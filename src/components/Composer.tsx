@@ -2,7 +2,7 @@ import { useRef } from "react";
 import { ModelStatus } from "./ModelStatus";
 import { EXAMPLE_TASKS, type RunState } from "../data/mock";
 
-export function Composer({ task, setTask, state, onRun, onOpenSettings }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void; onOpenSettings: () => void }) {
+export function Composer({ task, setTask, state, onRun }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void }) {
   const busy = state === "working" || state === "verifying";
   const canRun = task.trim().length > 0 && !busy;
   const areaRef = useRef<HTMLTextAreaElement>(null);
@@ -31,7 +31,7 @@ export function Composer({ task, setTask, state, onRun, onOpenSettings }: { task
         />
         <div className="task-controls">
           <div className="flex min-w-0 items-center gap-3 sm:gap-5">
-            <ModelStatus onOpenSettings={onOpenSettings} />
+            <ModelStatus />
             <span className="hidden items-center gap-2 text-[11px] text-faint sm:flex" title="Monid search is planned for a future backend integration; it is not connected in this preview.">
               <span className="h-1.5 w-1.5 rounded-full bg-line" aria-hidden="true" />
               Monid · search planned
