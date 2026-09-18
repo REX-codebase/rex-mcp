@@ -22,6 +22,8 @@ export default function App() {
   const [ultraPulse, setUltraPulse] = useState(0);
   const [fast, setFast] = useState(false);
   const [fastPulse, setFastPulse] = useState(0);
+  const [fastPhase, setFastPhase] = useState<"idle" | "engaging" | "disengaging">("idle");
+  const fastTimer = useRef<number | null>(null);
   const [task, setTask] = useState("");
   const [session, setSession] = useState<Session | null>(null);
   const [hero, setHero] = useState<"shown" | "settling" | "gone">("shown");
@@ -54,6 +56,7 @@ export default function App() {
     () => () => {
       cancel.current?.();
       if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
+      if (fastTimer.current !== null) window.clearTimeout(fastTimer.current);
     },
     []
   );
@@ -66,6 +69,15 @@ export default function App() {
     setHero((prev) => (prev === "gone" ? prev : "settling"));
     if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
     settleTimer.current = window.setTimeout(() => setHero("gone"), reduced ? 40 : 520);
+  };
+
+  const toggleFast = () => {
+    const next = !fast;
+    if (fastTimer.current !== null) window.clearTimeout(fastTimer.current);
+    setFastPhase(reduced ? "idle" : next ? "engaging" : "disengaging");
+    setFast(next);
+    setFastPulse((v) => v + 1);
+    if (!reduced) fastTimer.current = window.setTimeout(() => setFastPhase("idle"), 1120);
   };
 
   const onRun = () => {
@@ -97,15 +109,20 @@ export default function App() {
   };
 
   return (
-    <div className={`harness-shell min-h-full ${ultra ? "ultra-on" : ""} ${fast ? "fast-on" : ""} ${reduced ? "reduced-fx" : ""}`} data-ultra={ultra ? "on" : "off"}>
+    <div className={`harness-shell min-h-full ${ultra ? "ultra-on" : ""} ${fast ? "fast-on" : ""} ${fastPhase !== "idle" ? `fast-${fastPhase}` : ""} ${reduced ? "reduced-fx" : ""}`} data-ultra={ultra ? "on" : "off"}>
       <div className="ultra-transition" key={ultraPulse} aria-hidden="true"><span /><span /><span /><span /></div>
-      <div className="fast-transition" key={fastPulse} aria-hidden="true">
-        <span /><span /><span /><span /><span /><span /><span /><span /><span />
-      </div>
+      {fastPhase !== "idle" && (
+        <div className="fast-transition" key={fastPulse} aria-hidden="true">
+          <div className="fast-iris"><i /><i /><i /></div>
+          <div className="fast-rails"><i /><i /><i /><i /><i /><i /></div>
+          <div className="fast-word"><span>FAST</span><small>LATENCY PROFILE / VISUAL PREVIEW</small></div>
+          <div className="fast-cut fast-cut-a" /><div className="fast-cut fast-cut-b" />
+        </div>
+      )}
       <div className="ultra-atmosphere" aria-hidden="true"><span className="ultra-horizon" /><span className="ultra-scan" /></div>
-      <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={() => { setFast((v) => !v); setFastPulse((v) => v + 1); }} />
+      <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={toggleFast} />
       <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Premium preview engaged" : "Premium preview offline"}</b><small>No extra capabilities are active</small></div>
-      <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "Interface tempo preview" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small></div>
+      <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "TEMPO PROFILE ARMED" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small><i aria-hidden="true" /></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
         {view === "settings" ? (
           <SettingsView
