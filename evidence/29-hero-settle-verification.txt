@@ -1,0 +1,27 @@
+29-hero-settle-verification: build, interaction and pixel checks
+Date: 2026-09-18 (IST)
+Build: tsc + vite production build passes.
+Method: playwright-core driving system Chrome 151 against vite preview (dist), script
+verification/hero-settle/verify-hero.mjs. Screenshots in verification/hero-settle/,
+recording hero-settle-demo.mp4 (18.8s, 1280x800).
+
+DOM assertions (all pass):
+- idle: hero=1 followup=0 composers; overflow 0
+- mid-transition (240ms): hero+followup overlap (the morph), followup arriving blurred
+- settled (740ms): hero=0 followup=1 - INV-01 single composer holds
+- run done: followup textarea has focus; original task quoted at top of thread;
+  hero=0 followup=1; overflow 0
+- follow-up sent via Ctrl+Enter: 2 turns, still exactly 1 composer
+- New task button: hero returns (hero=1 followup=0), session cleared
+- history select from idle: hero settles away, exactly 1 composer, overflow 0
+- reduced motion (emulated): hero gone at 150ms, no travel/blur; run completes
+- mobile 390: idle and done overflow 0; hero=0 followup=1 after run
+
+Pixel inspection (tools read on PNGs):
+- 02-transition-1440: bottom composer mid-arrival with blur clearing, hero exited
+- 04-done-1440: single composer focused at bottom, task quote, evidence, receipt
+- 05-followup-done-1440: two turns, one composer
+- 06-newtask-1440: hero restored intact (logo/header/tabs unchanged)
+- 08-reduced-early-1440: instant swap, no blur/travel
+- 11-transition-390 / 12-done-390: mobile settle and final state clean, no overflow
+- video frame 2.6s: blurred settle visible in motion

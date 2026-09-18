@@ -1,0 +1,20 @@
+28-hero-settle-grounding: owner request and constraints
+Date: 2026-09-18 (IST)
+Owner (WhatsApp, via main agent): "Great. But once user enter his first query, the main
+prompt box on the top should disappear or move and adjust to bottom with a sleek blurred
+animation! It is inconsistent that it should still be their. Do this and show me!"
+Main's interpretation (delegation): after the first run, the large top starter composer
+must not remain; it disappears or visually resolves into the bottom follow-up composer
+with a brief blur/move effect; once results exist, exactly one composer lives at the
+bottom of the session; reduced-motion replaces movement/blur with an immediate or subtle
+state change; preserve follow-up behavior, Settings, truthful preview labels, REX
+header/logo, frontend-only scope.
+
+Current-state facts (verified in source at 9f1c3fd):
+- src/App.tsx mounts the hero <Composer> unconditionally above <SessionView>.
+- src/components/SessionView.tsx renders <FollowUpComposer> only when the latest turn
+  has finished, so during a run there are effectively two composers (hero + none at
+  bottom until done) and after a run there are two composers (hero + follow-up).
+- Motion system: App computes `reduced` from Settings (system/reduce/full) and applies
+  .reduced-fx; index.css also honors prefers-reduced-motion globally.
+- FollowUpComposer already shares the task-field visual language (.followup-field).

@@ -60,3 +60,19 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
   .followup-input{padding:14px 14px 8px}
   .model-status-menu{width:min(272px,calc(100vw - 42px))}
 }
+
+/* Hero settle: starter composer resolves into the single bottom composer */
+.hero-wrap{display:grid;grid-template-rows:1fr;transition:grid-template-rows 460ms cubic-bezier(.32,.72,0,1)}
+.hero-wrap>div{min-height:0;overflow:hidden}
+.hero-wrap.settling{grid-template-rows:0fr;pointer-events:none}
+.hero-settle-inner{animation:hero-in 380ms cubic-bezier(.32,.72,0,1) both}
+.hero-wrap.settling .hero-settle-inner{animation:hero-settle 440ms cubic-bezier(.32,.72,0,1) both}
+@keyframes hero-settle{to{opacity:0;transform:translateY(52px) scale(.985);filter:blur(10px)}}
+@keyframes hero-in{from{opacity:0;transform:translateY(8px);filter:blur(3px)}to{opacity:1;transform:none;filter:none}}
+.composer-arrive{animation:composer-arrive 520ms cubic-bezier(.32,.72,0,1) 90ms both}
+@keyframes composer-arrive{from{opacity:0;transform:translateY(30px) scale(.99);filter:blur(8px)}to{opacity:1;transform:none;filter:none}}
+
+/* Session header with the new-task reset */
+.session-head{display:flex;align-items:center;justify-content:space-between}
+.newtask-button{display:flex;min-height:34px;align-items:center;gap:7px;border:1px solid color-mix(in srgb,var(--color-line) 82%,transparent);border-radius:8px;background:transparent;padding:0 12px;font-size:12px;font-weight:500;color:var(--color-muted);transition:color 150ms,border-color 150ms}
+.newtask-button:hover{color:var(--color-text);border-color:var(--color-line)}

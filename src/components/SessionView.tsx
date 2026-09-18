@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Session, Turn } from "../data/mock";
 
 function fmt(ms: number) {
@@ -11,12 +11,10 @@ function TurnBlock({ turn, receipt, expanded }: { turn: Turn; receipt: string; e
   const passed = turn.steps.filter((s) => s.ok).length;
   return (
     <article className={turn.kind === "follow-up" ? "turn-block" : ""} aria-label={turn.kind === "follow-up" ? "Follow-up" : "Result"}>
-      {turn.kind === "follow-up" && (
-        <p className="turn-request">
-          <span className="eyebrow">Follow-up</span>
-          <span className="turn-request-text">&ldquo;{turn.request}&rdquo;</span>
-        </p>
-      )}
+      <p className="turn-request">
+        <span className="eyebrow">{turn.kind === "follow-up" ? "Follow-up" : "Task"}</span>
+        <span className="turn-request-text">&ldquo;{turn.request}&rdquo;</span>
+      </p>
       <div className="flex items-baseline justify-between gap-4">
         <p className="eyebrow">{turn.state === "blocked" ? "Stopped" : turn.kind === "follow-up" ? "Updated result" : "Result"}</p>
         <span className="font-mono text-[11px] text-faint">
@@ -76,10 +74,13 @@ function TurnBlock({ turn, receipt, expanded }: { turn: Turn; receipt: string; e
   );
 }
 
-function FollowUpComposer({ busy, onFollowUp }: { busy: boolean; onFollowUp: (request: string) => void }) {
+function FollowUpComposer({ busy, onFollowUp, focusWhenReady }: { busy: boolean; onFollowUp: (request: string) => void; focusWhenReady: boolean }) {
   const [text, setText] = useState("");
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const canSend = text.trim().length > 0 && !busy;
+  useEffect(() => {
+    if (focusWhenReady && !busy) areaRef.current?.focus();
+  }, [focusWhenReady, busy]);
   const send = () => {
     const request = text.trim();
     if (!request) return;
@@ -87,7 +88,7 @@ function FollowUpComposer({ busy, onFollowUp }: { busy: boolean; onFollowUp: (re
     setText("");
   };
   return (
-    <div className="followup-field" aria-label="Follow up on this run">
+    <div className="followup-field composer-arrive" aria-label="Follow up on this run">
       <textarea
         ref={areaRef}
         rows={2}
@@ -112,24 +113,25 @@ function FollowUpComposer({ busy, onFollowUp }: { busy: boolean; onFollowUp: (re
   );
 }
 
-export function SessionView({ session, busy, onFollowUp }: { session: Session; busy: boolean; onFollowUp: (request: string) => void }) {
+export function SessionView({ session, busy, onFollowUp, onNewTask, focusComposer }: { session: Session; busy: boolean; onFollowUp: (request: string) => void; onNewTask: () => void; focusComposer: boolean }) {
   const latestIndex = session.turns.length - 1;
-  const latest = session.turns[latestIndex];
-  const latestFinished = latest && (latest.state === "done" || latest.state === "blocked");
   return (
     <section aria-label="Session" className="result-section">
+      <div className="session-head">
+        <span className="eyebrow">Session</span>
+        <button type="button" className="newtask-button" onClick={onNewTask}>
+          <svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 1.5v9M1.5 6h9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+          New task
+        </button>
+      </div>
       {session.turns.map((turn, i) => (
         <TurnBlock key={turn.id} turn={turn} receipt={session.receipt} expanded={i === latestIndex} />
       ))}
-      {latestFinished && (
-        <>
-          <FollowUpComposer busy={busy} onFollowUp={onFollowUp} />
-          <p className="mt-3 text-[11px] leading-relaxed text-faint">
-            Follow-ups keep this run&rsquo;s context instead of starting over. Preview: responses are
-            simulated locally, nothing is sent to a model.
-          </p>
-        </>
-      )}
+      <FollowUpComposer busy={busy} onFollowUp={onFollowUp} focusWhenReady={focusComposer} />
+      <p className="mt-3 text-[11px] leading-relaxed text-faint">
+        Follow-ups keep this run&rsquo;s context instead of starting over. Preview: responses are
+        simulated locally, nothing is sent to a model.
+      </p>
       <p className="mt-6 text-xs leading-relaxed text-faint">Preview only. No backend is connected, so this is sample interface data, not real agent output.</p>
     </section>
   );
