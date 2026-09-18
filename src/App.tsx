@@ -15,7 +15,9 @@ const MOTION_KEY = "rex-harness-motion";
 // wrapper collapses - and unmounts, leaving exactly one composer at the
 // bottom of the session. Reduced motion swaps it instantly.
 export default function App() {
-  const [view, setView] = useState<"task" | "settings" | "browser">("task");
+  const [view, setView] = useState<"task" | "settings">("task");
+  const [browserPhase, setBrowserPhase] = useState<"closed" | "active" | "collapsed">("closed");
+  const [browserRun, setBrowserRun] = useState(0);
   const [ultra, setUltra] = useState(false);
   const [ultraPulse, setUltraPulse] = useState(0);
   const [task, setTask] = useState("");
@@ -41,11 +43,11 @@ export default function App() {
       /* storage unavailable; preference just won't persist */
     }
   }, [motion]);
-  // The agent browser exists only inside Ultra. Turning Ultra off while
-  // the browser view is open returns to the task view.
+  // Ultra owns the browser as a task tool, never as a destination. Turning
+  // Ultra off removes the tool without changing the Standard task surface.
   useEffect(() => {
-    if (!ultra && view === "browser") setView("task");
-  }, [ultra, view]);
+    if (!ultra) setBrowserPhase("closed");
+  }, [ultra]);
   useEffect(
     () => () => {
       cancel.current?.();
@@ -70,6 +72,10 @@ export default function App() {
     if (!label) return;
     const s = newSession(label);
     cancel.current = startMockTurn(s, label, "task", setSession, reduced);
+    if (ultra) {
+      setBrowserRun((v) => v + 1);
+      setBrowserPhase("active");
+    }
     beginSettle();
   };
 
@@ -85,6 +91,7 @@ export default function App() {
     setSession(null);
     setTask("");
     setHero("shown");
+    setBrowserPhase("closed");
   };
 
   return (
@@ -94,9 +101,7 @@ export default function App() {
       <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} />
       <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Premium preview engaged" : "Premium preview offline"}</b><small>No extra capabilities are active</small></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
-        {view === "browser" && ultra ? (
-          <BrowserView reduced={reduced} />
-        ) : view === "settings" ? (
+        {view === "settings" ? (
           <SettingsView
             motion={motion}
             setMotion={setMotion}
@@ -130,6 +135,24 @@ export default function App() {
               </div>
             )}
             <StateRail state={state} blockedReason={latest?.blockedReason} />
+            {ultra && session && browserPhase === "active" && (
+              <BrowserView
+                key={browserRun}
+                reduced={reduced}
+                onFinished={() => setBrowserPhase("collapsed")}
+              />
+            )}
+            {ultra && session && browserPhase === "collapsed" && (
+              <button
+                type="button"
+                className="browser-collapsed"
+                onClick={() => { setBrowserRun((v) => v + 1); setBrowserPhase("active"); }}
+                aria-label="Reopen the simulated browser work receipt"
+              >
+                <span><b>Browser work complete</b><small>Tool closed · receipt B-0119 · SAMPLE</small></span>
+                <span>Review</span>
+              </button>
+            )}
             {session ? (
               <SessionView
                 key={session.id}
