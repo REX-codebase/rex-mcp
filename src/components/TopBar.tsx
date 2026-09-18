@@ -1,6 +1,6 @@
 import rexLogo from "../assets/rex-logo.svg";
 
-export function TopBar({ view, onView, ultra, onUltra }: { view: "task" | "settings"; onView: (v: "task" | "settings") => void; ultra: boolean; onUltra: () => void }) {
+export function TopBar({ view, onView, ultra, onUltra }: { view: "task" | "settings" | "browser"; onView: (v: "task" | "settings" | "browser") => void; ultra: boolean; onUltra: () => void }) {
   return (
     <header className="top-shell mx-auto flex w-full max-w-[820px] items-center justify-between px-5 py-5 sm:px-8 sm:py-7">
       <div className="brand-lockup flex min-w-0 items-center gap-3">
@@ -10,6 +10,9 @@ export function TopBar({ view, onView, ultra, onUltra }: { view: "task" | "setti
       <div className="top-actions flex shrink-0 items-center gap-2 sm:gap-4">
         <nav className="view-tabs" aria-label="View">
           <button type="button" aria-current={view === "task" ? "page" : undefined} className={view === "task" ? "is-current" : ""} onClick={() => onView("task")}>Task</button>
+          {ultra && (
+            <button type="button" aria-current={view === "browser" ? "page" : undefined} className={view === "browser" ? "is-current" : ""} onClick={() => onView("browser")}>Browser</button>
+          )}
           <button type="button" aria-current={view === "settings" ? "page" : undefined} className={view === "settings" ? "is-current" : ""} onClick={() => onView("settings")}>Settings</button>
         </nav>
         <button type="button" className={`ultra-control ${ultra ? "is-on" : ""}`} aria-pressed={ultra} aria-label={`${ultra ? "Turn off" : "Preview"} Ultra mode`} onClick={onUltra}>
