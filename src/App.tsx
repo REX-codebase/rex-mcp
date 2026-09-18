@@ -128,7 +128,6 @@ export default function App() {
                       setTask={setTask}
                       state={state}
                       onRun={onRun}
-                      onOpenSettings={() => setView("settings")}
                     />
                   </div>
                 </div>
