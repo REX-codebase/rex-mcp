@@ -1,0 +1,54 @@
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #0b0a10;
+  --color-surface: #14121c;
+  --color-raised: #1c1928;
+  --color-border: #292339;
+  --color-text: #edebf5;
+  --color-muted: #918ca3;
+  --color-faint: #6b6580;
+  --color-accent: #8b7cf0;
+  --color-done: #6ed3a5;
+  --color-blocked: #e0a458;
+  --color-danger: #df6b6b;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: color-mix(in srgb, var(--color-accent) 35%, transparent); }
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 70%, transparent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.motion-safe-fade { transition: opacity 180ms ease-out, transform 180ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.working-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
