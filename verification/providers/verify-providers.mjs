@@ -1,0 +1,38 @@
+import { chromium } from 'playwright';
+import { mkdir, writeFile } from 'node:fs/promises';
+const base='http://127.0.0.1:4173';
+await mkdir('verification/providers',{recursive:true});
+const browser=await chromium.launch({headless:true});
+const results={};
+async function run(name,width,height,reduced=false){
+ const context=await browser.newContext({viewport:{width,height},reducedMotion:reduced?'reduce':'no-preference',recordVideo:{dir:'verification/providers/videos',size:{width,height}}});
+ const page=await context.newPage();
+ await page.goto(base,{waitUntil:'networkidle'});
+ await page.getByRole('button',{name:'Settings',exact:true}).click();
+ await page.getByRole('heading',{name:'Google Gemini'}).waitFor();
+ results[`${name}_defaultProvider`]=await page.getByRole('heading',{name:'Google Gemini'}).isVisible();
+ results[`${name}_testDisabled`]=await page.getByRole('button',{name:'Test connection'}).isDisabled();
+ results[`${name}_passwordInputCount`]=await page.locator('input[type=password]').count();
+ await page.getByRole('button',{name:/DeepSeek/}).click();
+ if(await page.getByLabel('Base URL').inputValue() !== 'https://api.deepseek.com') throw new Error('DeepSeek preset mismatch');
+ await page.getByLabel('Default model ID').fill('deepseek-chat');
+ results[`${name}_draftState`]=await page.getByText('Unsaved draft').isVisible();
+ await page.getByRole('button',{name:'Keep draft for this session'}).click();
+ results[`${name}_keptState`]=await page.getByText('Draft · runtime needed').isVisible();
+ await page.getByRole('button',{name:/Custom endpoint/}).click();
+ await page.getByLabel('Base URL').fill('https://example.invalid/v1');
+ await page.getByLabel('Default model ID').fill('my-model');
+ await page.screenshot({path:`verification/providers/${name}.png`,fullPage:true});
+ results[`${name}_overflow`]=await page.evaluate(()=>({scrollWidth:document.documentElement.scrollWidth,innerWidth:window.innerWidth,ok:document.documentElement.scrollWidth<=window.innerWidth}));
+ results[`${name}_secretStorage`]=await page.evaluate(()=>Object.keys(localStorage).filter(k=>/key|provider|token|secret/i.test(k)));
+ results[`${name}_reduced`]=reduced;
+ await context.close();
+}
+await run('01-providers-1440',1440,900);
+await run('02-providers-390',390,844);
+await run('03-providers-reduced-1440',1440,900,true);
+await browser.close();
+await writeFile('verification/providers/checks.json',JSON.stringify(results,null,2));
+if(Object.entries(results).some(([k,v])=>k.endsWith('_overflow')&&!v.ok)) throw new Error('overflow');
+if(Object.entries(results).some(([k,v])=>k.endsWith('_secretStorage')&&v.length)) throw new Error('secret storage');
+console.log(JSON.stringify(results,null,2));

@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { ProvidersSettings } from "./ProvidersSettings";
 export type MotionPref = "system" | "reduce" | "full";
 
 const MOTION_OPTIONS: { id: MotionPref; label: string; hint: string }[] = [
@@ -7,13 +9,19 @@ const MOTION_OPTIONS: { id: MotionPref; label: string; hint: string }[] = [
 ];
 
 export function SettingsView({ motion, setMotion, onReset }: { motion: MotionPref; setMotion: (m: MotionPref) => void; onReset: () => void }) {
+  const [section, setSection] = useState<"general" | "providers">("providers");
   return (
     <div className="mt-3 sm:mt-7">
-      <div className="mb-7 sm:mb-9">
+      <div className="mb-6 sm:mb-8">
         <p className="eyebrow">Settings</p>
         <h1 className="mt-2 text-[30px] font-medium leading-[1.12] tracking-[-0.04em] text-text sm:text-[38px]">Quiet defaults, honest state.</h1>
       </div>
+      <nav className="settings-tabs" aria-label="Settings sections">
+        <button type="button" className={section === "general" ? "is-current" : ""} aria-current={section === "general" ? "page" : undefined} onClick={() => setSection("general")}>General</button>
+        <button type="button" className={section === "providers" ? "is-current" : ""} aria-current={section === "providers" ? "page" : undefined} onClick={() => setSection("providers")}>Providers</button>
+      </nav>
 
+      {section === "providers" ? <ProvidersSettings /> : <>
       <section aria-label="Runtime" className="settings-section">
         <h2 className="eyebrow">Runtime</h2>
         <div className="settings-row">
@@ -84,6 +92,7 @@ export function SettingsView({ motion, setMotion, onReset }: { motion: MotionPre
         </p>
       </section>
 
+      </>}
       <p className="mt-8 text-xs leading-relaxed text-faint">REX Harness · Preview build · Frontend only, no backend connected.</p>
     </div>
   );
