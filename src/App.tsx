@@ -5,6 +5,7 @@ import { StateRail } from "./components/StateRail";
 import { SessionView } from "./components/SessionView";
 import { HistoryList } from "./components/HistoryList";
 import { SettingsView, type MotionPref } from "./components/SettingsView";
+import { BrowserView } from "./components/BrowserView";
 import { PAST_SESSIONS, newSession, startMockTurn, type Session } from "./data/mock";
 
 const MOTION_KEY = "rex-harness-motion";
@@ -14,7 +15,7 @@ const MOTION_KEY = "rex-harness-motion";
 // wrapper collapses - and unmounts, leaving exactly one composer at the
 // bottom of the session. Reduced motion swaps it instantly.
 export default function App() {
-  const [view, setView] = useState<"task" | "settings">("task");
+  const [view, setView] = useState<"task" | "settings" | "browser">("task");
   const [ultra, setUltra] = useState(false);
   const [ultraPulse, setUltraPulse] = useState(0);
   const [task, setTask] = useState("");
@@ -40,6 +41,11 @@ export default function App() {
       /* storage unavailable; preference just won't persist */
     }
   }, [motion]);
+  // The agent browser exists only inside Ultra. Turning Ultra off while
+  // the browser view is open returns to the task view.
+  useEffect(() => {
+    if (!ultra && view === "browser") setView("task");
+  }, [ultra, view]);
   useEffect(
     () => () => {
       cancel.current?.();
@@ -88,7 +94,9 @@ export default function App() {
       <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} />
       <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Premium preview engaged" : "Premium preview offline"}</b><small>No extra capabilities are active</small></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
-        {view === "settings" ? (
+        {view === "browser" && ultra ? (
+          <BrowserView reduced={reduced} />
+        ) : view === "settings" ? (
           <SettingsView
             motion={motion}
             setMotion={setMotion}
