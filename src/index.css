@@ -267,3 +267,15 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
   .sim-page{min-height:300px}
 }
 .reduced-fx .sim-skel{animation:none;background:#e7dfca}
+
+
+/* Ultra browser is a transient tool inside the active task, never a view. */
+.browser-tool-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin:4px 2px 14px}
+.browser-tool-head .browser-intent{margin:0;min-width:0}
+.browser-tool-state{flex-shrink:0;font-family:var(--font-mono);font-size:10px;letter-spacing:.04em;color:var(--color-faint)}
+.browser-view{margin:4px 0 26px;padding:14px 0 24px;border-top:1px solid rgba(216,203,179,.2);border-bottom:1px solid rgba(216,203,179,.2);animation:browser-tool-in .32s ease-out both}
+.browser-collapsed{display:flex;width:100%;align-items:center;justify-content:space-between;gap:16px;margin:4px 0 24px;border:1px solid color-mix(in srgb,var(--color-line) 82%,transparent);border-radius:8px;background:color-mix(in srgb,var(--color-surface) 72%,transparent);padding:12px 14px;text-align:left;color:var(--color-text)}
+.browser-collapsed>span:first-child{display:flex;min-width:0;flex-direction:column;gap:3px}.browser-collapsed b{font-size:12px;font-weight:550}.browser-collapsed small{font-family:var(--font-mono);font-size:10px;color:var(--color-faint)}.browser-collapsed>span:last-child{font-size:11px;color:var(--color-accent)}
+@keyframes browser-tool-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.reduced-fx .browser-view{animation:none}
+@media(max-width:560px){.browser-tool-head{display:block}.browser-tool-state{display:block;margin-top:7px}.browser-collapsed{align-items:flex-start}.browser-collapsed small{white-space:normal}}
