@@ -12,13 +12,11 @@ One task surface, one truthful session spine:
 - **Composer** - describe one task, run it (Ctrl+Enter).
 - **Follow-ups** - keep talking to the agent after a run: ask for changes and
   iterate with the run's context kept, on the same receipt.
-- **Model status** - honest by construction. No runtime is connected, so the
-  control says so and points at Settings instead of listing invented models.
+- **Prompt-native model picker** - connected models will appear inside the composer. The same menu opens animated subscription and API setup dialogs; the preview invents no connected models and performs no real connection.
 - **State rail** - Idle / Working / Verifying / Done / Blocked. Blocked runs say why.
 - **Result + evidence** - plain-language outcome first, then the evidence ledger
   (steps, check types, durations) and a verification summary with a receipt ID.
-- **Settings** - runtime status, a working motion preference, keyboard
-  shortcuts, and a reset for local preferences.
+- **Settings** - general runtime status, motion, keyboard shortcuts, and local-preference reset. Provider setup is not a separate settings surface.
 - **Past runs** - quiet history, not a dashboard.
 - **Ultra browser tool** - appears inside the active task only when the sample agent calls it, then closes to a compact receipt when browser work finishes. It is never a separate tab or product surface. Standard mode has no browser UI.
 
