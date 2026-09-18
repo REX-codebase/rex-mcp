@@ -7,12 +7,18 @@ window shows comes from a local sample-data engine and is labeled as such
 
 ## What it is
 
-One task surface, one model dropdown, one truthful run spine:
+One task surface, one truthful session spine:
 
-- **Composer** - describe one task, pick a model, run it (Ctrl+Enter).
+- **Composer** - describe one task, run it (Ctrl+Enter).
+- **Follow-ups** - keep talking to the agent after a run: ask for changes and
+  iterate with the run's context kept, on the same receipt.
+- **Model status** - honest by construction. No runtime is connected, so the
+  control says so and points at Settings instead of listing invented models.
 - **State rail** - Idle / Working / Verifying / Done / Blocked. Blocked runs say why.
 - **Result + evidence** - plain-language outcome first, then the evidence ledger
   (steps, check types, durations) and a verification summary with a receipt ID.
+- **Settings** - runtime status, a working motion preference, keyboard
+  shortcuts, and a reset for local preferences.
 - **Past runs** - quiet history, not a dashboard.
 
 Behavior is rooted in the Fable workflow (evidence, verification, receipts)

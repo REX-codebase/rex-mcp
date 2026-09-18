@@ -1,0 +1,16 @@
+Follow-up + Settings verification, 2026-09-18 (playwright-core + system Chrome, vite dev :1420)
+Build: tsc && vite build PASS.
+Programmatic checks:
+- overflowDesktop=false, overflowMobile=false, overflowMobileSettings=false (1440x1100 / 390x844)
+- bodyHasAtlas=false (zero invented model labels in rendered UI)
+- followUpContext=true ("Read the session so far" step renders in follow-up turns)
+- sampleLabels=3 (SAMPLE seal on task turn, follow-up turn, and history)
+- reducedClassApplied=true, motionPersisted="reduce" (Settings motion control is functional + localStorage)
+- reducedRunMs=2302 (reduced-motion run completes faster, pacing honored)
+Keyboard: Ctrl+Enter runs task and sends follow-up; Esc closes model-status popover; Tab focus ring visible (07-keyboard-focus-1440.png).
+Pixels inspected: 01 idle, 02 model-status popover, 03 working, 04 done + follow-up composer,
+05 follow-up working, 06 follow-up done (thread with prior turn + quoted request), 07 keyboard focus,
+08/09 settings (+Reduce applied), 10-13 mobile idle/done/follow-up-done/settings.
+Fable workflow: session rex-harness-followup-settings; grounding items, 3 invariants, mockup
+deliberation (inline-thread selected), 2 refinement cycles, Phase 3, execution unlock receipt
+(evidence/25), rubric defined (evidence/26; pointers pending formal verdict submission).
