@@ -80,9 +80,8 @@ function Shot({ kind }: { kind: string }) {
   );
 }
 
-export function BrowserView({ reduced }: { reduced: boolean }) {
+export function BrowserView({ reduced, onFinished }: { reduced: boolean; onFinished: () => void }) {
   const [session, setSession] = useState<BrowserSession | null>(null);
-  const [followText, setFollowText] = useState("");
   const ctl = useRef<ReturnType<typeof startBrowserPreview> | null>(null);
 
   const boot = () => {
@@ -95,6 +94,12 @@ export function BrowserView({ reduced }: { reduced: boolean }) {
     return () => ctl.current?.cancel();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reduced]);
+
+  useEffect(() => {
+    if (!session?.done) return;
+    const timer = window.setTimeout(onFinished, reduced ? 180 : 1100);
+    return () => window.clearTimeout(timer);
+  }, [session?.done, reduced, onFinished]);
 
   useEffect(() => {
     if (!session?.targeting) return;
@@ -110,11 +115,14 @@ export function BrowserView({ reduced }: { reduced: boolean }) {
   const userDriving = s.ownership === "user";
 
   return (
-    <section aria-label="Agent browser (simulated preview)" className="browser-view">
-      <p className="browser-intent">
-        <span className="eyebrow">Agent intent</span>
-        <span className="browser-intent-text">{s.intent}</span>
-      </p>
+    <section aria-label="Agent browser tool (simulated preview)" className="browser-view">
+      <div className="browser-tool-head">
+        <p className="browser-intent">
+          <span className="eyebrow">Browser called</span>
+          <span className="browser-intent-text">{s.intent}</span>
+        </p>
+        <span className="browser-tool-state">Inside this task · SAMPLE</span>
+      </div>
 
       <div className="browser-frame">
         <div className="browser-nav">
@@ -212,31 +220,7 @@ export function BrowserView({ reduced }: { reduced: boolean }) {
             Receipt <b>{s.receipt}</b> · {s.done ? (s.blockedReason ? "stopped" : "complete") : "in progress"} · SAMPLE
           </p>
           {s.blockedReason && <p className="blocked-line">{s.blockedReason}</p>}
-          {s.done && !s.blockedReason && (
-            <div className="browser-followup">
-              <input
-                value={followText}
-                onChange={(e) => setFollowText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && followText.trim()) {
-                    ctl.current?.followUp(followText.trim());
-                    setFollowText("");
-                  }
-                }}
-                aria-label="Follow up on this browser session"
-                placeholder="Follow up on this session. Context is kept."
-                className="browser-followup-input"
-              />
-              <button
-                type="button"
-                className="run-button"
-                disabled={!followText.trim()}
-                onClick={() => { ctl.current?.followUp(followText.trim()); setFollowText(""); }}
-              >
-                <span>Follow up</span>
-              </button>
-            </div>
-          )}
+
         </div>
       </div>
 
@@ -246,4 +230,4 @@ export function BrowserView({ reduced }: { reduced: boolean }) {
       </p>
     </section>
   );
-              }
+}
