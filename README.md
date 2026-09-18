@@ -20,6 +20,7 @@ One task surface, one truthful session spine:
 - **Settings** - runtime status, a working motion preference, keyboard
   shortcuts, and a reset for local preferences.
 - **Past runs** - quiet history, not a dashboard.
+- **Ultra browser tool** - appears inside the active task only when the sample agent calls it, then closes to a compact receipt when browser work finishes. It is never a separate tab or product surface. Standard mode has no browser UI.
 
 Behavior is rooted in the Fable workflow (evidence, verification, receipts)
 without exposing any protocol internals.
