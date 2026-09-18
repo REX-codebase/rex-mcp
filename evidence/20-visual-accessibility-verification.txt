@@ -1,0 +1,4 @@
+Pixel verification: desktop 1440x900 and mobile 360x800, idle/done/blocked/model-open/live-run states.
+Visual inspection: selected continuous-sheet direction is legible, aligned and free of clipping/overlap. One lifted task surface remains; result and history are open reading sections separated only by hairlines. Mobile evidence and verification metadata wrap cleanly.
+Automated browser probes: no horizontal overflow at 1440 or 360 in all captured states; keyboard listbox ArrowDown+Enter selected Atlas 1.5 Flash; Ctrl+Enter started the run; reduced-motion browser context completed; semantic labels present for task, model, result, evidence and history.
+Recording: verification/pixel-refinement/rex-harness-pixel-refinement.mp4 (1280x800, 13 seconds).

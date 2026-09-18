@@ -1,0 +1,76 @@
+{
+  "screens": [
+    {
+      "scrollWidth": 1440,
+      "clientWidth": 1440,
+      "labels": [
+        "New task",
+        "Task description",
+        "Model: Atlas 1.5 Pro",
+        "Example tasks",
+        "Past runs"
+      ]
+    },
+    {
+      "scrollWidth": 360,
+      "clientWidth": 360,
+      "labels": [
+        "New task",
+        "Task description",
+        "Model: Atlas 1.5 Pro",
+        "Example tasks",
+        "Past runs"
+      ]
+    },
+    {
+      "scrollWidth": 1440,
+      "clientWidth": 1440,
+      "labels": [
+        "New task",
+        "Task description",
+        "Model: Atlas 1.5 Pro",
+        "Result",
+        "Evidence",
+        "Past runs"
+      ]
+    },
+    {
+      "scrollWidth": 360,
+      "clientWidth": 360,
+      "labels": [
+        "New task",
+        "Task description",
+        "Model: Atlas 1.5 Pro",
+        "Result",
+        "Evidence",
+        "Past runs"
+      ]
+    },
+    {
+      "scrollWidth": 1440,
+      "clientWidth": 1440,
+      "labels": [
+        "New task",
+        "Task description",
+        "Model: Atlas 1.5 Pro",
+        "Result",
+        "Evidence",
+        "Past runs"
+      ]
+    },
+    {
+      "scrollWidth": 360,
+      "clientWidth": 360,
+      "labels": [
+        "New task",
+        "Task description",
+        "Model: Atlas 1.5 Pro",
+        "Model",
+        "Example tasks",
+        "Past runs"
+      ]
+    }
+  ],
+  "keyboard": "Model: Atlas 1.5 Flash",
+  "reducedMotion": true
+}

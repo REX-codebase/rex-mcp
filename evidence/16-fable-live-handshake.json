@@ -1,0 +1,23 @@
+{
+  "server": {
+    "name": "fable-engine",
+    "version": "1.3.9"
+  },
+  "protocol": "2024-11-05",
+  "tools": [
+    "fable_session",
+    "browser_open",
+    "browser_navigate",
+    "browser_click",
+    "browser_type",
+    "browser_scroll",
+    "browser_snapshot_layers",
+    "browser_screenshot",
+    "browser_close",
+    "browser_back",
+    "browser_forward",
+    "browser_wait",
+    "browser_press",
+    "browser_reload"
+  ]
+}

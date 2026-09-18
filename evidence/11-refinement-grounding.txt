@@ -1,0 +1,6 @@
+REX Harness Pixel-restraint refinement grounding, 2026-09-18
+- Owner revision: keep the existing frontend-only product shape, but make the interface substantially more minimal and Google Pixel-like: calmer spacing, stronger typography/hierarchy, fewer boxes and borders, softer clear state transitions, excellent density, and nearly no decorative noise.
+- Existing repo recovered from the user's private Drive backup and checksum-verified: rex-harness-v0.1.1.tar.gz SHA256 3f6c095d9d436c4b3cf9c5216491da59914fe3079249fd1e072fbe17587d030a.
+- Existing UI audit: five stacked bordered cards, border on almost every container/control, uniform 12px radii, persistent footer border, and equal visual weight for composer/result/history produce a generic component-library feel.
+- Preserve: one task surface, one model dropdown, truthful sample-data labels, lifecycle states, plain-language result, expandable evidence, private Tauri 2 frontend-only scope.
+- Runtime goal: no new runtime dependencies. Typography, spacing and hierarchy can be improved with existing React/Tailwind/CSS.
