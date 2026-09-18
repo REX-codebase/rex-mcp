@@ -1,0 +1,33 @@
+### 📊 Fable Session Status & Telemetry (`rex-harness-tauri-ui`)
+
+- **Objective**: Build the REX Harness desktop UI as a frontend-only Tauri 2 app: one task surface, one model dropdown, truthful capability states, clean human result with expandable evidence, restrained purple-black design. No backend.
+- **Active Phase**: `Phase 3: Adversarial Red-Teaming & Falsification` (Phase 3/6)
+- **Execution Lock**: 🟢 UNLOCKED (`can_execute_code: True`)
+- **Pacing**: `10m 56s` elapsed / `0s` remaining (`546.8%` budget used)
+- **Authority**: `0s` remaining (immutable outer deadline)
+- **Epistemic Breakdown**: `7 PROVEN`, `0 HYPOTHESIS`, `0 UNKNOWN` (Total: `7`)
+- **Invariants Recorded**: `2`
+- **Refinement Cycles**: `3`
+
+#### 🧠 System 3 Meta-Cognitive State:
+- **Variational Free Energy $F$**: `1.5726` (Complexity $D_{KL}$: `0.7649`, Accuracy: `-0.8077`)
+- **Kripke Safety Invariant**: `AG(safe) -> True`
+- **Active Biases Tracked**: `0`
+- **Contradiction Density**: `0.0`
+- **Hyperbolic Metric**: `INITIALIZED`
+
+#### 🔍 Recent Epistemic Ledger Items:
+- `[PROVEN]` **epi_003**: npm registry reachable; current Tauri JS packages are @tauri-apps/api 2.11.1 and @tauri-apps/cli 2.11.4 (Evidence: /home/sandbox/rex-harness/evidence/03-npm-registry.txt)
+- `[PROVEN]` **epi_004**: Approved product shape: executing general agent (not chatbot/run dashboard); one task surface; one model dropdown; truthful capability states; clean human result with expandable evidence; Fable-rooted behavior without raw protocol; restrained high-end purple-black; frontend only with clearly labeled mock data; pixel-tested; private archive to Drive (Evidence: /home/sandbox/rex-harness/evidence/04-product-shape.txt)
+- `[PROVEN]` **epi_005**: tauri.conf.json v2 schema confirmed from official Tauri docs: productName, version, identifier (required, reverse-DNS), build{beforeDevCommand,beforeBuildCommand,devUrl,frontendDist}, app{windows[],security}, bundle, plugins (Evidence: /tmp/tauri-config.md)
+- `[PROVEN]` **epi_006**: Design brief + thesis fixed: receipt chain as spatial spine; color reserved for state change; evidence ledger is the only ornament; model picker one compact dropdown; sample-data truthfulness markers specified (Evidence: /home/sandbox/rex-harness/brain/design-brief.md)
+- `[PROVEN]` **epi_007**: Design token system fixed with computed contrast pairs: text/canvas 14.9:1, muted/canvas 6.1:1, accent/canvas 5.2:1, done/canvas 8.4:1 (Evidence: /home/sandbox/rex-harness/brain/design-tokens.md)
+
+#### 📐 Invariants Specification:
+- **INV-01** `[architecture]`: The delivered UI never presents mock/demo data as live. For every rendered run, result, capability, or metric, a visible label or state distinguishes sample data from real backend state.
+- **INV-02** `[architecture]`: The UI remains usable and legible at 360x800, 768x1024, and 1440x900; all primary controls are keyboard-reachable with visible focus; prefers-reduced-motion is honored.
+
+#### 🔄 Recent Refinement Cycles:
+- **Cycle #1** `[ARCHETYPE MUTATION]` (layout archetypes for a trust-first agent UI): Single-column task spine: persistent composer, live state rail, result + receipt region, evidence ledger as the only ornament. Run history demoted to one quiet entry point.
+- **Cycle #2** `[INVARIANT STRESS-TESTING]` (truthfulness of run states with no backend): Run lifecycle is driven by a local mock engine module named and labeled as such; a persistent Preview marker sits on the run surface; Done receipts carry a sample-data seal; no fake network or model latency claims.
+- **Cycle #3** `[FALSIFICATION]` (executable attack pass on the built UI): Ran executable probes against the built frontend in headless Chromium: 10 screenshots across 3 viewports and 6 states; fixed 3 real defects found in pixels (dropdown opening over the composer, Done stage rendered active instead of complete, mobile evidence rows wrapping); keyboard listbox selection verified (Atlas 1.5 Flash chosen via arrows+Enter); reduced-motion run completes; mock-masquerade risk closed by sample flags + Preview pill + receipt seal.
