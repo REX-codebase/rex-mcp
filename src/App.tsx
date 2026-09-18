@@ -20,6 +20,8 @@ export default function App() {
   const [browserRun, setBrowserRun] = useState(0);
   const [ultra, setUltra] = useState(false);
   const [ultraPulse, setUltraPulse] = useState(0);
+  const [fast, setFast] = useState(false);
+  const [fastPulse, setFastPulse] = useState(0);
   const [task, setTask] = useState("");
   const [session, setSession] = useState<Session | null>(null);
   const [hero, setHero] = useState<"shown" | "settling" | "gone">("shown");
@@ -95,11 +97,15 @@ export default function App() {
   };
 
   return (
-    <div className={`harness-shell min-h-full ${ultra ? "ultra-on" : ""} ${reduced ? "reduced-fx" : ""}`} data-ultra={ultra ? "on" : "off"}>
+    <div className={`harness-shell min-h-full ${ultra ? "ultra-on" : ""} ${fast ? "fast-on" : ""} ${reduced ? "reduced-fx" : ""}`} data-ultra={ultra ? "on" : "off"}>
       <div className="ultra-transition" key={ultraPulse} aria-hidden="true"><span /><span /><span /><span /></div>
+      <div className="fast-transition" key={fastPulse} aria-hidden="true">
+        <span /><span /><span /><span /><span /><span /><span /><span /><span />
+      </div>
       <div className="ultra-atmosphere" aria-hidden="true"><span className="ultra-horizon" /><span className="ultra-scan" /></div>
-      <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} />
+      <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={() => { setFast((v) => !v); setFastPulse((v) => v + 1); }} />
       <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Premium preview engaged" : "Premium preview offline"}</b><small>No extra capabilities are active</small></div>
+      <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "Interface tempo preview" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
         {view === "settings" ? (
           <SettingsView
