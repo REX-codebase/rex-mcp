@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { PROVIDER_PRESETS, protocolLabel, type ProviderDraft, type ProviderPreset } from "../data/providers";
+import { backendKind, describeError, listSummaries, refreshCatalog, type BackendKind, type ProviderSummary } from "../data/backend";
 
 function makeDraft(preset: ProviderPreset): ProviderDraft {
   return {
@@ -14,6 +15,22 @@ function makeDraft(preset: ProviderPreset): ProviderDraft {
 }
 
 export function ProvidersSettings() {
+  const [backend, setBackend] = useState<BackendKind | null>(null);
+  const [live, setLive] = useState<Record<string, ProviderSummary>>({});
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<string | null>(null);
+  useEffect(() => {
+    backendKind().then(async (k) => {
+      setBackend(k);
+      if (!k) return;
+      try {
+        const summaries = await listSummaries();
+        setLive(Object.fromEntries(summaries.map((s) => [s.id, s])));
+      } catch {
+        /* backend went away; stay in draft mode */
+      }
+    });
+  }, []);
   const [selectedId, setSelectedId] = useState("gemini");
   const [drafts, setDrafts] = useState<Record<string, ProviderDraft>>(() =>
     Object.fromEntries(PROVIDER_PRESETS.map((p) => [p.id, makeDraft(p)]))
@@ -26,6 +43,7 @@ export function ProvidersSettings() {
       [selected.id]: { ...current[selected.id], status: "draft", ...patch },
     }));
   const isCompatible = selected.protocol === "openai-compatible";
+  const liveState = live[selected.id];
   const discoveryLabel = selected.modelDiscovery === "native" ? "Native model list" : selected.modelDiscovery === "openai-models" ? "Try GET /models" : "Manual model ID";
   const statusLabel = draft.status === "draft" ? "Unsaved draft" : draft.status === "needs-runtime" ? "Draft · runtime needed" : "Not connected";
 
@@ -87,16 +105,17 @@ export function ProvidersSettings() {
           <label>
             <span>API key</span>
             <button type="button" className="locked-field" disabled>
-              Desktop keychain <b>Pending runtime</b>
+              {backend ? (liveState?.has_key ? "Stored by Rust backend" : "Not stored") : "Desktop keychain"}{" "}
+              <b>{backend ? (liveState?.has_key ? "Connected" : "Missing") : "Pending runtime"}</b>
             </button>
-            <small>No key is entered or stored in this frontend preview.</small>
+            <small>{backend ? "Keys live in the backend credential store, never in this interface. Add one from the model menu in the task box." : "No key is entered or stored in this frontend preview."}</small>
           </label>
           <label>
             <span>Model discovery</span>
             <button type="button" className="locked-field" disabled>
-              {discoveryLabel} <b>Unavailable</b>
+              {discoveryLabel} <b>{backend ? (liveState?.catalog ? `${liveState.catalog.models.length} models` : "Ready") : "Unavailable"}</b>
             </button>
-            <small>REX will discover where supported, with manual entry as fallback.</small>
+            <small>{backend ? (liveState?.catalog ? `Fetched ${liveState.catalog.source === "live" ? "live" : "from a recorded live response"}.` : "Fetch runs from the model menu or Test connection.") : "REX will discover where supported, with manual entry as fallback."}</small>
           </label>
           <label className="provider-field-wide">
             <span>Default model ID</span>
@@ -110,13 +129,38 @@ export function ProvidersSettings() {
         </div>
 
         <div className="provider-actions">
-          <button type="button" className="test-button" disabled>Test connection</button>
+          {testResult && <span className="provider-err-line" role="status" style={{ marginRight: "auto" }}>{testResult}</span>}
+          <button
+            type="button"
+            className="test-button"
+            disabled={!backend || !liveState?.has_key || testing}
+            title={!backend ? "Needs the desktop runtime or dev sidecar" : !liveState?.has_key ? "Store an API key first (model menu in the task box)" : "Fetch the live model catalog"}
+            onClick={async () => {
+              setTesting(true);
+              setTestResult(null);
+              const result = await refreshCatalog(selected.id);
+              if (result.ok) {
+                setTestResult(`Live: ${result.catalog.models.length} models from ${selected.name}`);
+                try {
+                  const summaries = await listSummaries();
+                  setLive(Object.fromEntries(summaries.map((s) => [s.id, s])));
+                } catch { /* ignore */ }
+              } else {
+                setTestResult(describeError(result.error));
+              }
+              setTesting(false);
+            }}
+          >
+            {testing ? "Testing…" : "Test connection"}
+          </button>
           <button type="button" className="stage-button" onClick={() => update({ status: "needs-runtime" })}>{draft.status === "needs-runtime" ? "Draft kept in memory" : "Keep draft for this session"}</button>
         </div>
         <div className="provider-truth" role="note">
           <span aria-hidden="true">i</span>
           <p>
-            Configuration UI only. Live tests, encrypted persistence, model discovery, and inference need the desktop runtime. Draft fields stay in memory and disappear when this preview closes.
+            {backend
+              ? "Connected to the Rust provider backend. Keys sit in its credential store; this page only reads status and model counts."
+              : "Configuration UI only. Live tests, encrypted persistence, model discovery, and inference need the desktop runtime. Draft fields stay in memory and disappear when this preview closes."}
           </p>
         </div>
         {isCompatible && (

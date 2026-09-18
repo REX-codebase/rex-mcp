@@ -1,13 +1,68 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { PROVIDER_PRESETS } from "../data/providers";
+import {
+  backendKind,
+  clearProviderKey,
+  describeError,
+  listSummaries,
+  refreshCatalog,
+  setProviderKey,
+  type BackendKind,
+  type ProviderSummary,
+} from "../data/backend";
 
 type ConnectFlow = "subscription" | "api" | null;
+
+type Selection = { provider: string; id: string; label: string };
+
+const SELECTION_KEY = "rex-model-selection";
+
+function loadSelection(): Selection | null {
+  try {
+    const raw = window.localStorage.getItem(SELECTION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.id === "string" && typeof parsed.provider === "string") return parsed;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
 
 export function ModelStatus() {
   const [open, setOpen] = useState(false);
   const [flow, setFlow] = useState<ConnectFlow>(null);
+  const [kind, setKind] = useState<BackendKind | null>(null);
+  const [summaries, setSummaries] = useState<ProviderSummary[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState<string | null>(null);
+  const [selection, setSelection] = useState<Selection | null>(loadSelection);
+  // Connect-API form state. The key lives only in this field until it is
+  // handed to the backend; it is cleared immediately after.
   const [provider, setProvider] = useState(PROVIDER_PRESETS[0].id);
+  const [keyField, setKeyField] = useState("");
+  const [baseUrlField, setBaseUrlField] = useState("");
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    try {
+      setSummaries(await listSummaries());
+    } catch {
+      setSummaries([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    backendKind().then((k) => {
+      setKind(k);
+      if (k) reload();
+    });
+  }, [reload]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -31,10 +86,245 @@ export function ModelStatus() {
   const launch = (next: Exclude<ConnectFlow, null>) => {
     setOpen(false);
     setFlow(next);
+    setConnectError(null);
   };
 
+  const choose = (next: Selection) => {
+    setSelection(next);
+    try {
+      window.localStorage.setItem(SELECTION_KEY, JSON.stringify(next));
+    } catch {
+      /* ignore */
+    }
+    setOpen(false);
+  };
+
+  const refresh = async (providerId: string) => {
+    setRefreshing(providerId);
+    await refreshCatalog(providerId);
+    await reload();
+    setRefreshing(null);
+  };
+
+  const submitKey = async () => {
+    if (!keyField.trim() || connectBusy) return;
+    setConnectBusy(true);
+    setConnectError(null);
+    const preset = PROVIDER_PRESETS.find((p) => p.id === provider);
+    const baseUrl = preset?.protocol === "openai-compatible" ? baseUrlField.trim() || undefined : undefined;
+    const written = await setProviderKey(provider, keyField.trim(), baseUrl);
+    setKeyField("");
+    if (!written.ok) {
+      setConnectError(describeError(written.error));
+      setConnectBusy(false);
+      return;
+    }
+    const fetched = await refreshCatalog(provider);
+    if (!fetched.ok) {
+      setConnectError(describeError(fetched.error));
+      setConnectBusy(false);
+      await reload();
+      return;
+    }
+    setConnectBusy(false);
+    setFlow(null);
+    await reload();
+  };
+
+  const removeKey = async (providerId: string) => {
+    await clearProviderKey(providerId);
+    if (selection?.provider === providerId) {
+      setSelection(null);
+      try {
+        window.localStorage.removeItem(SELECTION_KEY);
+      } catch {
+        /* ignore */
+      }
+    }
+    await reload();
+  };
+
+  const totalModels = summaries.reduce((sum, s) => sum + (s.catalog?.models.length ?? 0), 0);
+  const connected = summaries.filter((s) => s.has_key || s.catalog);
+  const selectedPreset = PROVIDER_PRESETS.find((p) => p.id === provider)!;
+
+  // -------- Preview (no backend): exactly the honest preview UI --------
+  if (!kind) {
+    return <PreviewPicker open={open} setOpen={setOpen} flow={flow} launch={launch} setFlow={setFlow} provider={provider} setProvider={setProvider} refObj={ref} />;
+  }
+
+  // -------- Real backend --------
   return (
     <div ref={ref} className="relative model-picker">
+      <button
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={selection ? `Choose model. Current: ${selection.label}` : "Choose model. No model selected"}
+        onClick={() => {
+          setOpen((value) => !value);
+          if (!open) reload();
+        }}
+        className="model-trigger"
+      >
+        <span className={`model-mark ${selection ? "is-live" : ""}`} aria-hidden="true" />
+        <span>
+          <small>{selection ? selection.provider : "Model"}</small>
+          <b>{selection ? selection.id : totalModels > 0 ? `${totalModels} models available` : "Connect a model"}</b>
+        </span>
+        <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" /></svg>
+      </button>
+
+      {open && (
+        <div role="menu" aria-label="Models and provider connections" className="model-menu provider-menu live">
+          <div className="provider-menu-head">
+            <span>Available models</span>
+            <b>{loading ? "…" : totalModels}</b>
+          </div>
+
+          <div className="provider-model-scroll">
+            {loading && <div className="provider-empty"><span aria-hidden="true" /><div><b>Contacting providers</b><small>Fetching live model catalogs.</small></div></div>}
+
+            {!loading && connected.length === 0 && (
+              <div className="provider-empty">
+                <span aria-hidden="true" />
+                <div><b>No providers connected</b><small>Add an API key and its available models appear here, fetched live.</small></div>
+              </div>
+            )}
+
+            {!loading && connected.map((s) => (
+              <section key={s.id} className="provider-block" aria-label={`${s.name} models`}>
+                <header>
+                  <span>
+                    <b>{s.name}</b>
+                    {s.catalog && (
+                      <small>
+                        {s.catalog.models.length} models · {s.catalog.source === "live" ? "live" : "recorded live"} {new Date(s.catalog.fetched_at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                      </small>
+                    )}
+                  </span>
+                  <span className="provider-block-actions">
+                    <button type="button" onClick={() => refresh(s.id)} disabled={refreshing === s.id} aria-label={`Refresh ${s.name} models`}>
+                      {refreshing === s.id ? "…" : "Refresh"}
+                    </button>
+                    {s.has_key && <button type="button" onClick={() => removeKey(s.id)} aria-label={`Disconnect ${s.name}`}>Disconnect</button>}
+                  </span>
+                </header>
+                {s.catalog && (
+                  <ul>
+                    {s.catalog.models.map((m) => (
+                      <li key={m.id}>
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={selection?.provider === s.id && selection.id === m.id}
+                          className={`model-option ${selection?.provider === s.id && selection.id === m.id ? "is-active" : ""}`}
+                          onClick={() => choose({ provider: s.id, id: m.id, label: m.label })}
+                        >
+                          <span><b>{m.label}</b><small>{m.id}</small></span>
+                          {selection?.provider === s.id && selection.id === m.id && <i aria-hidden="true">✓</i>}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {!s.catalog && s.last_error && (
+                  <p className="provider-err-line">{describeError(s.last_error)}</p>
+                )}
+              </section>
+            ))}
+          </div>
+
+          <div className="provider-menu-actions">
+            <button type="button" role="menuitem" onClick={() => launch("api")}>
+              <span className="provider-action-icon" aria-hidden="true">{`{ }`}</span>
+              <span><b>Connect API</b><small>Add a provider key - stored by the Rust backend</small></span>
+              <i aria-hidden="true">→</i>
+            </button>
+            <button type="button" role="menuitem" onClick={() => launch("subscription")}>
+              <span className="provider-action-icon" aria-hidden="true">S</span>
+              <span><b>Connect subscription</b><small>Provider plan sign-in - not implemented yet</small></span>
+              <i aria-hidden="true">→</i>
+            </button>
+          </div>
+          <p className="provider-menu-note">{kind === "tauri" ? "LIVE · Rust desktop runtime" : "DEV · Rust sidecar on 127.0.0.1"}</p>
+        </div>
+      )}
+
+      {flow && (
+        <div className="connect-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setFlow(null); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="connect-title" className="connect-dialog">
+            <button type="button" className="dialog-close" aria-label="Close connection dialog" onClick={() => setFlow(null)}>×</button>
+            <span className="dialog-orbit" aria-hidden="true"><i /><i /></span>
+            <p className="eyebrow">{flow === "subscription" ? "Provider subscription" : "Provider API"}</p>
+            <h2 id="connect-title">{flow === "subscription" ? "Connect the plan you already use." : "Connect your own API access."}</h2>
+            {flow === "subscription" ? (
+              <>
+                <p className="dialog-copy">Sign-in with a provider plan is not implemented yet. API keys work today.</p>
+                <div className="connect-choice-list" aria-label="Subscription providers">
+                  {["Google", "OpenAI", "Anthropic"].map((name) => <button type="button" key={name} disabled><span>{name}</span><small>Not implemented</small></button>)}
+                </div>
+                <button type="button" className="dialog-primary" disabled>Not available yet</button>
+                <p className="dialog-truth"><span aria-hidden="true">i</span>No sign-in route exists yet, so nothing here opens or calls out.</p>
+              </>
+            ) : (
+              <>
+                <p className="dialog-copy">Choose a provider and paste its key. The key goes straight to the Rust backend's credential store; this interface never keeps or displays it.</p>
+                <div className="api-preview">
+                  <label>
+                    <span>Provider</span>
+                    <select value={provider} onChange={(event) => setProvider(event.target.value)}>
+                      {PROVIDER_PRESETS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span>API key</span>
+                    <input
+                      type="password"
+                      value={keyField}
+                      autoComplete="off"
+                      placeholder="Paste the key"
+                      onChange={(event) => setKeyField(event.target.value)}
+                    />
+                  </label>
+                  {selectedPreset.protocol === "openai-compatible" && (
+                    <label className="provider-field-wide" style={{ gridColumn: "1 / -1" }}>
+                      <span>Base URL</span>
+                      <input
+                        value={baseUrlField}
+                        placeholder={selectedPreset.baseUrl || "https://api.example.com/v1"}
+                        spellCheck={false}
+                        onChange={(event) => setBaseUrlField(event.target.value)}
+                      />
+                    </label>
+                  )}
+                </div>
+                {connectError && <p className="provider-err-line" role="alert">{connectError}</p>}
+                <button type="button" className="dialog-primary is-active" disabled={!keyField.trim() || connectBusy} onClick={submitKey}>
+                  {connectBusy ? "Connecting…" : "Save key & fetch models"}
+                </button>
+                <p className="dialog-truth"><span aria-hidden="true">i</span>After saving, REX immediately asks the provider for its real model list. Auth, network, and empty-catalog failures show up here verbatim.</p>
+              </>
+            )}
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PreviewPicker({ open, setOpen, flow, launch, setFlow, provider, setProvider, refObj }: {
+  open: boolean;
+  setOpen: (v: boolean | ((p: boolean) => boolean)) => void;
+  flow: ConnectFlow;
+  launch: (f: Exclude<ConnectFlow, null>) => void;
+  setFlow: (f: ConnectFlow) => void;
+  provider: string;
+  setProvider: (p: string) => void;
+  refObj: React.RefObject<HTMLDivElement | null>;
+}) {
+  return (
+    <div ref={refObj as React.RefObject<HTMLDivElement>} className="relative model-picker">
       <button
         type="button"
         aria-haspopup="menu"

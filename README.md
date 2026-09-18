@@ -56,3 +56,15 @@ verification/   screenshots + recording of the verified states
 brain/          design brief, thesis, token system
 evidence/       grounding receipts from the build session
 ```
+
+## Backend: provider connectivity (Rust)
+
+The first real backend slice lives in `crates/rex-providers` (workspace root `Cargo.toml`):
+
+- **Provider core** - registry for Gemini, Anthropic, and OpenAI-compatible endpoints; live model-catalog fetch with pagination; normalization into one model shape; truthful error taxonomy (not-configured, auth, rate-limit, network, unsupported, empty catalog, invalid response).
+- **Credentials** - keys enter through the backend only, land in a permission-locked store (0600), and are never returned to the frontend, logged, or serialized.
+- **Desktop app** - `src-tauri` exposes the core through Tauri commands (`provider_summaries`, `provider_set_key`, `provider_clear_key`, `provider_refresh`, `provider_catalog`).
+- **Dev sidecar** - `cargo run -p rex-providers --bin rex-dev-server` bridges the same core to the vite dev frontend on 127.0.0.1:8787. `--replay gemini=crates/rex-providers/fixtures/gemini-list-models-live.json` seeds the recorded live Gemini catalog, labeled as recorded in the UI.
+- **Frontend** - the prompt-box model dropdown is driven by the backend: live catalogs, selection, refresh, disconnect, and a working Connect-API dialog. With no backend reachable it stays the labeled preview.
+
+Tests: `cargo test -p rex-providers` (17 tests, including a real-socket status mapping and the recorded live Gemini response).

@@ -1,0 +1,9 @@
+Live Gemini ListModels verification - 2026-09-18 ~22:48 IST
+- Credential: Agrim's AI Studio key from the secure vault, filled directly
+  into the browser bridge; the key never entered chat, files, or the repo.
+- Call: GET /v1beta/models (x-goog-api-key header), paginated.
+- Result: HTTP 200, 58 models returned by the provider.
+- Recorded response: crates/rex-providers/fixtures/gemini-list-models-live.json
+  (41 generateContent-capable after normalization filtering).
+- Auth-error path verified live against api.anthropic.com with a deliberately
+  invalid key: HTTP 401 mapped to auth_failed, shown verbatim in the UI.
