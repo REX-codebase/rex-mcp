@@ -11,5 +11,7 @@ fi
 export PKG_CONFIG_SYSROOT_DIR="$ROOT"
 export PKG_CONFIG_PATH="$ROOT/usr/lib/x86_64-linux-gnu/pkgconfig:$ROOT/usr/share/pkgconfig"
 export PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1
-export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath-link,$ROOT/usr/lib/x86_64-linux-gnu"
+export LIBRARY_PATH="$ROOT/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$ROOT/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath-link,$ROOT/usr/lib/x86_64-linux-gnu -L native=$ROOT/usr/lib/x86_64-linux-gnu"
 exec "$@"

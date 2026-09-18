@@ -51,7 +51,28 @@ fn provider_catalog(service: State<'_, Arc<Service>>, provider: String) -> Optio
     service.catalog(&provider)
 }
 
+fn provider_bridge_smoke() -> bool {
+    if std::env::args().any(|arg| arg == "--verify-provider-bridge") {
+        let dir = std::env::temp_dir().join(format!("rex-harness-smoke-{}", std::process::id()));
+        let store = FileSecretStore::new(dir.clone()).expect("could not open smoke credential store");
+        let service = ProviderService::new(store, UreqTransport::new());
+        let summaries = service.summaries();
+        assert!(!summaries.is_empty(), "provider registry must not be empty");
+        println!("{}", serde_json::to_string(&summaries).expect("provider summaries must serialize"));
+        let _ = std::fs::remove_dir_all(dir);
+        return true;
+    }
+    false
+}
+
 fn main() {
+    // A native-binary smoke path verifies that this exact desktop executable
+    // contains and can initialize the provider core, without opening a window
+    // or requiring credentials. It never reads the normal credential store.
+    if provider_bridge_smoke() {
+        return;
+    }
+
     let store = FileSecretStore::new(config_dir()).expect("could not open the credential store");
     let service = Arc::new(ProviderService::new(store, UreqTransport::new()));
 
