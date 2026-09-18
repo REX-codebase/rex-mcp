@@ -1,0 +1,10 @@
+REX logo background treatment
+Date: 2026-09-18
+
+The traced SVG path geometry is unchanged. The converter's pure-black and near-black JPEG background fills were changed to the app canvas color, #0a090d (rgb(10,9,13)). White and light-gray mark fills are unchanged. This removes the visible #000 rectangle while retaining the full traced mark and its edge detail.
+
+Verification:
+- Path count before/after: 161 / 161
+- Every path d attribute is byte-identical before/after
+- Production build: passed
+- Desktop and mobile pixels: inspected for rectangle seams, edge halos, clipping, and overflow
