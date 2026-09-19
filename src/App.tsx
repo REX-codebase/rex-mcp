@@ -196,7 +196,7 @@ export default function App() {
       installedAgentBegin(
         installedBackend,
         label,
-        "",
+        options.workspace.trim(),
         options.model.trim() || undefined,
         options.effort.trim() || undefined
       )
