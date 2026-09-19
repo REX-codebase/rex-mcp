@@ -1,7 +1,7 @@
 //! Access policy: which account types REX may connect for each provider, and
 //! why. Agrim's rule, encoded: REX only offers a subscription hook when the
 //! provider's own current terms and authentication documentation clearly
-//! permit third-party harness use. Absence of permission is refusal.
+//! permit third-party harness use. Explicit bans, undocumented routes, and partner-gated routes are distinct states.
 //!
 //! Every verdict here is grounded in official provider sources, checked on
 //! `VERIFIED_ON`. The human-readable matrix with quotes lives in
@@ -38,8 +38,13 @@ pub enum PolicyStatus {
     ToolScoped,
     /// Official terms explicitly forbid the route.
     NotPermitted,
-    /// No official documentation permits the route. REX treats the absence
-    /// of permission as refusal.
+    /// Provider has not published a general contract for arbitrary harnesses.
+    /// Disabled without claiming the provider bans users or that the route is illegal.
+    Undocumented,
+    /// Provider officially supports named third-party integrations but has not
+    /// published general self-service client registration; REX needs approval.
+    PartnerGated,
+    /// Route is not offered for another documented reason.
     NotOffered,
 }
 
@@ -112,13 +117,14 @@ pub fn access_policies(provider: &str) -> Vec<AccessPolicy> {
             ),
             policy(
                 AccessKind::SubscriptionOauth,
-                PolicyStatus::NotOffered,
+                PolicyStatus::Undocumented,
                 "ChatGPT sign-in",
-                "OpenAI documents Sign in with ChatGPT only for its own Codex clients (app, CLI, IDE extension, cloud); no documented contract exists for third-party harnesses, so REX omits it.",
+                "Pi implements Codex OAuth and OpenAI names Pi among tools OSS maintainers may prefer, but OpenAI publishes no reusable client-registration or auth contract for arbitrary harnesses. REX disables this as undocumented, not forbidden.",
                 &[
                     "https://developers.openai.com/codex/auth",
-                    "https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan",
+                    "https://developers.openai.com/community/codex-for-oss",
                     "https://github.com/openai/codex/issues/36886",
+                    "https://github.com/earendil-works/pi/blob/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/ai/src/auth/oauth/openai-codex.ts",
                 ],
             ),
         ],
@@ -130,10 +136,16 @@ pub fn access_policies(provider: &str) -> Vec<AccessPolicy> {
             ),
             policy(
                 AccessKind::SubscriptionOauth,
-                PolicyStatus::NotOffered,
+                PolicyStatus::PartnerGated,
                 "X Premium / SuperGrok",
-                "xAI keeps consumer Grok subscriptions and API access strictly separate; the subscriptions carry no programmatic entitlement for third-party tools, so REX omits them.",
-                &["https://docs.x.ai/grok/faq", "https://docs.x.ai/developers/pricing"],
+                "xAI officially enables subscription OAuth in named third-party harnesses, while publishing no general client-registration route. REX needs its own approved client and will not copy another app client ID.",
+                &[
+                    "https://x.ai/news/grok-hermes",
+                    "https://x.ai/news/grok-openclaw",
+                    "https://x.ai/news/grok-opencode",
+                    "https://x.ai/news/grok-warp",
+                    "https://github.com/earendil-works/pi/blob/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/ai/src/auth/oauth/xai.ts",
+                ],
             ),
         ],
         "deepseek" => vec![api_key(
