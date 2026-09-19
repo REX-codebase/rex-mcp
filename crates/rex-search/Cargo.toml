@@ -1,0 +1,14 @@
+[package]
+name = "rex-search"
+version = "0.1.0"
+edition = "2021"
+description = "Provider-independent, robots-aware live web evidence retrieval for REX agents"
+license = "Proprietary"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
+
+[dev-dependencies]
