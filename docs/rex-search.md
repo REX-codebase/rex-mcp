@@ -38,7 +38,11 @@ The index is a private JSON file under the app configuration directory, written 
 - `scripts/tauri-linux-env.sh cargo check --workspace --all-targets --locked`
 - `npm run build`
 
-Tests cover robots behavior, private targets, scope, safe text extraction, ranking, sitemap/feed URL extraction, query-aware robots matching, and local-index upsert/query/deletion. Redirect integration is additionally exercised by the typed full workspace check. A production deployment should add a local adversarial HTTP fixture to exercise each hop and DNS outcome end to end.
+Unit tests cover robots behavior, private targets, scope, safe text extraction, ranking, sitemap/feed URL extraction, query-aware robots matching, and local-index upsert/query/deletion.
+
+An adversarial local HTTP fixture (`http_fixtures` test module) drives scripted loopback servers through the real engine, using a `cfg(test)`-only loopback carve-out that production builds cannot enable. It verifies: multi-hop redirect chains recorded in order; per-origin robots re-evaluation across redirect origins, including denial without ever requesting the denied page; out-of-scope cross-host redirects refused before fetch; missing and malformed `Location` headers reported distinctly; redirect loops stopped exactly at the hop limit; redirects to private, link-local (cloud metadata), CGNAT, and alternate loopback destinations rejected; robots-denied seeds never fetched; the production constructor still refusing live loopback seeds; and DNS safety covering special-use IPv4/IPv6 ranges (CGNAT 100.64/10, benchmarking 198.18/15, documentation ranges, multicast, reserved 240/4, IPv4-mapped IPv6).
+
+That DNS audit found and fixed real gaps: the public-IP check previously admitted shared address space (100.64.0.0/10), benchmarking space (198.18.0.0/15), multicast, reserved 240.0.0.0/4, IPv4/IPv6 documentation ranges, and IPv4-mapped IPv6 forms of blocked IPv4 addresses. All are now rejected.
 
 ## Standards and sources (checked 2026-09-19)
 

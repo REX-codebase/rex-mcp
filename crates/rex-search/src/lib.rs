@@ -140,6 +140,12 @@ impl Default for SearchConfig {
 pub struct SearchEngine {
     agent: ureq::Agent,
     config: SearchConfig,
+    /// Test-only escape hatch: adversarial HTTP fixtures bind loopback, so the
+    /// crate's own unit tests may permit literal loopback destinations. This
+    /// field exists only in `cfg(test)` builds; production code paths can
+    /// never enable it.
+    #[cfg(test)]
+    allow_test_loopback: bool,
 }
 
 impl SearchEngine {
@@ -155,7 +161,65 @@ impl SearchEngine {
             DefaultConnector::new(),
             PublicResolver::default(),
         );
-        Self { agent, config }
+        Self {
+            agent,
+            config,
+            #[cfg(test)]
+            allow_test_loopback: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(config: SearchConfig) -> Self {
+        let http_config = ureq::Agent::config_builder()
+            .timeout_global(Some(config.timeout))
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .user_agent(USER_AGENT)
+            .build();
+        let agent = ureq::Agent::with_parts(
+            http_config,
+            DefaultConnector::new(),
+            PublicResolver::allowing_loopback(),
+        );
+        Self {
+            agent,
+            config,
+            allow_test_loopback: true,
+        }
+    }
+
+    /// Destination check applied to seeds and robots fetches. In test builds
+    /// with the loopback fixture flag, literal loopback hosts are permitted;
+    /// every other rule still applies.
+    fn check_destination(&self, url: &Url) -> Result<(), String> {
+        #[cfg(test)]
+        if self.allow_test_loopback && is_loopback_host(url) {
+            return Ok(());
+        }
+        reject_private_destination(url)
+    }
+
+    /// Per-hop local-address check. Same test-only loopback carve-out.
+    fn check_local(&self, url: &Url) -> Result<(), String> {
+        #[cfg(test)]
+        if self.allow_test_loopback && is_loopback_host(url) {
+            return Ok(());
+        }
+        reject_local_hostname(url)
+    }
+
+    fn normalize_seed(&self, raw: &str) -> Result<Url, (FetchState, String)> {
+        let url = Url::parse(raw).map_err(|e| (FetchState::InvalidUrl, e.to_string()))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err((
+                FetchState::InvalidUrl,
+                "only http and https are supported".into(),
+            ));
+        }
+        self.check_destination(&url)
+            .map_err(|e| (FetchState::UnsafeAddress, e))?;
+        Ok(url)
     }
 
     pub fn search(&self, mut request: SearchRequest) -> SearchResponse {
@@ -176,7 +240,7 @@ impl SearchEngine {
         let mut feed_urls_discovered = 0;
 
         for seed in &request.seeds {
-            match normalize_public_url(seed) {
+            match self.normalize_seed(seed) {
                 Ok(url) => {
                     if !roots
                         .iter()
@@ -365,7 +429,7 @@ impl SearchEngine {
         let Ok(robots_url) = page.join("/robots.txt") else {
             return RobotsRules::allow_all();
         };
-        if reject_private_destination(&robots_url).is_err() {
+        if self.check_destination(&robots_url).is_err() {
             return RobotsRules::deny_all();
         }
         match self
@@ -396,7 +460,8 @@ impl SearchEngine {
         allow_subdomains: bool,
         robots: &mut HashMap<String, RobotsRules>,
     ) -> Result<(), (FetchState, String)> {
-        reject_local_hostname(url).map_err(|e| (FetchState::UnsafeAddress, e))?;
+        self.check_local(url)
+            .map_err(|e| (FetchState::UnsafeAddress, e))?;
         if !roots.iter().any(|r| same_scope(r, url, allow_subdomains)) {
             return Err((
                 FetchState::OutOfScopeRedirect,
@@ -972,6 +1037,7 @@ fn robots_pattern_matches(pattern: &str, path: &str) -> bool {
     }
     !anchored || cursor == path.len()
 }
+#[cfg(test)]
 fn normalize_public_url(raw: &str) -> Result<Url, (FetchState, String)> {
     let url = Url::parse(raw).map_err(|e| (FetchState::InvalidUrl, e.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -987,6 +1053,18 @@ fn normalize_public_url(raw: &str) -> Result<Url, (FetchState, String)> {
 #[derive(Debug, Default)]
 struct PublicResolver {
     inner: DefaultResolver,
+    #[cfg(test)]
+    allow_loopback: bool,
+}
+
+#[cfg(test)]
+impl PublicResolver {
+    fn allowing_loopback() -> Self {
+        Self {
+            inner: DefaultResolver::default(),
+            allow_loopback: true,
+        }
+    }
 }
 
 impl Resolver for PublicResolver {
@@ -1005,7 +1083,7 @@ impl Resolver for PublicResolver {
         for addr in resolved
             .iter()
             .copied()
-            .filter(|addr| is_public_ip(addr.ip()))
+            .filter(|addr| self.permits(addr.ip()))
         {
             public.push(addr);
         }
@@ -1015,6 +1093,29 @@ impl Resolver for PublicResolver {
             Ok(public)
         }
     }
+}
+
+impl PublicResolver {
+    #[cfg(test)]
+    fn permits(&self, ip: IpAddr) -> bool {
+        is_public_ip(ip) || (self.allow_loopback && ip.is_loopback())
+    }
+
+    #[cfg(not(test))]
+    fn permits(&self, ip: IpAddr) -> bool {
+        is_public_ip(ip)
+    }
+}
+
+#[cfg(test)]
+fn is_loopback_host(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+    })
 }
 
 fn reject_local_hostname(url: &Url) -> Result<(), String> {
@@ -1057,21 +1158,43 @@ fn reject_private_destination(url: &Url) -> Result<(), String> {
 }
 fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v) => {
-            !(v.is_private()
-                || v.is_loopback()
-                || v.is_link_local()
-                || v.is_broadcast()
-                || v.is_unspecified()
-                || v.octets()[0] == 0)
-        }
+        IpAddr::V4(v) => is_public_ipv4(v),
         IpAddr::V6(v) => {
+            // An IPv4-mapped IPv6 address must satisfy the IPv4 rules:
+            // ::ffff:127.0.0.1 is loopback, not a public destination.
+            if let Some(mapped) = v.to_ipv4_mapped() {
+                return is_public_ipv4(mapped);
+            }
+            let segments = v.segments();
             !(v.is_loopback()
                 || v.is_unspecified()
                 || v.is_unique_local()
-                || v.is_unicast_link_local())
+                || v.is_unicast_link_local()
+                || v.is_multicast()
+                // 2001:db8::/32 documentation range
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
         }
     }
+}
+fn is_public_ipv4(v: std::net::Ipv4Addr) -> bool {
+    let o = v.octets();
+    !(v.is_private()
+        || v.is_loopback()
+        || v.is_link_local()
+        || v.is_broadcast()
+        || v.is_unspecified()
+        || v.is_multicast()
+        || o[0] == 0
+        // 100.64.0.0/10 shared address space (CGNAT)
+        || (o[0] == 100 && (o[1] & 0xC0) == 64)
+        // 198.18.0.0/15 benchmarking
+        || (o[0] == 198 && (o[1] & 0xFE) == 18)
+        // 240.0.0.0/4 reserved
+        || o[0] >= 240
+        // documentation ranges 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113))
 }
 fn same_scope(root: &Url, candidate: &Url, subdomains: bool) -> bool {
     let (Some(a), Some(b)) = (root.host_str(), candidate.host_str()) else {
@@ -1536,5 +1659,407 @@ mod tests {
         assert!(index.remove("one").unwrap());
         assert!(index.query("rust", 5).unwrap().is_empty());
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Adversarial local HTTP fixtures: scripted loopback servers that exercise
+/// every redirect and destination-safety branch end to end. These run only in
+/// `cfg(test)` through `SearchEngine::new_for_tests`, which permits literal
+/// loopback destinations while leaving every other production protection
+/// (scope, per-origin robots, redirect limits, private-IP rejection, DNS
+/// pinning) fully active.
+#[cfg(test)]
+mod http_fixtures {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct Route {
+        status: u16,
+        reason: &'static str,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+    fn redirect_to(location: &str) -> Route {
+        Route {
+            status: 302,
+            reason: "Found",
+            headers: vec![("Location".into(), location.into())],
+            body: String::new(),
+        }
+    }
+    fn redirect_without_location() -> Route {
+        Route {
+            status: 302,
+            reason: "Found",
+            headers: vec![],
+            body: String::new(),
+        }
+    }
+    fn html_page(body: &str) -> Route {
+        Route {
+            status: 200,
+            reason: "OK",
+            headers: vec![("Content-Type".into(), "text/html".into())],
+            body: body.into(),
+        }
+    }
+    fn plain(status: u16, reason: &'static str, body: &str) -> Route {
+        Route {
+            status,
+            reason,
+            headers: vec![("Content-Type".into(), "text/plain".into())],
+            body: body.into(),
+        }
+    }
+
+    struct FixtureServer {
+        base: String,
+        hits: Arc<AtomicUsize>,
+    }
+    impl FixtureServer {
+        fn url(&self, path: &str) -> String {
+            format!("{}{}", self.base, path)
+        }
+    }
+
+    fn serve(routes: Vec<(&'static str, Route)>) -> FixtureServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let thread_hits = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .ok();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 2048];
+                let mut target = String::new();
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..pos]);
+                                target = head
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("")
+                                    .to_string();
+                                break;
+                            }
+                            if buf.len() > 64 * 1024 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                thread_hits.fetch_add(1, Ordering::SeqCst);
+                let response = match routes.iter().find(|(path, _)| *path == target) {
+                    Some((_, route)) => {
+                        let mut out = format!("HTTP/1.1 {} {}\r\n", route.status, route.reason);
+                        for (name, value) in &route.headers {
+                            out.push_str(&format!("{name}: {value}\r\n"));
+                        }
+                        out.push_str(&format!(
+                            "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            route.body.len(),
+                            route.body
+                        ));
+                        out
+                    }
+                    None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                };
+                stream.write_all(response.as_bytes()).ok();
+                stream.flush().ok();
+            }
+        });
+        FixtureServer {
+            base: format!("http://127.0.0.1:{port}"),
+            hits,
+        }
+    }
+
+    fn fixture_engine(max_redirects: usize) -> SearchEngine {
+        SearchEngine::new_for_tests(SearchConfig {
+            timeout: Duration::from_secs(5),
+            per_origin_delay: Duration::from_millis(0),
+            max_redirects,
+            ..SearchConfig::default()
+        })
+    }
+    fn seed_request(seed: &str) -> SearchRequest {
+        SearchRequest {
+            query: "evidence marker".into(),
+            seeds: vec![seed.into()],
+            max_pages: 8,
+            max_results: 8,
+            allow_subdomains: false,
+            discover_sitemaps: false,
+            discover_feeds: false,
+        }
+    }
+
+    #[test]
+    fn multi_hop_redirect_chain_is_followed_and_recorded() {
+        let server = serve(vec![
+            ("/start", redirect_to("/hop-two")),
+            ("/hop-two", redirect_to("/hop-three")),
+            (
+                "/hop-three",
+                redirect_to("/final"),
+            ),
+            (
+                "/final",
+                html_page("<html><head><title>Final page</title></head><body>evidence marker content</body></html>"),
+            ),
+        ]);
+        let response = fixture_engine(5).search(seed_request(&server.url("/start")));
+        assert_eq!(response.evidence.len(), 1, "failures: {:?}", response.failures);
+        let item = &response.evidence[0];
+        assert_eq!(item.state, FetchState::Fetched);
+        assert_eq!(item.final_url, server.url("/final"));
+        assert_eq!(
+            item.redirect_chain,
+            vec![
+                server.url("/start"),
+                server.url("/hop-two"),
+                server.url("/hop-three"),
+                server.url("/final")
+            ]
+        );
+        assert!(item.content.as_deref().unwrap_or("").contains("evidence marker"));
+        assert_eq!(response.coverage.redirects_followed, 3);
+    }
+
+    #[test]
+    fn redirect_to_other_origin_applies_that_origins_robots() {
+        let allowed_origin = serve(vec![
+            (
+                "/robots.txt",
+                plain(200, "OK", "User-agent: *\nDisallow: /private\n"),
+            ),
+            (
+                "/public",
+                html_page("<html><body>evidence marker public</body></html>"),
+            ),
+        ]);
+        let source = serve(vec![
+            ("/open", redirect_to(&allowed_origin.url("/public"))),
+            ("/closed", redirect_to(&allowed_origin.url("/private"))),
+        ]);
+        let engine = fixture_engine(5);
+
+        // The source origin allows everything, yet the destination origin's
+        // robots must win: /private is denied, /public is fetched.
+        let denied = engine.search(seed_request(&source.url("/closed")));
+        assert_eq!(denied.evidence.len(), 0);
+        assert_eq!(denied.failures.len(), 1);
+        assert_eq!(denied.failures[0].state, FetchState::RobotsDenied);
+        assert_eq!(denied.failures[0].final_url, allowed_origin.url("/private"));
+        assert_eq!(
+            denied.failures[0].redirect_chain,
+            vec![source.url("/closed"), allowed_origin.url("/private")]
+        );
+        // Only the destination's robots.txt was read; the denied page itself
+        // was never requested.
+        assert_eq!(allowed_origin.hits.load(Ordering::SeqCst), 1);
+
+        let fetched = engine.search(seed_request(&source.url("/open")));
+        assert_eq!(fetched.evidence.len(), 1, "failures: {:?}", fetched.failures);
+        assert_eq!(fetched.evidence[0].final_url, allowed_origin.url("/public"));
+        // Second search reloads robots.txt, then fetches the page; /private
+        // was still never requested.
+        assert_eq!(allowed_origin.hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn cross_host_redirect_out_of_scope_is_refused_before_fetch() {
+        let server = serve(vec![(
+            "/start",
+            redirect_to("http://example.com/escape"),
+        )]);
+        let response = fixture_engine(5).search(seed_request(&server.url("/start")));
+        assert_eq!(response.evidence.len(), 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(response.failures[0].state, FetchState::OutOfScopeRedirect);
+        assert_eq!(response.failures[0].final_url, "http://example.com/escape");
+    }
+
+    #[test]
+    fn redirect_without_location_is_reported() {
+        let server = serve(vec![("/start", redirect_without_location())]);
+        let response = fixture_engine(5).search(seed_request(&server.url("/start")));
+        assert_eq!(response.evidence.len(), 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(response.failures[0].state, FetchState::RedirectMissingLocation);
+        assert_eq!(response.failures[0].http_status, Some(302));
+    }
+
+    #[test]
+    fn malformed_redirect_location_is_reported() {
+        let server = serve(vec![("/start", redirect_to("http://[::1"))]);
+        let response = fixture_engine(5).search(seed_request(&server.url("/start")));
+        assert_eq!(response.evidence.len(), 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(response.failures[0].state, FetchState::InvalidUrl);
+        assert_eq!(response.failures[0].http_status, Some(302));
+    }
+
+    #[test]
+    fn redirect_to_a_different_loopback_host_is_stopped_by_scope() {
+        // Fixture mode permits loopback destinations, so a redirect to a
+        // *different* loopback host is stopped by the scope rule rather than
+        // the address rule. Production mode rejects [::1] outright.
+        let server = serve(vec![("/v6loop", redirect_to("http://[::1]:9/x"))]);
+        let response = fixture_engine(5).search(seed_request(&server.url("/v6loop")));
+        assert_eq!(response.evidence.len(), 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(response.failures[0].state, FetchState::OutOfScopeRedirect);
+    }
+
+    #[test]
+    fn redirect_loop_stops_at_the_hop_limit() {
+        let server = serve(vec![
+            ("/loop-a", redirect_to("/loop-b")),
+            ("/loop-b", redirect_to("/loop-a")),
+        ]);
+        let engine = fixture_engine(3);
+        let response = engine.search(seed_request(&server.url("/loop-a")));
+        assert_eq!(response.evidence.len(), 0);
+        assert_eq!(response.failures.len(), 1);
+        let failure = &response.failures[0];
+        assert_eq!(failure.state, FetchState::RedirectLimit);
+        assert_eq!(failure.http_status, Some(302));
+        assert_eq!(failure.redirect_chain.len(), 4); // start plus 3 followed hops
+        // robots fetch plus 4 page requests, no unbounded spinning.
+        assert_eq!(server.hits.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn redirect_to_private_or_loopback_destination_is_rejected() {
+        let server = serve(vec![
+            ("/metadata", redirect_to("http://169.254.169.254/latest/meta-data")),
+            ("/internal-net", redirect_to("http://10.9.8.7/x")),
+            ("/cg-nat", redirect_to("http://100.64.0.1/x")),
+        ]);
+        let engine = fixture_engine(5);
+        for path in ["/metadata", "/internal-net", "/cg-nat"] {
+            let response = engine.search(seed_request(&server.url(path)));
+            assert_eq!(response.evidence.len(), 0, "{path}");
+            assert_eq!(response.failures.len(), 1, "{path}");
+            assert_eq!(
+                response.failures[0].state,
+                FetchState::UnsafeAddress,
+                "{path}: {:?}",
+                response.failures[0].error
+            );
+        }
+    }
+
+    #[test]
+    fn robots_denied_seed_is_not_fetched() {
+        let server = serve(vec![
+            (
+                "/robots.txt",
+                plain(200, "OK", "User-agent: *\nDisallow: /blocked\n"),
+            ),
+            (
+                "/blocked",
+                html_page("<html><body>should never be read</body></html>"),
+            ),
+        ]);
+        let response = fixture_engine(5).search(seed_request(&server.url("/blocked")));
+        assert_eq!(response.evidence.len(), 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(response.failures[0].state, FetchState::RobotsDenied);
+        // Only the robots fetch happened; the denied page was never requested.
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(response.coverage.pages_denied, 1);
+    }
+
+    #[test]
+    fn production_engine_still_refuses_loopback_seeds() {
+        // The production constructor has no loopback carve-out: even with a
+        // live loopback server answering, seeds must fail closed.
+        let server = serve(vec![(
+            "/",
+            html_page("<html><body>evidence marker</body></html>"),
+        )]);
+        let engine = SearchEngine::new(SearchConfig {
+            timeout: Duration::from_secs(2),
+            per_origin_delay: Duration::from_millis(0),
+            ..SearchConfig::default()
+        });
+        for seed in [server.url("/"), format!("http://localhost:{}/", server.base.rsplit(':').next().unwrap())] {
+            let response = engine.search(seed_request(&seed));
+            assert_eq!(response.evidence.len(), 0, "{seed}");
+            assert_eq!(response.failures.len(), 1, "{seed}");
+            assert_eq!(response.failures[0].state, FetchState::UnsafeAddress, "{seed}");
+        }
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dns_safety_rules_cover_special_use_ranges() {
+        // Literal-IP checks need no network: these are the DNS outcomes the
+        // resolver and destination checks must reject after any lookup.
+        let blocked_v4 = [
+            "10.0.0.9",
+            "172.16.0.9",
+            "192.168.0.9",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "100.127.255.254",
+            "0.0.0.0",
+            "198.18.0.1",
+            "198.19.255.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+        ];
+        for ip in blocked_v4 {
+            assert!(
+                !is_public_ip(ip.parse().unwrap()),
+                "{ip} must not be treated as public"
+            );
+        }
+        let blocked_v6 = ["::1", "::", "fc00::1", "fe80::1", "ff02::1", "2001:db8::1"];
+        for ip in blocked_v6 {
+            assert!(
+                !is_public_ip(ip.parse().unwrap()),
+                "{ip} must not be treated as public"
+            );
+        }
+        // IPv4-mapped IPv6 inherits the IPv4 verdict in both directions.
+        assert!(!is_public_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("::ffff:169.254.169.254".parse().unwrap()));
+        assert!(is_public_ip("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+
+        // localhost resolves through the system resolver (hosts file), so the
+        // full DNS path can be checked offline.
+        let localhost = Url::parse("http://localhost/").unwrap();
+        assert!(reject_private_destination(&localhost).is_err());
+        let v6_loopback = Url::parse("http://[::1]/").unwrap();
+        assert!(reject_private_destination(&v6_loopback).is_err());
+        let unspecified = Url::parse("http://0.0.0.0/").unwrap();
+        assert!(reject_private_destination(&unspecified).is_err());
     }
 }
