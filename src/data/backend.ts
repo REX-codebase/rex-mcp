@@ -135,7 +135,7 @@ function SIDEBAR_SAFE() {
   return SIDECAR;
 }
 
-export type InstalledAgentId = "cursor" | "codex" | "claude-code" | "pi" | "google-antigravity";
+export type InstalledAgentId = "codex";
 export type InstalledAgentState = "ready" | "installed_auth_unknown" | "missing" | "unsupported_version" | "support_needs_review";
 export interface InstalledAgentSummary {
   id: InstalledAgentId; name: string; executable: string; state: InstalledAgentState; version?: string; automation: string; auth_boundary: string; docs_url: string; approval_boundary: string;

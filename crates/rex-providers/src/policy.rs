@@ -137,7 +137,7 @@ pub fn access_policies(provider: &str) -> Vec<AccessPolicy> {
                 AccessKind::SubscriptionOauth,
                 PolicyStatus::Undocumented,
                 "ChatGPT sign-in",
-                "Pi implements Codex OAuth and OpenAI names Pi among tools OSS maintainers may prefer, but OpenAI publishes no reusable client-registration or auth contract for arbitrary harnesses. REX disables this as undocumented, not forbidden.",
+                "Pi implements Codex OAuth and OpenAI names Pi among tools OSS maintainers may prefer, but OpenAI publishes no reusable client-registration or auth contract for arbitrary harnesses. REX disables this as undocumented, not forbidden. The official Codex CLI remains available separately as an installed agent, where the CLI itself owns ChatGPT or API-key sign-in.",
                 &[
                     "https://developers.openai.com/codex/auth",
                     "https://developers.openai.com/community/codex-for-oss",

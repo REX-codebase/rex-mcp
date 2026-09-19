@@ -193,13 +193,7 @@ export default function App() {
       setInstalledRun(null);
       setInstalledStarting(true);
       beginSettle();
-      installedAgentBegin(
-        installedBackend,
-        label,
-        options.workspace.trim(),
-        options.model.trim() || undefined,
-        options.effort.trim() || undefined
-      )
+      installedAgentBegin(installedBackend, label, options.workspace.trim())
         .then((snap) => {
           setInstalledRun(snap);
           if (snap.status === "running") startInstalledPolling(snap.id);
@@ -212,8 +206,8 @@ export default function App() {
           workspace: "",
           staging_workspace: "",
           preview_dir: "",
-          model: options.model.trim() || null,
-          effort: options.effort.trim() || null,
+          model: null,
+          effort: null,
           created_at_ms: Date.now(),
           updated_at_ms: Date.now(),
           exit_code: null,

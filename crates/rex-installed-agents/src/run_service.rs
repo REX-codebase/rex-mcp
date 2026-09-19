@@ -8,16 +8,17 @@
 //! approval. All state transitions are persisted under the REX config dir so
 //! a run record survives a reload.
 //!
-//! Permission truth: vendor CLIs run with their safest documented permission
-//! mode. Google Antigravity's headless stream-json mode cannot prompt for
-//! tool approvals - tools that need one are soft-denied by the child itself
-//! and REX treats that as a failed completion gate, never as success. REX's
-//! own approval boundary is the staging review below: the child only ever
-//! writes an isolated copy, and promotion applies the reviewed diff.
+//! Permission truth: the retained vendor CLI runs with its safest documented
+//! permission mode. OpenAI Codex `exec` runs in its read-only sandbox and
+//! never receives a skip-permissions or full-auto flag; its stream is gated
+//! by the documented JSONL contract, so a failed turn or an unknown event is
+//! a failure, never a success. REX's own approval boundary is the staging
+//! review below: the child only ever writes an isolated copy, and promotion
+//! applies the reviewed diff.
 
 use crate::{
-    collect_events, safe_args_with_options, spec, validate_antigravity_stream, AgentEvent,
-    InstalledAgentError, InstalledAgentId, RunOptions,
+    collect_events, enforce_contract, safe_args_with_options, spec, validate_codex_stream,
+    AgentEvent, InstalledAgentError, InstalledAgentId, RunOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -264,6 +265,7 @@ impl RunManager {
         let s = spec(backend);
         let exe = crate::find_on_path(s.executable)
             .ok_or_else(|| InstalledAgentError::Missing(format!("{} is not installed", s.name)))?;
+        enforce_contract(&exe, s)?;
         self.begin_with(backend, prompt, workspace, options, &exe)
     }
 
@@ -396,16 +398,8 @@ impl RunManager {
                 record.snapshot.error = Some(error.to_string());
                 record.snapshot.completion = Some(error.to_string());
             } else {
-                let gate = if backend == InstalledAgentId::GoogleAntigravity {
-                    validate_antigravity_stream(&record.snapshot.events, &stderr, exit_code)
-                        .map(|_| "completed".to_string())
-                } else if exit_code == Some(0) {
-                    Ok("completed".to_string())
-                } else {
-                    Err(InstalledAgentError::Child(format!(
-                        "child exited with {exit_code:?}"
-                    )))
-                };
+                let gate = validate_codex_stream(&record.snapshot.events, exit_code)
+                    .map(|_| "completed".to_string());
                 match gate {
                     Ok(verdict) => {
                         record.snapshot.completion = Some(verdict);
@@ -663,34 +657,12 @@ mod tests {
     }
 
     #[test]
-    fn model_and_effort_pass_through_for_antigravity_only() {
-        let options = RunOptions {
-            model: Some("gemini-3.8-flash".into()),
-            effort: Some("high".into()),
-        };
-        let (args, _) =
-            safe_args_with_options(InstalledAgentId::GoogleAntigravity, "build", &options).unwrap();
-        let text: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(text.windows(2).any(|w| w[0] == "--model" && w[1] == "gemini-3.8-flash"));
-        assert!(text.windows(2).any(|w| w[0] == "--effort" && w[1] == "high"));
-        // Never a skip-permissions flag, with or without options.
-        assert!(!text.iter().any(|a| a.contains("dangerously")));
-    }
-
-    #[test]
-    fn other_backends_fail_closed_on_model_selection() {
+    fn codex_fails_closed_on_model_selection() {
         let options = RunOptions {
             model: Some("anything".into()),
-            effort: None,
+            effort: Some("high".into()),
         };
-        for id in [
-            InstalledAgentId::Cursor,
-            InstalledAgentId::Codex,
-            InstalledAgentId::ClaudeCode,
-            InstalledAgentId::Pi,
-        ] {
-            assert!(safe_args_with_options(id, "x", &options).is_err());
-        }
+        assert!(safe_args_with_options(InstalledAgentId::Codex, "x", &options).is_err());
     }
 
     #[test]
@@ -746,13 +718,13 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let script = fake_cli(
             &root,
-            "agy",
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"event\":\"init\",\"init\":{\"cwd\":\"/tmp/x\",\"tools\":[\"read_file\"],\"permission_mode\":\"request-review\"}}'\nprintf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}'\n",
+            "codex",
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}'\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
         );
         let (m, dir) = manager();
         let snap = m
             .begin_with(
-                InstalledAgentId::GoogleAntigravity,
+                InstalledAgentId::Codex,
                 "make a page",
                 "",
                 RunOptions::default(),
@@ -765,7 +737,7 @@ mod tests {
         assert_eq!(final_snap.status, RunStatus::Completed);
         assert_eq!(final_snap.completion.as_deref(), Some("completed"));
         assert_eq!(final_snap.events.len(), 2);
-        assert_eq!(final_snap.events[0].event, "init");
+        assert_eq!(final_snap.events[0].event, "thread.started");
         assert!(Path::new(&final_snap.preview_dir).is_dir());
         assert!(dir.join(format!("{}.json", final_snap.id)).is_file());
         let _ = fs::remove_dir_all(root);
@@ -781,13 +753,13 @@ mod tests {
         fs::write(source.join("existing.txt"), "original").unwrap();
         let script = fake_cli(
             &fixture,
-            "agy",
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"event\":\"init\",\"init\":{\"cwd\":\"/tmp/x\",\"tools\":[\"write_file\"],\"permission_mode\":\"request-review\"}}'\necho created > created.txt\nprintf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}'\n",
+            "codex",
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}'\necho created > created.txt\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
         );
         let (m, _dir) = manager();
         let snap = m
             .begin_with(
-                InstalledAgentId::GoogleAntigravity,
+                InstalledAgentId::Codex,
                 "change the project",
                 source.to_str().unwrap(),
                 RunOptions::default(),
@@ -823,12 +795,12 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         let script = fake_cli(
             &fixture,
-            "agy",
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"event\":\"init\",\"init\":{\"cwd\":\"/tmp/x\",\"tools\":[\"write_file\"],\"permission_mode\":\"request-review\"}}'\necho nope > rejected.txt\nprintf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}'\n",
+            "codex",
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}'\necho nope > rejected.txt\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
         );
         let (m, _dir) = manager();
         let snap = m
-            .begin_with(InstalledAgentId::GoogleAntigravity, "try", source.to_str().unwrap(), RunOptions::default(), &script)
+            .begin_with(InstalledAgentId::Codex, "try", source.to_str().unwrap(), RunOptions::default(), &script)
             .unwrap();
         let reviewed = wait_terminal(&m, &snap.id, 10_000);
         assert_eq!(reviewed.status, RunStatus::AwaitingReview);
@@ -847,12 +819,12 @@ mod tests {
         let fixture = root.join("bin");
         let script = fake_cli(
             &fixture,
-            "agy",
-            "#!/bin/sh\ncat >/dev/null\nsleep 60\n",
+            "codex",
+            "#!/bin/sh\nsleep 60\n",
         );
         let (m, _dir) = manager();
         let snap = m
-            .begin_with(InstalledAgentId::GoogleAntigravity, "long task", "", RunOptions::default(), &script)
+            .begin_with(InstalledAgentId::Codex, "long task", "", RunOptions::default(), &script)
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let cancelled = m.cancel(&snap.id).unwrap();

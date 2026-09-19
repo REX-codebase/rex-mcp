@@ -6,6 +6,18 @@
 //! with the safest documented permission mode: REX remains the approval
 //! boundary, while the child can inspect and reason but cannot silently take
 //! privileged actions in the user's real workspace.
+//!
+//! Route policy (reviewed 2026-09-19): OpenAI Codex CLI is the only retained
+//! installed-agent backend. OpenAI's own documentation covers `codex exec`
+//! non-interactive automation with the CLI's own ChatGPT or API-key sign-in,
+//! and the OpenAI Terms of Use contain no clause barring third-party software
+//! from driving the official client. The Google Antigravity, Claude Code,
+//! Cursor and Pi adapters were removed the same day: their providers' current
+//! terms either expressly prohibit third-party harness use of a consumer
+//! subscription (Google Antigravity Additional Terms section 6; Anthropic's
+//! third-party prohibition) or publish no third-party harness entitlement for
+//! the subscription the CLI would spend (Cursor, Pi). See
+//! `docs/subscription-policy.md` and `crates/rex-installed-agents/COMPATIBILITY.md`.
 
 pub mod run_service;
 pub use run_service::{DiffEntry, DiffKind, DiffSummary, PromotionState, RunManager, RunSnapshot, RunStatus};
@@ -24,11 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InstalledAgentId {
-    Cursor,
     Codex,
-    ClaudeCode,
-    Pi,
-    GoogleAntigravity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,12 +129,13 @@ struct Spec {
     entitlement_note: &'static str,
 }
 
-const SPECS: [Spec;5] = [
-    Spec{id:InstalledAgentId::Cursor,name:"Cursor Agent",executable:"agent",automation:"ACP over stdio; headless stream-json fallback",auth_boundary:"Cursor CLI owns browser login and subscription access",docs_url:"https://cursor.com/docs/cli/acp",entitlement_note:"Uses Cursor CLI authentication; availability follows the user's Cursor plan and current CLI terms"},
-    Spec{id:InstalledAgentId::Codex,name:"Codex CLI",executable:"codex",automation:"codex exec JSONL",auth_boundary:"Codex CLI owns ChatGPT/API authentication",docs_url:"https://developers.openai.com/codex/non-interactive-mode",entitlement_note:"OpenAI documents ChatGPT sign-in for Codex CLI; API keys remain the recommended ordinary automation route"},
-    Spec{id:InstalledAgentId::ClaudeCode,name:"Claude Code",executable:"claude",automation:"claude -p stream-json",auth_boundary:"Claude Code owns Pro/Max/API authentication",docs_url:"https://docs.anthropic.com/en/docs/claude-code/headless",entitlement_note:"Uses Claude Code's own accepted Pro/Max or API login; never the bare/API-only path for subscription reuse"},
-    Spec{id:InstalledAgentId::Pi,name:"Pi",executable:"pi",automation:"Pi JSONL RPC over stdin/stdout",auth_boundary:"Pi owns provider login; entitlement depends on its configured provider",docs_url:"https://pi.dev/docs/latest/rpc",entitlement_note:"RPC is supported; each configured provider's current subscription entitlement is evaluated by Pi and may require billed usage"},
-    Spec{id:InstalledAgentId::GoogleAntigravity,name:"Google Antigravity",executable:"agy",automation:"agy stream-json input/output",auth_boundary:"Antigravity owns Google keyring or explicit Gemini API authentication",docs_url:"https://antigravity.google/docs/cli/headless/",entitlement_note:"Uses Antigravity's own secure-keyring Google session or explicit Gemini API-key mode"},
+/// Date the Codex route's interface and terms basis was last re-verified
+/// against first-party OpenAI sources. `docs/codex-compatibility.md` carries
+/// the full reviewable contract; bump both together.
+pub const CODEX_CONTRACT_VERIFIED_ON: &str = "2026-09-19";
+
+const SPECS: [Spec;1] = [
+    Spec{id:InstalledAgentId::Codex,name:"Codex CLI",executable:"codex",automation:"codex exec JSONL",auth_boundary:"Codex CLI owns ChatGPT/API authentication",docs_url:"https://developers.openai.com/codex/non-interactive-mode",entitlement_note:"OpenAI documents codex exec non-interactive automation with the CLI's own ChatGPT or API-key sign-in; auth never passes through REX. API keys remain OpenAI's recommended automation route"},
 ];
 
 pub(crate) fn spec(id: InstalledAgentId) -> Spec {
@@ -139,6 +148,27 @@ pub(crate) fn spec(id: InstalledAgentId) -> Spec {
 pub fn discover() -> Vec<InstalledAgentSummary> {
     SPECS.iter().map(|s| detect(*s)).collect()
 }
+
+/// Offline contract probe for the retained Codex route: the documented
+/// non-interactive flags must still exist in the installed CLI. This runs the
+/// binary's own help text only - no network, no auth, no model call. If the
+/// flags changed, REX fails closed until the adapter is re-reviewed.
+fn codex_exec_interface_matches(exe: &Path) -> bool {
+    Command::new(exe)
+        .args(["exec", "--help"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            ["--json", "--sandbox", "--skip-git-repo-check"]
+                .iter()
+                .all(|flag| text.contains(flag))
+        })
+        .unwrap_or(false)
+}
+
 fn detect(s: Spec) -> InstalledAgentSummary {
     let found = find_on_path(s.executable);
     let version = found
@@ -159,23 +189,14 @@ fn detect(s: Spec) -> InstalledAgentSummary {
         });
     let state = if found.is_none() {
         DetectionState::Missing
-    } else if s.id == InstalledAgentId::GoogleAntigravity {
-        match version.as_deref() {
-            Some(value)
-                if value
-                    .split(|c: char| !(c.is_ascii_digit() || c == '.'))
-                    .any(|part| part == "1.2.7") =>
-            {
-                DetectionState::InstalledAuthUnknown
-            }
-            _ => DetectionState::UnsupportedVersion,
-        }
-    } else if version.is_some() {
-        DetectionState::InstalledAuthUnknown
-    } else {
+    } else if version.is_none() {
         DetectionState::UnsupportedVersion
+    } else if !codex_exec_interface_matches(found.as_ref().expect("checked above")) {
+        DetectionState::SupportNeedsReview
+    } else {
+        DetectionState::InstalledAuthUnknown
     };
-    InstalledAgentSummary{id:s.id,name:s.name,executable:s.executable,state,version,automation:s.automation,auth_boundary:s.auth_boundary,docs_url:s.docs_url,approval_boundary:"REX owns approval. The child never receives a skip-permissions flag and runs against an isolated staging copy.",compatibility:CompatibilityContract{verified_on:"2026-09-19",documented_interface:s.automation,entitlement_note:s.entitlement_note,fail_closed:true}}
+    InstalledAgentSummary{id:s.id,name:s.name,executable:s.executable,state,version,automation:s.automation,auth_boundary:s.auth_boundary,docs_url:s.docs_url,approval_boundary:"REX owns approval. The child never receives a skip-permissions flag and runs against an isolated staging copy.",compatibility:CompatibilityContract{verified_on:CODEX_CONTRACT_VERIFIED_ON,documented_interface:s.automation,entitlement_note:s.entitlement_note,fail_closed:true}}
 }
 
 pub(crate) fn find_on_path(exe: &str) -> Option<PathBuf> {
@@ -199,13 +220,14 @@ fn safe_args(id: InstalledAgentId, prompt: &str) -> (Args, Option<String>) {
 /// generation controls only through interfaces verified to accept them.
 /// Model and effort values travel as separate argv entries - never through a
 /// shell - and a backend whose control surface is not yet verified fails
-/// closed instead of silently dropping or mangling the selection.
+/// closed instead of silently dropping or mangling the selection. No
+/// retained backend currently has a verified model/effort control surface.
 pub fn safe_args_with_options(
     id: InstalledAgentId,
     prompt: &str,
     options: &RunOptions,
 ) -> Result<(Args, Option<String>), InstalledAgentError> {
-    if id != InstalledAgentId::GoogleAntigravity && (options.model.is_some() || options.effort.is_some()) {
+    if options.model.is_some() || options.effort.is_some() {
         return Err(InstalledAgentError::Invalid(format!(
             "model/effort selection is not yet verified for {}; run it with its own defaults",
             spec(id).name
@@ -214,19 +236,8 @@ pub fn safe_args_with_options(
     Ok(safe_args_verified(id, prompt, options))
 }
 
-fn safe_args_verified(id: InstalledAgentId, prompt: &str, options: &RunOptions) -> (Args, Option<String>) {
+fn safe_args_verified(id: InstalledAgentId, prompt: &str, _options: &RunOptions) -> (Args, Option<String>) {
     match id {
-        InstalledAgentId::Cursor => (
-            vec![
-                "-p".into(),
-                prompt.into(),
-                "--output-format".into(),
-                "stream-json".into(),
-                "--sandbox".into(),
-                "enabled".into(),
-            ],
-            None,
-        ),
         InstalledAgentId::Codex => (
             vec![
                 "exec".into(),
@@ -238,45 +249,20 @@ fn safe_args_verified(id: InstalledAgentId, prompt: &str, options: &RunOptions) 
             ],
             None,
         ),
-        InstalledAgentId::ClaudeCode => (
-            vec![
-                "-p".into(),
-                prompt.into(),
-                "--output-format".into(),
-                "stream-json".into(),
-                "--permission-mode".into(),
-                "plan".into(),
-                "--verbose".into(),
-            ],
-            None,
-        ),
-        InstalledAgentId::Pi => (
-            vec!["--mode".into(), "rpc".into()],
-            Some(serde_json::json!({"type":"prompt","message":prompt}).to_string()),
-        ),
-        InstalledAgentId::GoogleAntigravity => {
-            let mut args: Args = vec![
-                "--input-format".into(),
-                "stream-json".into(),
-                "--output-format".into(),
-                "stream-json".into(),
-                "--sandbox".into(),
-            ];
-            // Documented Antigravity CLI controls. Each value is one argv
-            // entry; an absent selection keeps agy's own default choice.
-            if let Some(model) = options.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
-                args.push("--model".into());
-                args.push(model.into());
-            }
-            if let Some(effort) = options.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
-                args.push("--effort".into());
-                args.push(effort.into());
-            }
-            (
-                args,
-                Some(serde_json::json!({"event":"user","message":{"content":prompt}}).to_string()),
-            )
-        }
+    }
+}
+
+/// Fail closed before spawning: the installed executable must still match
+/// the reviewed interface contract. Detection alone is display-only; this is
+/// the run-time gate.
+fn enforce_contract(exe: &Path, s: Spec) -> Result<(), InstalledAgentError> {
+    if codex_exec_interface_matches(exe) {
+        Ok(())
+    } else {
+        Err(InstalledAgentError::Invalid(format!(
+            "{} no longer matches the reviewed {} interface contract; support needs review before further runs",
+            s.name, CODEX_CONTRACT_VERIFIED_ON
+        )))
     }
 }
 
@@ -296,6 +282,7 @@ pub fn run(
     let s = spec(id);
     let exe = find_on_path(s.executable)
         .ok_or_else(|| InstalledAgentError::Missing(format!("{} is not installed", s.name)))?;
+    enforce_contract(&exe, s)?;
     run_with_executable(id, prompt, workspace, &exe)
 }
 
@@ -346,19 +333,14 @@ pub mod collect_events {
     use super::{AgentEvent, InstalledAgentError, InstalledAgentId};
     use serde_json::Value;
 
-    pub fn parse_line(id: InstalledAgentId, line: &str) -> Result<AgentEvent, InstalledAgentError> {
+    pub fn parse_line(_id: InstalledAgentId, line: &str) -> Result<AgentEvent, InstalledAgentError> {
         let payload: Value = match serde_json::from_str(line) {
             Ok(value) => value,
-            Err(error) if id == InstalledAgentId::GoogleAntigravity => {
-                return Err(InstalledAgentError::Invalid(format!(
-                    "malformed agent event: {error}"
-                )))
-            }
             Err(_) => Value::String(line.to_string()),
         };
         let event = payload
-            .get("event")
-            .or_else(|| payload.get("type"))
+            .get("type")
+            .or_else(|| payload.get("event"))
             .and_then(Value::as_str)
             .unwrap_or("output")
             .to_string();
@@ -422,13 +404,7 @@ fn collect_child(
         .join()
         .map_err(|_| InstalledAgentError::Child("stderr reader panicked".into()))?
         .map_err(|e| InstalledAgentError::Io(e.to_string()))?;
-    let status = if id == InstalledAgentId::GoogleAntigravity {
-        validate_antigravity_stream(&events, &stderr, output.status.code())?
-    } else if output.status.success() {
-        "completed".into()
-    } else {
-        "failed".into()
-    };
+    let status = validate_codex_stream(&events, output.status.code())?;
     Ok(InstalledAgentRun {
         backend: id,
         status,
@@ -439,160 +415,80 @@ fn collect_child(
     })
 }
 
-pub(crate) fn validate_antigravity_stream(
+/// Completion gate for the documented `codex exec --json` stream, reviewed
+/// 2026-09-19 against https://developers.openai.com/codex/non-interactive-mode.
+/// The stream must open with `thread.started`, stay inside the documented
+/// event vocabulary (`thread.started`, `turn.started`, `turn.completed`,
+/// `turn.failed`, `error`, `item.*`), and end with exactly one terminal
+/// `turn.completed`; `turn.failed`, an `error` event, an unknown event type,
+/// or a non-zero exit each fail the run closed. Exit code alone never counts
+/// as success.
+pub(crate) fn validate_codex_stream(
     events: &[AgentEvent],
-    stderr: &str,
     exit_code: Option<i32>,
 ) -> Result<String, InstalledAgentError> {
     if events.is_empty() {
         return Err(InstalledAgentError::Invalid(
-            "Antigravity emitted no events".into(),
+            "Codex emitted no events".into(),
         ));
     }
-    if events[0].event != "init" {
+    if events[0].event != "thread.started" {
         return Err(InstalledAgentError::Invalid(
-            "Antigravity stream must begin with init".into(),
+            "Codex stream must begin with thread.started".into(),
         ));
     }
-    let mut init_count = 0;
-    let mut result_count = 0;
-    let mut result_status = None;
+    let mut thread_starts = 0;
+    let mut terminal_count = 0;
+    let mut terminal_failure: Option<String> = None;
     for (index, event) in events.iter().enumerate() {
-        match event.event.as_str() {
-            "init" => {
-                init_count += 1;
-                if index != 0 {
-                    return Err(InstalledAgentError::Invalid(
-                        "init appeared after stream start".into(),
-                    ));
-                }
-                let init = event
+        let kind = event.event.as_str();
+        let terminal = matches!(kind, "turn.completed" | "turn.failed" | "error");
+        let known = matches!(kind, "thread.started" | "turn.started")
+            || terminal
+            || kind.starts_with("item.");
+        if !known {
+            return Err(InstalledAgentError::Invalid(format!(
+                "unknown Codex output event: {kind}"
+            )));
+        }
+        if kind == "thread.started" {
+            thread_starts += 1;
+            if index != 0 {
+                return Err(InstalledAgentError::Invalid(
+                    "thread.started appeared after stream start".into(),
+                ));
+            }
+        }
+        if terminal {
+            terminal_count += 1;
+            if index + 1 != events.len() {
+                return Err(InstalledAgentError::Invalid(
+                    "terminal event was not the last event".into(),
+                ));
+            }
+            if kind != "turn.completed" {
+                let detail = event
                     .payload
-                    .get("init")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        InstalledAgentError::Invalid("init payload is invalid".into())
-                    })?;
-                if !init.get("cwd").is_some_and(Value::is_string)
-                    || !init.get("tools").is_some_and(Value::is_array)
-                {
-                    return Err(InstalledAgentError::Invalid(
-                        "init omitted cwd or tools".into(),
-                    ));
-                }
-                let mode = event
-                    .payload
-                    .pointer("/init/permission_mode")
+                    .get("message")
+                    .or_else(|| event.payload.get("error"))
                     .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        InstalledAgentError::Invalid("init omitted permission_mode".into())
-                    })?;
-                if mode == "always-proceed" {
-                    return Err(InstalledAgentError::Invalid(
-                        "unsafe Antigravity permission mode".into(),
-                    ));
-                }
-            }
-            "step_update" => {
-                if result_count > 0 {
-                    return Err(InstalledAgentError::Invalid(
-                        "event appeared after terminal result".into(),
-                    ));
-                }
-                let step = event
-                    .payload
-                    .get("step_update")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        InstalledAgentError::Invalid("step_update payload is invalid".into())
-                    })?;
-                if !step.get("state").is_some_and(Value::is_string)
-                    || !step.get("step_type").is_some_and(Value::is_string)
-                {
-                    return Err(InstalledAgentError::Invalid(
-                        "step_update omitted state or step_type".into(),
-                    ));
-                }
-                if step.get("step_type").and_then(Value::as_str) == Some("tool") {
-                    let info = step
-                        .get("tool_info")
-                        .and_then(Value::as_object)
-                        .ok_or_else(|| {
-                            InstalledAgentError::Invalid("tool step omitted tool_info".into())
-                        })?;
-                    if info.contains_key("error") {
-                        return Err(InstalledAgentError::Child(
-                            "Antigravity tool step reported an error".into(),
-                        ));
-                    }
-                }
-            }
-            "result" => {
-                result_count += 1;
-                if index + 1 != events.len() {
-                    return Err(InstalledAgentError::Invalid(
-                        "result was not terminal".into(),
-                    ));
-                }
-                result_status = event
-                    .payload
-                    .pointer("/result/status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let result = event
-                    .payload
-                    .get("result")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        InstalledAgentError::Invalid("result payload is invalid".into())
-                    })?;
-                if !result.get("response").is_some_and(Value::is_string)
-                    || !result.get("usage").is_some_and(Value::is_object)
-                {
-                    return Err(InstalledAgentError::Invalid(
-                        "result omitted response or usage".into(),
-                    ));
-                }
-            }
-            other => {
-                return Err(InstalledAgentError::Invalid(format!(
-                    "unknown Antigravity output event: {other}"
-                )))
+                    .unwrap_or(kind)
+                    .to_string();
+                terminal_failure = Some(format!("Codex terminal event was {kind}: {detail}"));
             }
         }
     }
-    if init_count != 1 || result_count != 1 {
+    if thread_starts != 1 || terminal_count != 1 {
         return Err(InstalledAgentError::Invalid(
-            "Antigravity stream requires exactly one init and one result per turn".into(),
+            "Codex stream requires exactly one thread.started and one terminal event".into(),
         ));
     }
-    let status = result_status.unwrap_or_else(|| "INVALID".into());
-    if status != "SUCCESS" {
-        return Err(InstalledAgentError::Child(format!(
-            "Antigravity terminal status was {status}"
-        )));
-    }
-    let lower = stderr.to_ascii_lowercase();
-    let denial = [
-        "soft-denied",
-        "soft denied",
-        "permission denied",
-        "requires approval",
-        "not allowed by permissions",
-        "denied by permission",
-        "was denied",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    if denial {
-        return Err(InstalledAgentError::Child(
-            "Antigravity reported a permission denial; exit code is not accepted as completion"
-                .into(),
-        ));
+    if let Some(failure) = terminal_failure {
+        return Err(InstalledAgentError::Child(failure));
     }
     if exit_code != Some(0) {
         return Err(InstalledAgentError::Child(format!(
-            "Antigravity exited with {exit_code:?} after its result"
+            "Codex exited with {exit_code:?} after its result"
         )));
     }
     Ok("completed".into())
@@ -646,16 +542,17 @@ mod tests {
     fn valid_events() -> Vec<AgentEvent> {
         vec![
             event(
-                "init",
-                serde_json::json!({"event":"init","init":{"cwd":"/tmp/stage","tools":["read_file"],"permission_mode":"request-review"}}),
+                "thread.started",
+                serde_json::json!({"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}),
+            ),
+            event("turn.started", serde_json::json!({"type":"turn.started"})),
+            event(
+                "item.completed",
+                serde_json::json!({"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"done"}}),
             ),
             event(
-                "step_update",
-                serde_json::json!({"event":"step_update","step_update":{"state":"DONE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"path":"README.md"},"output":"ok"},"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}),
-            ),
-            event(
-                "result",
-                serde_json::json!({"event":"result","result":{"status":"SUCCESS","response":"done","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}),
+                "turn.completed",
+                serde_json::json!({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}),
             ),
         ]
     }
@@ -668,23 +565,31 @@ mod tests {
         }
     }
     #[test]
-    fn antigravity_command_is_the_documented_sandboxed_stream_contract() {
-        let (args, input) = safe_args(InstalledAgentId::GoogleAntigravity, "hello");
+    fn only_codex_is_retained() {
+        assert_eq!(SPECS.len(), 1);
+        assert_eq!(SPECS[0].id, InstalledAgentId::Codex);
+        assert_eq!(SPECS[0].executable, "codex");
+    }
+    #[test]
+    fn contract_has_a_review_date() {
+        assert_eq!(CODEX_CONTRACT_VERIFIED_ON, "2026-09-19");
+    }
+    #[test]
+    fn codex_command_is_the_documented_sandboxed_contract() {
+        let (args, input) = safe_args(InstalledAgentId::Codex, "hello");
         let args = args.iter().map(|x| x.to_string_lossy()).collect::<Vec<_>>();
         assert_eq!(
             args,
             [
-                "--input-format",
-                "stream-json",
-                "--output-format",
-                "stream-json",
-                "--sandbox"
+                "exec",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "hello"
             ]
         );
-        assert_eq!(
-            serde_json::from_str::<Value>(&input.unwrap()).unwrap(),
-            serde_json::json!({"event":"user","message":{"content":"hello"}})
-        );
+        assert!(input.is_none());
     }
     #[test]
     fn safe_commands_never_skip_permissions_or_add_allow_rules() {
@@ -698,93 +603,105 @@ mod tests {
             assert!(!text.contains("dangerously"));
             assert!(!text.contains("bypass"));
             assert!(!text.contains("permissions.allow"));
+            assert!(!text.contains("full-auto"));
         }
     }
     #[test]
-    fn codex_cursor_and_claude_stay_contained() {
+    fn codex_stays_contained_in_read_only_sandbox() {
         let (codex, _) = safe_args(InstalledAgentId::Codex, "x");
         assert!(codex
             .windows(2)
             .any(|v| v[0] == "--sandbox" && v[1] == "read-only"));
-        let (cursor, _) = safe_args(InstalledAgentId::Cursor, "x");
-        assert!(cursor
-            .windows(2)
-            .any(|v| v[0] == "--sandbox" && v[1] == "enabled"));
-        let (claude, _) = safe_args(InstalledAgentId::ClaudeCode, "x");
-        assert!(claude.iter().any(|v| v == "plan"));
     }
     #[test]
-    fn accepts_tool_calls_usage_and_one_terminal_result() {
+    fn model_and_effort_fail_closed() {
+        for options in [
+            RunOptions {
+                model: Some("gpt-5-codex".into()),
+                effort: None,
+            },
+            RunOptions {
+                model: None,
+                effort: Some("high".into()),
+            },
+        ] {
+            assert!(safe_args_with_options(InstalledAgentId::Codex, "x", &options).is_err());
+        }
+    }
+    #[test]
+    fn accepts_documented_stream_with_one_terminal_completion() {
         assert_eq!(
-            validate_antigravity_stream(&valid_events(), "", Some(0)).unwrap(),
+            validate_codex_stream(&valid_events(), Some(0)).unwrap(),
             "completed"
         );
     }
     #[test]
-    fn tool_error_is_not_completion() {
+    fn failed_turn_is_not_completion() {
         let mut events = valid_events();
-        events[1].payload["step_update"]["tool_info"]["error"] =
-            serde_json::json!({"type":"permission","message":"denied"});
-        assert!(validate_antigravity_stream(&events, "", Some(0)).is_err());
+        *events.last_mut().unwrap() = event(
+            "turn.failed",
+            serde_json::json!({"type":"turn.failed","message":"model error"}),
+        );
+        assert!(validate_codex_stream(&events, Some(1)).is_err());
     }
     #[test]
-    fn denial_with_zero_exit_is_not_completion() {
-        let err = validate_antigravity_stream(
-            &valid_events(),
-            "tool soft-denied because it requires approval",
-            Some(0),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("permission denial"));
+    fn error_event_is_not_completion() {
+        let mut events = valid_events();
+        *events.last_mut().unwrap() =
+            event("error", serde_json::json!({"type":"error","message":"boom"}));
+        assert!(validate_codex_stream(&events, Some(0)).is_err());
     }
     #[test]
-    fn rejects_malformed_event_ordering_and_duplicate_result() {
+    fn missing_or_misplaced_thread_start_fails_closed() {
         let mut e = valid_events();
         e.swap(0, 1);
-        assert!(validate_antigravity_stream(&e, "", Some(0)).is_err());
-        let mut e = valid_events();
-        e.push(e.last().unwrap().clone());
-        assert!(validate_antigravity_stream(&e, "", Some(0)).is_err());
+        assert!(validate_codex_stream(&e, Some(0)).is_err());
+        assert!(validate_codex_stream(&valid_events()[1..], Some(0)).is_err());
     }
     #[test]
-    fn rejects_missing_result_error_result_and_unknown_schema() {
+    fn event_after_terminal_and_duplicate_terminal_fail_closed() {
         let mut e = valid_events();
-        e.pop();
-        assert!(validate_antigravity_stream(&e, "", Some(0)).is_err());
+        e.push(event("turn.started", serde_json::json!({"type":"turn.started"})));
+        assert!(validate_codex_stream(&e, Some(0)).is_err());
         let mut e = valid_events();
-        e.last_mut().unwrap().payload["result"]["status"] = Value::String("ERROR".into());
-        assert!(validate_antigravity_stream(&e, "", Some(0)).is_err());
+        e.push(e.last().unwrap().clone());
+        assert!(validate_codex_stream(&e, Some(0)).is_err());
+    }
+    #[test]
+    fn unknown_event_type_fails_closed() {
         let mut e = valid_events();
         e.insert(
             1,
-            event("future_event", serde_json::json!({"event":"future_event"})),
+            event("future.event", serde_json::json!({"type":"future.event"})),
         );
-        assert!(validate_antigravity_stream(&e, "", Some(0)).is_err());
+        assert!(validate_codex_stream(&e, Some(0)).is_err());
     }
     #[test]
-    fn always_proceed_is_rejected() {
-        let mut e = valid_events();
-        e[0].payload["init"]["permission_mode"] = Value::String("always-proceed".into());
-        assert!(validate_antigravity_stream(&e, "", Some(0)).is_err());
+    fn non_zero_exit_is_not_completion() {
+        assert!(validate_codex_stream(&valid_events(), Some(3)).is_err());
+        assert!(validate_codex_stream(&valid_events(), None).is_err());
+    }
+    #[test]
+    fn empty_stream_is_not_completion() {
+        assert!(validate_codex_stream(&[], Some(0)).is_err());
     }
     #[cfg(unix)]
     #[test]
     fn parser_failure_terminates_and_reaps_child() {
         use std::os::unix::fs::PermissionsExt;
-        let root = env::temp_dir().join(format!("rex-agy-fixture-{}", std::process::id()));
+        let root = env::temp_dir().join(format!("rex-codex-fixture-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let fake = root.join("agy-fixture");
+        let fake = root.join("codex-fixture");
         fs::write(
             &fake,
-            "#!/bin/sh\nprintf '%s\\n' '{\"event\":\"unknown\"}'\n",
+            "#!/bin/sh\nprintf '%s\\n' 'this is not json at all {'\n",
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
         let started = std::time::Instant::now();
-        let err = run_with_executable(InstalledAgentId::GoogleAntigravity, "x", &root, &fake)
-            .unwrap_err();
-        assert!(err.to_string().contains("must begin with init"));
+        let err = run_with_executable(InstalledAgentId::Codex, "x", &root, &fake).unwrap_err();
+        assert!(err.to_string().contains("thread.started"));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         let _ = fs::remove_dir_all(&root);
     }

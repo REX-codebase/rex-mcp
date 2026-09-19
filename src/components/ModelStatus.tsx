@@ -21,23 +21,19 @@ const SELECTION_KEY = "rex-model-selection";
 const INSTALLED_OPTIONS_KEY = "rex-installed-agent-options";
 
 export interface InstalledAgentOptions {
-  model: string;
-  effort: string;
   workspace: string;
 }
 
 export function loadInstalledAgentOptions(): InstalledAgentOptions {
   try {
     const raw = window.localStorage.getItem(INSTALLED_OPTIONS_KEY);
-    if (!raw) return { model: "", effort: "", workspace: "" };
+    if (!raw) return { workspace: "" };
     const parsed = JSON.parse(raw);
     return {
-      model: typeof parsed?.model === "string" ? parsed.model : "",
-      effort: typeof parsed?.effort === "string" ? parsed.effort : "",
       workspace: typeof parsed?.workspace === "string" ? parsed.workspace : "",
     };
   } catch {
-    return { model: "", effort: "", workspace: "" };
+    return { workspace: "" };
   }
 }
 
@@ -313,24 +309,6 @@ export function ModelStatus() {
               {selection?.provider?.startsWith("installed:") && (
                 <div className="installed-options">
                   <label>
-                    <span>Model override</span>
-                    <input
-                      value={installedOptions.model}
-                      placeholder="CLI default"
-                      spellCheck={false}
-                      onChange={(event) => saveInstalledOptions({ ...installedOptions, model: event.target.value })}
-                    />
-                  </label>
-                  <label>
-                    <span>Effort override</span>
-                    <input
-                      value={installedOptions.effort}
-                      placeholder="CLI default"
-                      spellCheck={false}
-                      onChange={(event) => saveInstalledOptions({ ...installedOptions, effort: event.target.value })}
-                    />
-                  </label>
-                  <label>
                     <span>Workspace folder</span>
                     <input
                       value={installedOptions.workspace}
@@ -339,7 +317,7 @@ export function ModelStatus() {
                       onChange={(event) => saveInstalledOptions({ ...installedOptions, workspace: event.target.value })}
                     />
                   </label>
-                  <small className="api-hint">Passed verbatim to the vendor CLI as its documented --model / --effort flags. Empty keeps the CLI's own default; unsupported values fail truthfully. With a workspace folder set, the agent works on an isolated copy and REX holds every file change for your review before anything is written back.</small>
+                  <small className="api-hint">The agent runs with the vendor CLI's own model defaults in its documented read-only sandbox. With a workspace folder set, the agent works on an isolated copy and REX holds every file change for your review before anything is written back.</small>
                 </div>
               )}
             </section>

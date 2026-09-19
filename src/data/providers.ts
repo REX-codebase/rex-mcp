@@ -96,7 +96,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
         kind: "subscription-oauth",
         status: "not-offered",
         label: "ChatGPT sign-in",
-        detail: "OpenAI documents Sign in with ChatGPT only for its own Codex clients; no documented contract exists for third-party harnesses.",
+        detail: "OpenAI documents Sign in with ChatGPT only for its own Codex clients; no documented contract exists for third-party harnesses. The official Codex CLI remains available separately as an installed agent with its own sign-in.",
       },
     ],
   },

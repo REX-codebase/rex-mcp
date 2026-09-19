@@ -28,7 +28,7 @@ REX never uses, and will never accept a contribution that adds:
 | --- | --- | --- |
 | Google Gemini | **Offered** - AI Studio key, free tier exists | **Not offered** - plans are for Google's own products |
 | Anthropic | **Offered** - Claude Console key | **Forbidden by Anthropic** - never offered |
-| OpenAI | **Offered** - Platform key | **Undocumented for arbitrary harnesses** - Pi implements Codex OAuth and OpenAI names Pi as a preferred tool for OSS maintainers, but OpenAI publishes no reusable third-party client-registration/auth contract |
+| OpenAI | **Offered** - Platform key | **REX-implemented OAuth not offered** (undocumented for arbitrary harnesses). The official Codex CLI stays available as an installed-agent route - see below |
 | xAI (Grok) | **Offered** - console.x.ai key | **Partner-gated** - xAI officially enables subscription OAuth in named harnesses; no public route lets an arbitrary new harness self-register |
 | Kimi (Moonshot) | **Offered** - platform key | **Offered** - Kimi for Coding, officially for third-party tools |
 | Zhipu GLM | **Offered** - Z.AI open platform key | **Not offered** - GLM Coding Plan is limited to Z.AI's tool list |
@@ -77,20 +77,35 @@ Console are the permitted route.
 
 - Source: https://code.claude.com/docs/en/legal-and-compliance
 
-### OpenAI - ChatGPT sign-in (undocumented for arbitrary harnesses)
+### OpenAI - two distinct routes
 
-Pi currently implements the real Codex OAuth flow: OpenAI authorization and token
-endpoints, PKCE/device code, OpenAI's Codex client ID, and the ChatGPT Codex backend.
-OpenAI also names Pi among the tools OSS maintainers may prefer in its Codex for Open
-Source programme. This is evidence that Pi usage is known and welcomed, not evidence
-of a ban.
+**REX-implemented ChatGPT OAuth: not offered (undocumented for arbitrary
+harnesses).** Pi currently implements the real Codex OAuth flow: OpenAI authorization
+and token endpoints, PKCE/device code, OpenAI's Codex client ID, and the ChatGPT Codex
+backend. OpenAI also names Pi among the tools OSS maintainers may prefer in its Codex
+for Open Source programme. This is evidence that Pi usage is known and welcomed, not
+evidence of a ban. The missing piece for REX is a public contract for arbitrary new
+harnesses: OpenAI's auth page documents Codex app, CLI and IDE sign-in, but not
+third-party client registration or reuse of the first-party Codex client ID/backend.
+The openai/codex request for that contract remains unanswered. REX therefore keeps
+its own OAuth implementation disabled as **undocumented/unsupported**, not forbidden
+or illegal. There is no grounded claim here that OpenAI bans users merely for using
+Pi.
 
-The missing piece for REX is a public contract for arbitrary new harnesses: OpenAI's
-auth page documents Codex app, CLI and IDE sign-in, but not third-party client
-registration or reuse of the first-party Codex client ID/backend. The openai/codex
-request for that contract remains unanswered. REX therefore disables the route as
-**undocumented/unsupported**, not forbidden or illegal. There is no grounded claim
-here that OpenAI bans users merely for using Pi.
+**Official Codex CLI as an installed agent: retained.** OpenAI's own documentation
+covers driving the Codex CLI non-interactively from scripts, pipelines and other
+tools (`codex exec --json`), with authentication staying inside the CLI (Sign in
+with ChatGPT or an API key), and the OpenAI Terms of Use contain no clause barring
+third-party software from launching the official client. On 2026-09-19 the user
+decided to keep this route under strict non-abuse controls: the official binary
+only, read-only sandbox, no permission-bypass flags, staged review of every change,
+and an offline fail-closed contract probe. The full dated contract with sources is
+`crates/rex-installed-agents/COMPATIBILITY.md`. If OpenAI's terms or the documented
+interface change, the route fails closed until re-review.
+
+- Additional sources for the retained route:
+  - https://developers.openai.com/codex/non-interactive-mode
+  - https://openai.com/policies/terms-of-use/
 
 - Official sources:
   - https://developers.openai.com/codex/auth
@@ -176,6 +191,20 @@ Copilot hook is not offered. If GitHub ever opens a general third-party
 programme, this entry can be revisited.
 
 - Source: https://github.blog/changelog/2026-01-16-github-copilot-now-supports-opencode/
+
+## Removed installed-agent routes (2026-09-19)
+
+The Installed Agent settings surface previously offered vendor-CLI backends for
+Google Antigravity, Claude Code, Cursor and Pi. All four were removed on
+2026-09-19 after route-by-route terms audits: Google's Antigravity Additional
+Terms section 6 expressly prohibits third-party software accessing the service
+with Antigravity OAuth (no ACP exception); Anthropic expressly forbids
+third-party products offering claude.ai login or Pro/Max rate limits; Cursor
+publishes no third-party harness entitlement for its consumer subscription; and
+Pi's pattern of re-implementing providers' OAuth with copied first-party client
+IDs has no provider-published permission. OpenAI Codex CLI is the only retained
+installed-agent backend. Details and sources:
+`crates/rex-installed-agents/COMPATIBILITY.md`.
 
 ## How this is enforced in code
 

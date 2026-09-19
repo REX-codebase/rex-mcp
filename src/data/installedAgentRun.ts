@@ -51,13 +51,14 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 export const installedAgentAvailable = () =>
   backendKind().then((kind) => kind === "tauri").catch(() => false);
 
+// Generation overrides are intentionally not exposed: no control surface for
+// them is verified against the current vendor CLI, so runs keep the CLI's own
+// defaults and the Rust side fails closed if any are ever sent.
 export const installedAgentBegin = (
   backend: InstalledAgentId,
   prompt: string,
   workspace = "",
-  model?: string,
-  effort?: string,
-) => invoke<InstalledRunSnapshot>("installed_agent_begin", { backend, prompt, workspace, model: model ?? null, effort: effort ?? null });
+) => invoke<InstalledRunSnapshot>("installed_agent_begin", { backend, prompt, workspace, model: null, effort: null });
 
 export const installedAgentSnapshot = (runId: string) =>
   invoke<InstalledRunSnapshot>("installed_agent_snapshot", { runId });
