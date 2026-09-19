@@ -8,8 +8,10 @@ marked otherwise. When a provider changes its terms, update this document,
 
 REX connects a provider account only through routes the provider's own
 current terms and authentication documentation clearly permit for
-third-party harness use. **Absence of permission is refusal.** A hook that
-puts the user's account at risk of suspension is a bug, not a feature.
+third-party harness use. **Do not invent permission.** Explicit bans remain hard stops. Undocumented routes
+remain disabled until the provider documents them, without claiming the provider bans
+users or that technical use is illegal. A hook with a grounded account-enforcement risk
+is a bug, not a feature.
 
 REX never uses, and will never accept a contribution that adds:
 
@@ -26,8 +28,8 @@ REX never uses, and will never accept a contribution that adds:
 | --- | --- | --- |
 | Google Gemini | **Offered** - AI Studio key, free tier exists | **Not offered** - plans are for Google's own products |
 | Anthropic | **Offered** - Claude Console key | **Forbidden by Anthropic** - never offered |
-| OpenAI | **Offered** - Platform key | **Not offered** - ChatGPT sign-in is first-party Codex only |
-| xAI (Grok) | **Offered** - console.x.ai key | **Not offered** - X Premium/SuperGrok carry no API entitlement |
+| OpenAI | **Offered** - Platform key | **Undocumented for arbitrary harnesses** - Pi implements Codex OAuth and OpenAI names Pi as a preferred tool for OSS maintainers, but OpenAI publishes no reusable third-party client-registration/auth contract |
+| xAI (Grok) | **Offered** - console.x.ai key | **Partner-gated** - xAI officially enables subscription OAuth in named harnesses; no public route lets an arbitrary new harness self-register |
 | Kimi (Moonshot) | **Offered** - platform key | **Offered** - Kimi for Coding, officially for third-party tools |
 | Zhipu GLM | **Offered** - Z.AI open platform key | **Not offered** - GLM Coding Plan is limited to Z.AI's tool list |
 | Qwen (Alibaba) | **Offered** - ModelStudio key | **Not offered** - free OAuth discontinued; Coding Plan is Qwen Code-scoped |
@@ -75,35 +77,52 @@ Console are the permitted route.
 
 - Source: https://code.claude.com/docs/en/legal-and-compliance
 
-### OpenAI - ChatGPT sign-in
+### OpenAI - ChatGPT sign-in (undocumented for arbitrary harnesses)
 
-OpenAI documents "Sign in with ChatGPT" only for its own clients: "Codex
-cloud requires signing in with ChatGPT. The Codex CLI and IDE extension
-support both sign-in methods." For programmatic use OpenAI says: "We
-recommend API key authentication for programmatic Codex CLI workflows."
+Pi currently implements the real Codex OAuth flow: OpenAI authorization and token
+endpoints, PKCE/device code, OpenAI's Codex client ID, and the ChatGPT Codex backend.
+OpenAI also names Pi among the tools OSS maintainers may prefer in its Codex for Open
+Source programme. This is evidence that Pi usage is known and welcomed, not evidence
+of a ban.
 
-There is no documented contract for third-party clients: openai/codex issue
-#36886 asks for one and remains unanswered by OpenAI, and the unofficial
-path it describes works "by observation, not by contract" through an
-internal endpoint with undocumented headers - precisely the
-reverse-engineering REX refuses.
+The missing piece for REX is a public contract for arbitrary new harnesses: OpenAI's
+auth page documents Codex app, CLI and IDE sign-in, but not third-party client
+registration or reuse of the first-party Codex client ID/backend. The openai/codex
+request for that contract remains unanswered. REX therefore disables the route as
+**undocumented/unsupported**, not forbidden or illegal. There is no grounded claim
+here that OpenAI bans users merely for using Pi.
 
-- Sources:
+- Official sources:
   - https://developers.openai.com/codex/auth
-  - https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
+  - https://developers.openai.com/community/codex-for-oss
   - https://github.com/openai/codex/issues/36886
+- Pi implementation evidence (snapshot inspected 2026-09-19):
+  - https://github.com/earendil-works/pi/blob/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/ai/src/auth/oauth/openai-codex.ts
+  - https://github.com/earendil-works/pi/blob/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/ai/src/providers/openai-codex.ts
 
-### xAI - X Premium / SuperGrok
+### xAI - X Premium / SuperGrok (partner-gated)
 
-xAI keeps the products separate: consumer Grok subscriptions (X Premium,
-SuperGrok) govern usage inside X and grok.com, while the API "is billed
-separately" per token through console.x.ai. xAI's own FAQ treats X Premium
-and API credits as unrelated products. No subscription credential carries
-an API entitlement, so there is nothing REX could legitimately hook.
+Pi currently implements xAI's standard device authorization and refresh-token flow
+against `auth.x.ai`, requests `grok-cli:access api:access`, and sends requests to the
+public xAI API. xAI has also published official launch pages for Grok subscription
+connections in named third-party harnesses including Hermes Agent, OpenClaw, OpenCode
+and Warp. The old statement that consumer plans have no third-party programmatic
+entitlement was therefore too broad.
 
-- Sources:
-  - https://docs.x.ai/grok/faq
-  - https://docs.x.ai/developers/pricing
+What xAI has not published is a general developer registration path or permission to
+copy another app's OAuth client ID. That makes subscription OAuth **partner-gated**,
+not prohibited. REX keeps it disabled until xAI issues REX its own supported client
+registration or publishes a general integration contract. This avoids impersonating
+Pi or another approved client while stating the real limitation.
+
+- Official xAI sources:
+  - https://x.ai/news/grok-hermes
+  - https://x.ai/news/grok-openclaw
+  - https://x.ai/news/grok-opencode
+  - https://x.ai/news/grok-warp
+- Pi implementation evidence (snapshot inspected 2026-09-19):
+  - https://github.com/earendil-works/pi/blob/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/ai/src/auth/oauth/xai.ts
+  - https://github.com/earendil-works/pi/blob/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/ai/src/providers/xai.ts
 
 ### Google - AI Pro / Ultra
 
