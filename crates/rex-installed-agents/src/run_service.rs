@@ -19,8 +19,6 @@ use crate::{
     collect_events, safe_args_with_options, spec, validate_antigravity_stream, AgentEvent,
     InstalledAgentError, InstalledAgentId, RunOptions,
 };
-#[cfg(test)]
-use crate as _self;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -356,9 +354,8 @@ impl RunManager {
 
         let manager = Arc::clone(self);
         let run_id = id.clone();
-        let prompt_owned = prompt.to_string();
         thread::spawn(move || {
-            manager.work(run_id, backend, prompt_owned, input, shared_child, source, staging);
+            manager.work(run_id, backend, input, shared_child, source, staging);
         });
         Ok(snapshot)
     }
@@ -367,12 +364,13 @@ impl RunManager {
         &self,
         run_id: String,
         backend: InstalledAgentId,
-        _prompt: String,
         input: Option<String>,
         shared_child: Arc<Mutex<Option<Child>>>,
         source: Option<PathBuf>,
         staging: PathBuf,
     ) {
+        let _ = &source;
+        let _ = &staging;
         let outcome = drive_child(backend, input, &shared_child, |event| {
             self.append_event(&run_id, event);
         });
@@ -382,7 +380,7 @@ impl RunManager {
             Err(error) => (String::new(), None, Some(error)),
         };
 
-        let mut finalize = None;
+        let finalize;
         {
             let mut runs = self.runs.lock().expect("runs lock");
             let Some(record) = runs.get_mut(&run_id) else { return };
@@ -468,7 +466,7 @@ impl RunManager {
     /// Trusted operator decision on the staged diff. This is the only path
     /// that writes child output back into the source workspace.
     pub fn decide(&self, run_id: &str, approved: bool) -> Result<RunSnapshot, InstalledAgentError> {
-        let mut cleanup = None;
+        let cleanup;
         let snapshot = {
             let mut runs = self.runs.lock().expect("runs lock");
             let record = runs
@@ -509,7 +507,7 @@ impl RunManager {
     }
 
     pub fn cancel(&self, run_id: &str) -> Result<RunSnapshot, InstalledAgentError> {
-        let mut staging_cleanup = None;
+        let staging_cleanup;
         let snapshot = {
             let mut runs = self.runs.lock().expect("runs lock");
             let record = runs
@@ -530,9 +528,11 @@ impl RunManager {
             }
             record.snapshot.status = RunStatus::Cancelled;
             record.snapshot.updated_at_ms = now_ms();
-            if record.source.is_some() {
-                staging_cleanup = Some(record.staging.clone());
-            }
+            staging_cleanup = if record.source.is_some() {
+                Some(record.staging.clone())
+            } else {
+                None
+            };
             record.snapshot.clone()
         };
         if let Some(staging) = staging_cleanup {
@@ -547,7 +547,11 @@ fn tail(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }
-    text[text.len() - limit..].to_string()
+    let mut start = text.len() - limit;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 /// Spawn-side driver: streams child stdout into per-line events as they
