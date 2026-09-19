@@ -14,5 +14,8 @@ Passed here:
 - npm test: 9/9.
 - npm run build.
 
+Additional native verification:
+- The rootless sysroot now contains the full transitive GTK/WebKitGTK runtime closure; `cargo test --workspace --all-targets --locked` linked the native Tauri binary and passed every workspace test (86 total).
+
 Open boundary:
-- The rootless sysroot can compile/check the complete native workspace, but full linked Tauri tests remain blocked by missing shared runtime dependencies in this fresh environment. This increment does not claim the requested native MP4, Gemini Flash Lite run, or full bounded model-loop integration. Those remain open.
+- This increment does not claim the requested native MP4, Gemini Flash Lite run, or full bounded model-loop integration. Those remain open.
