@@ -111,7 +111,7 @@ impl SearchEngine {
     pub fn new(config: SearchConfig) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(config.timeout))
-            .max_redirects(5)
+            .max_redirects(0)
             .user_agent(USER_AGENT)
             .build()
             .into();
@@ -227,7 +227,7 @@ impl SearchEngine {
             Err(e) => return Err(failure(url.as_str(), FetchState::NetworkError, e.to_string(), discovery, from)),
         };
         let status = response.status().as_u16();
-        let final_url = response.get_uri().to_string();
+        let final_url = url.to_string();
         let content_type = response.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("").to_ascii_lowercase();
         if !(content_type.contains("text/html") || content_type.contains("application/xhtml+xml") || content_type.contains("text/plain")) {
             return Err(failure(url.as_str(), FetchState::UnsupportedContent, format!("unsupported content type: {content_type}"), discovery, from).with_status(status));
@@ -237,10 +237,7 @@ impl SearchEngine {
         }
         let body = response.into_body().with_config().limit(self.config.max_body_bytes as u64).read_to_string()
             .map_err(|e| failure(url.as_str(), FetchState::NetworkError, format!("body read failed: {e}"), discovery.clone(), from.clone()).with_status(status))?;
-        let effective = Url::parse(&final_url).unwrap_or_else(|_| url.clone());
-        if let Err(detail) = reject_private_destination(&effective) {
-            return Err(failure(url.as_str(), FetchState::UnsafeAddress, format!("unsafe redirect: {detail}"), discovery, from).with_status(status));
-        }
+        let effective = url.clone();
         let title = extract_title(&body);
         let mut content = html_to_text(&body);
         content.truncate(char_boundary(&content, self.config.max_content_chars));
@@ -297,11 +294,13 @@ fn reject_private_destination(url: &Url) -> Result<(), String> {
     let host = url.host_str().ok_or_else(|| "URL has no host".to_string())?;
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") || host.ends_with(".internal") { return Err("local hostnames are blocked".into()) }
     let port = url.port_or_known_default().unwrap_or(80);
-    if let Ok(addrs) = (host, port).to_socket_addrs() {
-        for addr in addrs {
-            if !is_public_ip(addr.ip()) { return Err(format!("non-public destination {} is blocked", addr.ip())) }
-        }
+    let addrs = (host, port).to_socket_addrs().map_err(|e| format!("host resolution failed: {e}"))?;
+    let mut resolved = false;
+    for addr in addrs {
+        resolved = true;
+        if !is_public_ip(addr.ip()) { return Err(format!("non-public destination {} is blocked", addr.ip())) }
     }
+    if !resolved { return Err("host resolved to no addresses".into()) }
     Ok(())
 }
 fn is_public_ip(ip: IpAddr) -> bool {
@@ -341,8 +340,9 @@ fn html_to_text(html: &str) -> String {
     decode_entities(&out).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 fn decode_entities(s:&str)->String { s.replace("&amp;","&").replace("&lt;","<").replace("&gt;",">").replace("&quot;","\"").replace("&#39;","'").replace("&nbsp;"," ") }
+fn floor_boundary(s:&str, mut i:usize)->usize { i=i.min(s.len()); while !s.is_char_boundary(i){i-=1} i }
 fn char_boundary(s:&str,max:usize)->usize { if s.len()<=max{return s.len()} let mut i=max; while !s.is_char_boundary(i){i-=1} i }
-fn make_excerpt(content:&str, query:&[String])->Option<String>{ if content.is_empty(){return None} let lower=content.to_ascii_lowercase(); let pos=query.iter().filter_map(|t|lower.find(t)).min().unwrap_or(0); let start=pos.saturating_sub(180); let start=content.floor_char_boundary(start); let end=content.ceil_char_boundary((start+520).min(content.len())); Some(content[start..end].to_string()) }
+fn make_excerpt(content:&str, query:&[String])->Option<String>{ if content.is_empty(){return None} let lower=content.to_ascii_lowercase(); let pos=query.iter().filter_map(|t|lower.find(t)).min().unwrap_or(0); let start=pos.saturating_sub(180); let start=floor_boundary(content,start); let end=floor_boundary(content,(start+520).min(content.len())); Some(content[start..end].to_string()) }
 
 fn failure(url:&str,state:FetchState,detail:String,discovery:DiscoveryKind,from:Option<String>)->Evidence { Evidence { url:url.into(),final_url:url.into(),title:None,excerpt:None,content:None,retrieved_at_unix_ms:now_ms(),http_status:None,content_type:None,discovery,discovered_from:from,state,error:Some(detail),score:0.0,robots_allowed:None } }
 impl Evidence { fn with_status(mut self,status:u16)->Self{self.http_status=Some(status);self} fn with_robots(mut self,allowed:bool)->Self{self.robots_allowed=Some(allowed);self} }
