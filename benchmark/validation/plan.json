@@ -1,0 +1,156 @@
+{
+  "plan_version": 1,
+  "suite": "smoke",
+  "suite_path": "/tmp/smoke/suite.jsonl",
+  "env": {
+    "model": "mock-gemini-3.5-flash-lite",
+    "dataset_version": "smoke-v0",
+    "harness_version": "25bec7a"
+  },
+  "runs": [
+    {
+      "run_id": "smoke/t/add-two/raw/seed0",
+      "suite": "smoke",
+      "task_id": "t/add-two",
+      "mode": "raw",
+      "seed": 0,
+      "run_sha": "aff5035759845217"
+    },
+    {
+      "run_id": "smoke/t/add-two/simple/seed0",
+      "suite": "smoke",
+      "task_id": "t/add-two",
+      "mode": "simple",
+      "seed": 0,
+      "run_sha": "7b08efbd4baded86"
+    },
+    {
+      "run_id": "smoke/t/add-two/ultra/seed0",
+      "suite": "smoke",
+      "task_id": "t/add-two",
+      "mode": "ultra",
+      "seed": 0,
+      "run_sha": "7d584cf886e53e8b"
+    },
+    {
+      "run_id": "smoke/t/reverse-string/raw/seed0",
+      "suite": "smoke",
+      "task_id": "t/reverse-string",
+      "mode": "raw",
+      "seed": 0,
+      "run_sha": "2f9d85dcdb6cc949"
+    },
+    {
+      "run_id": "smoke/t/reverse-string/simple/seed0",
+      "suite": "smoke",
+      "task_id": "t/reverse-string",
+      "mode": "simple",
+      "seed": 0,
+      "run_sha": "08248a19751e33a0"
+    },
+    {
+      "run_id": "smoke/t/reverse-string/ultra/seed0",
+      "suite": "smoke",
+      "task_id": "t/reverse-string",
+      "mode": "ultra",
+      "seed": 0,
+      "run_sha": "c4f004a4d8f756d0"
+    },
+    {
+      "run_id": "smoke/t/fib/raw/seed0",
+      "suite": "smoke",
+      "task_id": "t/fib",
+      "mode": "raw",
+      "seed": 0,
+      "run_sha": "d8150e752118ed6f"
+    },
+    {
+      "run_id": "smoke/t/fib/simple/seed0",
+      "suite": "smoke",
+      "task_id": "t/fib",
+      "mode": "simple",
+      "seed": 0,
+      "run_sha": "3fb008e0d53fe866"
+    },
+    {
+      "run_id": "smoke/t/fib/ultra/seed0",
+      "suite": "smoke",
+      "task_id": "t/fib",
+      "mode": "ultra",
+      "seed": 0,
+      "run_sha": "e0973b9214bce2f1"
+    },
+    {
+      "run_id": "smoke/t/is-prime/raw/seed0",
+      "suite": "smoke",
+      "task_id": "t/is-prime",
+      "mode": "raw",
+      "seed": 0,
+      "run_sha": "0d4570fbfab00a17"
+    },
+    {
+      "run_id": "smoke/t/is-prime/simple/seed0",
+      "suite": "smoke",
+      "task_id": "t/is-prime",
+      "mode": "simple",
+      "seed": 0,
+      "run_sha": "00b330659db2b030"
+    },
+    {
+      "run_id": "smoke/t/is-prime/ultra/seed0",
+      "suite": "smoke",
+      "task_id": "t/is-prime",
+      "mode": "ultra",
+      "seed": 0,
+      "run_sha": "897ed78a0ed19a7b"
+    },
+    {
+      "run_id": "smoke/t/flatten/raw/seed0",
+      "suite": "smoke",
+      "task_id": "t/flatten",
+      "mode": "raw",
+      "seed": 0,
+      "run_sha": "2001475ae9228861"
+    },
+    {
+      "run_id": "smoke/t/flatten/simple/seed0",
+      "suite": "smoke",
+      "task_id": "t/flatten",
+      "mode": "simple",
+      "seed": 0,
+      "run_sha": "4fa19679ed0c8485"
+    },
+    {
+      "run_id": "smoke/t/flatten/ultra/seed0",
+      "suite": "smoke",
+      "task_id": "t/flatten",
+      "mode": "ultra",
+      "seed": 0,
+      "run_sha": "cf0c6db8db210d70"
+    },
+    {
+      "run_id": "smoke/t/word-count/raw/seed0",
+      "suite": "smoke",
+      "task_id": "t/word-count",
+      "mode": "raw",
+      "seed": 0,
+      "run_sha": "2e3ca8e03ca48109"
+    },
+    {
+      "run_id": "smoke/t/word-count/simple/seed0",
+      "suite": "smoke",
+      "task_id": "t/word-count",
+      "mode": "simple",
+      "seed": 0,
+      "run_sha": "28a6ff54a95152ad"
+    },
+    {
+      "run_id": "smoke/t/word-count/ultra/seed0",
+      "suite": "smoke",
+      "task_id": "t/word-count",
+      "mode": "ultra",
+      "seed": 0,
+      "run_sha": "ba2c6ac8c862a93e"
+    }
+  ]
+}

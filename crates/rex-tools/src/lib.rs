@@ -247,6 +247,61 @@ impl ToolRuntime {
         }
     }
 
+    /// Execute a suite-authored scoring command under the same sandbox as
+    /// model-approved commands (env_clear, rlimits, kill-tree timeout,
+    /// capped output, redaction, audit receipt), but with argv gated by
+    /// `allowed_executables` instead of the model-facing command_policy.
+    /// NOT reachable from model tool requests: the only caller is the
+    /// benchmark verifier, which runs pinned suite checks after a run.
+    pub fn execute_trusted_scoring(
+        &self,
+        argv: &[String],
+        cwd: Option<&str>,
+        timeout_ms: u64,
+        allowed_executables: &[&str],
+    ) -> ToolResult {
+        let started = Instant::now();
+        let started_at_ms = now_ms();
+        let call_id = new_call_id();
+        if let Err(e) = scoring_policy(argv, allowed_executables) {
+            return failure(
+                &call_id,
+                "trusted_scoring",
+                e.kind,
+                &e.detail,
+                started_at_ms,
+                started,
+                &self.root,
+            );
+        }
+        match self.run_command_impl(argv, cwd, timeout_ms) {
+            Ok(mut data) => {
+                let (clean, redactions) = redact(&data.output.unwrap_or_default());
+                data.receipt.redactions += redactions;
+                data.receipt.started_at_ms = started_at_ms;
+                data.receipt.duration_ms = started.elapsed().as_millis();
+                ToolResult {
+                    call_id,
+                    ok: true,
+                    tool: "trusted_scoring".into(),
+                    state: CallState::Executed,
+                    output: Some(clean),
+                    error: None,
+                    receipt: data.receipt,
+                }
+            }
+            Err(e) => failure(
+                &call_id,
+                "trusted_scoring",
+                e.kind,
+                &e.detail,
+                started_at_ms,
+                started,
+                &self.root,
+            ),
+        }
+    }
+
     pub fn execute(&self, call_id: &str) -> ToolResult {
         let started = Instant::now();
         let started_at_ms = now_ms();
@@ -576,6 +631,18 @@ impl ToolRuntime {
         timeout_ms: u64,
     ) -> Result<ExecData, ToolError> {
         command_policy(argv)?;
+        self.run_command_impl(argv, cwd, timeout_ms)
+    }
+
+    /// Bounded process execution shared by model-approved commands and
+    /// trusted scoring. Callers are responsible for policy; this applies
+    /// the sandbox (env_clear, rlimits, kill-tree timeout, capped output).
+    fn run_command_impl(
+        &self,
+        argv: &[String],
+        cwd: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<ExecData, ToolError> {
         let cwd = self.resolve_existing(cwd.unwrap_or("."), true)?;
         if !cwd.is_dir() {
             return Err(err(
@@ -851,6 +918,38 @@ fn summarize(r: &ToolRequest) -> String {
         }
     }
 }
+/// Trusted scoring policy for benchmark verification. This list is ONLY
+/// consulted by `execute_trusted_scoring` - model-issued RunCommand
+/// requests keep going through `command_policy`, which denies the same
+/// interpreter names. Suite executable checks are task-author
+/// infrastructure run by the harness verifier inside the disposable
+/// workspace; argv comes from the pinned suite file, never from model
+/// output. Executables must be bare names resolved via PATH so a suite
+/// cannot smuggle an absolute binary or a traversal path.
+fn scoring_policy(argv: &[String], allowed: &[&str]) -> Result<(), ToolError> {
+    if argv.is_empty() || argv[0].trim().is_empty() {
+        return Err(err(ErrorKind::InvalidRequest, "empty command"));
+    }
+    let raw = &argv[0];
+    if raw.contains('/') || raw.contains('\\') {
+        return Err(err(
+            ErrorKind::PolicyDenied,
+            "scoring executables must be bare names resolved via PATH",
+        ));
+    }
+    let exe = raw.to_ascii_lowercase();
+    if !allowed.iter().any(|a| a.eq_ignore_ascii_case(&exe)) {
+        return Err(err(
+            ErrorKind::PolicyDenied,
+            "executable is not in the suite scoring allowlist",
+        ));
+    }
+    if argv.iter().skip(1).any(|a| a.contains('\0')) {
+        return Err(err(ErrorKind::InvalidRequest, "NUL byte in argument"));
+    }
+    Ok(())
+}
+
 fn classify(r: &ToolRequest) -> (RiskClass, &'static str) {
     match r {
         ToolRequest::ReadFile { .. } | ToolRequest::SearchFiles { .. } => (
@@ -1159,6 +1258,33 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+fn trusted_scoring_runs_allowlisted_bare_names_only() {
+    let dir = std::env::temp_dir().join(format!("rex-scoring-test-{}", std::process::id()));
+    let rt = ToolRuntime::new(&dir).expect("runtime");
+    // allowlisted executable runs
+    let ok = rt.execute_trusted_scoring(&["true".to_string()], None, 5_000, &["true"]);
+    assert!(ok.ok, "true should pass: {:?}", ok.error);
+    // allowlisted executable that exits nonzero is a failure, not a policy block
+    let bad = rt.execute_trusted_scoring(&["false".to_string()], None, 5_000, &["false"]);
+    assert!(!bad.ok);
+    assert!(matches!(bad.error.as_ref().map(|e| &e.kind), Some(ErrorKind::ProcessFailed)));
+    // non-allowlisted interpreter stays blocked even though it exists
+    let denied = rt.execute_trusted_scoring(
+        &["sh".to_string(), "-c".to_string(), "true".to_string()],
+        None,
+        5_000,
+        &["true"],
+    );
+    assert!(!denied.ok);
+    assert!(matches!(denied.error.as_ref().map(|e| &e.kind), Some(ErrorKind::PolicyDenied)));
+    // path traversal as executable name refused
+    let trav = rt.execute_trusted_scoring(&["/bin/true".to_string()], None, 5_000, &["true"]);
+    assert!(!trav.ok);
+    assert!(matches!(trav.error.as_ref().map(|e| &e.kind), Some(ErrorKind::PolicyDenied)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
     fn symlink_escape_refused() {
         use std::os::unix::fs::symlink;
         let root = temp();

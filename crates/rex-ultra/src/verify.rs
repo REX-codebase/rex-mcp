@@ -53,6 +53,7 @@ fn verify_one(
     runtime: &ToolRuntime,
     workspace: &Path,
     evidence: &mut EvidenceStore,
+    scoring: Option<&[&str]>,
 ) -> ObligationOutcome {
     let started = std::time::Instant::now();
     let mut evidence_ids: Vec<String> = Vec::new();
@@ -121,23 +122,43 @@ fn verify_one(
                 Ok(p) => p,
                 Err(e) => return outcome!(ObligationStatus::Failed, format!("prepare failed: {}", e.detail)),
             };
-            if prepared.risk == RiskClass::Denied {
-                return outcome!(
-                    ObligationStatus::Failed,
-                    format!("verification command blocked by hard policy: {}", prepared.policy_reason),
-                );
-            }
-            // Harness-trusted approval inside the disposable run workspace;
-            // recorded in evidence so the user can audit every command.
-            if prepared.approval_required {
-                if let Err(e) = runtime.resolve_approval(&prepared.call_id, true) {
-                    return outcome!(ObligationStatus::Failed, format!("approval failed: {}", e.detail));
+            // Two execution paths, one audit trail. Model-facing policy
+            // denials stand UNLESS the caller pinned a scoring allowlist:
+            // then the suite-authored command runs through the verifier's
+            // trusted scoring path (same sandbox, same receipt). This never
+            // widens model-issued command authority.
+            let (result, via) = if prepared.risk == RiskClass::Denied {
+                match scoring {
+                    Some(allowed) => (
+                        runtime.execute_trusted_scoring(
+                            argv,
+                            cwd.as_deref(),
+                            timeout.unwrap_or(DEFAULT_TIMEOUT_MS),
+                            allowed,
+                        ),
+                        "trusted_scoring",
+                    ),
+                    None => {
+                        return outcome!(
+                            ObligationStatus::Failed,
+                            format!("verification command blocked by hard policy: {}", prepared.policy_reason),
+                        )
+                    }
                 }
-            }
-            let result = runtime.execute(&prepared.call_id);
+            } else {
+                // Harness-trusted approval inside the disposable run workspace;
+                // recorded in evidence so the user can audit every command.
+                if prepared.approval_required {
+                    if let Err(e) = runtime.resolve_approval(&prepared.call_id, true) {
+                        return outcome!(ObligationStatus::Failed, format!("approval failed: {}", e.detail));
+                    }
+                }
+                (runtime.execute(&prepared.call_id), "runtime")
+            };
             let output = result.output.clone().unwrap_or_default();
             let record = format!(
-                "argv={:?}\nexit={:?}\noutput_sha256={}\noutput:\n{}",
+                "via={}\nargv={:?}\nexit={:?}\noutput_sha256={}\noutput:\n{}",
+                via,
                 argv,
                 result.receipt.exit_code,
                 sha256_hex(output.as_bytes()),
@@ -177,6 +198,21 @@ pub fn verify_contract(
     workspace: &Path,
     evidence: &mut EvidenceStore,
 ) -> VerificationReport {
+    verify_contract_with_scoring(contract, workspace, evidence, None)
+}
+
+/// Verify with an optional trusted-scoring allowlist. When `scoring` names
+/// executables (e.g. ["python3", "pytest"]), suite-authored command checks
+/// that the model-facing policy denies still run - through
+/// ToolRuntime::execute_trusted_scoring, inside the same sandbox. Callers:
+/// the benchmark scorer passes the suite's pinned allowlist; every other
+/// caller passes None and keeps the old behavior.
+pub fn verify_contract_with_scoring(
+    contract: &AcceptanceContract,
+    workspace: &Path,
+    evidence: &mut EvidenceStore,
+    scoring: Option<&[&str]>,
+) -> VerificationReport {
     let runtime = match ToolRuntime::new(workspace) {
         Ok(r) => r,
         Err(e) => {
@@ -200,7 +236,7 @@ pub fn verify_contract(
     let outcomes: Vec<ObligationOutcome> = contract
         .obligations
         .iter()
-        .map(|ob| verify_one(ob, &runtime, workspace, evidence))
+        .map(|ob| verify_one(ob, &runtime, workspace, evidence, scoring))
         .collect();
     let executable_all_proven = outcomes
         .iter()
@@ -272,6 +308,48 @@ mod tests {
     }
 
     #[test]
+fn scoring_allowlist_runs_denied_interpreters_without_widening_model_policy() {
+    use crate::contract::{AcceptanceContract, Obligation, Proof};
+    use crate::evidence::EvidenceStore;
+    let mk = |argv: Vec<&str>| AcceptanceContract {
+        task: "t".into(),
+        obligations: vec![Obligation {
+            id: "c1".into(),
+            statement: "runs".into(),
+            proof: Proof::CommandSucceeds {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+            },
+        }],
+        forbidden_regressions: Vec::new(),
+    };
+    let dir = std::env::temp_dir().join(format!("rex-verify-scoring-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ev = EvidenceStore::open(&dir.join("ev")).unwrap();
+
+    // no allowlist: model-facing denial stands (old behavior preserved)
+    let r = verify_contract(&mk(vec!["sh", "-c", "true"]), &dir, &mut ev);
+    assert!(!r.executable_all_proven);
+    assert!(r.outcomes[0].detail.contains("blocked by hard policy"));
+
+    // allowlist with an exiting-zero command proves the obligation
+    let r = verify_contract_with_scoring(&mk(vec!["true"]), &dir, &mut ev, Some(&["true"]));
+    assert!(r.executable_all_proven, "{:?}", r.outcomes[0].detail);
+
+    // allowlist with a nonzero exit fails the obligation but EXECUTED
+    let r = verify_contract_with_scoring(&mk(vec!["false"]), &dir, &mut ev, Some(&["true"]));
+    assert!(!r.executable_all_proven);
+    assert!(!r.outcomes[0].detail.contains("blocked by hard policy"));
+
+    // allowlist never admits shells even when named
+    let r = verify_contract_with_scoring(&mk(vec!["sh", "-c", "true"]), &dir, &mut ev, Some(&["true"]));
+    assert!(!r.executable_all_proven);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
     fn behavior_claims_wait_for_the_judge() {
         let dir = tempfile::tempdir().unwrap();
         let mut ev = EvidenceStore::open(&dir.path().join("ev")).unwrap();

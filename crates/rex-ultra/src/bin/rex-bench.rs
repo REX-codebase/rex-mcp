@@ -20,6 +20,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Executables suite checks may name. Interpreters and test runners only -
+/// no shells, network clients, privilege or destructive tools. Model-issued
+/// commands never see this list; it exists so the trusted verifier can
+/// execute suite-authored tests (see rex-tools execute_trusted_scoring).
+const SCORING_EXECUTABLES: &[&str] = &[
+    "python3", "python", "pytest", "node", "cargo", "go", "java", "javac", "ruby",
+];
+
 struct Args {
     command: String,
     suite: Option<PathBuf>,
@@ -30,6 +38,7 @@ struct Args {
     runs_root: PathBuf,
     files: Vec<PathBuf>,
     task_filter: Option<String>,
+    stage_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -45,6 +54,7 @@ fn parse_args() -> Result<Args, String> {
         runs_root: std::env::temp_dir().join(format!("rex-bench-{}", std::process::id())),
         files: Vec::new(),
         task_filter: None,
+        stage_dir: None,
     };
     let mut rest: Vec<String> = args.collect();
     while !rest.is_empty() {
@@ -70,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
             "--out" => parsed.out = PathBuf::from(value("--out")?),
             "--runs-root" => parsed.runs_root = PathBuf::from(value("--runs-root")?),
             "--task" => parsed.task_filter = Some(value("--task")?),
+            "--stage-dir" => parsed.stage_dir = Some(PathBuf::from(value("--stage-dir")?)),
             other if !other.starts_with("--") => parsed.files.push(PathBuf::from(other)),
             other => return Err(format!("unknown flag {other}")),
         }
@@ -197,7 +208,30 @@ fn run_task(
         }
     };
 
-    let report = bench::score_workspace(task, &workspace, &evidence_dir);
+    // Hidden suite files (tests) land only now - after the model run - and
+    // overwrite anything the model wrote at the same paths, so scoring only
+    // ever executes suite-authored checks.
+    if let Some(stage) = &args.stage_dir {
+        if let Err(e) = bench::stage_hidden_files(stage, &task.id, &workspace) {
+            return TaskResult {
+                task_id: task.id.clone(),
+                mode: args.mode,
+                passed: false,
+                checks: Vec::new(),
+                tokens_used: tokens,
+                wall_ms: started.elapsed().as_millis() as u64,
+                steps,
+                approvals,
+                terminal: format!("stage_error: {e}"),
+            };
+        }
+    }
+    let report = bench::score_workspace_with_scoring(
+        task,
+        &workspace,
+        &evidence_dir,
+        Some(SCORING_EXECUTABLES),
+    );
     TaskResult {
         task_id: task.id.clone(),
         mode: args.mode,

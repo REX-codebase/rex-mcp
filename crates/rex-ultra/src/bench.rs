@@ -10,7 +10,7 @@
 
 use crate::contract::Proof;
 use crate::evidence::EvidenceStore;
-use crate::verify::{verify_contract, ObligationOutcome, VerificationReport};
+use crate::verify::{ObligationOutcome, VerificationReport};
 use crate::contract::AcceptanceContract;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -72,6 +72,17 @@ pub struct TaskResult {
 /// Score a finished workspace against a task's checks. This is the blind
 /// scorer: only fresh execution counts.
 pub fn score_workspace(task: &BenchTask, workspace: &Path, evidence_dir: &Path) -> VerificationReport {
+    score_workspace_with_scoring(task, workspace, evidence_dir, None)
+}
+
+/// Score with an optional trusted-scoring allowlist for suite-authored
+/// command checks (see verify::verify_contract_with_scoring).
+pub fn score_workspace_with_scoring(
+    task: &BenchTask,
+    workspace: &Path,
+    evidence_dir: &Path,
+    scoring: Option<&[&str]>,
+) -> VerificationReport {
     let mut evidence = EvidenceStore::open(evidence_dir).expect("evidence store");
     let contract = AcceptanceContract {
         task: task.prompt.clone(),
@@ -87,7 +98,47 @@ pub fn score_workspace(task: &BenchTask, workspace: &Path, evidence_dir: &Path) 
             .collect(),
         forbidden_regressions: Vec::new(),
     };
-    verify_contract(&contract, workspace, &mut evidence)
+    crate::verify::verify_contract_with_scoring(&contract, workspace, &mut evidence, scoring)
+}
+
+/// Stage hidden suite files (e.g. tests) into the workspace AFTER a run,
+/// before scoring. Files the model wrote at the same paths are overwritten -
+/// scoring must only ever see suite-authored checks. Symlinks in the stage
+/// tree are refused. Returns the staged relative paths for the audit trail.
+pub fn stage_hidden_files(stage_root: &Path, task_id: &str, workspace: &Path) -> Result<Vec<String>, String> {
+    let src = stage_root.join(task_id);
+    if !src.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut staged = Vec::new();
+    let mut stack = vec![src.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|e| format!("stage unreadable {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("stage entry: {e}"))?;
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(&src)
+                .map_err(|e| format!("stage relative: {e}"))?
+                .to_path_buf();
+            let ft = entry.file_type().map_err(|e| format!("stage type: {e}"))?;
+            if ft.is_symlink() {
+                return Err(format!("stage symlink refused: {}", path.display()));
+            }
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let dest = workspace.join(&rel);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("stage mkdir: {e}"))?;
+            }
+            fs::copy(&path, &dest).map_err(|e| format!("stage copy {}: {e}", path.display()))?;
+            staged.push(rel.display().to_string());
+        }
+    }
+    staged.sort();
+    Ok(staged)
 }
 
 /// Extract files from a raw-mode answer. The format the prompt demands:
@@ -179,6 +230,83 @@ mod tests {
     }
 
     #[test]
+fn stage_hidden_files_overwrites_model_planted_checks_and_refuses_symlinks() {
+    let base = std::env::temp_dir().join(format!("rex-stage-test-{}", std::process::id()));
+    let stage = base.join("stage").join("suite/task-1").join("tests");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(stage.join("test_solution.py"), b"suite-authored").unwrap();
+    let ws = base.join("ws");
+    std::fs::create_dir_all(ws.join("tests")).unwrap();
+    // model planted its own "tests" during the run
+    std::fs::write(ws.join("tests").join("test_solution.py"), b"model-authored").unwrap();
+    let staged = stage_hidden_files(&base.join("stage"), "suite/task-1", &ws).unwrap();
+    assert_eq!(staged, vec!["tests/test_solution.py".to_string()]);
+    let content = std::fs::read(ws.join("tests").join("test_solution.py")).unwrap();
+    assert_eq!(content, b"suite-authored");
+    // missing stage dir is a no-op
+    let none = stage_hidden_files(&base.join("stage"), "suite/absent", &ws).unwrap();
+    assert!(none.is_empty());
+    #[cfg(unix)]
+    {
+        let stage2 = base.join("stage2").join("suite/task-2");
+        std::fs::create_dir_all(&stage2).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", stage2.join("evil")).unwrap();
+        let err = stage_hidden_files(&base.join("stage2"), "suite/task-2", &ws);
+        assert!(err.is_err());
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn staged_hidden_tests_score_python_solution_end_to_end() {
+    // Full chain: model-written solution + staged hidden pytest file +
+    // trusted-scoring verifier. Skipped when pytest is unavailable.
+    if std::process::Command::new("pytest")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("pytest unavailable; skipping end-to-end scoring test");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("rex-stage-score-{}", std::process::id()));
+    let stage = base.join("stage").join("suite/add").join("tests");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(
+        stage.join("test_solution.py"),
+        b"import importlib.util\ndef test_add():\n    spec = importlib.util.spec_from_file_location(\"solution\", \"solution.py\")\n    m = importlib.util.module_from_spec(spec)\n    spec.loader.exec_module(m)\n    assert m.add(2, 3) == 5\n",
+    )
+    .unwrap();
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("solution.py"), b"def add(a, b):\n    return a + b\n").unwrap();
+    let staged = stage_hidden_files(&base.join("stage"), "suite/add", &ws).unwrap();
+    assert_eq!(staged.len(), 1);
+    let task = BenchTask {
+        id: "suite/add".into(),
+        prompt: "write add".into(),
+        checks: vec![
+            crate::contract::Proof::FileExists { path: "solution.py".into() },
+            crate::contract::Proof::CommandSucceeds {
+                argv: vec!["pytest".into(), "-q".into(), "tests/test_solution.py".into()],
+                cwd: None,
+                timeout_ms: Some(60_000),
+            },
+        ],
+    };
+    let report = score_workspace_with_scoring(&task, &ws, &base.join("ev"), Some(&["pytest"]));
+    assert!(report.executable_all_proven, "{:?}", report.outcomes);
+    // and a broken solution fails the same staged check
+    std::fs::write(ws.join("solution.py"), b"def add(a, b):\n    return 0\n").unwrap();
+    let staged = stage_hidden_files(&base.join("stage"), "suite/add", &ws).unwrap();
+    assert_eq!(staged.len(), 1);
+    let report = score_workspace_with_scoring(&task, &ws, &base.join("ev2"), Some(&["pytest"]));
+    assert!(!report.executable_all_proven);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
     fn blind_scoring_ignores_prose() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");

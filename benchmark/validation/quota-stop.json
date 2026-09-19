@@ -1,0 +1,7 @@
+{
+  "reason": "provider_error: 429 RESOURCE_EXHAUSTED: daily free-tier quota exceeded",
+  "run_id": "smoke/t/fib/simple/seed0",
+  "attempt": 1,
+  "stopped_at": "2026-09-19T19:25:05.891685+00:00",
+  "resume": "python3 orchestrate.py --plan /tmp/smoke/plan.json --rex-bench ./mock_rex_bench.py --results /tmp/smoke/results.jsonl --provider gemini"
+}
