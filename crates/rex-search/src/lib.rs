@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::DefaultConnector;
+use ureq::{Error as UreqError, ResponseExt};
 use url::Url;
 
 pub const USER_AGENT: &str = "REX-search/0.1 (+https://github.com/REX-codebase/rex-harness)";
@@ -116,12 +119,18 @@ pub struct SearchEngine {
 
 impl SearchEngine {
     pub fn new(config: SearchConfig) -> Self {
-        let agent = ureq::Agent::config_builder()
+        let http_config = ureq::Agent::config_builder()
             .timeout_global(Some(config.timeout))
+            // Redirects stay disabled in 0.1. Following them safely also requires
+            // re-applying crawl scope and robots policy at every hop.
             .max_redirects(0)
             .user_agent(USER_AGENT)
-            .build()
-            .into();
+            .build();
+        let agent = ureq::Agent::with_parts(
+            http_config,
+            DefaultConnector::new(),
+            PublicResolver::default(),
+        );
         Self { agent, config }
     }
 
@@ -306,7 +315,7 @@ impl SearchEngine {
             }
         };
         let status = response.status().as_u16();
-        let final_url = url.to_string();
+        let final_url = response.get_uri().to_string();
         let content_type = response
             .headers()
             .get("content-type")
@@ -544,6 +553,39 @@ fn normalize_public_url(raw: &str) -> Result<Url, (FetchState, String)> {
     }
     reject_private_destination(&url).map_err(|e| (FetchState::UnsafeAddress, e))?;
     Ok(url)
+}
+
+#[derive(Debug, Default)]
+struct PublicResolver {
+    inner: DefaultResolver,
+}
+
+impl Resolver for PublicResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, UreqError> {
+        let resolved = self.inner.resolve(uri, config, timeout)?;
+        // Return only the exact public addresses validated here. The connector
+        // consumes this list directly, so there is no second DNS lookup between
+        // policy validation and connect. TLS still receives the original URI
+        // hostname and verifies that name, not the numeric address.
+        let mut public = self.empty();
+        for addr in resolved
+            .iter()
+            .copied()
+            .filter(|addr| is_public_ip(addr.ip()))
+        {
+            public.push(addr);
+        }
+        if public.is_empty() {
+            Err(UreqError::HostNotFound)
+        } else {
+            Ok(public)
+        }
+    }
 }
 
 fn reject_private_destination(url: &Url) -> Result<(), String> {
@@ -897,4 +939,4 @@ mod tests {
             rank(Some("Rust agents"), Some("x"), &q) > rank(Some("x"), Some("rust agents"), &q)
         );
     }
-      }
+    }
