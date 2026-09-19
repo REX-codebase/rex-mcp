@@ -10,6 +10,7 @@
 
 pub mod adversary;
 pub mod bench;
+pub mod candidates;
 pub mod contract;
 pub mod evidence;
 pub mod judge;

@@ -154,6 +154,25 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
         model: Option<&str>,
         options: UltraOptions,
     ) -> Result<UltraSnapshot, String> {
+        let id = format!("ultra-{}-{:x}", std::process::id(), crate::now_ms());
+        let run_dir = self.run_dir(&id);
+        let workspace = run_dir.join("workspace");
+        self.begin_in(&id, task, provider, model, options, run_dir, workspace)
+    }
+
+    /// Start one Ultra pipeline in a caller-owned isolated workspace. Phase 2
+    /// uses this to give every candidate the same provider/model/options while
+    /// keeping proof bundles and filesystem effects separate.
+    pub fn begin_in(
+        &self,
+        id: &str,
+        task: &str,
+        provider: &str,
+        model: Option<&str>,
+        options: UltraOptions,
+        run_dir: PathBuf,
+        workspace: PathBuf,
+    ) -> Result<UltraSnapshot, String> {
         let task = task.trim();
         if task.is_empty() {
             return Err("task is empty".into());
@@ -161,8 +180,14 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
         if task.chars().count() > 8_000 {
             return Err("task is too long".into());
         }
+        if id.trim().is_empty() {
+            return Err("run id is empty".into());
+        }
         {
             let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+            if runs.contains_key(id) {
+                return Err("run id already exists".into());
+            }
             let active = runs
                 .values()
                 .filter(|h| h.shared.lock().map(|s| s.terminal.is_none()).unwrap_or(false))
@@ -171,11 +196,9 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
                 return Err("too many active Ultra runs; finish one first".into());
             }
         }
-        let id = format!("ultra-{}-{:x}", std::process::id(), crate::now_ms());
-        let run_dir = self.run_dir(&id);
-        let workspace = run_dir.join("workspace");
         fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
         fs::create_dir_all(run_dir.join("ultra")).map_err(|e| e.to_string())?;
+        let id = id.to_string();
 
         let handle = Arc::new(RunHandle {
             shared: Mutex::new(Shared {

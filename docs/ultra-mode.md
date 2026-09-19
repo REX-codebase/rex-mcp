@@ -48,13 +48,27 @@ acceptance contract.
   through the deterministic verifier. No cherry-picking: the suite is data in
   the repo, scoring is command execution, results land as JSONL.
 
-### Phase 2 - competing candidates and promotion
+### Phase 2 - competing candidates and promotion (landed)
 
-- Parallel git worktrees: N builder candidates compete in disposable
-  worktrees; each carries its own proof bundle.
-- Promotion is stricter than exploration: only the candidate that satisfies
-  every gate merges into the real branch; rollback is the pre-run ref.
-- Bisect and checkpoint recovery across candidates.
+- Up to four candidates start from one immutable pre-run state. Git targets
+  use disposable worktrees and branches; plain directories use full isolated
+  copies plus a checksum-locked backup. Candidates run two at a time under
+  the same provider, pinned worker model and Ultra options.
+- Every candidate runs the complete Phase 1 pipeline and owns a separate
+  proof bundle. Selection reloads the bundle, rejects missing or inconsistent
+  contract / verifier / adversary / judge evidence, and independently
+  re-executes every executable obligation against that candidate workspace.
+- Selection is deterministic: qualified candidates only, then fewest repairs,
+  fewest tokens and original candidate order. Scheduler-dependent wall time
+  is recorded but never breaks ties.
+- `candidates.json` is atomically checkpointed after each candidate. A matching
+  interrupted competition can resume its independently verified candidates;
+  mismatched targets, models, providers, candidate counts or corrupted backup
+  hashes fail closed.
+- Promotion occurs only after selection: a no-fast-forward winner merge for a
+  git target or an exact manifest sync for a plain directory. Rollback restores
+  the exact pre-run commit/tree, and disposable workspaces and branches are
+  removed after their manifests have been sealed.
 
 ### Phase 3 - adversary world, counterexamples, differential oracle
 
