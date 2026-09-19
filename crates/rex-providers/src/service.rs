@@ -1,6 +1,7 @@
 use crate::catalog::{CatalogSource, ModelCatalog, ModelInfo};
 use crate::error::ProviderError;
 use crate::http::Transport;
+use crate::policy::{AccessPolicy, access_policies};
 use crate::providers::{ModelDiscovery, ProviderProtocol, ProviderSpec, find_spec, registry};
 use crate::secrets::SecretStore;
 use serde::Serialize;
@@ -21,6 +22,7 @@ pub struct ProviderSummary {
     pub name: String,
     pub protocol: ProviderProtocol,
     pub discovery: ModelDiscovery,
+    pub access: Vec<AccessPolicy>,
     pub base_url: Option<String>,
     pub has_key: bool,
     pub catalog: Option<ModelCatalog>,
@@ -80,6 +82,7 @@ impl<S: SecretStore, T: Transport> ProviderService<S, T> {
                     name: spec.name.to_string(),
                     protocol: spec.protocol,
                     discovery: spec.discovery,
+                    access: access_policies(spec.id),
                     base_url: state.base_url.or(spec.default_base_url.map(str::to_string)),
                     has_key: self.secrets.has_key(spec.id),
                     catalog: state.catalog,
@@ -178,17 +181,15 @@ fn check_status(status: u16) -> Result<(), ProviderError> {
 }
 
 fn fetch_models(transport: &dyn Transport, spec: &ProviderSpec, base: &str, key: &str) -> Result<Vec<ModelInfo>, ProviderError> {
+    if spec.discovery == ModelDiscovery::Manual {
+        return Err(ProviderError::Unsupported(
+            "this endpoint has no discovery API; enter a model ID manually".into(),
+        ));
+    }
     match spec.protocol {
         ProviderProtocol::Gemini => fetch_gemini(transport, base, key, spec.id),
         ProviderProtocol::Anthropic => fetch_anthropic(transport, base, key, spec.id),
-        ProviderProtocol::OpenAiCompatible => {
-            if spec.discovery == ModelDiscovery::Manual {
-                return Err(ProviderError::Unsupported(
-                    "this endpoint has no discovery API; enter a model ID manually".into(),
-                ));
-            }
-            fetch_openai_models(transport, base, key, spec.id)
-        }
+        ProviderProtocol::OpenAiCompatible => fetch_openai_models(transport, base, key, spec.id),
     }
 }
 

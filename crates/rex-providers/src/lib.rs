@@ -14,6 +14,7 @@
 pub mod catalog;
 pub mod error;
 pub mod http;
+pub mod policy;
 pub mod providers;
 pub mod secrets;
 pub mod service;
@@ -21,6 +22,7 @@ pub mod service;
 pub use catalog::{CatalogSource, ModelCatalog, ModelInfo};
 pub use error::ProviderError;
 pub use http::{Transport, UreqTransport};
+pub use policy::{access_policies, AccessKind, AccessPolicy, PolicyStatus, VERIFIED_ON};
 pub use providers::{ModelDiscovery, ProviderProtocol, ProviderSpec, registry, find_spec};
 pub use secrets::{FileSecretStore, MemorySecretStore, SecretStore};
 pub use service::{ProviderService, ProviderSummary};

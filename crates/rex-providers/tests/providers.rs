@@ -326,3 +326,132 @@ fn real_http_client_reports_network_error() {
     svc.set_key("local", "k", Some("http://127.0.0.1:1/v1")).unwrap();
     assert!(matches!(svc.refresh("local").unwrap_err(), ProviderError::Network(_)));
 }
+
+// ---- Access policy: which account types REX may connect, and why ----
+
+#[test]
+fn every_registry_provider_has_a_policy() {
+    for spec in registry() {
+        let policies = access_policies(spec.id);
+        assert!(!policies.is_empty(), "provider {} must carry an access policy", spec.id);
+    }
+}
+
+#[test]
+fn non_supported_routes_always_cite_official_sources() {
+    for spec in registry() {
+        for policy in access_policies(spec.id) {
+            if policy.status == PolicyStatus::Supported {
+                continue;
+            }
+            assert!(
+                !policy.sources.is_empty(),
+                "{} / {} is {:?} but cites no source",
+                spec.id,
+                policy.label,
+                policy.status
+            );
+            for source in policy.sources {
+                assert!(source.starts_with("https://"), "sources must be canonical URLs: {source}");
+            }
+        }
+    }
+}
+
+#[test]
+fn supported_subscription_routes_are_grounded() {
+    let mut found = 0;
+    for spec in registry() {
+        for policy in access_policies(spec.id) {
+            let is_subscription = matches!(policy.kind, AccessKind::SubscriptionKey | AccessKind::SubscriptionOauth);
+            if is_subscription && policy.status == PolicyStatus::Supported {
+                found += 1;
+                assert!(
+                    policy.sources.len() >= 2,
+                    "{} / {} is an offered subscription hook and needs primary sources",
+                    spec.id,
+                    policy.label
+                );
+            }
+        }
+    }
+    assert!(found >= 1, "at least one legitimately offered subscription hook must exist");
+}
+
+#[test]
+fn subscription_oauth_is_never_offered() {
+    // No consumer-subscription OAuth/login flow is currently documented for
+    // third-party harnesses by any provider in the registry. If one ever is,
+    // this test forces an explicit, sourced review instead of a quiet add.
+    for spec in registry() {
+        for policy in access_policies(spec.id) {
+            assert!(
+                !(policy.kind == AccessKind::SubscriptionOauth && policy.status == PolicyStatus::Supported),
+                "{} / {}: consumer-subscription OAuth must not be offered",
+                spec.id,
+                policy.label
+            );
+        }
+    }
+}
+
+#[test]
+fn anthropic_subscription_signin_stays_not_permitted() {
+    // Anthropic's legal page explicitly forbids routing requests through
+    // Free/Pro/Max plan credentials in third-party products. Guard it.
+    let policies = access_policies("anthropic");
+    assert!(policies.iter().any(|p| p.kind == AccessKind::SubscriptionOauth
+        && p.status == PolicyStatus::NotPermitted
+        && !p.sources.is_empty()));
+}
+
+#[test]
+fn verified_dates_are_real_dates() {
+    let valid = |d: &str| {
+        d.len() == 10
+            && d.chars().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() })
+    };
+    assert!(valid(VERIFIED_ON));
+    for spec in registry() {
+        for policy in access_policies(spec.id) {
+            assert!(valid(policy.verified_on));
+            assert_eq!(policy.verified_on, VERIFIED_ON, "policy dates and the crate constant move together");
+        }
+    }
+}
+
+#[test]
+fn summaries_expose_access_policies() {
+    let svc = service_with(ScriptedTransport::new(vec![]));
+    for summary in svc.summaries() {
+        assert_eq!(summary.access.len(), access_policies(&summary.id).len());
+    }
+}
+
+#[test]
+fn openai_and_xai_and_qwen_use_openai_models_discovery() {
+    let body = serde_json::json!({"data": [{"id": "m-1"}]}).to_string();
+    for (provider, expected_url) in [
+        ("openai", "https://api.openai.com/v1/models"),
+        ("xai", "https://api.x.ai/v1/models"),
+        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
+    ] {
+        let svc = service_with(ScriptedTransport::new(vec![(200, body.clone())]));
+        svc.set_key(provider, "test-key", None).unwrap();
+        let catalog = svc.refresh(provider).unwrap();
+        assert_eq!(catalog.models[0].id, "m-1");
+        let urls = svc.transport().seen_urls.lock().unwrap();
+        assert_eq!(urls[0], expected_url, "wrong listing URL for {provider}");
+    }
+}
+
+#[test]
+fn kimi_coding_honors_manual_discovery_without_http() {
+    // The Kimi for Coding endpoint has no documented model-listing API; REX
+    // must say so truthfully instead of probing an unsupported route.
+    let svc = service_with(ScriptedTransport::new(vec![]));
+    svc.set_key("kimi-coding", "test-key", None).unwrap();
+    let err = svc.refresh("kimi-coding").unwrap_err();
+    assert!(matches!(err, ProviderError::Unsupported(_)));
+    assert!(svc.transport().seen_urls.lock().unwrap().is_empty(), "no HTTP call may be attempted");
+}

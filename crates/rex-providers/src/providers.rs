@@ -50,6 +50,20 @@ pub fn registry() -> Vec<ProviderSpec> {
             discovery: ModelDiscovery::Native,
         },
         ProviderSpec {
+            id: "openai",
+            name: "OpenAI",
+            protocol: ProviderProtocol::OpenAiCompatible,
+            default_base_url: Some("https://api.openai.com/v1"),
+            discovery: ModelDiscovery::OpenAiModels,
+        },
+        ProviderSpec {
+            id: "xai",
+            name: "xAI (Grok)",
+            protocol: ProviderProtocol::OpenAiCompatible,
+            default_base_url: Some("https://api.x.ai/v1"),
+            discovery: ModelDiscovery::OpenAiModels,
+        },
+        ProviderSpec {
             id: "deepseek",
             name: "DeepSeek",
             protocol: ProviderProtocol::OpenAiCompatible,
@@ -61,6 +75,20 @@ pub fn registry() -> Vec<ProviderSpec> {
             name: "Kimi",
             protocol: ProviderProtocol::OpenAiCompatible,
             default_base_url: Some("https://api.moonshot.ai/v1"),
+            discovery: ModelDiscovery::OpenAiModels,
+        },
+        ProviderSpec {
+            id: "kimi-coding",
+            name: "Kimi for Coding",
+            protocol: ProviderProtocol::Anthropic,
+            default_base_url: Some("https://api.kimi.com/coding"),
+            discovery: ModelDiscovery::Manual,
+        },
+        ProviderSpec {
+            id: "qwen",
+            name: "Qwen (Alibaba)",
+            protocol: ProviderProtocol::OpenAiCompatible,
+            default_base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
             discovery: ModelDiscovery::OpenAiModels,
         },
         ProviderSpec {
