@@ -19,9 +19,9 @@ The response also states its coverage model, attempts, denials, budget truncatio
 
 ## Safety and protocol policy
 
-- HTTP(S) only; loopback, link-local, private, `.local`, and `.internal` targets are blocked before requests and after redirects.
+- HTTP(S) only; loopback, link-local, private, `.local`, and `.internal` targets are blocked. The HTTP resolver returns only the public IP addresses it validated to the connector, preventing a second DNS lookup between validation and connect while preserving TLS verification against the original hostname.
 - `robots.txt` is checked per origin. A 5xx, timeout, or unreachable robots file fails closed for the current run. Rules use longest-match precedence for the `REX-search` and `*` groups.
-- A named user-agent is sent, bodies are capped at 2 MiB, redirects at 5, requests at 15 seconds, crawl budget at 64 pages, and each origin is delayed at least 750 ms.
+- A named user-agent is sent, bodies are capped at 2 MiB, redirects are disabled in 0.1, requests time out after 15 seconds, crawl budget is capped at 64 pages, and each origin is delayed at least 750 ms. Redirect support stays off until every hop can be checked against destination safety, crawl scope, and robots policy.
 - Only text/HTML is extracted. Scripts, styles, and noscript blocks are discarded. REX-search does not execute JavaScript, submit forms, log in, bypass paywalls, solve challenges, or fetch private networks.
 - Rate limits and HTTP/network/content failures have separate states. The engine never labels a partial crawl as the whole web.
 - Stored indexing is intentionally absent in 0.1. Any later index needs retention, deletion, recrawl, canonicalization, copyright, privacy, and operator-control policy before it ships.
@@ -49,4 +49,4 @@ Direct crawling is good at fresh retrieval within known sites and bad at global 
 
 `cargo test -p rex-search`
 
-Tests cover robots precedence, named-agent matching, private-target rejection, origin/subdomain scope, safe text extraction, and query ranking. The current build environment used for this increment has no Rust toolchain, so tests are committed but not falsely reported as executed. Cargo syntax and dependency integration still need CI or a Rust-equipped machine to confirm.
+Tests cover robots precedence, wildcard and end-anchor matching, named-agent group selection and merging, private-target rejection, origin/subdomain scope, safe text extraction, and query ranking. The Rust core tests were executed with Rust 1.98.1. Building the Linux Tauri shell additionally requires the documented GTK/WebKit system packages.
