@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use rex_providers::{FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, UreqTransport};
+use rex_search::{SearchEngine, SearchRequest, SearchResponse};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
@@ -51,6 +52,15 @@ fn provider_catalog(service: State<'_, Arc<Service>>, provider: String) -> Optio
     service.catalog(&provider)
 }
 
+/// Run a bounded, robots-aware live evidence search over explicit public seeds.
+/// This is intentionally synchronous in 0.1; Tauri executes commands off the UI
+/// call site and the request budgets cap work. No provider key or browser state
+/// is involved.
+#[tauri::command]
+fn search_live(request: SearchRequest) -> SearchResponse {
+    SearchEngine::default().search(request)
+}
+
 fn provider_bridge_smoke() -> bool {
     if std::env::args().any(|arg| arg == "--verify-provider-bridge") {
         let dir = std::env::temp_dir().join(format!("rex-harness-smoke-{}", std::process::id()));
@@ -84,6 +94,7 @@ fn main() {
             provider_clear_key,
             provider_refresh,
             provider_catalog,
+            search_live,
         ])
         .run(tauri::generate_context!())
         .expect("error while running REX Harness");
