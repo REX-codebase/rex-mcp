@@ -29,6 +29,17 @@ import {
   type AgentSnapshot,
 } from "./data/agentRun";
 import { terminalActive } from "./data/agentTypes";
+import { InstalledAgentRunView } from "./components/InstalledAgentRunView";
+import {
+  installedAgentBegin,
+  installedAgentCancel,
+  installedAgentDecide,
+  installedAgentSnapshot,
+  installedRunTerminal,
+  type InstalledRunSnapshot,
+} from "./data/installedAgentRun";
+import { loadInstalledAgentOptions } from "./components/ModelStatus";
+import type { InstalledAgentId } from "./data/backend";
 
 // The hero starter composer exists only while there is no session. The moment
 // the first run starts it settles - a brief blur + downward travel while its
@@ -52,6 +63,12 @@ export default function App() {
   const [liveDeciding, setLiveDeciding] = useState(false);
   const [liveCancelling, setLiveCancelling] = useState(false);
   const livePoll = useRef<number | null>(null);
+  const [installedRun, setInstalledRun] = useState<InstalledRunSnapshot | null>(null);
+  const [installedStarting, setInstalledStarting] = useState(false);
+  const [installedDeciding, setInstalledDeciding] = useState(false);
+  const [installedCancelling, setInstalledCancelling] = useState(false);
+  const installedPoll = useRef<number | null>(null);
+  const [nativePreviewDir, setNativePreviewDir] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
     liveRunAvailable().then((ok) => { if (active) setLiveCapable(ok); }).catch(() => undefined);
@@ -98,9 +115,25 @@ export default function App() {
       if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
       if (fastTimer.current !== null) window.clearTimeout(fastTimer.current);
       if (livePoll.current !== null) window.clearInterval(livePoll.current);
+      if (installedPoll.current !== null) window.clearInterval(installedPoll.current);
     },
     []
   );
+
+  const startInstalledPolling = (id: string) => {
+    if (installedPoll.current !== null) window.clearInterval(installedPoll.current);
+    installedPoll.current = window.setInterval(() => {
+      installedAgentSnapshot(id)
+        .then((snap) => {
+          setInstalledRun(snap);
+          if (snap.status !== "running" && installedPoll.current !== null) {
+            window.clearInterval(installedPoll.current);
+            installedPoll.current = null;
+          }
+        })
+        .catch(() => undefined);
+    }, 900);
+  };
 
   // Poll the Rust loop while it is non-terminal; the snapshot is the whole
   // truth, so rendering never depends on event timing.
@@ -138,13 +171,62 @@ export default function App() {
     if (!reduced) fastTimer.current = window.setTimeout(() => setFastPhase("idle"), 1120);
   };
 
-  const nativeProject = new URLSearchParams(window.location.search).get("native-preview");
+  const nativeProject = nativePreviewDir ?? new URLSearchParams(window.location.search).get("native-preview");
   const previewTask = /(?:html|react|next\.?js|vite|astro|svelte|website|ui|interface|dashboard|landing page|app)/i.test(task);
 
   const onRun = () => {
     cancel.current?.();
     const label = task.trim();
     if (!label) return;
+    let installedBackend: InstalledAgentId | null = null;
+    try {
+      const selected = JSON.parse(window.localStorage.getItem("rex-model-selection") || "null") as { provider?: string; id?: string } | null;
+      if (selected?.provider?.startsWith("installed:") && selected.id) {
+        installedBackend = selected.id as InstalledAgentId;
+      }
+    } catch { /* no selection */ }
+    if (installedBackend) {
+      // Real installed-agent path: the vendor CLI runs the task on an
+      // isolated workspace while REX streams its events, applies the
+      // completion gate, and holds any source changes for reviewed promotion.
+      const options = loadInstalledAgentOptions();
+      setInstalledRun(null);
+      setInstalledStarting(true);
+      beginSettle();
+      installedAgentBegin(
+        installedBackend,
+        label,
+        "",
+        options.model.trim() || undefined,
+        options.effort.trim() || undefined
+      )
+        .then((snap) => {
+          setInstalledRun(snap);
+          if (snap.status === "running") startInstalledPolling(snap.id);
+        })
+        .catch((e) => setInstalledRun({
+          id: "run-failed",
+          backend: installedBackend,
+          status: "failed",
+          prompt: label,
+          workspace: "",
+          staging_workspace: "",
+          preview_dir: "",
+          model: options.model.trim() || null,
+          effort: options.effort.trim() || null,
+          created_at_ms: Date.now(),
+          updated_at_ms: Date.now(),
+          exit_code: null,
+          events: [],
+          stderr_tail: "",
+          diff: null,
+          promotion: "not_required",
+          completion: null,
+          error: String(e),
+        }))
+        .finally(() => setInstalledStarting(false));
+      return;
+    }
     if (liveCapable) {
       // Real path: the autonomous Rust loop plans, acts through trusted
       // approvals, verifies its own work against gates, and stops truthfully.
@@ -210,6 +292,24 @@ export default function App() {
       .finally(() => setLiveCancelling(false));
   };
 
+  const onInstalledDecision = (approved: boolean) => {
+    if (!installedRun || installedDeciding) return;
+    setInstalledDeciding(true);
+    installedAgentDecide(installedRun.id, approved)
+      .then((snap) => setInstalledRun(snap))
+      .catch((e) => setInstalledRun((prev) => (prev ? { ...prev, error: String(e) } : prev)))
+      .finally(() => setInstalledDeciding(false));
+  };
+
+  const onInstalledCancel = () => {
+    if (!installedRun || installedCancelling) return;
+    setInstalledCancelling(true);
+    installedAgentCancel(installedRun.id)
+      .then((snap) => setInstalledRun(snap))
+      .catch(() => undefined)
+      .finally(() => setInstalledCancelling(false));
+  };
+
   const onFollowUp = (request: string) => {
     if (!session || busy) return;
     cancel.current?.();
@@ -223,7 +323,15 @@ export default function App() {
       window.clearInterval(livePoll.current);
       livePoll.current = null;
     }
+    if (installedPoll.current !== null) {
+      window.clearInterval(installedPoll.current);
+      installedPoll.current = null;
+    }
     if (liveRun && !liveRun.id.startsWith("run-failed")) agentTeardown(liveRun.id).catch(() => undefined);
+    setInstalledRun(null);
+    setInstalledStarting(false);
+    setInstalledDeciding(false);
+    setNativePreviewDir(null);
     setLiveRun(null);
     setLiveStarting(false);
     setLiveDeciding(false);
@@ -283,6 +391,25 @@ export default function App() {
             )}
             <StateRail state={state} blockedReason={latest?.blockedReason} />
             {import.meta.env.DEV && new URLSearchParams(window.location.search).has("approval-preview") && <ToolApprovalPreview />}
+            {(installedRun || installedStarting) && installedRun && (
+              <InstalledAgentRunView
+                run={installedRun}
+                deciding={installedDeciding}
+                cancelling={installedCancelling}
+                onDecide={onInstalledDecision}
+                onCancel={onInstalledCancel}
+                onOpenPreview={(dir) => setNativePreviewDir(dir)}
+              />
+            )}
+            {(installedRun || installedStarting) && !installedRun && (
+              <section className="live-run" aria-label="Starting the installed agent">
+                <div className="live-status" role="status">
+                  <span className="live-dot" aria-hidden="true" />
+                  <span className="eyebrow">Installed agent</span>
+                  <span className="live-status-text">Starting the vendor CLI…</span>
+                </div>
+              </section>
+            )}
             {(liveRun || liveStarting) && liveRun && (
               <AgentRunView
                 run={liveRun}

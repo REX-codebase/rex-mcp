@@ -4,10 +4,12 @@ import {
   backendKind,
   clearProviderKey,
   describeError,
+  listInstalledAgents,
   listSummaries,
   refreshCatalog,
   setProviderKey,
   type BackendKind,
+  type InstalledAgentSummary,
   type ProviderSummary,
 } from "../data/backend";
 
@@ -16,6 +18,26 @@ type ConnectFlow = "subscription" | "api" | null;
 type Selection = { provider: string; id: string; label: string };
 
 const SELECTION_KEY = "rex-model-selection";
+const INSTALLED_OPTIONS_KEY = "rex-installed-agent-options";
+
+export interface InstalledAgentOptions {
+  model: string;
+  effort: string;
+}
+
+export function loadInstalledAgentOptions(): InstalledAgentOptions {
+  try {
+    const raw = window.localStorage.getItem(INSTALLED_OPTIONS_KEY);
+    if (!raw) return { model: "", effort: "" };
+    const parsed = JSON.parse(raw);
+    return {
+      model: typeof parsed?.model === "string" ? parsed.model : "",
+      effort: typeof parsed?.effort === "string" ? parsed.effort : "",
+    };
+  } catch {
+    return { model: "", effort: "" };
+  }
+}
 
 function loadSelection(): Selection | null {
   try {
@@ -34,6 +56,8 @@ export function ModelStatus() {
   const [flow, setFlow] = useState<ConnectFlow>(null);
   const [kind, setKind] = useState<BackendKind | null>(null);
   const [summaries, setSummaries] = useState<ProviderSummary[]>([]);
+  const [installed, setInstalled] = useState<InstalledAgentSummary[]>([]);
+  const [installedOptions, setInstalledOptions] = useState<InstalledAgentOptions>(loadInstalledAgentOptions);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState<string | null>(null);
   const [selection, setSelection] = useState<Selection | null>(loadSelection);
@@ -53,10 +77,24 @@ export function ModelStatus() {
       setSummaries(await listSummaries());
     } catch {
       setSummaries([]);
+    }
+    try {
+      setInstalled(await listInstalledAgents());
+    } catch {
+      setInstalled([]);
     } finally {
       setLoading(false);
     }
   }, []);
+
+  const saveInstalledOptions = (next: InstalledAgentOptions) => {
+    setInstalledOptions(next);
+    try {
+      window.localStorage.setItem(INSTALLED_OPTIONS_KEY, JSON.stringify(next));
+    } catch {
+      /* ignore */
+    }
+  };
 
   useEffect(() => {
     backendKind().then((k) => {
@@ -248,6 +286,53 @@ export function ModelStatus() {
               </section>
             ))}
           </div>
+
+          {installed.filter((a) => a.state !== "missing").length > 0 && (
+            <section className="provider-block" aria-label="Installed agent backends">
+              <header>
+                <span><b>Installed agents</b><small>The vendor CLI keeps its own login · REX reviews every change</small></span>
+              </header>
+              <ul>
+                {installed.filter((a) => a.state !== "missing").map((agent) => (
+                  <li key={agent.id}>
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={selection?.provider === `installed:${agent.id}`}
+                      className={`model-option ${selection?.provider === `installed:${agent.id}` ? "is-active" : ""}`}
+                      onClick={() => choose({ provider: `installed:${agent.id}`, id: agent.id, label: agent.name })}
+                    >
+                      <span><b>{agent.name}</b><small>{agent.state === "unsupported_version" ? `update required · ${agent.version ?? "unknown version"}` : agent.version ?? "version unknown"}</small></span>
+                      {selection?.provider === `installed:${agent.id}` && <i aria-hidden="true">✓</i>}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {selection?.provider?.startsWith("installed:") && (
+                <div className="installed-options">
+                  <label>
+                    <span>Model override</span>
+                    <input
+                      value={installedOptions.model}
+                      placeholder="CLI default"
+                      spellCheck={false}
+                      onChange={(event) => saveInstalledOptions({ ...installedOptions, model: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    <span>Effort override</span>
+                    <input
+                      value={installedOptions.effort}
+                      placeholder="CLI default"
+                      spellCheck={false}
+                      onChange={(event) => saveInstalledOptions({ ...installedOptions, effort: event.target.value })}
+                    />
+                  </label>
+                  <small className="api-hint">Passed verbatim to the vendor CLI as its documented --model / --effort flags. Empty keeps the CLI's own default; unsupported values fail truthfully.</small>
+                </div>
+              )}
+            </section>
+          )}
 
           <div className="provider-menu-actions">
             <button type="button" role="menuitem" onClick={() => launch("api")}>

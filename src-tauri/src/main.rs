@@ -6,7 +6,8 @@
 
 use rex_installed_agents::{
     discover as discover_installed_agents, run as run_installed_agent, InstalledAgentId,
-    InstalledAgentRun, InstalledAgentSummary,
+    InstalledAgentRun, InstalledAgentSummary, RunManager as InstalledAgentManager, RunOptions,
+    RunSnapshot as InstalledRunSnapshot,
 };
 use rex_preview::{
     BrowserAction, BrowserEvidence, IterationReceipt, PreviewRecipe, PreviewSupervisor,
@@ -29,6 +30,7 @@ type Agent = AutonomousRunService<FileSecretStore, UreqTransport>;
 type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 type LocalTools = ToolRuntime;
 type NativePreview = PreviewSupervisor;
+type InstalledRuns = InstalledAgentManager;
 
 fn search_index() -> LocalIndex {
     LocalIndex::open(config_dir().join("search-index.json"))
@@ -56,6 +58,54 @@ fn installed_agent_run(
     workspace: String,
 ) -> Result<InstalledAgentRun, rex_installed_agents::InstalledAgentError> {
     run_installed_agent(backend, &prompt, std::path::Path::new(&workspace))
+}
+
+/// Begin a real installed-agent run. Returns immediately; every child event
+/// becomes visible through `installed_agent_snapshot` while the child works.
+/// An empty workspace creates a fresh task workspace the child owns outright;
+/// a real workspace is staged and its diff waits for `installed_agent_decide`.
+#[tauri::command]
+fn installed_agent_begin(
+    runs: State<'_, Arc<InstalledRuns>>,
+    backend: InstalledAgentId,
+    prompt: String,
+    workspace: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<InstalledRunSnapshot, rex_installed_agents::InstalledAgentError> {
+    runs.begin(
+        backend,
+        &prompt,
+        &workspace.unwrap_or_default(),
+        RunOptions { model, effort },
+    )
+}
+
+#[tauri::command]
+fn installed_agent_snapshot(
+    runs: State<'_, Arc<InstalledRuns>>,
+    run_id: String,
+) -> Result<InstalledRunSnapshot, String> {
+    runs.snapshot(&run_id).ok_or_else(|| "unknown run".to_string())
+}
+
+/// Trusted operator decision on a staged diff. The model and the child can
+/// never reach this path; only the desktop UI invokes it.
+#[tauri::command]
+fn installed_agent_decide(
+    runs: State<'_, Arc<InstalledRuns>>,
+    run_id: String,
+    approved: bool,
+) -> Result<InstalledRunSnapshot, String> {
+    runs.decide(&run_id, approved).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn installed_agent_cancel(
+    runs: State<'_, Arc<InstalledRuns>>,
+    run_id: String,
+) -> Result<InstalledRunSnapshot, String> {
+    runs.cancel(&run_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -431,6 +481,10 @@ fn main() {
         ),
         config_dir().join("runs"),
     ));
+    let installed_runs = Arc::new(
+        InstalledAgentManager::new(config_dir().join("installed-agent-runs"))
+            .expect("could not open installed-agent run store"),
+    );
     let agent = Arc::new(AutonomousRunService::new(
         ProviderService::new(
             FileSecretStore::new(config_dir()).expect("could not open the credential store"),
@@ -450,9 +504,14 @@ fn main() {
         .manage(preview)
         .manage(live)
         .manage(agent)
+        .manage(installed_runs)
         .invoke_handler(tauri::generate_handler![
             installed_agent_summaries,
             installed_agent_run,
+            installed_agent_begin,
+            installed_agent_snapshot,
+            installed_agent_decide,
+            installed_agent_cancel,
             provider_summaries,
             provider_set_key,
             provider_clear_key,
