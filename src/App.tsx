@@ -13,6 +13,8 @@ import {
   type MotionPref,
 } from "./data/motion";
 import { BrowserView } from "./components/BrowserView";
+import { PreviewRuntimeView } from "./components/PreviewRuntimeView";
+import "./preview-runtime.css";
 import { PAST_SESSIONS, newSession, startMockTurn, type Session } from "./data/mock";
 
 // The hero starter composer exists only while there is no session. The moment
@@ -78,6 +80,8 @@ export default function App() {
     setFastPulse((v) => v + 1);
     if (!reduced) fastTimer.current = window.setTimeout(() => setFastPhase("idle"), 1120);
   };
+
+  const previewTask = /(?:html|react|next\.?js|vite|astro|svelte|website|ui|interface|dashboard|landing page|app)/i.test(task);
 
   const onRun = () => {
     cancel.current?.();
@@ -156,7 +160,8 @@ export default function App() {
               </div>
             )}
             <StateRail state={state} blockedReason={latest?.blockedReason} />
-            {ultra && session && browserPhase === "active" && (
+            {session && previewTask && <PreviewRuntimeView />}
+            {ultra && session && !previewTask && browserPhase === "active" && (
               <BrowserView
                 key={browserRun}
                 reduced={reduced}
