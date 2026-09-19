@@ -14,6 +14,9 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
+pub mod supervisor;
+pub use supervisor::{LifecycleEvent, LifecycleKind, PreviewSupervisor, SupervisorSummary};
+
 pub const MAX_ITERATIONS: u8 = 12;
 pub const MAX_EVIDENCE_ITEMS: usize = 256;
 pub const MAX_CONSOLE_BYTES: usize = 256 * 1024;
@@ -155,23 +158,37 @@ impl LaunchPlan {
             return Err(PreviewError::CommandDenied);
         }
         let mut args = recipe.args.clone();
+        let mut environment = BTreeMap::from([
+            ("NO_COLOR".into(), "1".into()),
+            ("BROWSER".into(), "none".into()),
+        ]);
         if recipe.program == "npm" {
-            args.extend([
-                "--host".into(),
-                "127.0.0.1".into(),
-                "--port".into(),
-                port.to_string(),
-            ]);
+            match recipe.framework {
+                Framework::NextJs => args.extend([
+                    "--hostname".into(),
+                    "127.0.0.1".into(),
+                    "--port".into(),
+                    port.to_string(),
+                ]),
+                Framework::CreateReactApp => {
+                    environment.insert("HOST".into(), "127.0.0.1".into());
+                    environment.insert("PORT".into(), port.to_string());
+                }
+                Framework::Vite | Framework::Astro | Framework::SvelteKit => args.extend([
+                    "--host".into(),
+                    "127.0.0.1".into(),
+                    "--port".into(),
+                    port.to_string(),
+                ]),
+                Framework::StaticHtml => {}
+            }
         }
         Ok(Self {
             program: recipe.program.clone(),
             args,
             cwd: recipe.project_dir.clone(),
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-            environment: BTreeMap::from([
-                ("NO_COLOR".into(), "1".into()),
-                ("BROWSER".into(), "none".into()),
-            ]),
+            environment,
             startup_timeout_ms: MAX_STARTUP.as_millis() as u64,
             idle_timeout_ms: MAX_IDLE.as_millis() as u64,
         })

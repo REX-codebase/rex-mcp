@@ -4,6 +4,7 @@
 // only - key material never crosses the bridge.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use rex_preview::{BrowserAction, PreviewRecipe, PreviewSupervisor, SupervisorSummary};
 use rex_providers::{
     FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, SearchProvider,
     SearchProviderSummary, SearchRouter, UreqTransport,
@@ -17,6 +18,7 @@ use tauri::State;
 type Service = ProviderService<FileSecretStore, UreqTransport>;
 type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 type LocalTools = ToolRuntime;
+type NativePreview = PreviewSupervisor;
 
 fn search_index() -> LocalIndex {
     LocalIndex::open(config_dir().join("search-index.json"))
@@ -158,6 +160,61 @@ fn tool_cancel(
     tools.cancel(&call_id)
 }
 
+#[tauri::command]
+fn preview_detect(
+    preview: State<'_, Arc<NativePreview>>,
+    project_dir: String,
+) -> Result<PreviewRecipe, String> {
+    preview
+        .detect(std::path::Path::new(&project_dir))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_start(
+    preview: State<'_, Arc<NativePreview>>,
+    project_dir: String,
+) -> Result<SupervisorSummary, String> {
+    preview
+        .start(std::path::Path::new(&project_dir))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_status(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+) -> Result<SupervisorSummary, String> {
+    preview.summary(&session_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_action(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+    action: BrowserAction,
+) -> Result<(), String> {
+    preview
+        .action(&session_id, &action)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_cancel(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+) -> Result<SupervisorSummary, String> {
+    preview.cancel(&session_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_teardown(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+) -> Result<(), String> {
+    preview.teardown(&session_id).map_err(|e| e.to_string())
+}
+
 fn provider_bridge_smoke() -> bool {
     if std::env::args().any(|arg| arg == "--verify-provider-bridge") {
         let dir = std::env::temp_dir().join(format!("rex-harness-smoke-{}", std::process::id()));
@@ -192,12 +249,16 @@ fn main() {
     let workspace = std::env::var("REX_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| config_dir().join("workspace"));
-    let tools = Arc::new(ToolRuntime::new(workspace).expect("could not open local tool workspace"));
+    let tools =
+        Arc::new(ToolRuntime::new(workspace.clone()).expect("could not open local tool workspace"));
+    let preview =
+        Arc::new(PreviewSupervisor::new(workspace).expect("could not open preview workspace"));
 
     tauri::Builder::default()
         .manage(service)
         .manage(search_service)
         .manage(tools)
+        .manage(preview)
         .invoke_handler(tauri::generate_handler![
             provider_summaries,
             provider_set_key,
@@ -216,6 +277,12 @@ fn main() {
             tool_resolve_approval,
             tool_execute,
             tool_cancel,
+            preview_detect,
+            preview_start,
+            preview_status,
+            preview_action,
+            preview_cancel,
+            preview_teardown,
         ])
         .run(tauri::generate_context!())
         .expect("error while running REX Harness");
