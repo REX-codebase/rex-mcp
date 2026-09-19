@@ -93,7 +93,9 @@ async function probe(): Promise<{ kind: BackendKind; invoke: InvokeFn | null } |
       return null;
     }
   }
-  if (import.meta.env.DEV) {
+  const host = window.location.hostname;
+  const localHost = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  if (import.meta.env.DEV || localHost) {
     try {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 900);
