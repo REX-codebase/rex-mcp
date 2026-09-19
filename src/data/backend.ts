@@ -180,3 +180,23 @@ export async function refreshCatalog(provider: string): Promise<RefreshResult> {
   }
   return request<RefreshResult>(`/api/providers/${provider}/refresh`, { method: "POST", body: "{}" });
 }
+
+export type SearchProviderId = "rex" | "exa" | "tinyfish";
+export interface SearchProviderSummary { id: SearchProviderId; name: string; active: boolean; built_in: boolean; has_key: boolean; endpoint: string; docs_url: string; }
+export async function listSearchProviders(): Promise<SearchProviderSummary[]> {
+  const b=await backend();
+  if (b.kind === "tauri") return b.invoke!<SearchProviderSummary[]>("search_provider_summaries");
+  throw new Error("search provider routing requires the desktop runtime");
+}
+export async function setSearchProviderKey(provider: SearchProviderId, key: string): Promise<WriteResult> {
+  const b=await backend(); if(b.kind!=="tauri") throw new Error("desktop runtime required");
+  try { await b.invoke!("search_provider_set_key",{provider,key}); return {ok:true}; } catch(error){ return {ok:false,error:error as ProviderErrorShape}; }
+}
+export async function clearSearchProviderKey(provider: SearchProviderId): Promise<WriteResult> {
+  const b=await backend(); if(b.kind!=="tauri") throw new Error("desktop runtime required");
+  try { await b.invoke!("search_provider_clear_key",{provider}); return {ok:true}; } catch(error){ return {ok:false,error:error as ProviderErrorShape}; }
+}
+export async function selectSearchProvider(provider: SearchProviderId): Promise<WriteResult> {
+  const b=await backend(); if(b.kind!=="tauri") throw new Error("desktop runtime required");
+  try { await b.invoke!("search_provider_select",{provider}); return {ok:true}; } catch(error){ return {ok:false,error:error as ProviderErrorShape}; }
+}

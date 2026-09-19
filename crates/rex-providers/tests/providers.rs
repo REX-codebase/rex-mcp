@@ -455,3 +455,42 @@ fn kimi_coding_honors_manual_discovery_without_http() {
     assert!(matches!(err, ProviderError::Unsupported(_)));
     assert!(svc.transport().seen_urls.lock().unwrap().is_empty(), "no HTTP call may be attempted");
 }
+
+#[derive(Clone)]
+struct SearchTransport { status: u16, body: String }
+impl Transport for SearchTransport {
+    fn get(&self, _: &str, _: &[(String, String)]) -> Result<(u16, String), ProviderError> { Ok((self.status, self.body.clone())) }
+    fn post(&self, _: &str, _: &[(String, String)], _: &str) -> Result<(u16, String), ProviderError> { Ok((self.status, self.body.clone())) }
+}
+#[test]
+fn search_router_defaults_to_private_rex_and_requires_keys_for_external_selection() {
+    let router = SearchRouter::new(MemorySecretStore::new(), SearchTransport { status: 200, body: "{}".into() });
+    assert_eq!(router.active(), SearchProvider::Rex);
+    assert_eq!(router.select(SearchProvider::Exa), Err(ProviderError::NotConfigured));
+    router.set_key(SearchProvider::Exa, "secret").unwrap();
+    router.select(SearchProvider::Exa).unwrap();
+    assert_eq!(router.active(), SearchProvider::Exa);
+    router.clear_key(SearchProvider::Exa).unwrap();
+    assert_eq!(router.active(), SearchProvider::Rex);
+}
+#[test]
+fn exa_and_tinyfish_normalize_to_one_evidence_contract() {
+    let body = r#"{"results":[{"url":"https://example.com/a","title":"A","text":"body","score":0.9}]}"#;
+    for provider in [SearchProvider::Exa, SearchProvider::Tinyfish] {
+        let router = SearchRouter::new(MemorySecretStore::new(), SearchTransport { status: 200, body: body.into() });
+        router.set_key(provider, "secret").unwrap();
+        router.select(provider).unwrap();
+        let response = router.search(rex_search::SearchRequest { query: "a".into(), seeds: vec![], max_pages: 2, max_results: 2, allow_subdomains: false, discover_sitemaps: false, discover_feeds: false }).unwrap();
+        assert_eq!(response.evidence[0].url, "https://example.com/a");
+        assert_eq!(response.evidence[0].state, rex_search::FetchState::Fetched);
+        assert!(response.coverage.model.starts_with("hosted:"));
+    }
+}
+#[test]
+fn hosted_rate_limits_stay_truthful() {
+    let router = SearchRouter::new(MemorySecretStore::new(), SearchTransport { status: 429, body: String::new() });
+    router.set_key(SearchProvider::Tinyfish, "secret").unwrap();
+    router.select(SearchProvider::Tinyfish).unwrap();
+    let result = router.search(rex_search::SearchRequest { query: "a".into(), seeds: vec![], max_pages: 1, max_results: 1, allow_subdomains: false, discover_sitemaps: false, discover_feeds: false });
+    assert_eq!(result.unwrap_err(), ProviderError::RateLimited);
+}

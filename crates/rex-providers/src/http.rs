@@ -5,6 +5,16 @@ use std::time::Duration;
 /// credentials; implementations must never log them.
 pub trait Transport: Send + Sync {
     fn get(&self, url: &str, headers: &[(String, String)]) -> Result<(u16, String), ProviderError>;
+    fn post(
+        &self,
+        _url: &str,
+        _headers: &[(String, String)],
+        _body: &str,
+    ) -> Result<(u16, String), ProviderError> {
+        Err(ProviderError::Unsupported(
+            "HTTP POST is not implemented by this transport".into(),
+        ))
+    }
 }
 
 /// Production transport over ureq/rustls with a hard global timeout.
@@ -17,7 +27,9 @@ impl UreqTransport {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
             .build();
-        Self { agent: config.into() }
+        Self {
+            agent: config.into(),
+        }
     }
 }
 
@@ -28,6 +40,29 @@ impl Default for UreqTransport {
 }
 
 impl Transport for UreqTransport {
+    fn post(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &str,
+    ) -> Result<(u16, String), ProviderError> {
+        let mut request = self.agent.post(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        match request.send(body) {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response
+                    .into_body()
+                    .read_to_string()
+                    .map_err(|e| ProviderError::Network(format!("failed reading body: {e}")))?;
+                Ok((status, body))
+            }
+            Err(ureq::Error::StatusCode(code)) => Ok((code, String::new())),
+            Err(e) => Err(ProviderError::Network(e.to_string())),
+        }
+    }
     fn get(&self, url: &str, headers: &[(String, String)]) -> Result<(u16, String), ProviderError> {
         let mut request = self.agent.get(url);
         for (name, value) in headers {

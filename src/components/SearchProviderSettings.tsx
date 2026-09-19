@@ -1,0 +1,20 @@
+import { useEffect, useState } from "react";
+import { backendKind, clearSearchProviderKey, describeError, listSearchProviders, selectSearchProvider, setSearchProviderKey, type SearchProviderId, type SearchProviderSummary } from "../data/backend";
+const PREVIEW: SearchProviderSummary[]=[
+  {id:"rex",name:"REX-search",active:true,built_in:true,has_key:true,endpoint:"Local bounded retrieval",docs_url:""},
+  {id:"exa",name:"Exa",active:false,built_in:false,has_key:false,endpoint:"api.exa.ai/search",docs_url:"https://exa.ai/docs/reference/search"},
+  {id:"tinyfish",name:"TinyFish",active:false,built_in:false,has_key:false,endpoint:"api.search.tinyfish.ai",docs_url:"https://docs.tinyfish.ai/search-api/reference"},
+];
+export function SearchProviderSettings(){
+ const [items,setItems]=useState(PREVIEW),[key,setKey]=useState<Record<string,string>>({exa:"",tinyfish:""}),[runtime,setRuntime]=useState(false),[busy,setBusy]=useState<string|null>(null),[notice,setNotice]=useState("");
+ const reload=async()=>{try{const x=await listSearchProviders();setItems(x);setRuntime(true)}catch{setRuntime(false)}};
+ useEffect(()=>{backendKind().then(k=>{if(k==="tauri")reload()})},[]);
+ const connect=async(id:SearchProviderId)=>{setBusy(id);setNotice("");const r=await setSearchProviderKey(id,key[id]||"");if(r.ok){setKey(x=>({...x,[id]:""}));await reload();setNotice(`${id==="exa"?"Exa":"TinyFish"} connected. Select it when you want hosted search.`)}else setNotice(describeError(r.error));setBusy(null)};
+ const disconnect=async(id:SearchProviderId)=>{setBusy(id);const r=await clearSearchProviderKey(id);if(r.ok){await reload();setNotice("Disconnected. REX-search is active if that provider was selected.")}else setNotice(describeError(r.error));setBusy(null)};
+ const choose=async(id:SearchProviderId)=>{setBusy(id);const r=await selectSearchProvider(id);if(r.ok){await reload();setNotice(`${items.find(x=>x.id===id)?.name} is now the active search source.`)}else setNotice(describeError(r.error));setBusy(null)};
+ return <section aria-label="Search provider" className="settings-section search-provider-settings"><div className="search-settings-head"><div><h2 className="eyebrow">Search provider</h2><p className="settings-note">REX-search stays the private built-in default. External providers are opt-in and their keys stay in the Rust credential store.</p></div><span className="active-search-chip">Active · {items.find(x=>x.active)?.name||"REX-search"}</span></div>
+ <div className="search-provider-grid">{items.map(p=><article key={p.id} className={`search-provider-card ${p.active?"is-active":""}`}><div className="search-provider-title"><div><strong>{p.name}</strong><small>{p.built_in?"Private · built in":p.endpoint}</small></div>{p.active&&<span>In use</span>}</div>
+ <p>{p.id==="rex"?"Bounded retrieval over explicit seeds. No account, API fee, or global index.":p.id==="exa"?"Hosted web-scale search. Uses Exa's official Search API and ranking.":"Hosted ranked web results from TinyFish's official Search API."}</p>
+ {p.built_in?<button className="test-button" disabled={p.active||!!busy} onClick={()=>choose(p.id)}>{p.active?"Default active":"Use REX-search"}</button>:<>{p.has_key?<div className="search-card-actions"><button className="test-button" disabled={p.active||!!busy} onClick={()=>choose(p.id)}>{p.active?"Active":"Use provider"}</button><button className="reset-button" disabled={!!busy} onClick={()=>disconnect(p.id)}>Disconnect</button></div>:<div className="search-key-row"><input type="password" value={key[p.id]||""} onChange={e=>setKey(x=>({...x,[p.id]:e.target.value}))} placeholder={`${p.name} API key`} autoComplete="off" disabled={!runtime}/><button className="test-button" disabled={!runtime||!key[p.id]?.trim()||!!busy} onClick={()=>connect(p.id)}>Connect</button></div>}<a href={p.docs_url} target="_blank" rel="noreferrer">Official API contract</a></>}</article>)}</div>
+ {!runtime&&<p className="settings-note search-runtime-note">Open the desktop runtime to connect a provider. This preview never stores keys.</p>}{notice&&<p className="provider-err-line" role="status">{notice}</p>}</section>
+}

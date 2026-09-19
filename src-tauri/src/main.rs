@@ -5,16 +5,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use rex_providers::{
-    FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, UreqTransport,
+    FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, SearchProvider,
+    SearchProviderSummary, SearchRouter, UreqTransport,
 };
-use rex_search::{
-    IndexHit, IndexedDocument, LocalIndex, SearchEngine, SearchRequest, SearchResponse,
-};
+use rex_search::{IndexHit, IndexedDocument, LocalIndex, SearchRequest, SearchResponse};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
 
 type Service = ProviderService<FileSecretStore, UreqTransport>;
+type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 
 fn search_index() -> LocalIndex {
     LocalIndex::open(config_dir().join("search-index.json"))
@@ -71,8 +71,38 @@ fn provider_catalog(service: State<'_, Arc<Service>>, provider: String) -> Optio
 /// call site and the request budgets cap work. No provider key or browser state
 /// is involved.
 #[tauri::command]
-fn search_live(request: SearchRequest) -> SearchResponse {
-    SearchEngine::default().search(request)
+fn search_live(
+    search: State<'_, Arc<SearchService>>,
+    request: SearchRequest,
+) -> Result<SearchResponse, ProviderError> {
+    search.search(request)
+}
+
+#[tauri::command]
+fn search_provider_summaries(search: State<'_, Arc<SearchService>>) -> Vec<SearchProviderSummary> {
+    search.summaries()
+}
+#[tauri::command]
+fn search_provider_set_key(
+    search: State<'_, Arc<SearchService>>,
+    provider: SearchProvider,
+    key: String,
+) -> Result<(), ProviderError> {
+    search.set_key(provider, &key)
+}
+#[tauri::command]
+fn search_provider_clear_key(
+    search: State<'_, Arc<SearchService>>,
+    provider: SearchProvider,
+) -> Result<(), ProviderError> {
+    search.clear_key(provider)
+}
+#[tauri::command]
+fn search_provider_select(
+    search: State<'_, Arc<SearchService>>,
+    provider: SearchProvider,
+) -> Result<(), ProviderError> {
+    search.select(provider)
 }
 
 /// Add or replace one operator-selected document in the private local index.
@@ -123,9 +153,13 @@ fn main() {
 
     let store = FileSecretStore::new(config_dir()).expect("could not open the credential store");
     let service = Arc::new(ProviderService::new(store, UreqTransport::new()));
+    let search_store =
+        FileSecretStore::new(config_dir()).expect("could not open search credential store");
+    let search_service = Arc::new(SearchRouter::new(search_store, UreqTransport::new()));
 
     tauri::Builder::default()
         .manage(service)
+        .manage(search_service)
         .invoke_handler(tauri::generate_handler![
             provider_summaries,
             provider_set_key,
@@ -133,6 +167,10 @@ fn main() {
             provider_refresh,
             provider_catalog,
             search_live,
+            search_provider_summaries,
+            search_provider_set_key,
+            search_provider_clear_key,
+            search_provider_select,
             search_index_upsert,
             search_index_remove,
             search_index_query,

@@ -2529,9 +2529,11 @@ dependencies = [
 name = "rex-providers"
 version = "0.1.0"
 dependencies = [
+ "rex-search",
  "serde",
  "serde_json",
  "ureq",
+ "url",
 ]
 
 [[package]]

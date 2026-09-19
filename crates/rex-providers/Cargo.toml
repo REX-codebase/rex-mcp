@@ -9,3 +9,5 @@ license = "Proprietary"
 serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+rex-search = { path = "../rex-search" }
+url = "2"
