@@ -14,7 +14,9 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
+pub mod browser;
 pub mod supervisor;
+pub use browser::BrowserEvidence;
 pub use supervisor::{LifecycleEvent, LifecycleKind, PreviewSupervisor, SupervisorSummary};
 
 pub const MAX_ITERATIONS: u8 = 12;

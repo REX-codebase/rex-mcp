@@ -4,7 +4,9 @@
 // only - key material never crosses the bridge.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use rex_preview::{BrowserAction, PreviewRecipe, PreviewSupervisor, SupervisorSummary};
+use rex_preview::{
+    BrowserAction, BrowserEvidence, PreviewRecipe, PreviewSupervisor, SupervisorSummary,
+};
 use rex_providers::{
     FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, SearchProvider,
     SearchProviderSummary, SearchRouter, UreqTransport,
@@ -200,6 +202,14 @@ fn preview_action(
 }
 
 #[tauri::command]
+fn preview_capture(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+) -> Result<BrowserEvidence, String> {
+    preview.capture(&session_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn preview_cancel(
     preview: State<'_, Arc<NativePreview>>,
     session_id: String,
@@ -281,6 +291,7 @@ fn main() {
             preview_start,
             preview_status,
             preview_action,
+            preview_capture,
             preview_cancel,
             preview_teardown,
         ])

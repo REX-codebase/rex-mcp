@@ -1,6 +1,6 @@
 use crate::{
-    detect_project, BrowserAction, Framework, LaunchPlan, PreviewError, PreviewRecipe,
-    SessionState, PORT_MAX, PORT_MIN,
+    browser::BrowserRuntime, detect_project, BrowserAction, Framework, LaunchPlan, PreviewError,
+    PreviewRecipe, SessionState, PORT_MAX, PORT_MIN,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -94,6 +94,7 @@ struct Runtime {
     events: Arc<Mutex<VecDeque<LifecycleEvent>>>,
     stop: Arc<AtomicBool>,
     static_thread: Option<thread::JoinHandle<()>>,
+    browser: Option<BrowserRuntime>,
 }
 
 impl Runtime {
@@ -139,6 +140,7 @@ impl Runtime {
     }
     fn terminate(&mut self, kind: LifecycleKind) {
         self.stop.store(true, Ordering::SeqCst);
+        self.browser.take();
         if let Some(mut child) = self.child.take() {
             #[cfg(unix)]
             unsafe {
@@ -270,6 +272,7 @@ impl PreviewSupervisor {
             events: Default::default(),
             stop: Arc::new(AtomicBool::new(false)),
             static_thread: None,
+            browser: None,
         };
         runtime.event(
             LifecycleKind::Starting,
@@ -324,7 +327,24 @@ impl PreviewSupervisor {
         if r.state != SessionState::Running {
             return Err(PreviewError::NotRunning);
         };
-        Ok(())
+        if r.browser.is_none() {
+            r.browser = Some(BrowserRuntime::launch(&r.url)?);
+        }
+        r.browser
+            .as_mut()
+            .ok_or(PreviewError::NotRunning)?
+            .action(action, &r.url)
+    }
+    pub fn capture(&self, id: &str) -> Result<crate::BrowserEvidence, PreviewError> {
+        let mut s = self.sessions.lock().unwrap();
+        let r = s.get_mut(id).ok_or(PreviewError::NotRunning)?;
+        if r.browser.is_none() {
+            r.browser = Some(BrowserRuntime::launch(&r.url)?);
+        }
+        r.browser
+            .as_mut()
+            .ok_or(PreviewError::NotRunning)?
+            .capture()
     }
     pub fn cancel(&self, id: &str) -> Result<SupervisorSummary, PreviewError> {
         let mut s = self.sessions.lock().unwrap();
@@ -544,5 +564,48 @@ mod tests {
         let (_, p) = reserve_port().unwrap();
         assert!(p >= PORT_MIN + 3);
         drop(guards);
+    }
+    #[test]
+    fn browser_capture_is_real_and_actions_reach_page() {
+        let w = temp("browser");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><button id='b' onclick="this.textContent='clicked'">press</button>"#,
+        )
+        .unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        let first = sup.capture(&started.id).unwrap();
+        assert!(first.dom_text.contains("press"));
+        assert!(first
+            .screenshot_data_url
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("data:image/png;base64,"));
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerMove { x: 25.0, y: 15.0 },
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerDown {
+                button: crate::PointerButton::Primary,
+            },
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerUp {
+                button: crate::PointerButton::Primary,
+            },
+        )
+        .unwrap();
+        let second = sup.capture(&started.id).unwrap();
+        assert!(second.dom_text.contains("clicked"));
+        sup.teardown(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
     }
 }

@@ -14,6 +14,7 @@ import {
 } from "./data/motion";
 import { BrowserView } from "./components/BrowserView";
 import { PreviewRuntimeView } from "./components/PreviewRuntimeView";
+import { NativePreviewView } from "./components/NativePreviewView";
 import { ToolApprovalPreview } from "./components/ToolApprovalPreview";
 import "./preview-runtime.css";
 import { PAST_SESSIONS, newSession, startMockTurn, type Session } from "./data/mock";
@@ -82,6 +83,7 @@ export default function App() {
     if (!reduced) fastTimer.current = window.setTimeout(() => setFastPhase("idle"), 1120);
   };
 
+  const nativeProject = new URLSearchParams(window.location.search).get("native-preview");
   const previewTask = /(?:html|react|next\.?js|vite|astro|svelte|website|ui|interface|dashboard|landing page|app)/i.test(task);
 
   const onRun = () => {
@@ -162,7 +164,7 @@ export default function App() {
             )}
             <StateRail state={state} blockedReason={latest?.blockedReason} />
             {import.meta.env.DEV && new URLSearchParams(window.location.search).has("approval-preview") && <ToolApprovalPreview />}
-            {session && previewTask && <PreviewRuntimeView />}
+            {nativeProject ? <NativePreviewView projectDir={nativeProject} /> : session && previewTask && <PreviewRuntimeView />}
             {ultra && session && !previewTask && browserPhase === "active" && (
               <BrowserView
                 key={browserRun}

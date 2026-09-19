@@ -26,7 +26,12 @@ export type PreviewSessionSummary = {
   url: string;
   framework: PreviewFramework;
   iteration: number;
-  cancellation_requested: boolean;
+  cancellation_requested?: boolean;
+  pid?: number;
+  exit_code?: number;
+  stdout?: string;
+  stderr?: string;
+  events?: unknown[];
 };
 
 export type PreviewBrowserAction =
@@ -42,6 +47,6 @@ export type PreviewBrowserAction =
 export const previewDetect = (projectDir: string) => invoke<PreviewRecipe>("preview_detect", { projectDir });
 export const previewStart = (projectDir: string) => invoke<PreviewSessionSummary>("preview_start", { projectDir });
 export const previewAction = (sessionId: string, action: PreviewBrowserAction) => invoke<void>("preview_action", { sessionId, action });
-export const previewCapture = (sessionId: string) => invoke<void>("preview_capture", { sessionId });
+export const previewCapture = (sessionId: string) => invoke<{ items: unknown[]; screenshot_data_url?: string; dom_text: string; accessibility_text: string }>("preview_capture", { sessionId });
 export const previewCancel = (sessionId: string) => invoke<PreviewSessionSummary>("preview_cancel", { sessionId });
 export const previewTeardown = (sessionId: string) => invoke<void>("preview_teardown", { sessionId });

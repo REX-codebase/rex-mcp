@@ -9,6 +9,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "2"
 url = "2"
+base64 = "0.22"
+sha2 = "0.10"
+tungstenite = "0.27"
+ureq = { version = "3", features = ["json"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
