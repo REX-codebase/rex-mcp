@@ -26,6 +26,9 @@ impl UreqTransport {
     pub fn new() -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
+            // Keep 4xx/5xx as responses: provider error bodies carry the
+            // reason, and dropping them makes failures undebuggable.
+            .http_status_as_error(false)
             .build();
         Self {
             agent: config.into(),

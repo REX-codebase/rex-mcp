@@ -313,6 +313,9 @@ impl RunHandle {
 /// One decoded model-side call: either a rex-tools request or a loop-level
 /// instruction handled by the harness itself.
 enum AgentCall {
+    /// A call we could not decode; reported back to the model as an error
+    /// so it can correct itself instead of dying as a provider failure.
+    BadCall { name: String, id: String, error: String },
     Tool { id: String, request: ToolRequest },
     UpdatePlan { items: Vec<PlanItem> },
     WebSearch { id: String, query: String, max_results: usize },
@@ -823,7 +826,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             }));
         }
 
-        let (texts, calls) = match decode_gemini_calls(&response) {
+        let decoded = match decode_gemini_calls(&response) {
             Ok(v) => v,
             Err(e) => {
                 finish(&ctx, &mut ledger, TerminalReason::ProviderError {
@@ -832,12 +835,12 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
                 return;
             }
         };
-        for text in &texts {
+        for text in &decoded.texts {
             RunHandle::push_event(&ctx.handle.shared, AgentEvent::ModelText { text: text.clone() });
         }
 
         // ---- execute the turn's calls ------------------------------------
-        let out = execute_turn(&ctx, &tools, &mut ledger, calls, &mut cp, started);
+        let out = execute_turn(&ctx, &tools, &mut ledger, decoded.calls, decoded.thought_signature, &mut cp, started);
         if let Some(fatal) = out.fatal {
             #[cfg(test)]
             if matches!(fatal, TerminalReason::Cancelled)
@@ -1031,7 +1034,15 @@ fn usage_tokens(response: &str) -> Option<u64> {
 /// is the loop's own adapter: loop-level tools (update_plan, web_search,
 /// complete_task) are separated from rex-tools requests here, and unknown
 /// calls fail loudly instead of being guessed into a capability.
-fn decode_gemini_calls(response: &str) -> Result<(Vec<String>, Vec<AgentCall>), String> {
+struct DecodedCalls {
+    texts: Vec<String>,
+    calls: Vec<(AgentCall, Option<Value>)>,
+    /// Gemini 2.5 thinking models sign the model turn; the signature must be
+    /// echoed back with the next request's function calls.
+    thought_signature: Option<String>,
+}
+
+fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
     let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
     let parts = value
         .get("candidates")
@@ -1042,9 +1053,16 @@ fn decode_gemini_calls(response: &str) -> Result<(Vec<String>, Vec<AgentCall>), 
         .and_then(Value::as_array)
         .ok_or("missing candidates[0].content.parts")?;
     let mut texts = Vec::new();
-    let mut calls = Vec::new();
+    let mut calls: Vec<(AgentCall, Option<Value>)> = Vec::new();
+    let mut thought_signature: Option<String> = None;
     let mut call_seq = 0usize;
     for part in parts {
+        if thought_signature.is_none() {
+            thought_signature = part
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
         if let Some(text) = part.get("text").and_then(Value::as_str) {
             if !text.trim().is_empty() {
                 texts.push(text.to_string());
@@ -1057,6 +1075,7 @@ fn decode_gemini_calls(response: &str) -> Result<(Vec<String>, Vec<AgentCall>), 
         };
         call_seq += 1;
         let id = format!("call-{call_seq}");
+        let raw = Some(part.clone());
         let name = fc
             .get("name")
             .and_then(Value::as_str)
@@ -1064,25 +1083,36 @@ fn decode_gemini_calls(response: &str) -> Result<(Vec<String>, Vec<AgentCall>), 
         let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
         match name {
             "update_plan" => {
-                let items: Vec<PlanItem> = serde_json::from_value(
+                match serde_json::from_value::<Vec<PlanItem>>(
                     args.get("items").cloned().unwrap_or_else(|| json!([])),
-                )
-                .map_err(|e| format!("invalid update_plan items: {e}"))?;
-                calls.push(AgentCall::UpdatePlan { items });
+                ) {
+                    Ok(items) => calls.push((AgentCall::UpdatePlan { items }, raw)),
+                    Err(e) => calls.push((AgentCall::BadCall {
+                        name: "update_plan".into(),
+                        id,
+                        error: format!("invalid update_plan items: {e}; every item needs id, title, status"),
+                    }, raw)),
+                }
             }
             "web_search" => {
-                let query = args
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .ok_or("web_search missing query")?
-                    .to_string();
+                let query = match args.get("query").and_then(Value::as_str) {
+                    Some(q) => q.to_string(),
+                    None => {
+                        calls.push((AgentCall::BadCall {
+                            name: "web_search".into(),
+                            id,
+                            error: "web_search missing query".into(),
+                        }, raw));
+                        continue;
+                    }
+                };
                 let max_results = args
                     .get("max_results")
                     .and_then(Value::as_u64)
                     .map(|n| n as usize)
                     .unwrap_or(5)
                     .clamp(1, 8);
-                calls.push(AgentCall::WebSearch { id, query, max_results });
+                calls.push((AgentCall::WebSearch { id, query, max_results }, raw));
             }
             "complete_task" => {
                 let summary = args
@@ -1090,7 +1120,7 @@ fn decode_gemini_calls(response: &str) -> Result<(Vec<String>, Vec<AgentCall>), 
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                calls.push(AgentCall::CompleteTask { summary });
+                calls.push((AgentCall::CompleteTask { summary }, raw));
             }
             _ => {
                 let mut object = args;
@@ -1101,13 +1131,18 @@ fn decode_gemini_calls(response: &str) -> Result<(Vec<String>, Vec<AgentCall>), 
                     .as_object_mut()
                     .unwrap()
                     .insert("tool".into(), Value::String(name.into()));
-                let request: ToolRequest = serde_json::from_value(object)
-                    .map_err(|e| format!("invalid {name} request: {e}"))?;
-                calls.push(AgentCall::Tool { id, request });
+                match serde_json::from_value::<ToolRequest>(object) {
+                    Ok(request) => calls.push((AgentCall::Tool { id, request }, raw)),
+                    Err(e) => calls.push((AgentCall::BadCall {
+                        name: name.into(),
+                        id,
+                        error: format!("invalid {name} request: {e}"),
+                    }, raw)),
+                }
             }
         }
     }
-    Ok((texts, calls))
+    Ok(DecodedCalls { texts, calls, thought_signature })
 }
 
 fn call_signature(tool: &str, request: &Value) -> String {
@@ -1118,7 +1153,8 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
     ctx: &LoopCtx<S, T>,
     tools: &ToolRuntime,
     ledger: &mut Option<Ledger>,
-    calls: Vec<AgentCall>,
+    calls: Vec<(AgentCall, Option<Value>)>,
+    thought_signature: Option<String>,
     cp: &mut Checkpoint,
     started: Instant,
 ) -> DriveOut {
@@ -1134,7 +1170,23 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
     let mut response_parts: Vec<Value> = Vec::new();
     let mut model_parts: Vec<Value> = Vec::new();
 
-    for call in calls {
+    let mut first_model_part = true;
+    let mut push_model_part = |model_parts: &mut Vec<Value>, raw: Option<Value>, fallback: Value| {
+        let mut part = raw.unwrap_or(fallback);
+        // Gemini 2.5 thinking models require the turn's thoughtSignature on
+        // the first function call echoed back; carry it if the raw part
+        // lost it (older models simply ignore nothing - they never send one).
+        if first_model_part {
+            if let Some(sig) = &thought_signature {
+                if part.get("thoughtSignature").is_none() {
+                    part["thoughtSignature"] = json!(sig);
+                }
+            }
+        }
+        first_model_part = false;
+        model_parts.push(part);
+    };
+    for (call, raw) in calls {
         if ctx.handle.cancel.load(Ordering::SeqCst) {
             out.fatal = Some(TerminalReason::Cancelled);
             return out;
@@ -1147,6 +1199,16 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
         }
         cp.tool_calls += 1;
         match call {
+            AgentCall::BadCall { name, id, error } => {
+                out.digest_actions.push(DigestAction {
+                    tool: name.clone(),
+                    ok: false,
+                    target: None,
+                    error_kind: Some("bad_call".into()),
+                });
+                push_model_part(&mut model_parts, raw, json!({"functionCall":{"name": name,"args": {}}}));
+                response_parts.push(function_response(&name, &id, false, &error));
+            }
             AgentCall::UpdatePlan { items } => {
                 let items: Vec<PlanItem> = items.into_iter().take(8).collect();
                 let in_progress = items.iter().filter(|i| i.status == PlanStatus::InProgress).count();
@@ -1215,7 +1277,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     target: Some(query.clone()),
                     error_kind: if ok { None } else { Some("search_failed".into()) },
                 });
-                model_parts.push(json!({"functionCall":{"name":"web_search","args":{"query": query}}}));
+                push_model_part(&mut model_parts, raw, json!({"functionCall":{"name":"web_search","args":{"query": query}}}));
                 response_parts.push(function_response("web_search", &id, ok, &content));
             }
             AgentCall::CompleteTask { summary } => {
@@ -1255,7 +1317,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     target: None,
                     error_kind: Some("gates_failed".into()),
                 });
-                model_parts.push(json!({"functionCall":{"name":"complete_task","args":{"summary": summary}}}));
+                push_model_part(&mut model_parts, raw, json!({"functionCall":{"name":"complete_task","args":{"summary": summary}}}));
                 response_parts.push(function_response("complete_task", "gate", false, &feedback));
             }
             AgentCall::Tool { id, request } => {
@@ -1271,7 +1333,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                             target: None,
                             error_kind: Some(format!("{:?}", e.kind).to_lowercase()),
                         });
-                        model_parts.push(json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}));
+                        push_model_part(&mut model_parts, raw, json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}));
                         response_parts.push(function_response(tool_name, &id, false, &content));
                         continue;
                     }
@@ -1362,7 +1424,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     target: receipt.target.clone().or(receipt.command.as_ref().map(|c| c.join(" "))),
                     error_kind: result.error.as_ref().map(|e| format!("{:?}", e.kind).to_lowercase()),
                 });
-                model_parts.push(json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}));
+                push_model_part(&mut model_parts, raw, json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}));
                 response_parts.push(function_response(tool_name, &id, result.ok, &content));
             }
         }
