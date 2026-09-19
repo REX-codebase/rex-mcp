@@ -343,3 +343,24 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .dialog-primary.is-active:disabled{background:var(--color-line);color:var(--color-faint);cursor:not-allowed}
 .provider-menu.live{width:380px}
 @media(max-width:420px){.provider-menu.live{width:min(380px,calc(100vw - 42px))}}
+
+/* Access policy: sourced verdicts on which account types REX may connect */
+.policy-block{display:flex;flex-direction:column;gap:12px;margin-top:20px;border-top:1px solid var(--color-line);padding-top:16px}
+.policy-line{display:flex;gap:10px;align-items:flex-start}
+.policy-chip{flex:none;margin-top:1px;border:1px solid var(--color-line);border-radius:999px;padding:4px 8px;font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--color-faint)}
+.policy-chip.is-ok{border-color:color-mix(in srgb,var(--color-accent) 32%,var(--color-line));color:var(--color-muted)}
+.policy-text{margin:0;font-size:10px;line-height:1.6;color:var(--color-faint)}
+.policy-text strong{display:block;font-weight:600;color:var(--color-muted)}
+.policy-note{margin:0;font-size:9px;line-height:1.6;color:var(--color-faint);opacity:.8}
+
+/* Subscription verdict list inside the connect dialog */
+.connect-choice-list.is-scrollable{max-height:280px;overflow-y:auto;scrollbar-width:thin}
+.connect-choice-list button>span{display:flex;min-width:0;flex-direction:column;align-items:flex-start;gap:3px;text-align:left}
+.connect-choice-list button b{font-size:11px;font-weight:600;color:var(--color-faint)}
+.connect-choice-list button:not(:disabled){cursor:pointer;border-color:color-mix(in srgb,var(--color-accent) 40%,var(--color-line))}
+.connect-choice-list button:not(:disabled) b{color:var(--color-text)}
+.connect-choice-list .sub-status{flex:none;margin-left:12px;letter-spacing:.05em;text-transform:uppercase}
+.api-hint{font-size:9px;line-height:1.5;color:var(--color-faint)}
+
+/* Keep the connect dialog inside short viewports */
+.connect-dialog{max-height:calc(100vh - 48px);overflow-y:auto}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { PROVIDER_PRESETS } from "../data/providers";
+import { PROVIDER_PRESETS, accessStatusLabel, type AccessLine, type AccessStatus } from "../data/providers";
 import {
   backendKind,
   clearProviderKey,
@@ -42,6 +42,7 @@ export function ModelStatus() {
   const [provider, setProvider] = useState(PROVIDER_PRESETS[0].id);
   const [keyField, setKeyField] = useState("");
   const [baseUrlField, setBaseUrlField] = useState("");
+  const [modelIdField, setModelIdField] = useState("");
   const [connectBusy, setConnectBusy] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
@@ -117,6 +118,17 @@ export function ModelStatus() {
     if (!written.ok) {
       setConnectError(describeError(written.error));
       setConnectBusy(false);
+      return;
+    }
+    if (preset?.modelDiscovery === "manual") {
+      // Manual providers have no documented listing API, so REX never probes
+      // one: the key is saved and the typed model ID becomes the selection.
+      const id = modelIdField.trim();
+      setModelIdField("");
+      setConnectBusy(false);
+      if (id) choose({ provider, id, label: id });
+      setFlow(null);
+      await reload();
       return;
     }
     const fetched = await refreshCatalog(provider);
@@ -204,9 +216,11 @@ export function ModelStatus() {
                     )}
                   </span>
                   <span className="provider-block-actions">
+                    {s.discovery !== "manual" && (
                     <button type="button" onClick={() => refresh(s.id)} disabled={refreshing === s.id} aria-label={`Refresh ${s.name} models`}>
                       {refreshing === s.id ? "…" : "Refresh"}
                     </button>
+                    )}
                     {s.has_key && <button type="button" onClick={() => removeKey(s.id)} aria-label={`Disconnect ${s.name}`}>Disconnect</button>}
                   </span>
                 </header>
@@ -243,7 +257,7 @@ export function ModelStatus() {
             </button>
             <button type="button" role="menuitem" onClick={() => launch("subscription")}>
               <span className="provider-action-icon" aria-hidden="true">S</span>
-              <span><b>Connect subscription</b><small>Provider plan sign-in - not implemented yet</small></span>
+              <span><b>Connect subscription</b><small>Eligible plans, each checked against provider policy</small></span>
               <i aria-hidden="true">→</i>
             </button>
           </div>
@@ -260,12 +274,9 @@ export function ModelStatus() {
             <h2 id="connect-title">{flow === "subscription" ? "Connect the plan you already use." : "Connect your own API access."}</h2>
             {flow === "subscription" ? (
               <>
-                <p className="dialog-copy">Sign-in with a provider plan is not implemented yet. API keys work today.</p>
-                <div className="connect-choice-list" aria-label="Subscription providers">
-                  {["Google", "OpenAI", "Anthropic"].map((name) => <button type="button" key={name} disabled><span>{name}</span><small>Not implemented</small></button>)}
-                </div>
-                <button type="button" className="dialog-primary" disabled>Not available yet</button>
-                <p className="dialog-truth"><span aria-hidden="true">i</span>No sign-in route exists yet, so nothing here opens or calls out.</p>
+                <p className="dialog-copy">Only plans whose provider officially allows third-party harness use can connect. REX refuses the rest - each row says why.</p>
+                <SubscriptionChoices onConnect={(id) => { setProvider(id); setFlow("api"); }} />
+                <p className="dialog-truth"><span aria-hidden="true">i</span>Verdicts come from each provider's official documentation, verified 2026-09-19. Sources and reasoning: docs/subscription-policy.md.</p>
               </>
             ) : (
               <>
@@ -298,12 +309,32 @@ export function ModelStatus() {
                       />
                     </label>
                   )}
+                  {selectedPreset.modelDiscovery === "manual" && (
+                    <label className="provider-field-wide" style={{ gridColumn: "1 / -1" }}>
+                      <span>Model ID</span>
+                      <input
+                        value={modelIdField}
+                        placeholder="Exact model ID from the provider's docs"
+                        spellCheck={false}
+                        onChange={(event) => setModelIdField(event.target.value)}
+                      />
+                      {selectedPreset.examples && <small className="api-hint">{selectedPreset.examples}</small>}
+                    </label>
+                  )}
                 </div>
                 {connectError && <p className="provider-err-line" role="alert">{connectError}</p>}
-                <button type="button" className="dialog-primary is-active" disabled={!keyField.trim() || connectBusy} onClick={submitKey}>
-                  {connectBusy ? "Connecting…" : "Save key & fetch models"}
+                <button
+                  type="button"
+                  className="dialog-primary is-active"
+                  disabled={!keyField.trim() || connectBusy || (selectedPreset.modelDiscovery === "manual" && !modelIdField.trim())}
+                  onClick={submitKey}
+                >
+                  {connectBusy ? "Connecting…" : selectedPreset.modelDiscovery === "manual" ? "Save key & use model" : "Save key & fetch models"}
                 </button>
-                <p className="dialog-truth"><span aria-hidden="true">i</span>After saving, REX immediately asks the provider for its real model list. Auth, network, and empty-catalog failures show up here verbatim.</p>
+                <p className="dialog-truth"><span aria-hidden="true">i</span>{selectedPreset.modelDiscovery === "manual"
+                  ? "This provider has no documented model-listing API, so REX saves the key and uses the model ID you entered. Nothing is probed."
+                  : "After saving, REX immediately asks the provider for its real model list. Auth, network, and empty-catalog failures show up here verbatim."}
+                </p>
               </>
             )}
           </section>
@@ -370,13 +401,11 @@ function PreviewPicker({ open, setOpen, flow, launch, setFlow, provider, setProv
             <h2 id="connect-title">{flow === "subscription" ? "Connect the plan you already use." : "Connect your own API access."}</h2>
             <p className="dialog-copy">
               {flow === "subscription"
-                ? "REX will show official sign-in routes supported by each provider, then add the models available to your account."
+                ? "Only plans whose provider officially allows third-party harness use can connect. REX refuses the rest - each row says why."
                 : "Choose a provider. Keys will be stored by the desktop runtime, never inside this interface."}
             </p>
             {flow === "subscription" ? (
-              <div className="connect-choice-list" aria-label="Subscription providers">
-                {["Google", "OpenAI", "Anthropic"].map((name) => <button type="button" key={name} disabled><span>{name}</span><small>Runtime needed</small></button>)}
-              </div>
+              <SubscriptionChoices onConnect={(id) => { setProvider(id); setFlow("api"); }} />
             ) : (
               <div className="api-preview">
                 <label><span>Provider</span><select value={provider} onChange={(event) => setProvider(event.target.value)}>{PROVIDER_PRESETS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
@@ -388,6 +417,39 @@ function PreviewPicker({ open, setOpen, flow, launch, setFlow, provider, setProv
           </section>
         </div>
       )}
+    </div>
+  );
+}
+
+type SubscriptionRow = { providerId: string; line: AccessLine };
+
+function subscriptionRows(): SubscriptionRow[] {
+  const rank = (status: AccessStatus) => (status === "supported" ? 0 : status === "tool-scoped" ? 1 : status === "not-offered" ? 2 : 3);
+  return PROVIDER_PRESETS.flatMap((preset) =>
+    preset.access.filter((line) => line.kind !== "api-key").map((line) => ({ providerId: preset.id, line }))
+  ).sort((a, b) => rank(a.line.status) - rank(b.line.status));
+}
+
+// Every consumer-subscription route REX evaluated, with its verdict. Only a
+// "supported" row is clickable, and it connects through the mechanism the
+// provider officially documents (for Kimi for Coding: its own API key).
+function SubscriptionChoices({ onConnect }: { onConnect: (providerId: string) => void }) {
+  return (
+    <div className="connect-choice-list is-scrollable" aria-label="Subscription verdicts">
+      {subscriptionRows().map(({ providerId, line }) => (
+        <button
+          key={`${providerId}-${line.label}`}
+          type="button"
+          disabled={line.status !== "supported"}
+          onClick={line.status === "supported" ? () => onConnect(providerId) : undefined}
+        >
+          <span>
+            <b>{line.label}</b>
+            <small>{line.detail}</small>
+          </span>
+          <small className="sub-status">{accessStatusLabel[line.status]}</small>
+        </button>
+      ))}
     </div>
   );
 }

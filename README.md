@@ -61,10 +61,11 @@ evidence/       grounding receipts from the build session
 
 The first real backend slice lives in `crates/rex-providers` (workspace root `Cargo.toml`):
 
-- **Provider core** - registry for Gemini, Anthropic, and OpenAI-compatible endpoints; live model-catalog fetch with pagination; normalization into one model shape; truthful error taxonomy (not-configured, auth, rate-limit, network, unsupported, empty catalog, invalid response).
+- **Provider core** - registry for Gemini, Anthropic, OpenAI, xAI, DeepSeek, Kimi, Kimi for Coding, Qwen, GLM, local, and custom endpoints; live model-catalog fetch with pagination; normalization into one model shape; truthful error taxonomy (not-configured, auth, rate-limit, network, unsupported, empty catalog, invalid response).
+- **Access policy** - `crates/rex-providers/src/policy.rs` decides which account types REX may connect, grounded in each provider's official documentation (verified 2026-09-19). Consumer subscriptions are offered only where the provider explicitly permits third-party harness use (today: Kimi for Coding); Claude Pro/Max sign-in is forbidden by Anthropic, and ChatGPT, X Premium/SuperGrok, Google AI, GLM Coding Plan, Alibaba Coding Plan, and GitHub Copilot subscriptions are refused with sourced reasons. Full matrix: `docs/subscription-policy.md`.
 - **Credentials** - keys enter through the backend only, land in a permission-locked store (0600), and are never returned to the frontend, logged, or serialized.
 - **Desktop app** - `src-tauri` exposes the core through Tauri commands (`provider_summaries`, `provider_set_key`, `provider_clear_key`, `provider_refresh`, `provider_catalog`).
 - **Dev sidecar** - `cargo run -p rex-providers --bin rex-dev-server` bridges the same core to the vite dev frontend on 127.0.0.1:8787. `--replay gemini=crates/rex-providers/fixtures/gemini-list-models-live.json` seeds the recorded live Gemini catalog, labeled as recorded in the UI.
 - **Frontend** - the prompt-box model dropdown is driven by the backend: live catalogs, selection, refresh, disconnect, and a working Connect-API dialog. With no backend reachable it stays the labeled preview.
 
-Tests: `cargo test -p rex-providers` (17 tests, including a real-socket status mapping and the recorded live Gemini response).
+Tests: `cargo test -p rex-providers` (26 tests, including policy guards, a real-socket status mapping, and the recorded live Gemini response).

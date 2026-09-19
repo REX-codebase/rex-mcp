@@ -31,11 +31,22 @@ export interface ModelCatalog {
   models: ModelInfo[];
 }
 
+// Access policy verdict mirrored from the Rust backend (policy.rs).
+export interface AccessPolicy {
+  kind: "api-key" | "subscription-key" | "subscription-oauth";
+  status: "supported" | "tool-scoped" | "not-permitted" | "not-offered";
+  label: string;
+  detail: string;
+  sources: string[];
+  verified_on: string;
+}
+
 export interface ProviderSummary {
   id: string;
   name: string;
   protocol: "gemini" | "anthropic" | "openai-compatible";
   discovery: "native" | "openai-models" | "manual";
+  access?: AccessPolicy[];
   base_url: string | null;
   has_key: boolean;
   catalog: ModelCatalog | null;

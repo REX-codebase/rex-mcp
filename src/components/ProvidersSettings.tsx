@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { PROVIDER_PRESETS, protocolLabel, type ProviderDraft, type ProviderPreset } from "../data/providers";
+import { PROVIDER_PRESETS, accessStatusLabel, protocolLabel, type ProviderDraft, type ProviderPreset } from "../data/providers";
 import { backendKind, describeError, listSummaries, refreshCatalog, type BackendKind, type ProviderSummary } from "../data/backend";
 
 function makeDraft(preset: ProviderPreset): ProviderDraft {
@@ -80,6 +80,24 @@ export function ProvidersSettings() {
           <span className={`status-chip ${draft.status !== "not-configured" ? "has-draft" : ""}`}>{statusLabel}</span>
         </div>
         <p className="provider-summary">{selected.summary}</p>
+
+        {selected.access.length > 0 && (
+          <div className="policy-block" aria-label="Access policy">
+            {selected.access.map((line) => (
+              <div className="policy-line" key={line.label}>
+                <span className={`policy-chip ${line.status === "supported" ? "is-ok" : ""}`}>{accessStatusLabel[line.status]}</span>
+                <p className="policy-text">
+                  <strong>{line.label}</strong>
+                  {line.detail}
+                </p>
+              </div>
+            ))}
+            <p className="policy-note">
+              Verdicts come from each provider's official documentation, verified 2026-09-19. REX connects an account only where the
+              provider clearly permits third-party harness use. Full matrix: docs/subscription-policy.md.
+            </p>
+          </div>
+        )}
 
         <div className="provider-form">
           <label>
