@@ -7,6 +7,9 @@
 //! boundary, while the child can inspect and reason but cannot silently take
 //! privileged actions in the user's real workspace.
 
+pub mod run_service;
+pub use run_service::{DiffEntry, DiffKind, DiffSummary, PromotionState, RunManager, RunSnapshot, RunStatus};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
@@ -76,6 +79,14 @@ pub struct InstalledAgentRun {
     pub staging_workspace: String,
 }
 
+/// Operator-selected generation controls. `None` always means the vendor
+/// CLI's own default - REX never invents a model name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOptions {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum InstalledAgentError {
     Missing(String),
@@ -118,7 +129,7 @@ const SPECS: [Spec;5] = [
     Spec{id:InstalledAgentId::GoogleAntigravity,name:"Google Antigravity",executable:"agy",automation:"agy stream-json input/output",auth_boundary:"Antigravity owns Google keyring or explicit Gemini API authentication",docs_url:"https://antigravity.google/docs/cli/headless/",entitlement_note:"Uses Antigravity's own secure-keyring Google session or explicit Gemini API-key mode"},
 ];
 
-fn spec(id: InstalledAgentId) -> Spec {
+pub(crate) fn spec(id: InstalledAgentId) -> Spec {
     *SPECS
         .iter()
         .find(|s| s.id == id)
@@ -167,7 +178,7 @@ fn detect(s: Spec) -> InstalledAgentSummary {
     InstalledAgentSummary{id:s.id,name:s.name,executable:s.executable,state,version,automation:s.automation,auth_boundary:s.auth_boundary,docs_url:s.docs_url,approval_boundary:"REX owns approval. The child never receives a skip-permissions flag and runs against an isolated staging copy.",compatibility:CompatibilityContract{verified_on:"2026-09-19",documented_interface:s.automation,entitlement_note:s.entitlement_note,fail_closed:true}}
 }
 
-fn find_on_path(exe: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(exe: &str) -> Option<PathBuf> {
     let candidate = Path::new(exe);
     if candidate.components().count() > 1 && candidate.is_file() {
         return Some(candidate.to_path_buf());
@@ -180,6 +191,30 @@ fn find_on_path(exe: &str) -> Option<PathBuf> {
 }
 
 fn safe_args(id: InstalledAgentId, prompt: &str) -> (Args, Option<String>) {
+    safe_args_with_options(id, prompt, &RunOptions::default())
+        .expect("default options are valid for every backend")
+}
+
+/// Build the documented sandboxed command for a backend, threading explicit
+/// generation controls only through interfaces verified to accept them.
+/// Model and effort values travel as separate argv entries - never through a
+/// shell - and a backend whose control surface is not yet verified fails
+/// closed instead of silently dropping or mangling the selection.
+pub fn safe_args_with_options(
+    id: InstalledAgentId,
+    prompt: &str,
+    options: &RunOptions,
+) -> Result<(Args, Option<String>), InstalledAgentError> {
+    if id != InstalledAgentId::GoogleAntigravity && (options.model.is_some() || options.effort.is_some()) {
+        return Err(InstalledAgentError::Invalid(format!(
+            "model/effort selection is not yet verified for {}; run it with its own defaults",
+            spec(id).name
+        )));
+    }
+    Ok(safe_args_verified(id, prompt, options))
+}
+
+fn safe_args_verified(id: InstalledAgentId, prompt: &str, options: &RunOptions) -> (Args, Option<String>) {
     match id {
         InstalledAgentId::Cursor => (
             vec![
@@ -219,16 +254,29 @@ fn safe_args(id: InstalledAgentId, prompt: &str) -> (Args, Option<String>) {
             vec!["--mode".into(), "rpc".into()],
             Some(serde_json::json!({"type":"prompt","message":prompt}).to_string()),
         ),
-        InstalledAgentId::GoogleAntigravity => (
-            vec![
+        InstalledAgentId::GoogleAntigravity => {
+            let mut args: Args = vec![
                 "--input-format".into(),
                 "stream-json".into(),
                 "--output-format".into(),
                 "stream-json".into(),
                 "--sandbox".into(),
-            ],
-            Some(serde_json::json!({"event":"user","message":{"content":prompt}}).to_string()),
-        ),
+            ];
+            // Documented Antigravity CLI controls. Each value is one argv
+            // entry; an absent selection keeps agy's own default choice.
+            if let Some(model) = options.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                args.push("--model".into());
+                args.push(model.into());
+            }
+            if let Some(effort) = options.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+                args.push("--effort".into());
+                args.push(effort.into());
+            }
+            (
+                args,
+                Some(serde_json::json!({"event":"user","message":{"content":prompt}}).to_string()),
+            )
+        }
     }
 }
 
@@ -293,6 +341,31 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Per-line stream parsing shared by the buffered and live lifecycles.
+pub mod collect_events {
+    use super::{AgentEvent, InstalledAgentError, InstalledAgentId};
+    use serde_json::Value;
+
+    pub fn parse_line(id: InstalledAgentId, line: &str) -> Result<AgentEvent, InstalledAgentError> {
+        let payload: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) if id == InstalledAgentId::GoogleAntigravity => {
+                return Err(InstalledAgentError::Invalid(format!(
+                    "malformed agent event: {error}"
+                )))
+            }
+            Err(_) => Value::String(line.to_string()),
+        };
+        let event = payload
+            .get("event")
+            .or_else(|| payload.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("output")
+            .to_string();
+        Ok(AgentEvent { event, payload })
+    }
+}
+
 fn collect_child(
     id: InstalledAgentId,
     child: Child,
@@ -306,7 +379,14 @@ fn collect_child(
             .stdin
             .take()
             .ok_or_else(|| InstalledAgentError::Child("child stdin unavailable".into()))?;
-        writeln!(stdin, "{line}").map_err(|e| InstalledAgentError::Io(e.to_string()))?;
+        // A child may legitimately close stdin before consuming the turn
+        // (fast failure, protocol exit); a broken pipe there is not a REX
+        // error - the child's own stream and exit decide the verdict.
+        match writeln!(stdin, "{line}") {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(InstalledAgentError::Io(e.to_string())),
+        }
         // Closing stdin is the documented graceful end-of-session signal.
         drop(stdin);
     }
@@ -332,22 +412,7 @@ fn collect_child(
         if line.trim().is_empty() {
             continue;
         }
-        let payload: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) if id == InstalledAgentId::GoogleAntigravity => {
-                return Err(InstalledAgentError::Invalid(format!(
-                    "malformed agent event: {error}"
-                )))
-            }
-            Err(_) => Value::String(line),
-        };
-        let event = payload
-            .get("event")
-            .or_else(|| payload.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or("output")
-            .to_string();
-        events.push(AgentEvent { event, payload });
+        events.push(collect_events::parse_line(id, &line)?);
     }
     let output = child
         .take()
@@ -374,7 +439,7 @@ fn collect_child(
     })
 }
 
-fn validate_antigravity_stream(
+pub(crate) fn validate_antigravity_stream(
     events: &[AgentEvent],
     stderr: &str,
     exit_code: Option<i32>,
@@ -533,7 +598,7 @@ fn validate_antigravity_stream(
     Ok("completed".into())
 }
 
-fn stage_workspace(source: &Path) -> Result<PathBuf, InstalledAgentError> {
+pub(crate) fn stage_workspace(source: &Path) -> Result<PathBuf, InstalledAgentError> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| InstalledAgentError::Io(e.to_string()))?
