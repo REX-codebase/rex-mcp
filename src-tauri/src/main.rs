@@ -4,6 +4,10 @@
 // only - key material never crosses the bridge.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use rex_installed_agents::{
+    discover as discover_installed_agents, run as run_installed_agent, InstalledAgentId,
+    InstalledAgentRun, InstalledAgentSummary,
+};
 use rex_preview::{
     BrowserAction, BrowserEvidence, IterationReceipt, PreviewRecipe, PreviewSupervisor,
     ProductionReport, SupervisorSummary,
@@ -38,6 +42,20 @@ fn config_dir() -> PathBuf {
         return PathBuf::from(home).join(".config").join("rex-harness");
     }
     std::env::temp_dir().join("rex-harness")
+}
+
+#[tauri::command]
+fn installed_agent_summaries() -> Vec<InstalledAgentSummary> {
+    discover_installed_agents()
+}
+
+#[tauri::command]
+fn installed_agent_run(
+    backend: InstalledAgentId,
+    prompt: String,
+    workspace: String,
+) -> Result<InstalledAgentRun, rex_installed_agents::InstalledAgentError> {
+    run_installed_agent(backend, &prompt, std::path::Path::new(&workspace))
 }
 
 #[tauri::command]
@@ -433,6 +451,8 @@ fn main() {
         .manage(live)
         .manage(agent)
         .invoke_handler(tauri::generate_handler![
+            installed_agent_summaries,
+            installed_agent_run,
             provider_summaries,
             provider_set_key,
             provider_clear_key,

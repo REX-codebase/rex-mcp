@@ -135,6 +135,18 @@ function SIDEBAR_SAFE() {
   return SIDECAR;
 }
 
+export type InstalledAgentId = "cursor" | "codex" | "claude-code" | "pi" | "google-antigravity";
+export type InstalledAgentState = "ready" | "installed_auth_unknown" | "missing" | "unsupported_version" | "support_needs_review";
+export interface InstalledAgentSummary {
+  id: InstalledAgentId; name: string; executable: string; state: InstalledAgentState; version?: string; automation: string; auth_boundary: string; docs_url: string; approval_boundary: string;
+  compatibility: { verified_on: string; documented_interface: string; entitlement_note: string; fail_closed: boolean };
+}
+export async function listInstalledAgents(): Promise<InstalledAgentSummary[]> {
+  const b = await backend();
+  if (b.kind !== "tauri") throw new Error("installed agents require the desktop runtime");
+  return b.invoke!<InstalledAgentSummary[]>("installed_agent_summaries");
+}
+
 export async function listSummaries(): Promise<ProviderSummary[]> {
   const b = await backend();
   if (b.kind === "tauri") return b.invoke!<ProviderSummary[]>("provider_summaries");

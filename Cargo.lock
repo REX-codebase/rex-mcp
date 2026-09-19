@@ -2611,6 +2611,7 @@ dependencies = [
 name = "rex-harness"
 version = "0.1.0"
 dependencies = [
+ "rex-installed-agents",
  "rex-preview",
  "rex-providers",
  "rex-search",
@@ -2619,6 +2620,14 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "rex-installed-agents"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
