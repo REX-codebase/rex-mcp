@@ -162,7 +162,7 @@ export default function App() {
         </div>
       )}
       <div className="ultra-atmosphere" aria-hidden="true"><span className="ultra-horizon" /><span className="ultra-scan" /></div>
-      <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={toggleFast} />
+      <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={toggleFast} live={liveCapable} />
       <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Premium preview engaged" : "Premium preview offline"}</b><small>No extra capabilities are active</small></div>
       <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "TEMPO PROFILE ARMED" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small><i aria-hidden="true" /></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">

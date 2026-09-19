@@ -32,7 +32,8 @@
 .live-receipt-meta{margin-left:auto;font:10px "JetBrains Mono",monospace;color:var(--color-faint,#9ca3af)}
 .live-receipt .tool-receipt{margin:0;border:0;border-top:1px solid var(--color-line,#e5e7eb);border-radius:0}
 .live-preview{margin:16px 0 0}
-.live-canvas{cursor:none}
+.live-canvas{display:block;height:auto;min-height:420px;cursor:none}
+.live-canvas img{width:100%}
 .live-canvas-wait{padding:60px 20px;text-align:center;font-size:13px;color:#8a8d95}
 .live-evidence-toggle{margin:12px 0 0}
 .live-evidence{margin-top:10px;border-top:1px solid var(--color-line,#e5e7eb);padding-top:14px}
