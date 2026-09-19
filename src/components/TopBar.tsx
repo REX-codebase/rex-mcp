@@ -19,7 +19,7 @@ export function TopBar({ view, onView, ultra, onUltra, fast, onFast, live }: { v
         <button type="button" className={`ultra-control ${ultra ? "is-on" : ""}`} aria-pressed={ultra} aria-label={`${ultra ? "Turn off" : "Preview"} Ultra mode`} onClick={onUltra}>
           <span className="ultra-glyph" aria-hidden="true"><i /><i /><i /></span>
           <span className="ultra-label">Ultra</span>
-          <span className="ultra-tier">Preview</span>
+          <span className="ultra-tier">{ultra ? "Verified runs" : "Preview"}</span>
         </button>
         {live ? (
           <span className="preview-state flex shrink-0 items-center gap-2 text-[10px] font-medium tracking-wide text-faint sm:text-[11px]" title="A live backend is connected. Runs execute against the real provider.">

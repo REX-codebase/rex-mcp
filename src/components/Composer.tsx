@@ -32,9 +32,9 @@ export function Composer({ task, setTask, state, onRun }: { task: string; setTas
         <div className="task-controls">
           <div className="flex min-w-0 items-center gap-3 sm:gap-5">
             <ModelStatus />
-            <span className="hidden items-center gap-2 text-[11px] text-faint sm:flex" title="Monid search is planned for a future backend integration; it is not connected in this preview.">
+            <span className="hidden items-center gap-2 text-[11px] text-faint sm:flex" title="REX-search is the in-house zero-cost engine; it is not connected in this preview.">
               <span className="h-1.5 w-1.5 rounded-full bg-line" aria-hidden="true" />
-              Monid · search planned
+              REX-search · not connected in preview
             </span>
           </div>
           <div className="flex items-center gap-3">
@@ -56,7 +56,7 @@ export function Composer({ task, setTask, state, onRun }: { task: string; setTas
       )}
       <p className="mt-3 flex items-center gap-2 text-[11px] text-faint sm:hidden">
         <span className="h-1.5 w-1.5 rounded-full bg-line" aria-hidden="true" />
-        Monid search planned · not connected
+        REX-search not connected in this preview
       </p>
     </section>
   );
