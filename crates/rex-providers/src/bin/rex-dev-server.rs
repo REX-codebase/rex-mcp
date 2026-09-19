@@ -82,9 +82,9 @@ fn main() {
     }
 
     let store = match store_dir {
-        Some(dir) => Store::File(
-            FileSecretStore::new(dir.into()).expect("could not open dev secret store"),
-        ),
+        Some(dir) => {
+            Store::File(FileSecretStore::new(dir.into()).expect("could not open dev secret store"))
+        }
         None => Store::Memory(MemorySecretStore::new()),
     };
     let service = Arc::new(ProviderService::new(store, UreqTransport::new()));
@@ -103,7 +103,10 @@ fn main() {
     eprintln!("rex-dev-server listening on http://127.0.0.1:{port} (localhost only)");
     if !replays.is_empty() {
         let names: Vec<String> = replays.iter().map(|(p, _)| p.clone()).collect();
-        eprintln!("replayed catalogs (recorded live data): {}", names.join(", "));
+        eprintln!(
+            "replayed catalogs (recorded live data): {}",
+            names.join(", ")
+        );
     }
     for stream in listener.incoming() {
         match stream {
@@ -147,7 +150,11 @@ fn normalize_replay(provider: &str, body: &serde_json::Value) -> Vec<rex_provide
                 .filter(|d| !d.is_empty())
                 .unwrap_or(id)
                 .to_string();
-            out.push(rex_providers::ModelInfo { id: id.to_string(), label, provider: provider.to_string() });
+            out.push(rex_providers::ModelInfo {
+                id: id.to_string(),
+                label,
+                provider: provider.to_string(),
+            });
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -215,29 +222,54 @@ fn route(method: &str, path: &str, body: &str, service: &Arc<Service>) -> String
             json_response(200, &serde_json::to_string(&service.summaries()).unwrap())
         }
         ("POST", ["api", "providers", id, "key"]) => {
-            let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
             let key = parsed.get("key").and_then(|k| k.as_str()).unwrap_or("");
             let base_url = parsed.get("base_url").and_then(|b| b.as_str());
             match service.set_key(id, key, base_url) {
                 Ok(()) => json_response(200, "{\"ok\":true}"),
-                Err(e) => json_response(200, &format!("{{\"ok\":false,\"error\":{}}}", serde_json::to_string(&e).unwrap())),
+                Err(e) => json_response(
+                    200,
+                    &format!(
+                        "{{\"ok\":false,\"error\":{}}}",
+                        serde_json::to_string(&e).unwrap()
+                    ),
+                ),
             }
         }
         ("DELETE", ["api", "providers", id, "key"]) => match service.clear_key(id) {
             Ok(()) => json_response(200, "{\"ok\":true}"),
-            Err(e) => json_response(200, &format!("{{\"ok\":false,\"error\":{}}}", serde_json::to_string(&e).unwrap())),
+            Err(e) => json_response(
+                200,
+                &format!(
+                    "{{\"ok\":false,\"error\":{}}}",
+                    serde_json::to_string(&e).unwrap()
+                ),
+            ),
         },
         ("POST", ["api", "providers", id, "refresh"]) => match service.refresh(id) {
             Ok(catalog) => json_response(
                 200,
-                &format!("{{\"ok\":true,\"catalog\":{}}}", serde_json::to_string(&catalog).unwrap()),
+                &format!(
+                    "{{\"ok\":true,\"catalog\":{}}}",
+                    serde_json::to_string(&catalog).unwrap()
+                ),
             ),
-            Err(e) => json_response(200, &format!("{{\"ok\":false,\"error\":{}}}", serde_json::to_string(&e).unwrap())),
+            Err(e) => json_response(
+                200,
+                &format!(
+                    "{{\"ok\":false,\"error\":{}}}",
+                    serde_json::to_string(&e).unwrap()
+                ),
+            ),
         },
         ("GET", ["api", "providers", id, "catalog"]) => match service.catalog(id) {
             Some(catalog) => json_response(200, &serde_json::to_string(&catalog).unwrap()),
             None => json_response(404, "{\"error\":{\"kind\":\"not_configured\"}}"),
         },
-        _ => json_response(404, "{\"error\":{\"kind\":\"invalid_response\",\"detail\":\"unknown route\"}}"),
+        _ => json_response(
+            404,
+            "{\"error\":{\"kind\":\"invalid_response\",\"detail\":\"unknown route\"}}",
+        ),
     }
 }

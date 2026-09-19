@@ -14,6 +14,7 @@ import {
 } from "./data/motion";
 import { BrowserView } from "./components/BrowserView";
 import { PreviewRuntimeView } from "./components/PreviewRuntimeView";
+import { ToolApprovalPreview } from "./components/ToolApprovalPreview";
 import "./preview-runtime.css";
 import { PAST_SESSIONS, newSession, startMockTurn, type Session } from "./data/mock";
 
@@ -160,6 +161,7 @@ export default function App() {
               </div>
             )}
             <StateRail state={state} blockedReason={latest?.blockedReason} />
+            {import.meta.env.DEV && new URLSearchParams(window.location.search).has("approval-preview") && <ToolApprovalPreview />}
             {session && previewTask && <PreviewRuntimeView />}
             {ultra && session && !previewTask && browserPhase === "active" && (
               <BrowserView

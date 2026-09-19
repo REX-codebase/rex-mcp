@@ -1734,9 +1734,7 @@ mod http_fixtures {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .ok();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 let mut buf: Vec<u8> = Vec::new();
                 let mut chunk = [0u8; 2048];
                 let mut target = String::new();
@@ -1778,8 +1776,10 @@ mod http_fixtures {
                         ));
                         out
                     }
-                    None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_string(),
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
                 };
                 stream.write_all(response.as_bytes()).ok();
                 stream.flush().ok();
@@ -1826,7 +1826,12 @@ mod http_fixtures {
             ),
         ]);
         let response = fixture_engine(5).search(seed_request(&server.url("/start")));
-        assert_eq!(response.evidence.len(), 1, "failures: {:?}", response.failures);
+        assert_eq!(
+            response.evidence.len(),
+            1,
+            "failures: {:?}",
+            response.failures
+        );
         let item = &response.evidence[0];
         assert_eq!(item.state, FetchState::Fetched);
         assert_eq!(item.final_url, server.url("/final"));
@@ -1839,7 +1844,11 @@ mod http_fixtures {
                 server.url("/final")
             ]
         );
-        assert!(item.content.as_deref().unwrap_or("").contains("evidence marker"));
+        assert!(item
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("evidence marker"));
         assert_eq!(response.coverage.redirects_followed, 3);
     }
 
@@ -1877,7 +1886,12 @@ mod http_fixtures {
         assert_eq!(allowed_origin.hits.load(Ordering::SeqCst), 1);
 
         let fetched = engine.search(seed_request(&source.url("/open")));
-        assert_eq!(fetched.evidence.len(), 1, "failures: {:?}", fetched.failures);
+        assert_eq!(
+            fetched.evidence.len(),
+            1,
+            "failures: {:?}",
+            fetched.failures
+        );
         assert_eq!(fetched.evidence[0].final_url, allowed_origin.url("/public"));
         // Second search reloads robots.txt, then fetches the page; /private
         // was still never requested.
@@ -1886,10 +1900,7 @@ mod http_fixtures {
 
     #[test]
     fn cross_host_redirect_out_of_scope_is_refused_before_fetch() {
-        let server = serve(vec![(
-            "/start",
-            redirect_to("http://example.com/escape"),
-        )]);
+        let server = serve(vec![("/start", redirect_to("http://example.com/escape"))]);
         let response = fixture_engine(5).search(seed_request(&server.url("/start")));
         assert_eq!(response.evidence.len(), 0);
         assert_eq!(response.failures.len(), 1);
@@ -1903,7 +1914,10 @@ mod http_fixtures {
         let response = fixture_engine(5).search(seed_request(&server.url("/start")));
         assert_eq!(response.evidence.len(), 0);
         assert_eq!(response.failures.len(), 1);
-        assert_eq!(response.failures[0].state, FetchState::RedirectMissingLocation);
+        assert_eq!(
+            response.failures[0].state,
+            FetchState::RedirectMissingLocation
+        );
         assert_eq!(response.failures[0].http_status, Some(302));
     }
 
@@ -1943,14 +1957,17 @@ mod http_fixtures {
         assert_eq!(failure.state, FetchState::RedirectLimit);
         assert_eq!(failure.http_status, Some(302));
         assert_eq!(failure.redirect_chain.len(), 4); // start plus 3 followed hops
-        // robots fetch plus 4 page requests, no unbounded spinning.
+                                                     // robots fetch plus 4 page requests, no unbounded spinning.
         assert_eq!(server.hits.load(Ordering::SeqCst), 5);
     }
 
     #[test]
     fn redirect_to_private_or_loopback_destination_is_rejected() {
         let server = serve(vec![
-            ("/metadata", redirect_to("http://169.254.169.254/latest/meta-data")),
+            (
+                "/metadata",
+                redirect_to("http://169.254.169.254/latest/meta-data"),
+            ),
             ("/internal-net", redirect_to("http://10.9.8.7/x")),
             ("/cg-nat", redirect_to("http://100.64.0.1/x")),
         ]);
@@ -2002,11 +2019,21 @@ mod http_fixtures {
             per_origin_delay: Duration::from_millis(0),
             ..SearchConfig::default()
         });
-        for seed in [server.url("/"), format!("http://localhost:{}/", server.base.rsplit(':').next().unwrap())] {
+        for seed in [
+            server.url("/"),
+            format!(
+                "http://localhost:{}/",
+                server.base.rsplit(':').next().unwrap()
+            ),
+        ] {
             let response = engine.search(seed_request(&seed));
             assert_eq!(response.evidence.len(), 0, "{seed}");
             assert_eq!(response.failures.len(), 1, "{seed}");
-            assert_eq!(response.failures[0].state, FetchState::UnsafeAddress, "{seed}");
+            assert_eq!(
+                response.failures[0].state,
+                FetchState::UnsafeAddress,
+                "{seed}"
+            );
         }
         assert_eq!(server.hits.load(Ordering::SeqCst), 0);
     }

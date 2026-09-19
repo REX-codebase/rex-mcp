@@ -9,5 +9,10 @@ license = "Proprietary"
 serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+rex-tools = { path = "../rex-tools" }
 rex-search = { path = "../rex-search" }
 url = "2"
+
+
+[dev-dependencies]
+tempfile = "3"

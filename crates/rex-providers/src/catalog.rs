@@ -33,6 +33,11 @@ pub struct ModelCatalog {
 
 impl ModelCatalog {
     pub fn live(provider: &str, fetched_at: u64, models: Vec<ModelInfo>) -> Self {
-        Self { provider: provider.to_string(), fetched_at, source: CatalogSource::Live, models }
+        Self {
+            provider: provider.to_string(),
+            fetched_at,
+            source: CatalogSource::Live,
+            models,
+        }
     }
 }

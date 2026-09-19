@@ -37,7 +37,7 @@ const initial: LivePreviewState = {
 
 export function PreviewRuntimeView({ state = initial, onCancel }: { state?: LivePreviewState; onCancel?: () => void }) {
   const [active, setActive] = useState(state.selectedIteration);
-  const receipt = useMemo(() => state.evidence.find((item) => item.iteration === active) ?? state.evidence.at(-1), [active, state.evidence]);
+  const receipt = useMemo(() => state.evidence.find((item) => item.iteration === active) ?? state.evidence[state.evidence.length - 1], [active, state.evidence]);
 
   return (
     <section className="preview-runtime" aria-label="Live app preview">

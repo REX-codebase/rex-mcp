@@ -31,8 +31,8 @@ pub enum RiskClass {
     Denied,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "tool", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolRequest {
     ReadFile {
         path: String,
@@ -74,6 +74,7 @@ pub struct PreparedCall {
 #[serde(rename_all = "snake_case")]
 pub enum CallState {
     PendingApproval,
+    Cancelled,
     Ready,
     Denied,
     Executed,
@@ -122,6 +123,7 @@ pub enum ErrorKind {
     TooLarge,
     ApprovalRequired,
     UserDenied,
+    Cancelled,
     PolicyDenied,
     Conflict,
     Timeout,
@@ -226,6 +228,25 @@ impl ToolRuntime {
         Ok(call.state.clone())
     }
 
+    /// Cancel a pending call from trusted controller state. Cancellation is
+    /// terminal and never comes from model content.
+    pub fn cancel(&self, call_id: &str) -> Result<CallState, ToolError> {
+        let mut pending = self.pending.lock().expect("pending lock poisoned");
+        let call = pending
+            .get_mut(call_id)
+            .ok_or_else(|| err(ErrorKind::UnknownCall, "unknown or expired call"))?;
+        match call.state {
+            CallState::PendingApproval | CallState::Ready => {
+                call.state = CallState::Cancelled;
+                Ok(CallState::Cancelled)
+            }
+            _ => Err(err(
+                ErrorKind::InvalidRequest,
+                "call cannot be cancelled in its current state",
+            )),
+        }
+    }
+
     pub fn execute(&self, call_id: &str) -> ToolResult {
         let started = Instant::now();
         let started_at_ms = now_ms();
@@ -249,6 +270,17 @@ impl ToolRuntime {
                         &call.prepared.tool,
                         ErrorKind::ApprovalRequired,
                         "user approval is required",
+                        started_at_ms,
+                        started,
+                        &self.root,
+                    )
+                }
+                Some(call) if call.state == CallState::Cancelled => {
+                    return failure(
+                        call_id,
+                        &call.prepared.tool,
+                        ErrorKind::Cancelled,
+                        "call was cancelled",
                         started_at_ms,
                         started,
                         &self.root,

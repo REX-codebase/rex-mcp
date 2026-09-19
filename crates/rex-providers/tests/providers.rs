@@ -36,7 +36,9 @@ impl Transport for ScriptedTransport {
     }
 }
 
-fn service_with(transport: ScriptedTransport) -> ProviderService<MemorySecretStore, ScriptedTransport> {
+fn service_with(
+    transport: ScriptedTransport,
+) -> ProviderService<MemorySecretStore, ScriptedTransport> {
     ProviderService::new(MemorySecretStore::new(), transport)
 }
 
@@ -54,12 +56,20 @@ fn gemini_catalog_normalizes_and_filters() {
     svc.set_key("gemini", "test-key", None).unwrap();
     let catalog = svc.refresh("gemini").unwrap();
     assert_eq!(catalog.source, CatalogSource::Live);
-    assert_eq!(catalog.models.len(), 2, "embedding-only model must be filtered out");
+    assert_eq!(
+        catalog.models.len(),
+        2,
+        "embedding-only model must be filtered out"
+    );
     assert_eq!(catalog.models[0].id, "gemini-2.5-flash");
     assert_eq!(catalog.models[0].label, "Gemini 2.5 Flash");
     assert_eq!(catalog.models[1].id, "gemini-2.5-pro");
     assert!(
-        svc.transport().seen_header_names.lock().unwrap().contains(&"x-goog-api-key".to_string()),
+        svc.transport()
+            .seen_header_names
+            .lock()
+            .unwrap()
+            .contains(&"x-goog-api-key".to_string()),
         "gemini auth must use the x-goog-api-key header"
     );
 }
@@ -124,17 +134,22 @@ fn openai_compatible_catalog_normalizes() {
 fn openai_base_url_override_is_used() {
     let body = serde_json::json!({"data": [{"id": "local-model"}]}).to_string();
     let svc = service_with(ScriptedTransport::new(vec![(200, body)]));
-    svc.set_key("local", "not-needed", Some("http://127.0.0.1:1234/v1/")).unwrap();
+    svc.set_key("local", "not-needed", Some("http://127.0.0.1:1234/v1/"))
+        .unwrap();
     let catalog = svc.refresh("local").unwrap();
     assert_eq!(catalog.models[0].id, "local-model");
     let urls = svc.transport().seen_urls.lock().unwrap();
-    assert_eq!(urls[0], "http://127.0.0.1:1234/v1/models", "trailing slash must be trimmed");
+    assert_eq!(
+        urls[0], "http://127.0.0.1:1234/v1/models",
+        "trailing slash must be trimmed"
+    );
 }
 
 #[test]
 fn manual_discovery_reports_unsupported() {
     let svc = service_with(ScriptedTransport::new(vec![]));
-    svc.set_key("custom", "test-key", Some("https://example.com/v1")).unwrap();
+    svc.set_key("custom", "test-key", Some("https://example.com/v1"))
+        .unwrap();
     let err = svc.refresh("custom").unwrap_err();
     assert!(matches!(err, ProviderError::Unsupported(_)));
 }
@@ -152,7 +167,11 @@ fn auth_failure_is_mapped() {
     svc.set_key("gemini", "bad-key", None).unwrap();
     let err = svc.refresh("gemini").unwrap_err();
     assert_eq!(err, ProviderError::AuthFailed);
-    let summary = svc.summaries().into_iter().find(|s| s.id == "gemini").unwrap();
+    let summary = svc
+        .summaries()
+        .into_iter()
+        .find(|s| s.id == "gemini")
+        .unwrap();
     assert_eq!(summary.last_error, Some(ProviderError::AuthFailed));
 }
 
@@ -160,21 +179,33 @@ fn auth_failure_is_mapped() {
 fn rate_limit_is_mapped() {
     let svc = service_with(ScriptedTransport::new(vec![(429, "{}".into())]));
     svc.set_key("gemini", "k", None).unwrap();
-    assert_eq!(svc.refresh("gemini").unwrap_err(), ProviderError::RateLimited);
+    assert_eq!(
+        svc.refresh("gemini").unwrap_err(),
+        ProviderError::RateLimited
+    );
 }
 
 #[test]
 fn empty_catalog_is_mapped() {
-    let svc = service_with(ScriptedTransport::new(vec![(200, "{\"models\": []}".into())]));
+    let svc = service_with(ScriptedTransport::new(vec![(
+        200,
+        "{\"models\": []}".into(),
+    )]));
     svc.set_key("gemini", "k", None).unwrap();
-    assert_eq!(svc.refresh("gemini").unwrap_err(), ProviderError::EmptyCatalog);
+    assert_eq!(
+        svc.refresh("gemini").unwrap_err(),
+        ProviderError::EmptyCatalog
+    );
 }
 
 #[test]
 fn invalid_json_is_mapped() {
     let svc = service_with(ScriptedTransport::new(vec![(200, "not json".into())]));
     svc.set_key("gemini", "k", None).unwrap();
-    assert!(matches!(svc.refresh("gemini").unwrap_err(), ProviderError::InvalidResponse(_)));
+    assert!(matches!(
+        svc.refresh("gemini").unwrap_err(),
+        ProviderError::InvalidResponse(_)
+    ));
 }
 
 #[test]
@@ -183,11 +214,19 @@ fn failed_refresh_keeps_previous_catalog() {
         "models": [{"name": "models/keep-me", "supportedGenerationMethods": ["generateContent"]}]
     })
     .to_string();
-    let svc = service_with(ScriptedTransport::new(vec![(200, good), (500, "{}".into())]));
+    let svc = service_with(ScriptedTransport::new(vec![
+        (200, good),
+        (500, "{}".into()),
+    ]));
     svc.set_key("gemini", "k", None).unwrap();
     svc.refresh("gemini").unwrap();
-    assert!(matches!(svc.refresh("gemini").unwrap_err(), ProviderError::InvalidResponse(_)));
-    let catalog = svc.catalog("gemini").expect("previous catalog must survive a failed refresh");
+    assert!(matches!(
+        svc.refresh("gemini").unwrap_err(),
+        ProviderError::InvalidResponse(_)
+    ));
+    let catalog = svc
+        .catalog("gemini")
+        .expect("previous catalog must survive a failed refresh");
     assert_eq!(catalog.models[0].id, "keep-me");
 }
 
@@ -202,7 +241,11 @@ fn clear_key_drops_catalog() {
     svc.refresh("gemini").unwrap();
     svc.clear_key("gemini").unwrap();
     assert!(svc.catalog("gemini").is_none());
-    let summary = svc.summaries().into_iter().find(|s| s.id == "gemini").unwrap();
+    let summary = svc
+        .summaries()
+        .into_iter()
+        .find(|s| s.id == "gemini")
+        .unwrap();
     assert!(!summary.has_key);
 }
 
@@ -218,7 +261,11 @@ fn file_secret_store_roundtrip_and_permissions() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.join("secrets.json")).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(dir.join("secrets.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "secrets file must be owner-only");
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -227,7 +274,10 @@ fn file_secret_store_roundtrip_and_permissions() {
 #[test]
 fn live_fixture_parses_through_normalizer() {
     // Recorded from the real Gemini ListModels API (see fixtures/README).
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/gemini-list-models-live.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/gemini-list-models-live.json"
+    );
     if let Ok(body) = std::fs::read_to_string(path) {
         let svc = service_with(ScriptedTransport::new(vec![(200, body)]));
         svc.set_key("gemini", "recorded", None).unwrap();
@@ -277,7 +327,10 @@ impl OneShotServer {
             }
             seen
         });
-        Self { base: format!("http://127.0.0.1:{port}"), handle: Some(handle) }
+        Self {
+            base: format!("http://127.0.0.1:{port}"),
+            handle: Some(handle),
+        }
     }
 }
 
@@ -312,9 +365,13 @@ fn real_http_client_maps_statuses() {
         http_response(200, "{\"data\": [{\"id\": \"m1\"}]}"),
     ]);
     let svc = ProviderService::new(MemorySecretStore::new(), UreqTransport::new());
-    svc.set_key("local", "k", Some(&format!("{}/v1", server.base))).unwrap();
+    svc.set_key("local", "k", Some(&format!("{}/v1", server.base)))
+        .unwrap();
     assert_eq!(svc.refresh("local").unwrap_err(), ProviderError::AuthFailed);
-    assert_eq!(svc.refresh("local").unwrap_err(), ProviderError::RateLimited);
+    assert_eq!(
+        svc.refresh("local").unwrap_err(),
+        ProviderError::RateLimited
+    );
     let catalog = svc.refresh("local").unwrap();
     assert_eq!(catalog.models[0].id, "m1");
 }
@@ -323,8 +380,12 @@ fn real_http_client_maps_statuses() {
 fn real_http_client_reports_network_error() {
     // Port 1 is reserved and refuses connections: a genuine network failure.
     let svc = ProviderService::new(MemorySecretStore::new(), UreqTransport::new());
-    svc.set_key("local", "k", Some("http://127.0.0.1:1/v1")).unwrap();
-    assert!(matches!(svc.refresh("local").unwrap_err(), ProviderError::Network(_)));
+    svc.set_key("local", "k", Some("http://127.0.0.1:1/v1"))
+        .unwrap();
+    assert!(matches!(
+        svc.refresh("local").unwrap_err(),
+        ProviderError::Network(_)
+    ));
 }
 
 // ---- Access policy: which account types REX may connect, and why ----
@@ -333,7 +394,11 @@ fn real_http_client_reports_network_error() {
 fn every_registry_provider_has_a_policy() {
     for spec in registry() {
         let policies = access_policies(spec.id);
-        assert!(!policies.is_empty(), "provider {} must carry an access policy", spec.id);
+        assert!(
+            !policies.is_empty(),
+            "provider {} must carry an access policy",
+            spec.id
+        );
     }
 }
 
@@ -352,7 +417,10 @@ fn non_supported_routes_always_cite_official_sources() {
                 policy.status
             );
             for source in policy.sources {
-                assert!(source.starts_with("https://"), "sources must be canonical URLs: {source}");
+                assert!(
+                    source.starts_with("https://"),
+                    "sources must be canonical URLs: {source}"
+                );
             }
         }
     }
@@ -363,7 +431,10 @@ fn supported_subscription_routes_are_grounded() {
     let mut found = 0;
     for spec in registry() {
         for policy in access_policies(spec.id) {
-            let is_subscription = matches!(policy.kind, AccessKind::SubscriptionKey | AccessKind::SubscriptionOauth);
+            let is_subscription = matches!(
+                policy.kind,
+                AccessKind::SubscriptionKey | AccessKind::SubscriptionOauth
+            );
             if is_subscription && policy.status == PolicyStatus::Supported {
                 found += 1;
                 assert!(
@@ -375,7 +446,10 @@ fn supported_subscription_routes_are_grounded() {
             }
         }
     }
-    assert!(found >= 1, "at least one legitimately offered subscription hook must exist");
+    assert!(
+        found >= 1,
+        "at least one legitimately offered subscription hook must exist"
+    );
 }
 
 #[test]
@@ -386,7 +460,8 @@ fn subscription_oauth_is_never_offered() {
     for spec in registry() {
         for policy in access_policies(spec.id) {
             assert!(
-                !(policy.kind == AccessKind::SubscriptionOauth && policy.status == PolicyStatus::Supported),
+                !(policy.kind == AccessKind::SubscriptionOauth
+                    && policy.status == PolicyStatus::Supported),
                 "{} / {}: consumer-subscription OAuth must not be offered",
                 spec.id,
                 policy.label
@@ -400,22 +475,33 @@ fn anthropic_subscription_signin_stays_not_permitted() {
     // Anthropic's legal page explicitly forbids routing requests through
     // Free/Pro/Max plan credentials in third-party products. Guard it.
     let policies = access_policies("anthropic");
-    assert!(policies.iter().any(|p| p.kind == AccessKind::SubscriptionOauth
-        && p.status == PolicyStatus::NotPermitted
-        && !p.sources.is_empty()));
+    assert!(policies
+        .iter()
+        .any(|p| p.kind == AccessKind::SubscriptionOauth
+            && p.status == PolicyStatus::NotPermitted
+            && !p.sources.is_empty()));
 }
 
 #[test]
 fn verified_dates_are_real_dates() {
     let valid = |d: &str| {
         d.len() == 10
-            && d.chars().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() })
+            && d.chars().enumerate().all(|(i, c)| {
+                if i == 4 || i == 7 {
+                    c == '-'
+                } else {
+                    c.is_ascii_digit()
+                }
+            })
     };
     assert!(valid(VERIFIED_ON));
     for spec in registry() {
         for policy in access_policies(spec.id) {
             assert!(valid(policy.verified_on));
-            assert_eq!(policy.verified_on, VERIFIED_ON, "policy dates and the crate constant move together");
+            assert_eq!(
+                policy.verified_on, VERIFIED_ON,
+                "policy dates and the crate constant move together"
+            );
         }
     }
 }
@@ -434,7 +520,10 @@ fn openai_and_xai_and_qwen_use_openai_models_discovery() {
     for (provider, expected_url) in [
         ("openai", "https://api.openai.com/v1/models"),
         ("xai", "https://api.x.ai/v1/models"),
-        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
+        (
+            "qwen",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+        ),
     ] {
         let svc = service_with(ScriptedTransport::new(vec![(200, body.clone())]));
         svc.set_key(provider, "test-key", None).unwrap();
@@ -453,20 +542,44 @@ fn kimi_coding_honors_manual_discovery_without_http() {
     svc.set_key("kimi-coding", "test-key", None).unwrap();
     let err = svc.refresh("kimi-coding").unwrap_err();
     assert!(matches!(err, ProviderError::Unsupported(_)));
-    assert!(svc.transport().seen_urls.lock().unwrap().is_empty(), "no HTTP call may be attempted");
+    assert!(
+        svc.transport().seen_urls.lock().unwrap().is_empty(),
+        "no HTTP call may be attempted"
+    );
 }
 
 #[derive(Clone)]
-struct SearchTransport { status: u16, body: String }
+struct SearchTransport {
+    status: u16,
+    body: String,
+}
 impl Transport for SearchTransport {
-    fn get(&self, _: &str, _: &[(String, String)]) -> Result<(u16, String), ProviderError> { Ok((self.status, self.body.clone())) }
-    fn post(&self, _: &str, _: &[(String, String)], _: &str) -> Result<(u16, String), ProviderError> { Ok((self.status, self.body.clone())) }
+    fn get(&self, _: &str, _: &[(String, String)]) -> Result<(u16, String), ProviderError> {
+        Ok((self.status, self.body.clone()))
+    }
+    fn post(
+        &self,
+        _: &str,
+        _: &[(String, String)],
+        _: &str,
+    ) -> Result<(u16, String), ProviderError> {
+        Ok((self.status, self.body.clone()))
+    }
 }
 #[test]
 fn search_router_defaults_to_private_rex_and_requires_keys_for_external_selection() {
-    let router = SearchRouter::new(MemorySecretStore::new(), SearchTransport { status: 200, body: "{}".into() });
+    let router = SearchRouter::new(
+        MemorySecretStore::new(),
+        SearchTransport {
+            status: 200,
+            body: "{}".into(),
+        },
+    );
     assert_eq!(router.active(), SearchProvider::Rex);
-    assert_eq!(router.select(SearchProvider::Exa), Err(ProviderError::NotConfigured));
+    assert_eq!(
+        router.select(SearchProvider::Exa),
+        Err(ProviderError::NotConfigured)
+    );
     router.set_key(SearchProvider::Exa, "secret").unwrap();
     router.select(SearchProvider::Exa).unwrap();
     assert_eq!(router.active(), SearchProvider::Exa);
@@ -475,12 +588,29 @@ fn search_router_defaults_to_private_rex_and_requires_keys_for_external_selectio
 }
 #[test]
 fn exa_and_tinyfish_normalize_to_one_evidence_contract() {
-    let body = r#"{"results":[{"url":"https://example.com/a","title":"A","text":"body","score":0.9}]}"#;
+    let body =
+        r#"{"results":[{"url":"https://example.com/a","title":"A","text":"body","score":0.9}]}"#;
     for provider in [SearchProvider::Exa, SearchProvider::Tinyfish] {
-        let router = SearchRouter::new(MemorySecretStore::new(), SearchTransport { status: 200, body: body.into() });
+        let router = SearchRouter::new(
+            MemorySecretStore::new(),
+            SearchTransport {
+                status: 200,
+                body: body.into(),
+            },
+        );
         router.set_key(provider, "secret").unwrap();
         router.select(provider).unwrap();
-        let response = router.search(rex_search::SearchRequest { query: "a".into(), seeds: vec![], max_pages: 2, max_results: 2, allow_subdomains: false, discover_sitemaps: false, discover_feeds: false }).unwrap();
+        let response = router
+            .search(rex_search::SearchRequest {
+                query: "a".into(),
+                seeds: vec![],
+                max_pages: 2,
+                max_results: 2,
+                allow_subdomains: false,
+                discover_sitemaps: false,
+                discover_feeds: false,
+            })
+            .unwrap();
         assert_eq!(response.evidence[0].url, "https://example.com/a");
         assert_eq!(response.evidence[0].state, rex_search::FetchState::Fetched);
         assert!(response.coverage.model.starts_with("hosted:"));
@@ -488,9 +618,23 @@ fn exa_and_tinyfish_normalize_to_one_evidence_contract() {
 }
 #[test]
 fn hosted_rate_limits_stay_truthful() {
-    let router = SearchRouter::new(MemorySecretStore::new(), SearchTransport { status: 429, body: String::new() });
+    let router = SearchRouter::new(
+        MemorySecretStore::new(),
+        SearchTransport {
+            status: 429,
+            body: String::new(),
+        },
+    );
     router.set_key(SearchProvider::Tinyfish, "secret").unwrap();
     router.select(SearchProvider::Tinyfish).unwrap();
-    let result = router.search(rex_search::SearchRequest { query: "a".into(), seeds: vec![], max_pages: 1, max_results: 1, allow_subdomains: false, discover_sitemaps: false, discover_feeds: false });
+    let result = router.search(rex_search::SearchRequest {
+        query: "a".into(),
+        seeds: vec![],
+        max_pages: 1,
+        max_results: 1,
+        allow_subdomains: false,
+        discover_sitemaps: false,
+        discover_feeds: false,
+    });
     assert_eq!(result.unwrap_err(), ProviderError::RateLimited);
 }

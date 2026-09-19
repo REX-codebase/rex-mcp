@@ -10,17 +10,13 @@ use rex_providers::{
 };
 use rex_search::{IndexHit, IndexedDocument, LocalIndex, SearchRequest, SearchResponse};
 use rex_tools::{CallState, PreparedCall, ToolRequest, ToolResult, ToolRuntime};
-use rex_preview::{detect_project, BrowserAction, LaunchPlan, PreviewError, PreviewRecipe, PreviewSession, SessionState, PORT_MIN, PORT_MAX};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::sync::Arc;
 use tauri::State;
 
 type Service = ProviderService<FileSecretStore, UreqTransport>;
 type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 type LocalTools = ToolRuntime;
-type Previews = Mutex<HashMap<String, PreviewSession>>;
 
 fn search_index() -> LocalIndex {
     LocalIndex::open(config_dir().join("search-index.json"))
@@ -154,71 +150,12 @@ fn tool_execute(tools: State<'_, Arc<LocalTools>>, call_id: String) -> ToolResul
     tools.execute(&call_id)
 }
 
-
-fn preview_manifest_snapshot(workspace: &std::path::Path, project_dir: &std::path::Path) -> Result<BTreeMap<String, String>, PreviewError> {
-    let root = workspace.join(project_dir);
-    let mut files = BTreeMap::new();
-    for name in ["package.json", "index.html", "vite.config.ts", "vite.config.js", "next.config.js", "next.config.mjs", "next.config.ts"] {
-        let path = root.join(name);
-        if path.is_file() {
-            let text = std::fs::read_to_string(path).map_err(|_| PreviewError::UnsupportedProject)?;
-            if text.len() <= 1024 * 1024 { files.insert(name.to_string(), text); }
-        }
-    }
-    Ok(files)
-}
-
 #[tauri::command]
-fn preview_detect(project_dir: String) -> Result<PreviewRecipe, String> {
-    let workspace = std::env::var("REX_WORKSPACE_ROOT").map(PathBuf::from).unwrap_or_else(|_| config_dir().join("workspace"));
-    let project = PathBuf::from(project_dir);
-    let files = preview_manifest_snapshot(&workspace, &project).map_err(|e| e.to_string())?;
-    detect_project(&workspace, &project, &files).map_err(|e| e.to_string())
-}
-
-#[derive(serde::Serialize)]
-struct PreviewSessionSummary { id: String, state: SessionState, url: String, framework: rex_preview::Framework, iteration: u8, cancellation_requested: bool }
-
-fn preview_summary(session: &PreviewSession, framework: rex_preview::Framework) -> Result<PreviewSessionSummary, String> {
-    Ok(PreviewSessionSummary { id: session.id.clone(), state: session.state.clone(), url: session.launch.url("/").map_err(|e| e.to_string())?.to_string(), framework, iteration: session.iteration, cancellation_requested: session.cancellation_requested })
-}
-
-#[tauri::command]
-fn preview_start(previews: State<'_, Arc<Previews>>, project_dir: String) -> Result<PreviewSessionSummary, String> {
-    let recipe = preview_detect(project_dir)?;
-    let port = PORT_MIN + (std::process::id() as u16 % (PORT_MAX - PORT_MIN));
-    let launch = LaunchPlan::from_recipe(&recipe, port).map_err(|e| e.to_string())?;
-    let id = format!("preview-{}-{}", std::process::id(), port);
-    let mut session = PreviewSession::new(id.clone(), launch, SystemTime::now());
-    session.start().map_err(|e| e.to_string())?;
-    // Process spawning belongs to the native supervisor increment. Until then the
-    // session remains `starting`; the UI must never claim it is live.
-    let summary = preview_summary(&session, recipe.framework)?;
-    previews.lock().map_err(|_| "preview registry poisoned")?.insert(id, session);
-    Ok(summary)
-}
-
-#[tauri::command]
-fn preview_action(previews: State<'_, Arc<Previews>>, session_id: String, action: BrowserAction) -> Result<(), String> {
-    action.validate().map_err(|e| e.to_string())?;
-    let previews = previews.lock().map_err(|_| "preview registry poisoned")?;
-    let session = previews.get(&session_id).ok_or("preview session not found")?;
-    if session.terminal() { return Err("preview session is terminal".into()); }
-    Ok(())
-}
-
-#[tauri::command]
-fn preview_cancel(previews: State<'_, Arc<Previews>>, session_id: String) -> Result<(), String> {
-    let mut previews = previews.lock().map_err(|_| "preview registry poisoned")?;
-    previews.get_mut(&session_id).ok_or("preview session not found")?.cancel();
-    Ok(())
-}
-
-#[tauri::command]
-fn preview_teardown(previews: State<'_, Arc<Previews>>, session_id: String) -> Result<(), String> {
-    let mut previews = previews.lock().map_err(|_| "preview registry poisoned")?;
-    if let Some(mut session) = previews.remove(&session_id) { session.cancel(); }
-    Ok(())
+fn tool_cancel(
+    tools: State<'_, Arc<LocalTools>>,
+    call_id: String,
+) -> Result<CallState, rex_tools::ToolError> {
+    tools.cancel(&call_id)
 }
 
 fn provider_bridge_smoke() -> bool {
@@ -256,13 +193,11 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| config_dir().join("workspace"));
     let tools = Arc::new(ToolRuntime::new(workspace).expect("could not open local tool workspace"));
-    let previews: Arc<Previews> = Arc::new(Mutex::new(HashMap::new()));
 
     tauri::Builder::default()
         .manage(service)
         .manage(search_service)
         .manage(tools)
-        .manage(previews)
         .invoke_handler(tauri::generate_handler![
             provider_summaries,
             provider_set_key,
@@ -280,11 +215,7 @@ fn main() {
             tool_prepare,
             tool_resolve_approval,
             tool_execute,
-            preview_detect,
-            preview_start,
-            preview_action,
-            preview_cancel,
-            preview_teardown,
+            tool_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running REX Harness");

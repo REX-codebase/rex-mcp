@@ -62,8 +62,19 @@ pub struct AccessPolicy {
     pub verified_on: &'static str,
 }
 
-const fn api_key(label: &'static str, detail: &'static str, sources: &'static [&'static str]) -> AccessPolicy {
-    AccessPolicy { kind: AccessKind::ApiKey, status: PolicyStatus::Supported, label, detail, sources, verified_on: VERIFIED_ON }
+const fn api_key(
+    label: &'static str,
+    detail: &'static str,
+    sources: &'static [&'static str],
+) -> AccessPolicy {
+    AccessPolicy {
+        kind: AccessKind::ApiKey,
+        status: PolicyStatus::Supported,
+        label,
+        detail,
+        sources,
+        verified_on: VERIFIED_ON,
+    }
 }
 
 const fn policy(
@@ -73,7 +84,14 @@ const fn policy(
     detail: &'static str,
     sources: &'static [&'static str],
 ) -> AccessPolicy {
-    AccessPolicy { kind, status, label, detail, sources, verified_on: VERIFIED_ON }
+    AccessPolicy {
+        kind,
+        status,
+        label,
+        detail,
+        sources,
+        verified_on: VERIFIED_ON,
+    }
 }
 
 /// The access routes evaluated for one registry provider. The frontend reads

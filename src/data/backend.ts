@@ -200,3 +200,10 @@ export async function selectSearchProvider(provider: SearchProviderId): Promise<
   const b=await backend(); if(b.kind!=="tauri") throw new Error("desktop runtime required");
   try { await b.invoke!("search_provider_select",{provider}); return {ok:true}; } catch(error){ return {ok:false,error:error as ProviderErrorShape}; }
 }
+
+export type RiskClass = "read" | "write" | "execute" | "denied";
+export interface PreparedToolCall { call_id:string; tool:string; summary:string; risk:RiskClass; approval_required:boolean; policy_reason:string; }
+export interface ToolReceipt { started_at_ms:number; duration_ms:number; target:string|null; command:string[]|null; exit_code:number|null; bytes_read:number; bytes_written:number; output_truncated:boolean; diff:string|null; redactions:number; }
+export interface ToolResult { call_id:string; ok:boolean; tool:string; state:"pending_approval"|"ready"|"denied"|"cancelled"|"executed"; output:string|null; error:{kind:string;detail:string}|null; receipt:ToolReceipt; }
+export async function resolveToolApproval(callId:string,approved:boolean):Promise<ToolResult>{const b=await backend();if(b.kind!=="tauri")throw new Error("desktop runtime required");await b.invoke!("tool_resolve_approval",{callId,approved});return b.invoke!<ToolResult>("tool_execute",{callId});}
+export async function cancelToolCall(callId:string):Promise<void>{const b=await backend();if(b.kind!=="tauri")return;await b.invoke!("tool_cancel",{callId});}
