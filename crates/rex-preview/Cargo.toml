@@ -1,0 +1,11 @@
+[package]
+name = "rex-preview"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-owned live preview and grounded visual iteration runtime for REX Harness"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+url = "2"
