@@ -54,7 +54,16 @@ async function get<T>(cmd: string, path: string, args?: Record<string, unknown>)
   return (await response.json()) as T;
 }
 
-export const agentBegin = (task: string) => call<AgentSnapshot>("agent_begin", "/runs", { task });
+export const agentBegin = (task: string) => {
+  let provider = "gemini";
+  let model: string | undefined;
+  try {
+    const selected = JSON.parse(window.localStorage.getItem("rex-model-selection") || "null") as { provider?: string; id?: string } | null;
+    if (selected?.provider) provider = selected.provider;
+    if (selected?.id) model = selected.id;
+  } catch { /* fall back to Gemini */ }
+  return call<AgentSnapshot>("agent_begin", "/runs", { task, provider, model });
+};
 export const agentSnapshot = (runId: string) => get<AgentSnapshot>("agent_snapshot", `/runs/${runId}`, { runId });
 export const agentDecide = (runId: string, approved: boolean) =>
   call<AgentSnapshot>("agent_decide", `/runs/${runId}/decision`, { runId, approved });

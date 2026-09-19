@@ -103,7 +103,10 @@ fn main() {
     };
     let agent = Arc::new(Agent::new(
         ProviderService::new(make_store(&store_dir), UreqTransport::new()),
-        Some(SearchRouter::new(make_store(&store_dir), UreqTransport::new())),
+        Some(SearchRouter::new(
+            make_store(&store_dir),
+            UreqTransport::new(),
+        )),
         agent_runs_root,
     ));
 
@@ -356,7 +359,12 @@ fn route(method: &str, path: &str, body: &str, live: &Arc<Live>, agent: &Arc<Age
             let budgets: Option<Budgets> = parsed
                 .get("budgets")
                 .and_then(|b| serde_json::from_value(b.clone()).ok());
-            match agent.begin(task, "gemini", budgets) {
+            let provider = parsed
+                .get("provider")
+                .and_then(|p| p.as_str())
+                .unwrap_or("gemini");
+            let model = parsed.get("model").and_then(|m| m.as_str());
+            match agent.begin_with_model(task, provider, model, budgets) {
                 Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
                 Err(detail) => json_response(
                     200,

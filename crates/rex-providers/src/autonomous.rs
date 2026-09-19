@@ -20,15 +20,20 @@
 //! rolling transcript and no summary-of-summary prose; old material stays on
 //! disk, addressable, instead of being repeatedly rewritten.
 //!
+//! One loop is shared across provider protocols. Capability discovery selects a documented
+//! Gemini, Anthropic Messages, or OpenAI-compatible wire adapter; models never get
+//! their own control loop. Unknown/private protocols stop truthfully instead of being guessed.
+//!
 //! Hard controls: step/tool-call/time/token budgets, provider retry with
 //! backoff, cancellation, trusted approval suspension (the model can never
 //! release its own write), repeated-failure and no-progress detection, and
 //! truthful terminal reasons.
 
+use crate::http::Transport;
+use crate::providers::{find_spec, ProviderProtocol};
 use crate::search::SearchRouter;
 use crate::secrets::SecretStore;
 use crate::service::ProviderService;
-use crate::http::Transport;
 use rex_preview::{
     BrowserAction, BrowserEvidence, IterationReceipt, PreviewSupervisor, ProductionGate,
 };
@@ -173,14 +178,34 @@ impl TerminalReason {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AgentEvent {
-    PlanUpdated { items: Vec<PlanItem> },
-    ModelText { text: String },
-    ToolFinished { result: ToolResult },
-    ApprovalRequired { call: PreparedCall },
-    ApprovalResolved { call_id: String, approved: bool },
-    GateResult { attempt: u8, passed: bool, failures: Vec<String> },
-    Retry { attempt: u32, reason: String },
-    Info { message: String },
+    PlanUpdated {
+        items: Vec<PlanItem>,
+    },
+    ModelText {
+        text: String,
+    },
+    ToolFinished {
+        result: ToolResult,
+    },
+    ApprovalRequired {
+        call: PreparedCall,
+    },
+    ApprovalResolved {
+        call_id: String,
+        approved: bool,
+    },
+    GateResult {
+        attempt: u8,
+        passed: bool,
+        failures: Vec<String>,
+    },
+    Retry {
+        attempt: u32,
+        reason: String,
+    },
+    Info {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -248,7 +273,9 @@ struct DigestEntry {
 /// so the provider conversation stays valid without a full transcript.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct TurnPair {
+    /// Provider-native assistant tool-call blocks (or OpenAI tool_call objects).
     model_parts: Vec<Value>,
+    /// Provider-native tool-result blocks (or complete OpenAI tool messages).
     response_parts: Vec<Value>,
 }
 
@@ -315,11 +342,26 @@ impl RunHandle {
 enum AgentCall {
     /// A call we could not decode; reported back to the model as an error
     /// so it can correct itself instead of dying as a provider failure.
-    BadCall { name: String, id: String, error: String },
-    Tool { id: String, request: ToolRequest },
-    UpdatePlan { items: Vec<PlanItem> },
-    WebSearch { id: String, query: String, max_results: usize },
-    CompleteTask { summary: String },
+    BadCall {
+        name: String,
+        id: String,
+        error: String,
+    },
+    Tool {
+        id: String,
+        request: ToolRequest,
+    },
+    UpdatePlan {
+        items: Vec<PlanItem>,
+    },
+    WebSearch {
+        id: String,
+        query: String,
+        max_results: usize,
+    },
+    CompleteTask {
+        summary: String,
+    },
 }
 
 pub struct AutonomousRunService<S: SecretStore + 'static, T: Transport + 'static> {
@@ -355,13 +397,19 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             task: brief.as_ref().map(|b| b.task.clone()).unwrap_or_default(),
             status: state.status.clone(),
             terminal_reason: state.terminal.clone(),
-            provider: brief.as_ref().map(|b| b.provider.clone()).unwrap_or_default(),
+            provider: brief
+                .as_ref()
+                .map(|b| b.provider.clone())
+                .unwrap_or_default(),
             model: state.model.clone(),
             plan: state.plan.clone(),
             step: state.step,
             max_steps: brief.as_ref().map(|b| b.budgets.max_steps).unwrap_or(0),
             tool_calls: state.tool_calls,
-            max_tool_calls: brief.as_ref().map(|b| b.budgets.max_tool_calls).unwrap_or(0),
+            max_tool_calls: brief
+                .as_ref()
+                .map(|b| b.budgets.max_tool_calls)
+                .unwrap_or(0),
             tokens_used: state.tokens_used,
             max_tokens: brief.as_ref().map(|b| b.budgets.max_tokens).unwrap_or(0),
             elapsed_ms: state.elapsed_ms,
@@ -380,6 +428,18 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         provider: &str,
         budgets: Option<Budgets>,
     ) -> Result<AgentSnapshot, String> {
+        self.begin_with_model(task, provider, None, budgets)
+    }
+
+    /// Start the same autonomous runtime with any documented provider wire
+    /// protocol. The selected model is data, not a separate loop.
+    pub fn begin_with_model(
+        &self,
+        task: &str,
+        provider: &str,
+        requested_model: Option<&str>,
+        budgets: Option<Budgets>,
+    ) -> Result<AgentSnapshot, String> {
         let task = task.trim();
         if task.is_empty() {
             return Err("task is empty".into());
@@ -387,9 +447,15 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         if task.chars().count() > 4_000 {
             return Err("task is too long".into());
         }
-        if provider != "gemini" {
+        let spec = find_spec(provider).ok_or_else(|| format!("unknown provider {provider}"))?;
+        if !matches!(
+            spec.protocol,
+            ProviderProtocol::Gemini
+                | ProviderProtocol::Anthropic
+                | ProviderProtocol::OpenAiCompatible
+        ) {
             return Err(format!(
-                "autonomous runs are implemented for gemini, not {provider}"
+                "provider {provider} has no documented autonomous protocol adapter"
             ));
         }
         let budgets = budgets.unwrap_or_default().clamped();
@@ -460,7 +526,10 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             search: self.search.clone(),
             state_dir,
             workspace,
-            checkpoint: Checkpoint::default(),
+            checkpoint: Checkpoint {
+                model: requested_model.unwrap_or_default().trim().to_string(),
+                ..Checkpoint::default()
+            },
         };
         std::thread::spawn(move || drive(loop_ctx));
         Ok(self.snapshot_of(&id, &handle))
@@ -488,10 +557,10 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 .as_ref()
                 .map(|c| c.call_id.clone())
                 .unwrap_or_default();
-            push_locked(&mut state, AgentEvent::ApprovalResolved {
-                call_id,
-                approved,
-            });
+            push_locked(
+                &mut state,
+                AgentEvent::ApprovalResolved { call_id, approved },
+            );
         }
         handle.cond.notify_all();
         Ok(self.snapshot_of(run_id, handle))
@@ -514,7 +583,12 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         {
             let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
             if let Some(handle) = runs.get(run_id) {
-                if handle.shared.lock().map(|s| s.terminal.is_none()).unwrap_or(false) {
+                if handle
+                    .shared
+                    .lock()
+                    .map(|s| s.terminal.is_none())
+                    .unwrap_or(false)
+                {
                     return Err("run is already active".into());
                 }
             }
@@ -528,8 +602,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         }
         let checkpoint = read_json::<Checkpoint>(&state_dir.join("checkpoint.json"))
             .map_err(|_| "no checkpoint to resume from".to_string())?;
-        let plan: Vec<PlanItem> =
-            read_json(&state_dir.join("plan.json")).unwrap_or_default();
+        let plan: Vec<PlanItem> = read_json(&state_dir.join("plan.json")).unwrap_or_default();
         let workspace = run_dir.join("workspace");
         if !workspace.is_dir() {
             return Err("checkpointed workspace is missing".into());
@@ -622,9 +695,10 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             handle.cancel.store(true, Ordering::SeqCst);
             handle.cond.notify_all();
             if let Ok(mut state) = handle.shared.lock() {
-                if let (Some(sup), Some(sid)) =
-                    (state.preview_supervisor.take(), state.preview_session.take())
-                {
+                if let (Some(sup), Some(sid)) = (
+                    state.preview_supervisor.take(),
+                    state.preview_session.take(),
+                ) {
                     let _ = sup.teardown(&sid);
                 }
             }
@@ -709,9 +783,15 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
     let tools = match ToolRuntime::new(&ctx.workspace) {
         Ok(t) => t,
         Err(e) => {
-            finish(&ctx, &mut ledger, TerminalReason::ProviderError {
-                detail: format!("workspace tools failed: {}", e.detail),
-            }, started, &ctx.checkpoint);
+            finish(
+                &ctx,
+                &mut ledger,
+                TerminalReason::ProviderError {
+                    detail: format!("workspace tools failed: {}", e.detail),
+                },
+                started,
+                &ctx.checkpoint,
+            );
             return;
         }
     };
@@ -724,20 +804,36 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         match ctx.service.refresh(&ctx.brief.provider) {
             Ok(catalog) => {
                 let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
-                match crate::live::pick_flash_lite(&ids) {
-                    Some(m) => model = m,
-                    None => {
-                        finish(&ctx, &mut ledger, TerminalReason::ProviderError {
-                            detail: "no live Flash Lite model in the current catalog".into(),
-                        }, started, &ctx.checkpoint);
-                        return;
-                    }
+                model = if ctx.brief.provider == "gemini" {
+                    crate::live::pick_flash_lite(&ids)
+                        .or_else(|| ids.first().map(|s| (*s).to_string()))
+                } else {
+                    ids.first().map(|s| (*s).to_string())
+                }
+                .unwrap_or_default();
+                if model.is_empty() {
+                    finish(
+                        &ctx,
+                        &mut ledger,
+                        TerminalReason::ProviderError {
+                            detail: "provider returned no callable models".into(),
+                        },
+                        started,
+                        &ctx.checkpoint,
+                    );
+                    return;
                 }
             }
             Err(e) => {
-                finish(&ctx, &mut ledger, TerminalReason::ProviderError {
-                    detail: format!("catalog failed: {e}"),
-                }, started, &ctx.checkpoint);
+                finish(
+                    &ctx,
+                    &mut ledger,
+                    TerminalReason::ProviderError {
+                        detail: format!("catalog failed: {e}"),
+                    },
+                    started,
+                    &ctx.checkpoint,
+                );
                 return;
             }
         }
@@ -745,9 +841,15 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
     match ctx.service.get_key(&ctx.brief.provider) {
         Ok(Some(k)) => key = k,
         _ => {
-            finish(&ctx, &mut ledger, TerminalReason::ProviderError {
-                detail: "no API key stored for this provider".into(),
-            }, started, &ctx.checkpoint);
+            finish(
+                &ctx,
+                &mut ledger,
+                TerminalReason::ProviderError {
+                    detail: "no API key stored for this provider".into(),
+                },
+                started,
+                &ctx.checkpoint,
+            );
             return;
         }
     }
@@ -756,6 +858,36 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         s.status = AgentStatus::Running;
     }
 
+    let protocol = match find_spec(&ctx.brief.provider) {
+        Some(spec) => spec.protocol,
+        None => {
+            finish(
+                &ctx,
+                &mut ledger,
+                TerminalReason::ProviderError {
+                    detail: "provider disappeared from registry".into(),
+                },
+                started,
+                &ctx.checkpoint,
+            );
+            return;
+        }
+    };
+    let base_url = match ctx.service.base_url(&ctx.brief.provider) {
+        Ok(url) => url,
+        Err(e) => {
+            finish(
+                &ctx,
+                &mut ledger,
+                TerminalReason::ProviderError {
+                    detail: e.to_string(),
+                },
+                started,
+                &ctx.checkpoint,
+            );
+            return;
+        }
+    };
     let mut cp = ctx.checkpoint.clone();
     let budgets = ctx.brief.budgets;
 
@@ -778,69 +910,141 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             s.tokens_used = cp.tokens_used;
         }
         if cp.step >= budgets.max_steps {
-            finish(&ctx, &mut ledger, TerminalReason::BudgetSteps { max_steps: budgets.max_steps }, started, &cp);
+            finish(
+                &ctx,
+                &mut ledger,
+                TerminalReason::BudgetSteps {
+                    max_steps: budgets.max_steps,
+                },
+                started,
+                &cp,
+            );
             return;
         }
         if elapsed > budgets.max_wall_ms {
-            finish(&ctx, &mut ledger, TerminalReason::BudgetTime { max_wall_ms: budgets.max_wall_ms }, started, &cp);
+            finish(
+                &ctx,
+                &mut ledger,
+                TerminalReason::BudgetTime {
+                    max_wall_ms: budgets.max_wall_ms,
+                },
+                started,
+                &cp,
+            );
             return;
         }
         if cp.tokens_used > budgets.max_tokens {
-            finish(&ctx, &mut ledger, TerminalReason::BudgetTokens { max_tokens: budgets.max_tokens }, started, &cp);
+            finish(
+                &ctx,
+                &mut ledger,
+                TerminalReason::BudgetTokens {
+                    max_tokens: budgets.max_tokens,
+                },
+                started,
+                &cp,
+            );
             return;
         }
         if cp.turns_since_progress >= MAX_NO_PROGRESS_TURNS && cp.step > 0 {
-            finish(&ctx, &mut ledger, TerminalReason::NoProgress { turns: cp.turns_since_progress }, started, &cp);
+            finish(
+                &ctx,
+                &mut ledger,
+                TerminalReason::NoProgress {
+                    turns: cp.turns_since_progress,
+                },
+                started,
+                &cp,
+            );
             return;
         }
 
         // ---- dynamic context build ---------------------------------------
         let state_msg = build_state_message(&ctx.brief, &cp, budgets, current_plan(&ctx.handle));
-        let request_body = build_request(&model, &state_msg, cp.last_pair.as_ref());
+        let request_body = build_request(protocol, &model, &state_msg, cp.last_pair.as_ref());
         let turn_no = cp.step + 1;
         let _ = fs::write(
-            ctx.state_dir.join("evidence").join(format!("turn-{turn_no}-request.json")),
+            ctx.state_dir
+                .join("evidence")
+                .join(format!("turn-{turn_no}-request.json")),
             &request_body,
         );
 
         // ---- provider turn with bounded retry/backoff --------------------
-        let response = match generate_with_retry(ctx.service.transport(), &key, &model, &request_body, &ctx.handle) {
+        let response = match generate_with_retry(
+            ctx.service.transport(),
+            protocol,
+            &base_url,
+            &key,
+            &model,
+            &request_body,
+            &ctx.handle,
+        ) {
             Ok(r) => r,
             Err(detail) => {
-                finish(&ctx, &mut ledger, TerminalReason::ProviderError { detail }, started, &cp);
+                finish(
+                    &ctx,
+                    &mut ledger,
+                    TerminalReason::ProviderError { detail },
+                    started,
+                    &cp,
+                );
                 return;
             }
         };
         let _ = fs::write(
-            ctx.state_dir.join("evidence").join(format!("turn-{turn_no}-response.json")),
+            ctx.state_dir
+                .join("evidence")
+                .join(format!("turn-{turn_no}-response.json")),
             &response,
         );
         cp.step += 1;
-        let (usage_total, response_text) = (usage_tokens(&response), response.len() as u64);
+        let (usage_total, response_text) =
+            (usage_tokens(protocol, &response), response.len() as u64);
         cp.tokens_used += usage_total.unwrap_or((request_body.len() as u64 + response_text) / 4);
         if let Some(l) = ledger.as_mut() {
-            l.append("model_turn", json!({
-                "turn": turn_no, "model": model,
-                "request_bytes": request_body.len(), "response_bytes": response.len(),
-                "usage_tokens": usage_total,
-            }));
+            l.append(
+                "model_turn",
+                json!({
+                    "turn": turn_no, "model": model,
+                    "request_bytes": request_body.len(), "response_bytes": response.len(),
+                    "usage_tokens": usage_total,
+                }),
+            );
         }
 
-        let decoded = match decode_gemini_calls(&response) {
+        let decoded = match decode_provider_calls(protocol, &response) {
             Ok(v) => v,
             Err(e) => {
-                finish(&ctx, &mut ledger, TerminalReason::ProviderError {
-                    detail: format!("undecodable model turn: {e}"),
-                }, started, &cp);
+                finish(
+                    &ctx,
+                    &mut ledger,
+                    TerminalReason::ProviderError {
+                        detail: format!("undecodable model turn: {e}"),
+                    },
+                    started,
+                    &cp,
+                );
                 return;
             }
         };
         for text in &decoded.texts {
-            RunHandle::push_event(&ctx.handle.shared, AgentEvent::ModelText { text: text.clone() });
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::ModelText { text: text.clone() },
+            );
         }
 
         // ---- execute the turn's calls ------------------------------------
-        let out = execute_turn(&ctx, &tools, &mut ledger, decoded.calls, decoded.thought_signature, &mut cp, started);
+        let out = execute_turn(
+            &ctx,
+            &tools,
+            &mut ledger,
+            protocol,
+            decoded.calls,
+            decoded.thought_signature,
+            &mut cp,
+            started,
+        );
         if let Some(fatal) = out.fatal {
             #[cfg(test)]
             if matches!(fatal, TerminalReason::Cancelled)
@@ -866,12 +1070,21 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         if out.stall {
             cp.consec_stall += 1;
             if cp.consec_stall >= MAX_STALL_TURNS {
-                finish(&ctx, &mut ledger, TerminalReason::ModelStalled, started, &cp);
+                finish(
+                    &ctx,
+                    &mut ledger,
+                    TerminalReason::ModelStalled,
+                    started,
+                    &cp,
+                );
                 return;
             }
-            RunHandle::push_event(&ctx.handle.shared, AgentEvent::Info {
-                message: "model produced no tool calls; nudging it toward the plan".into(),
-            });
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::Info {
+                    message: "model produced no tool calls; nudging it toward the plan".into(),
+                },
+            );
         } else {
             cp.consec_stall = 0;
         }
@@ -883,7 +1096,10 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         if out.mutating_success {
             cp.any_mutating_success = true;
         }
-        cp.digest.push(DigestEntry { turn: turn_no, actions: out.digest_actions });
+        cp.digest.push(DigestEntry {
+            turn: turn_no,
+            actions: out.digest_actions,
+        });
         if cp.digest.len() > 12 {
             cp.digest.remove(0);
         }
@@ -940,26 +1156,62 @@ fn build_state_message(
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
 }
 
-fn build_request(_model: &str, state_msg: &str, prev: Option<&TurnPair>) -> String {
-    let mut contents = vec![json!({"role":"user","parts":[{"text": state_msg}]})];
-    if let Some(pair) = prev {
-        if !pair.model_parts.is_empty() {
-            contents.push(json!({"role":"model","parts": pair.model_parts}));
+fn build_request(
+    protocol: ProviderProtocol,
+    model: &str,
+    state_msg: &str,
+    prev: Option<&TurnPair>,
+) -> String {
+    match protocol {
+        ProviderProtocol::Gemini => {
+            let mut contents = vec![json!({"role":"user","parts":[{"text": state_msg}]})];
+            if let Some(pair) = prev {
+                if !pair.model_parts.is_empty() {
+                    contents.push(json!({"role":"model","parts": pair.model_parts}));
+                }
+                if !pair.response_parts.is_empty() {
+                    contents.push(json!({"role":"user","parts": pair.response_parts}));
+                }
+            }
+            json!({"contents": contents, "tools": gemini_tool_definitions(),
+                "toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},
+                "generationConfig":{"temperature":0.2,"maxOutputTokens":8192}})
+            .to_string()
         }
-        if !pair.response_parts.is_empty() {
-            contents.push(json!({"role":"user","parts": pair.response_parts}));
+        ProviderProtocol::Anthropic => {
+            let mut messages = Vec::new();
+            if let Some(pair) = prev {
+                if !pair.model_parts.is_empty() {
+                    messages.push(json!({"role":"assistant","content":pair.model_parts}));
+                }
+                if !pair.response_parts.is_empty() {
+                    messages.push(json!({"role":"user","content":pair.response_parts}));
+                }
+            }
+            messages.push(json!({"role":"user","content":state_msg}));
+            json!({"model":model,"max_tokens":8192,"temperature":0.2,
+                "system":"You are REX. Use the provided tools until the task is verifiably complete.",
+                "messages":messages,"tools":anthropic_tool_definitions()}).to_string()
+        }
+        ProviderProtocol::OpenAiCompatible => {
+            let mut messages = vec![
+                json!({"role":"system","content":"You are REX. Use the provided tools until the task is verifiably complete."}),
+            ];
+            if let Some(pair) = prev {
+                if !pair.model_parts.is_empty() {
+                    messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":pair.model_parts}));
+                }
+                messages.extend(pair.response_parts.clone());
+            }
+            messages.push(json!({"role":"user","content":state_msg}));
+            json!({"model":model,"messages":messages,"tools":openai_tool_definitions(),
+                "tool_choice":"auto","temperature":0.2,"max_tokens":8192})
+            .to_string()
         }
     }
-    json!({
-        "contents": contents,
-        "tools": tool_definitions(),
-        "toolConfig": {"functionCallingConfig": {"mode":"AUTO"}},
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
-    })
-    .to_string()
 }
 
-fn tool_definitions() -> Value {
+fn gemini_tool_definitions() -> Value {
     json!([{"functionDeclarations":[
         {"name":"update_plan","description":"Replace the visible todo plan. Keep 2-8 items; one in_progress at a time.","parameters":{"type":"OBJECT","properties":{"items":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"id":{"type":"STRING"},"title":{"type":"STRING"},"status":{"type":"STRING","enum":["pending","in_progress","done","blocked"]},"note":{"type":"STRING"}},"required":["id","title","status"]}}},"required":["items"]}},
         {"name":"read_file","description":"Read a file inside the selected workspace.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"}},"required":["path"]}},
@@ -972,33 +1224,90 @@ fn tool_definitions() -> Value {
     ]}])
 }
 
+fn anthropic_tool_definitions() -> Value {
+    let declarations = gemini_tool_definitions()[0]["functionDeclarations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Value::Array(declarations.into_iter().map(|d| json!({
+        "name": d["name"], "description": d["description"], "input_schema": lowercase_schema(d["parameters"].clone())
+    })).collect())
+}
+
+fn openai_tool_definitions() -> Value {
+    let declarations = gemini_tool_definitions()[0]["functionDeclarations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Value::Array(declarations.into_iter().map(|d| json!({"type":"function","function":{
+        "name":d["name"],"description":d["description"],"parameters":lowercase_schema(d["parameters"].clone())
+    }})).collect())
+}
+
+fn lowercase_schema(mut value: Value) -> Value {
+    match &mut value {
+        Value::Object(map) => {
+            if let Some(Value::String(t)) = map.get_mut("type") {
+                *t = t.to_ascii_lowercase();
+            }
+            for child in map.values_mut() {
+                *child = lowercase_schema(child.take());
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                *child = lowercase_schema(child.take());
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
 fn generate_with_retry<T: Transport>(
     transport: &T,
+    protocol: ProviderProtocol,
+    base_url: &str,
     key: &str,
     model: &str,
     body: &str,
     handle: &Arc<RunHandle>,
 ) -> Result<String, String> {
-    let url =
-        format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
+    let (url, headers) = match protocol {
+        ProviderProtocol::Gemini => (
+            format!(
+                "{}/v1beta/models/{model}:generateContent",
+                base_url.trim_end_matches('/')
+            ),
+            vec![
+                ("x-goog-api-key".into(), key.into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+        ),
+        ProviderProtocol::Anthropic => (
+            format!("{}/v1/messages", base_url.trim_end_matches('/')),
+            vec![
+                ("x-api-key".into(), key.into()),
+                ("anthropic-version".into(), "2023-06-01".into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+        ),
+        ProviderProtocol::OpenAiCompatible => (
+            format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            vec![
+                ("authorization".into(), format!("Bearer {key}")),
+                ("content-type".into(), "application/json".into()),
+            ],
+        ),
+    };
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         if handle.cancel.load(Ordering::SeqCst) {
             return Err("cancelled".into());
         }
-        let result = transport.post(
-            &url,
-            &[
-                ("x-goog-api-key".into(), key.into()),
-                ("content-type".into(), "application/json".into()),
-            ],
-            body,
-        );
-        let retryable = match &result {
-            Ok((status, _)) => *status == 429 || *status >= 500,
-            Err(_) => true,
-        };
+        let result = transport.post(&url, &headers, body);
+        let retryable = matches!(&result, Ok((429, _)) | Ok((500..=599, _)) | Err(_));
         match result {
             Ok((status, text)) if status / 100 == 2 => return Ok(text),
             Ok((status, text)) => {
@@ -1006,28 +1315,51 @@ fn generate_with_retry<T: Transport>(
                 if !retryable || attempt >= PROVIDER_RETRIES {
                     return Err(detail);
                 }
-                RunHandle::push_event(&handle.shared, AgentEvent::Retry { attempt, reason: detail });
+                RunHandle::push_event(
+                    &handle.shared,
+                    AgentEvent::Retry {
+                        attempt,
+                        reason: detail,
+                    },
+                );
             }
             Err(e) => {
                 if attempt >= PROVIDER_RETRIES {
                     return Err(format!("provider transport failed: {e}"));
                 }
-                RunHandle::push_event(&handle.shared, AgentEvent::Retry {
-                    attempt,
-                    reason: format!("transport error: {e}"),
-                });
+                RunHandle::push_event(
+                    &handle.shared,
+                    AgentEvent::Retry {
+                        attempt,
+                        reason: format!("transport error: {e}"),
+                    },
+                );
             }
         }
         std::thread::sleep(Duration::from_millis(500 * (1 << (attempt - 1))));
     }
 }
 
-fn usage_tokens(response: &str) -> Option<u64> {
+fn usage_tokens(protocol: ProviderProtocol, response: &str) -> Option<u64> {
     let value: Value = serde_json::from_str(response).ok()?;
-    value
-        .get("usageMetadata")
-        .and_then(|u| u.get("totalTokenCount"))
-        .and_then(Value::as_u64)
+    match protocol {
+        ProviderProtocol::Gemini => value
+            .pointer("/usageMetadata/totalTokenCount")
+            .and_then(Value::as_u64),
+        ProviderProtocol::Anthropic => Some(
+            value
+                .pointer("/usage/input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                + value
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+        ),
+        ProviderProtocol::OpenAiCompatible => {
+            value.pointer("/usage/total_tokens").and_then(Value::as_u64)
+        }
+    }
 }
 
 /// Decode a Gemini generateContent response into texts and loop calls. This
@@ -1098,11 +1430,14 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                 let query = match args.get("query").and_then(Value::as_str) {
                     Some(q) => q.to_string(),
                     None => {
-                        calls.push((AgentCall::BadCall {
-                            name: "web_search".into(),
-                            id,
-                            error: "web_search missing query".into(),
-                        }, raw));
+                        calls.push((
+                            AgentCall::BadCall {
+                                name: "web_search".into(),
+                                id,
+                                error: "web_search missing query".into(),
+                            },
+                            raw,
+                        ));
                         continue;
                     }
                 };
@@ -1112,7 +1447,14 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     .map(|n| n as usize)
                     .unwrap_or(5)
                     .clamp(1, 8);
-                calls.push((AgentCall::WebSearch { id, query, max_results }, raw));
+                calls.push((
+                    AgentCall::WebSearch {
+                        id,
+                        query,
+                        max_results,
+                    },
+                    raw,
+                ));
             }
             "complete_task" => {
                 let summary = args
@@ -1133,26 +1475,202 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     .insert("tool".into(), Value::String(name.into()));
                 match serde_json::from_value::<ToolRequest>(object) {
                     Ok(request) => calls.push((AgentCall::Tool { id, request }, raw)),
-                    Err(e) => calls.push((AgentCall::BadCall {
-                        name: name.into(),
-                        id,
-                        error: format!("invalid {name} request: {e}"),
-                    }, raw)),
+                    Err(e) => calls.push((
+                        AgentCall::BadCall {
+                            name: name.into(),
+                            id,
+                            error: format!("invalid {name} request: {e}"),
+                        },
+                        raw,
+                    )),
                 }
             }
         }
     }
-    Ok(DecodedCalls { texts, calls, thought_signature })
+    Ok(DecodedCalls {
+        texts,
+        calls,
+        thought_signature,
+    })
+}
+
+fn decode_provider_calls(
+    protocol: ProviderProtocol,
+    response: &str,
+) -> Result<DecodedCalls, String> {
+    match protocol {
+        ProviderProtocol::Gemini => decode_gemini_calls(response),
+        ProviderProtocol::Anthropic => decode_anthropic_calls(response),
+        ProviderProtocol::OpenAiCompatible => decode_openai_calls(response),
+    }
+}
+
+fn decode_named_call(
+    name: &str,
+    id: String,
+    args: Value,
+    raw: Value,
+) -> (AgentCall, Option<Value>) {
+    let bad = |error: String| {
+        (
+            AgentCall::BadCall {
+                name: name.into(),
+                id: id.clone(),
+                error,
+            },
+            Some(raw.clone()),
+        )
+    };
+    match name {
+        "update_plan" => match serde_json::from_value::<Vec<PlanItem>>(
+            args.get("items").cloned().unwrap_or_else(|| json!([])),
+        ) {
+            Ok(items) => (AgentCall::UpdatePlan { items }, Some(raw)),
+            Err(e) => bad(format!("invalid update_plan items: {e}")),
+        },
+        "web_search" => match args.get("query").and_then(Value::as_str) {
+            Some(q) => (
+                AgentCall::WebSearch {
+                    id,
+                    query: q.into(),
+                    max_results: args
+                        .get("max_results")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(5)
+                        .clamp(1, 8) as usize,
+                },
+                Some(raw),
+            ),
+            None => bad("web_search missing query".into()),
+        },
+        "complete_task" => (
+            AgentCall::CompleteTask {
+                summary: args
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+            },
+            Some(raw),
+        ),
+        _ => {
+            let mut object = args;
+            if !object.is_object() {
+                return bad(format!("tool {name} arguments must be an object"));
+            }
+            object
+                .as_object_mut()
+                .unwrap()
+                .insert("tool".into(), Value::String(name.into()));
+            match serde_json::from_value::<ToolRequest>(object) {
+                Ok(request) => (AgentCall::Tool { id, request }, Some(raw)),
+                Err(e) => bad(format!("invalid {name} request: {e}")),
+            }
+        }
+    }
+}
+
+fn decode_anthropic_calls(response: &str) -> Result<DecodedCalls, String> {
+    let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
+    let blocks = value
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or("missing content")?;
+    let mut texts = Vec::new();
+    let mut calls = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.trim().is_empty())
+                {
+                    texts.push(t.into())
+                }
+            }
+            Some("tool_use") => {
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("tool_use missing id")?
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or("tool_use missing name")?;
+                calls.push(decode_named_call(
+                    name,
+                    id,
+                    block.get("input").cloned().unwrap_or_else(|| json!({})),
+                    block.clone(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(DecodedCalls {
+        texts,
+        calls,
+        thought_signature: None,
+    })
+}
+
+fn decode_openai_calls(response: &str) -> Result<DecodedCalls, String> {
+    let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
+    let msg = value
+        .pointer("/choices/0/message")
+        .ok_or("missing choices[0].message")?;
+    let texts = msg
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| vec![t.into()])
+        .unwrap_or_default();
+    let mut calls = Vec::new();
+    for call in msg
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("tool call missing id")?
+            .to_string();
+        let f = call.get("function").ok_or("tool call missing function")?;
+        let name = f
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("tool call missing name")?;
+        let raw = f
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or("tool call missing arguments")?;
+        let args = serde_json::from_str(raw).map_err(|e| format!("invalid tool arguments: {e}"))?;
+        calls.push(decode_named_call(name, id, args, call.clone()));
+    }
+    Ok(DecodedCalls {
+        texts,
+        calls,
+        thought_signature: None,
+    })
 }
 
 fn call_signature(tool: &str, request: &Value) -> String {
-    format!("{}:{}", tool, serde_json::to_string(request).unwrap_or_default())
+    format!(
+        "{}:{}",
+        tool,
+        serde_json::to_string(request).unwrap_or_default()
+    )
 }
 
 fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
     ctx: &LoopCtx<S, T>,
     tools: &ToolRuntime,
     ledger: &mut Option<Ledger>,
+    protocol: ProviderProtocol,
     calls: Vec<(AgentCall, Option<Value>)>,
     thought_signature: Option<String>,
     cp: &mut Checkpoint,
@@ -1171,21 +1689,22 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
     let mut model_parts: Vec<Value> = Vec::new();
 
     let mut first_model_part = true;
-    let mut push_model_part = |model_parts: &mut Vec<Value>, raw: Option<Value>, fallback: Value| {
-        let mut part = raw.unwrap_or(fallback);
-        // Gemini 2.5 thinking models require the turn's thoughtSignature on
-        // the first function call echoed back; carry it if the raw part
-        // lost it (older models simply ignore nothing - they never send one).
-        if first_model_part {
-            if let Some(sig) = &thought_signature {
-                if part.get("thoughtSignature").is_none() {
-                    part["thoughtSignature"] = json!(sig);
+    let mut push_model_part =
+        |model_parts: &mut Vec<Value>, raw: Option<Value>, fallback: Value| {
+            let mut part = raw.unwrap_or(fallback);
+            // Gemini 2.5 thinking models require the turn's thoughtSignature on
+            // the first function call echoed back; carry it if the raw part
+            // lost it (older models simply ignore nothing - they never send one).
+            if first_model_part {
+                if let Some(sig) = &thought_signature {
+                    if part.get("thoughtSignature").is_none() {
+                        part["thoughtSignature"] = json!(sig);
+                    }
                 }
             }
-        }
-        first_model_part = false;
-        model_parts.push(part);
-    };
+            first_model_part = false;
+            model_parts.push(part);
+        };
     for (call, raw) in calls {
         if ctx.handle.cancel.load(Ordering::SeqCst) {
             out.fatal = Some(TerminalReason::Cancelled);
@@ -1206,12 +1725,19 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     target: None,
                     error_kind: Some("bad_call".into()),
                 });
-                push_model_part(&mut model_parts, raw, json!({"functionCall":{"name": name,"args": {}}}));
-                response_parts.push(function_response(&name, &id, false, &error));
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name": name,"args": {}}}),
+                );
+                response_parts.push(function_response(protocol, &name, &id, false, &error));
             }
             AgentCall::UpdatePlan { items } => {
                 let items: Vec<PlanItem> = items.into_iter().take(8).collect();
-                let in_progress = items.iter().filter(|i| i.status == PlanStatus::InProgress).count();
+                let in_progress = items
+                    .iter()
+                    .filter(|i| i.status == PlanStatus::InProgress)
+                    .count();
                 let note = if in_progress > 1 {
                     Some("multiple in_progress items; keep one active step")
                 } else {
@@ -1219,7 +1745,12 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 };
                 if let Ok(mut s) = ctx.handle.shared.lock() {
                     s.plan = items.clone();
-                    push_locked(&mut s, AgentEvent::PlanUpdated { items: items.clone() });
+                    push_locked(
+                        &mut s,
+                        AgentEvent::PlanUpdated {
+                            items: items.clone(),
+                        },
+                    );
                 }
                 let _ = write_json(&ctx.state_dir.join("plan.json"), &items);
                 if let Some(l) = ledger.as_mut() {
@@ -1233,7 +1764,11 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     error_kind: note.map(str::to_string),
                 });
             }
-            AgentCall::WebSearch { id, query, max_results } => {
+            AgentCall::WebSearch {
+                id,
+                query,
+                max_results,
+            } => {
                 let (ok, content) = match &ctx.search {
                     Some(router) => {
                         let request: SearchRequest = match serde_json::from_value(json!({
@@ -1241,7 +1776,13 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         })) {
                             Ok(r) => r,
                             Err(e) => {
-                                response_parts.push(function_response("web_search", &id, false, &format!("bad search request: {e}")));
+                                response_parts.push(function_response(
+                                    protocol,
+                                    "web_search",
+                                    &id,
+                                    false,
+                                    &format!("bad search request: {e}"),
+                                ));
                                 continue;
                             }
                         };
@@ -1257,11 +1798,15 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                                         "excerpt": e.excerpt.as_deref().map(|x| &x[..x.len().min(300)]),
                                     }))
                                     .collect();
-                                (true, serde_json::to_string(&json!({
-                                    "ok": true,
-                                    "results": results,
-                                    "note": resp.coverage.disclaimer,
-                                })).unwrap_or_else(|_| "{\"ok\":true}".into()))
+                                (
+                                    true,
+                                    serde_json::to_string(&json!({
+                                        "ok": true,
+                                        "results": results,
+                                        "note": resp.coverage.disclaimer,
+                                    }))
+                                    .unwrap_or_else(|_| "{\"ok\":true}".into()),
+                                )
                             }
                             Err(e) => (false, format!("search failed: {e}")),
                         }
@@ -1275,10 +1820,18 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     tool: "web_search".into(),
                     ok,
                     target: Some(query.clone()),
-                    error_kind: if ok { None } else { Some("search_failed".into()) },
+                    error_kind: if ok {
+                        None
+                    } else {
+                        Some("search_failed".into())
+                    },
                 });
-                push_model_part(&mut model_parts, raw, json!({"functionCall":{"name":"web_search","args":{"query": query}}}));
-                response_parts.push(function_response("web_search", &id, ok, &content));
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"web_search","args":{"query": query}}}),
+                );
+                response_parts.push(function_response(protocol, "web_search", &id, ok, &content));
             }
             AgentCall::CompleteTask { summary } => {
                 cp.gate_attempts += 1;
@@ -1286,11 +1839,14 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     s.status = AgentStatus::Verifying;
                 }
                 let (passed, failures) = verify_gates(ctx, cp, ledger);
-                RunHandle::push_event(&ctx.handle.shared, AgentEvent::GateResult {
-                    attempt: cp.gate_attempts,
-                    passed,
-                    failures: failures.clone(),
-                });
+                RunHandle::push_event(
+                    &ctx.handle.shared,
+                    AgentEvent::GateResult {
+                        attempt: cp.gate_attempts,
+                        passed,
+                        failures: failures.clone(),
+                    },
+                );
                 if let Some(l) = ledger.as_mut() {
                     l.append("gate", json!({"attempt": cp.gate_attempts, "passed": passed, "failures": failures}));
                 }
@@ -1317,12 +1873,25 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     target: None,
                     error_kind: Some("gates_failed".into()),
                 });
-                push_model_part(&mut model_parts, raw, json!({"functionCall":{"name":"complete_task","args":{"summary": summary}}}));
-                response_parts.push(function_response("complete_task", "gate", false, &feedback));
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"complete_task","args":{"summary": summary}}}),
+                );
+                response_parts.push(function_response(
+                    protocol,
+                    "complete_task",
+                    "gate",
+                    false,
+                    &feedback,
+                ));
             }
             AgentCall::Tool { id, request } => {
                 let tool_name = tool_name_of(&request);
-                let sig = call_signature(tool_name, &serde_json::to_value(&request).unwrap_or_default());
+                let sig = call_signature(
+                    tool_name,
+                    &serde_json::to_value(&request).unwrap_or_default(),
+                );
                 let prepared = match tools.prepare(request.clone()) {
                     Ok(p) => p,
                     Err(e) => {
@@ -1333,8 +1902,13 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                             target: None,
                             error_kind: Some(format!("{:?}", e.kind).to_lowercase()),
                         });
-                        push_model_part(&mut model_parts, raw, json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}));
-                        response_parts.push(function_response(tool_name, &id, false, &content));
+                        push_model_part(
+                            &mut model_parts,
+                            raw,
+                            json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}),
+                        );
+                        response_parts
+                            .push(function_response(protocol, tool_name, &id, false, &content));
                         continue;
                     }
                 };
@@ -1349,7 +1923,10 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                             cp.total_denials += 1;
                             let r = tools.execute(&prepared.call_id);
                             if cp.total_denials >= MAX_DENIALS {
-                                RunHandle::push_event(&ctx.handle.shared, AgentEvent::ToolFinished { result: r.clone() });
+                                RunHandle::push_event(
+                                    &ctx.handle.shared,
+                                    AgentEvent::ToolFinished { result: r.clone() },
+                                );
                                 out.fatal = Some(TerminalReason::Denied);
                                 return out;
                             }
@@ -1369,22 +1946,37 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     tools.execute(&prepared.call_id)
                 };
                 if let Some(l) = ledger.as_mut() {
-                    l.append("tool", json!({
-                        "call_id": result.call_id, "tool": result.tool, "ok": result.ok,
-                        "receipt": result.receipt,
-                    }));
+                    l.append(
+                        "tool",
+                        json!({
+                            "call_id": result.call_id, "tool": result.tool, "ok": result.ok,
+                            "receipt": result.receipt,
+                        }),
+                    );
                 }
                 let _ = fs::write(
-                    ctx.state_dir.join("evidence").join(format!("tool-{}.json", result.call_id)),
+                    ctx.state_dir
+                        .join("evidence")
+                        .join(format!("tool-{}.json", result.call_id)),
                     serde_json::to_string_pretty(&result).unwrap_or_default(),
                 );
-                RunHandle::push_event(&ctx.handle.shared, AgentEvent::ToolFinished { result: result.clone() });
+                RunHandle::push_event(
+                    &ctx.handle.shared,
+                    AgentEvent::ToolFinished {
+                        result: result.clone(),
+                    },
+                );
 
                 // repeated-failure detection on the exact call signature
                 if result.ok {
                     cp.consec_fail = 0;
                     cp.last_failure_sig = None;
-                    if matches!(request, ToolRequest::CreateFile { .. } | ToolRequest::EditFile { .. } | ToolRequest::RunCommand { .. }) {
+                    if matches!(
+                        request,
+                        ToolRequest::CreateFile { .. }
+                            | ToolRequest::EditFile { .. }
+                            | ToolRequest::RunCommand { .. }
+                    ) {
                         out.mutating_success = true;
                         out.progress = true;
                     }
@@ -1396,7 +1988,9 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         cp.last_failure_sig = Some(sig.clone());
                     }
                     if cp.consec_fail >= MAX_CONSEC_FAILURES {
-                        out.fatal = Some(TerminalReason::RepeatedFailure { tool: tool_name.into() });
+                        out.fatal = Some(TerminalReason::RepeatedFailure {
+                            tool: tool_name.into(),
+                        });
                         return out;
                     }
                 }
@@ -1421,11 +2015,23 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 out.digest_actions.push(DigestAction {
                     tool: tool_name.into(),
                     ok: result.ok,
-                    target: receipt.target.clone().or(receipt.command.as_ref().map(|c| c.join(" "))),
-                    error_kind: result.error.as_ref().map(|e| format!("{:?}", e.kind).to_lowercase()),
+                    target: receipt
+                        .target
+                        .clone()
+                        .or(receipt.command.as_ref().map(|c| c.join(" "))),
+                    error_kind: result
+                        .error
+                        .as_ref()
+                        .map(|e| format!("{:?}", e.kind).to_lowercase()),
                 });
-                push_model_part(&mut model_parts, raw, json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}));
-                response_parts.push(function_response(tool_name, &id, result.ok, &content));
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}),
+                );
+                response_parts.push(function_response(
+                    protocol, tool_name, &id, result.ok, &content,
+                ));
             }
         }
     }
@@ -1444,8 +2050,24 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
     out
 }
 
-fn function_response(name: &str, _id: &str, ok: bool, content: &str) -> Value {
-    json!({"functionResponse":{"name": name,"response":{"ok": ok,"content": content}}})
+fn function_response(
+    protocol: ProviderProtocol,
+    name: &str,
+    id: &str,
+    ok: bool,
+    content: &str,
+) -> Value {
+    match protocol {
+        ProviderProtocol::Gemini => {
+            json!({"functionResponse":{"name":name,"response":{"ok":ok,"content":content}}})
+        }
+        ProviderProtocol::Anthropic => {
+            json!({"type":"tool_result","tool_use_id":id,"is_error":!ok,"content":content})
+        }
+        ProviderProtocol::OpenAiCompatible => {
+            json!({"role":"tool","tool_call_id":id,"content":content})
+        }
+    }
 }
 
 fn tool_name_of(request: &ToolRequest) -> &'static str {
@@ -1495,7 +2117,11 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
         if let Some(approved) = guard.decision.take() {
             guard.status = AgentStatus::Running;
             guard.pending_approval = None;
-            return if approved { Decision::Approved } else { Decision::Denied };
+            return if approved {
+                Decision::Approved
+            } else {
+                Decision::Denied
+            };
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1534,7 +2160,10 @@ fn verify_gates<S: SecretStore + 'static, T: Transport + 'static>(
             failures.push(format!(
                 "plan has {} unfinished item(s): {}",
                 open.len(),
-                open.iter().map(|i| i.title.as_str()).collect::<Vec<_>>().join(", ")
+                open.iter()
+                    .map(|i| i.title.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -1556,19 +2185,44 @@ fn verify_ui<S: SecretStore + 'static, T: Transport + 'static>(
     ledger: &mut Option<Ledger>,
 ) -> Result<Vec<String>, String> {
     let supervisor = PreviewSupervisor::new(&ctx.workspace).map_err(|e| e.to_string())?;
-    let summary = supervisor.start(Path::new(".")).map_err(|e| e.to_string())?;
+    let summary = supervisor
+        .start(Path::new("."))
+        .map_err(|e| e.to_string())?;
     let sid = summary.id.clone();
-    let iteration = supervisor.begin_iteration(&sid).map_err(|e| e.to_string())?;
+    let iteration = supervisor
+        .begin_iteration(&sid)
+        .map_err(|e| e.to_string())?;
     supervisor
-        .action(&sid, &BrowserAction::SetViewport { width: 1280, height: 800, scale: 1.0 })
+        .action(
+            &sid,
+            &BrowserAction::SetViewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        )
         .map_err(|e| e.to_string())?;
     let desktop = supervisor.capture(&sid).map_err(|e| e.to_string())?;
     supervisor
-        .action(&sid, &BrowserAction::SetViewport { width: 390, height: 844, scale: 2.0 })
+        .action(
+            &sid,
+            &BrowserAction::SetViewport {
+                width: 390,
+                height: 844,
+                scale: 2.0,
+            },
+        )
         .map_err(|e| e.to_string())?;
     let mobile = supervisor.capture(&sid).map_err(|e| e.to_string())?;
     supervisor
-        .action(&sid, &BrowserAction::SetViewport { width: 1280, height: 800, scale: 1.0 })
+        .action(
+            &sid,
+            &BrowserAction::SetViewport {
+                width: 1280,
+                height: 800,
+                scale: 1.0,
+            },
+        )
         .map_err(|e| e.to_string())?;
 
     // Settle, then drain page-load noise (e.g. a favicon 404 or the initial
@@ -1582,11 +2236,23 @@ fn verify_ui<S: SecretStore + 'static, T: Transport + 'static>(
     let mut failures = Vec::new();
     let mut failed_gates = Vec::new();
     for (label, ev) in [("desktop", &settled[0]), ("mobile", &settled[1])] {
-        if ev.items.iter().any(|i| matches!(i, rex_preview::Evidence::Console { level: rex_preview::ConsoleLevel::Error, .. })) {
+        if ev.items.iter().any(|i| {
+            matches!(
+                i,
+                rex_preview::Evidence::Console {
+                    level: rex_preview::ConsoleLevel::Error,
+                    ..
+                }
+            )
+        }) {
             failures.push(format!("{label} viewport shows console errors"));
             failed_gates.push(ProductionGate::NoConsoleErrors);
         }
-        if ev.items.iter().any(|i| matches!(i, rex_preview::Evidence::NetworkFailure { .. })) {
+        if ev
+            .items
+            .iter()
+            .any(|i| matches!(i, rex_preview::Evidence::NetworkFailure { .. }))
+        {
             failures.push(format!("{label} viewport shows failed network requests"));
             failed_gates.push(ProductionGate::NoFailedRequests);
         }
@@ -1623,7 +2289,10 @@ fn verify_ui<S: SecretStore + 'static, T: Transport + 'static>(
         .map(|r| r.receipts)
         .unwrap_or_default();
     if let Some(l) = ledger.as_mut() {
-        l.append("capture", json!({"iteration": iteration, "accepted": accepted}));
+        l.append(
+            "capture",
+            json!({"iteration": iteration, "accepted": accepted}),
+        );
     }
     if let Ok(mut s) = ctx.handle.shared.lock() {
         s.preview = Some(AgentPreview {
@@ -1656,9 +2325,12 @@ fn finish<S: SecretStore + 'static, T: Transport + 'static>(
         if let TerminalReason::ProviderError { detail } = &reason {
             s.error = Some(detail.clone());
         }
-        push_locked(&mut s, AgentEvent::Info {
-            message: format!("run ended: {}", terminal_label(&reason)),
-        });
+        push_locked(
+            &mut s,
+            AgentEvent::Info {
+                message: format!("run ended: {}", terminal_label(&reason)),
+            },
+        );
         s.terminal = Some(reason.clone());
     }
     if let Some(l) = ledger.as_mut() {
@@ -1727,10 +2399,19 @@ mod tests {
     }
 
     impl Transport for Script {
-        fn get(&self, _url: &str, _headers: &[(String, String)]) -> Result<(u16, String), ProviderError> {
+        fn get(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+        ) -> Result<(u16, String), ProviderError> {
             Ok((200, r#"{"models":[{"name":"models/gemini-3.5-flash-lite","displayName":"Gemini 3.5 Flash Lite","supportedGenerationMethods":["generateContent"]}]}"#.into()))
         }
-        fn post(&self, _url: &str, _headers: &[(String, String)], body: &str) -> Result<(u16, String), ProviderError> {
+        fn post(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            body: &str,
+        ) -> Result<(u16, String), ProviderError> {
             self.posts.lock().unwrap().push(body.to_string());
             {
                 let mut fail = self.fail_posts.lock().unwrap();
@@ -1779,11 +2460,7 @@ mod tests {
     fn service(root: &Path, script: Script) -> Svc {
         let store = MemorySecretStore::new();
         store.set_key("gemini", "test-key").unwrap();
-        AutonomousRunService::new(
-            ProviderService::new(store, script),
-            None,
-            root.join("runs"),
-        )
+        AutonomousRunService::new(ProviderService::new(store, script), None, root.join("runs"))
     }
 
     fn wait_terminal(svc: &Svc, id: &str, timeout_ms: u64) -> AgentSnapshot {
@@ -1794,7 +2471,10 @@ mod tests {
                 return snap;
             }
             if start.elapsed().as_millis() as u64 > timeout_ms {
-                panic!("run did not reach a terminal state in time; status {:?}", snap.status);
+                panic!(
+                    "run did not reach a terminal state in time; status {:?}",
+                    snap.status
+                );
             }
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -1824,6 +2504,93 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_adapter_normalizes_loop_calls_and_history() {
+        let body = json!({"content":[
+            {"type":"text","text":"Planning."},
+            {"type":"tool_use","id":"toolu_1","name":"update_plan","input":{"items":[{"id":"1","title":"Build","status":"in_progress"}]}},
+            {"type":"tool_use","id":"toolu_2","name":"read_file","input":{"path":"README.md"}}
+        ],"usage":{"input_tokens":12,"output_tokens":8}}).to_string();
+        let decoded = decode_provider_calls(ProviderProtocol::Anthropic, &body).unwrap();
+        assert_eq!(decoded.texts, vec!["Planning."]);
+        assert_eq!(decoded.calls.len(), 2);
+        assert_eq!(usage_tokens(ProviderProtocol::Anthropic, &body), Some(20));
+        let pair = TurnPair {
+            model_parts: decoded
+                .calls
+                .iter()
+                .filter_map(|(_, r)| r.clone())
+                .collect(),
+            response_parts: vec![function_response(
+                ProviderProtocol::Anthropic,
+                "read_file",
+                "toolu_2",
+                true,
+                "ok",
+            )],
+        };
+        let request = build_request(
+            ProviderProtocol::Anthropic,
+            "claude-test",
+            "state",
+            Some(&pair),
+        );
+        assert!(request.contains("tool_result"));
+        assert!(request.contains("toolu_2"));
+        assert!(request.contains("input_schema"));
+    }
+
+    #[test]
+    fn openai_compatible_adapter_normalizes_calls_and_history() {
+        let body = json!({"choices":[{"message":{"content":"Acting.","tool_calls":[
+            {"id":"call_42","type":"function","function":{"name":"read_file","arguments":serde_json::to_string(&json!({"path":"README.md"})).unwrap()}}
+        ]},"finish_reason":"tool_calls"}],"usage":{"total_tokens":31}}).to_string();
+        let decoded = decode_provider_calls(ProviderProtocol::OpenAiCompatible, &body).unwrap();
+        assert_eq!(decoded.calls.len(), 1);
+        assert_eq!(
+            usage_tokens(ProviderProtocol::OpenAiCompatible, &body),
+            Some(31)
+        );
+        let pair = TurnPair {
+            model_parts: decoded
+                .calls
+                .iter()
+                .filter_map(|(_, r)| r.clone())
+                .collect(),
+            response_parts: vec![function_response(
+                ProviderProtocol::OpenAiCompatible,
+                "read_file",
+                "call_42",
+                true,
+                "ok",
+            )],
+        };
+        let request = build_request(
+            ProviderProtocol::OpenAiCompatible,
+            "gpt-test",
+            "state",
+            Some(&pair),
+        );
+        assert!(request.contains("tool_call_id"));
+        assert!(request.contains("call_42"));
+        assert!(request.contains("chat") || request.contains("tools"));
+    }
+
+    #[test]
+    fn provider_specific_requests_keep_credentials_out_of_evidence() {
+        let anthropic = build_request(ProviderProtocol::Anthropic, "claude-test", "state", None);
+        let openai = build_request(
+            ProviderProtocol::OpenAiCompatible,
+            "gpt-test",
+            "state",
+            None,
+        );
+        assert!(!anthropic.contains("api-key"));
+        assert!(!openai.contains("Bearer"));
+        assert!(anthropic.contains("claude-test"));
+        assert!(openai.contains("gpt-test"));
+    }
+
+    #[test]
     fn brief_is_written_once_and_never_rewritten() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("state");
@@ -1846,12 +2613,17 @@ mod tests {
     #[test]
     fn repeated_identical_failure_terminates_truthfully() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = Arc::new(service(tmp.path(), Script::new(vec![
-            call_turn(vec![read_call("missing.txt")]),
-            call_turn(vec![read_call("missing.txt")]),
-            call_turn(vec![read_call("missing.txt")]),
-        ])));
-        let snap = svc.begin("read something", "gemini", Some(budgets())).unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![read_call("missing.txt")]),
+                call_turn(vec![read_call("missing.txt")]),
+                call_turn(vec![read_call("missing.txt")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("read something", "gemini", Some(budgets()))
+            .unwrap();
         let done = wait_terminal(&svc, &snap.id, 15_000);
         assert!(matches!(
             done.terminal_reason,
@@ -1874,9 +2646,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = budgets();
         b.max_steps = 2;
-        let svc = Arc::new(service(tmp.path(), Script::new(vec![
-            text_turn("thinking"), text_turn("more thinking"), text_turn("never stops"),
-        ])));
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                text_turn("thinking"),
+                text_turn("more thinking"),
+                text_turn("never stops"),
+            ]),
+        ));
         let snap = svc.begin("ramble", "gemini", Some(b)).unwrap();
         let done = wait_terminal(&svc, &snap.id, 15_000);
         assert!(matches!(
@@ -1896,7 +2673,9 @@ mod tests {
             turns.push(call_turn(vec![read_call("a.txt")]));
         }
         let svc = Arc::new(service(tmp.path(), Script::new(turns)));
-        let snap = svc.begin("work then idle", "gemini", Some(budgets())).unwrap();
+        let snap = svc
+            .begin("work then idle", "gemini", Some(budgets()))
+            .unwrap();
         auto_approve(svc.clone(), snap.id.clone());
         let done = wait_terminal(&svc, &snap.id, 20_000);
         assert!(matches!(
@@ -1908,9 +2687,14 @@ mod tests {
     #[test]
     fn stalled_model_terminates_and_was_nudged() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = Arc::new(service(tmp.path(), Script::new(vec![
-            text_turn("let me think"), text_turn("still thinking"), text_turn("hmm"),
-        ])));
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                text_turn("let me think"),
+                text_turn("still thinking"),
+                text_turn("hmm"),
+            ]),
+        ));
         let snap = svc.begin("stall", "gemini", Some(budgets())).unwrap();
         let done = wait_terminal(&svc, &snap.id, 15_000);
         assert!(matches!(
@@ -1928,7 +2712,13 @@ mod tests {
         let mut b = budgets();
         b.max_tokens = 2_000; // clamp floor
         let turns: Vec<String> = (0..10)
-            .map(|i| call_turn(vec![plan_call(vec![("1", &format!("step {i}"), "in_progress")])]))
+            .map(|i| {
+                call_turn(vec![plan_call(vec![(
+                    "1",
+                    &format!("step {i}"),
+                    "in_progress",
+                )])])
+            })
             .collect();
         let svc = Arc::new(service(tmp.path(), Script::new(turns)));
         let snap = svc.begin("spend tokens", "gemini", Some(b)).unwrap();
@@ -1944,9 +2734,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = budgets();
         b.max_tool_calls = 1;
-        let svc = Arc::new(service(tmp.path(), Script::new(vec![
-            call_turn(vec![read_call("x"), read_call("y")]),
-        ])));
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![call_turn(vec![read_call("x"), read_call("y")])]),
+        ));
         let snap = svc.begin("two reads", "gemini", Some(b)).unwrap();
         let done = wait_terminal(&svc, &snap.id, 15_000);
         assert!(matches!(
@@ -1958,10 +2749,13 @@ mod tests {
     #[test]
     fn cancellation_during_approval_wait_is_terminal_and_truthful() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = Arc::new(service(tmp.path(), Script::new(vec![
-            call_turn(vec![create_call("b.txt", "beta")]),
-        ])));
-        let snap = svc.begin("write then cancel", "gemini", Some(budgets())).unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![call_turn(vec![create_call("b.txt", "beta")])]),
+        ));
+        let snap = svc
+            .begin("write then cancel", "gemini", Some(budgets()))
+            .unwrap();
         let start = Instant::now();
         loop {
             let s = svc.snapshot(&snap.id).unwrap();
@@ -1973,18 +2767,32 @@ mod tests {
         }
         svc.cancel(&snap.id).unwrap();
         let done = wait_terminal(&svc, &snap.id, 15_000);
-        assert!(matches!(done.terminal_reason, Some(TerminalReason::Cancelled)));
-        assert!(!tmp.path().join("runs").join(&snap.id).join("workspace").join("b.txt").exists());
+        assert!(matches!(
+            done.terminal_reason,
+            Some(TerminalReason::Cancelled)
+        ));
+        assert!(!tmp
+            .path()
+            .join("runs")
+            .join(&snap.id)
+            .join("workspace")
+            .join("b.txt")
+            .exists());
     }
 
     #[test]
     fn second_denial_stops_the_run() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = Arc::new(service(tmp.path(), Script::new(vec![
-            call_turn(vec![create_call("c.txt", "one")]),
-            call_turn(vec![create_call("c.txt", "two")]),
-        ])));
-        let snap = svc.begin("denied twice", "gemini", Some(budgets())).unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("c.txt", "one")]),
+                call_turn(vec![create_call("c.txt", "two")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("denied twice", "gemini", Some(budgets()))
+            .unwrap();
         let svc2 = svc.clone();
         let id = snap.id.clone();
         std::thread::spawn(move || loop {
@@ -1999,30 +2807,57 @@ mod tests {
         });
         let done = wait_terminal(&svc, &snap.id, 15_000);
         assert!(matches!(done.terminal_reason, Some(TerminalReason::Denied)));
-        assert!(!tmp.path().join("runs").join(&snap.id).join("workspace").join("c.txt").exists());
+        assert!(!tmp
+            .path()
+            .join("runs")
+            .join(&snap.id)
+            .join("workspace")
+            .join("c.txt")
+            .exists());
     }
 
     #[test]
     fn provider_retries_then_recovers() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = Arc::new(service(tmp.path(), Script::failing(
-            vec![text_turn("recovered"), text_turn("s1"), text_turn("s2"), text_turn("s3")],
-            2,
-            500,
-        )));
-        let snap = svc.begin("flaky provider", "gemini", Some(budgets())).unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::failing(
+                vec![
+                    text_turn("recovered"),
+                    text_turn("s1"),
+                    text_turn("s2"),
+                    text_turn("s3"),
+                ],
+                2,
+                500,
+            ),
+        ));
+        let snap = svc
+            .begin("flaky provider", "gemini", Some(budgets()))
+            .unwrap();
         let done = wait_terminal(&svc, &snap.id, 20_000);
         // recovered, then stalled out on text-only turns
-        assert!(matches!(done.terminal_reason, Some(TerminalReason::ModelStalled)));
-        assert!(done.events.iter().any(|e| matches!(e, AgentEvent::Retry { attempt: 1, .. })));
-        assert!(done.events.iter().any(|e| matches!(e, AgentEvent::Retry { attempt: 2, .. })));
+        assert!(matches!(
+            done.terminal_reason,
+            Some(TerminalReason::ModelStalled)
+        ));
+        assert!(done
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Retry { attempt: 1, .. })));
+        assert!(done
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Retry { attempt: 2, .. })));
     }
 
     #[test]
     fn hard_provider_failure_is_not_retried_forever() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = Arc::new(service(tmp.path(), Script::failing(vec![], 99, 401)));
-        let snap = svc.begin("unauthorized", "gemini", Some(budgets())).unwrap();
+        let snap = svc
+            .begin("unauthorized", "gemini", Some(budgets()))
+            .unwrap();
         let done = wait_terminal(&svc, &snap.id, 20_000);
         match done.terminal_reason {
             Some(TerminalReason::ProviderError { detail }) => {
@@ -2036,21 +2871,30 @@ mod tests {
     #[test]
     fn gate_failure_feeds_back_and_later_passes() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = Arc::new(service(tmp.path(), Script::new(vec![
-            // turn 1: write without any plan
-            call_turn(vec![create_call("index.html", PAGE)]),
-            // turn 2: claim completion - must fail gates (no plan)
-            call_turn(vec![complete_call("done")]),
-            // turn 3: plan done + complete again
-            call_turn(vec![
-                plan_call(vec![("1", "build page", "done")]),
-                complete_call("done"),
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                // turn 1: write without any plan
+                call_turn(vec![create_call("index.html", PAGE)]),
+                // turn 2: claim completion - must fail gates (no plan)
+                call_turn(vec![complete_call("done")]),
+                // turn 3: plan done + complete again
+                call_turn(vec![
+                    plan_call(vec![("1", "build page", "done")]),
+                    complete_call("done"),
+                ]),
             ]),
-        ])));
-        let snap = svc.begin("build a tea house page", "gemini", Some(budgets())).unwrap();
+        ));
+        let snap = svc
+            .begin("build a tea house page", "gemini", Some(budgets()))
+            .unwrap();
         auto_approve(svc.clone(), snap.id.clone());
         let done = wait_terminal(&svc, &snap.id, 120_000);
-        assert!(matches!(done.terminal_reason, Some(TerminalReason::Completed)), "got {:?}", done.terminal_reason);
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "got {:?}",
+            done.terminal_reason
+        );
         assert_eq!(done.status, AgentStatus::Completed);
         let posts = svc.service.transport().seen();
         assert!(posts.len() >= 3);
@@ -2059,7 +2903,14 @@ mod tests {
             "gate failure feedback must reach the model, got: {}",
             &posts[2][..posts[2].len().min(400)]
         );
-        assert!(done.events.iter().any(|e| matches!(e, AgentEvent::GateResult { attempt: 1, passed: false, .. })));
+        assert!(done.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::GateResult {
+                attempt: 1,
+                passed: false,
+                ..
+            }
+        )));
         let preview = done.preview.expect("verified preview must be visible");
         assert!(preview.desktop_shot.is_some() && preview.mobile_shot.is_some());
     }
@@ -2067,23 +2918,28 @@ mod tests {
     #[test]
     fn full_loop_completes_with_real_gates() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = Arc::new(service(tmp.path(), Script::new(vec![
-            call_turn(vec![
-                plan_call(vec![
-                    ("1", "build the page", "in_progress"),
-                    ("2", "verify it renders", "pending"),
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![
+                    plan_call(vec![
+                        ("1", "build the page", "in_progress"),
+                        ("2", "verify it renders", "pending"),
+                    ]),
+                    create_call("index.html", PAGE),
                 ]),
-                create_call("index.html", PAGE),
-            ]),
-            call_turn(vec![
-                plan_call(vec![
-                    ("1", "build the page", "done"),
-                    ("2", "verify it renders", "done"),
+                call_turn(vec![
+                    plan_call(vec![
+                        ("1", "build the page", "done"),
+                        ("2", "verify it renders", "done"),
+                    ]),
+                    complete_call("tea house page built"),
                 ]),
-                complete_call("tea house page built"),
             ]),
-        ])));
-        let snap = svc.begin("build a tea house landing page", "gemini", Some(budgets())).unwrap();
+        ));
+        let snap = svc
+            .begin("build a tea house landing page", "gemini", Some(budgets()))
+            .unwrap();
         auto_approve(svc.clone(), snap.id.clone());
         let done = wait_terminal(&svc, &snap.id, 120_000);
         if !matches!(done.terminal_reason, Some(TerminalReason::Completed)) {
@@ -2091,15 +2947,27 @@ mod tests {
                 eprintln!("EVENT: {}", serde_json::to_string(e).unwrap_or_default());
             }
         }
-        assert!(matches!(done.terminal_reason, Some(TerminalReason::Completed)), "got {:?}", done.terminal_reason);
-        assert_eq!(done.completion_summary.as_deref(), Some("tea house page built"));
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "got {:?}",
+            done.terminal_reason
+        );
+        assert_eq!(
+            done.completion_summary.as_deref(),
+            Some("tea house page built")
+        );
         let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
         assert!(ws.join("index.html").exists());
         let preview = done.preview.expect("preview");
         assert!(preview.url.starts_with("http://127.0.0.1:"));
         assert!(preview.receipts.iter().any(|r| r.accepted));
         // raw evidence is addressable on disk
-        let evidence = tmp.path().join("runs").join(&snap.id).join("state").join("evidence");
+        let evidence = tmp
+            .path()
+            .join("runs")
+            .join(&snap.id)
+            .join("state")
+            .join("evidence");
         assert!(evidence.join("turn-1-request.json").exists());
         assert!(evidence.join("turn-2-response.json").exists());
         svc.teardown(&snap.id).unwrap();
@@ -2111,14 +2979,19 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let run_id;
         {
-            let svc = Arc::new(service(&root, Script::new(vec![
-                call_turn(vec![
-                    plan_call(vec![("1", "write page", "in_progress")]),
-                    create_call("index.html", PAGE),
+            let svc = Arc::new(service(
+                &root,
+                Script::new(vec![
+                    call_turn(vec![
+                        plan_call(vec![("1", "write page", "in_progress")]),
+                        create_call("index.html", PAGE),
+                    ]),
+                    call_turn(vec![create_call("second.txt", "never finished")]),
                 ]),
-                call_turn(vec![create_call("second.txt", "never finished")]),
-            ])));
-            let snap = svc.begin("resumable task", "gemini", Some(budgets())).unwrap();
+            ));
+            let snap = svc
+                .begin("resumable task", "gemini", Some(budgets()))
+                .unwrap();
             run_id = snap.id.clone();
             // approve turn 1's write only, so turn 1 completes and checkpoints
             let svc1 = svc.clone();
@@ -2145,7 +3018,11 @@ mod tests {
                 if s.step >= 1 && s.status == AgentStatus::AwaitingApproval {
                     break;
                 }
-                assert!(start.elapsed().as_secs() < 30, "never parked: {:?}", s.status);
+                assert!(
+                    start.elapsed().as_secs() < 30,
+                    "never parked: {:?}",
+                    s.status
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
             // process death: the thread stops without writing a terminal state
@@ -2153,18 +3030,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         // a new service over the same runs root resumes from disk
-        let svc2 = Arc::new(service(&root, Script::new(vec![
-            call_turn(vec![
+        let svc2 = Arc::new(service(
+            &root,
+            Script::new(vec![call_turn(vec![
                 plan_call(vec![("1", "write page", "done")]),
                 complete_call("resumed and done"),
-            ]),
-        ])));
+            ])]),
+        ));
         let resumed = svc2.resume(&run_id).unwrap();
         assert!(resumed.step >= 1, "resumed at the checkpointed step");
         assert_eq!(resumed.plan.len(), 1);
         auto_approve(svc2.clone(), run_id.clone());
         let done = wait_terminal(&svc2, &run_id, 120_000);
-        assert!(matches!(done.terminal_reason, Some(TerminalReason::Completed)), "got {:?}", done.terminal_reason);
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "got {:?}",
+            done.terminal_reason
+        );
         assert!(done.events.iter().any(|e| matches!(e, AgentEvent::Info { message } if message.contains("resumed from checkpoint"))));
         svc2.teardown(&run_id).unwrap();
     }
@@ -2175,7 +3057,10 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let run_id;
         {
-            let svc = Arc::new(service(&root, Script::new(vec![text_turn("a"), text_turn("b"), text_turn("c")])));
+            let svc = Arc::new(service(
+                &root,
+                Script::new(vec![text_turn("a"), text_turn("b"), text_turn("c")]),
+            ));
             let snap = svc.begin("short stall", "gemini", Some(budgets())).unwrap();
             run_id = snap.id.clone();
             wait_terminal(&svc, &run_id, 15_000);
@@ -2186,17 +3071,25 @@ mod tests {
 
     #[test]
     fn budgets_are_clamped_to_hard_limits() {
-        let b = Budgets { max_steps: 0, max_tool_calls: 100_000, max_wall_ms: 1, max_tokens: 1 }.clamped();
+        let b = Budgets {
+            max_steps: 0,
+            max_tool_calls: 100_000,
+            max_wall_ms: 1,
+            max_tokens: 1,
+        }
+        .clamped();
         assert_eq!(b.max_steps, 1);
         assert_eq!(b.max_tool_calls, HARD_MAX_TOOL_CALLS);
         assert!(b.max_wall_ms >= 10_000);
     }
 
     #[test]
-    fn unsupported_provider_fails_before_any_work() {
+    fn unknown_provider_fails_before_any_work() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path(), Script::new(vec![]));
-        assert!(svc.begin("task", "anthropic", None).is_err());
+        assert!(svc
+            .begin("task", "private-undocumented-wire", None)
+            .is_err());
         assert!(svc.begin("   ", "gemini", None).is_err());
     }
 }

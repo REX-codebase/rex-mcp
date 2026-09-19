@@ -157,6 +157,17 @@ impl<S: SecretStore, T: Transport> ProviderService<S, T> {
         &self.transport
     }
 
+    /// Effective endpoint for provider calls. Credential material never
+    /// crosses this boundary; autonomous adapters only receive the URL.
+    pub fn base_url(&self, provider: &str) -> Result<String, ProviderError> {
+        let spec =
+            find_spec(provider).ok_or_else(|| ProviderError::Unsupported(provider.to_string()))?;
+        self.state_for(provider)
+            .base_url
+            .or_else(|| spec.default_base_url.map(str::to_string))
+            .ok_or_else(|| ProviderError::Unsupported("no base URL configured".into()))
+    }
+
     pub fn catalog(&self, provider: &str) -> Option<ModelCatalog> {
         self.state_for(provider).catalog
     }

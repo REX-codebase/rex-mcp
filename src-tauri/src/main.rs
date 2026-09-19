@@ -285,7 +285,8 @@ fn run_decide(
 
 #[tauri::command]
 fn run_snapshot(live: State<'_, Arc<Live>>, run_id: String) -> Result<RunSnapshot, String> {
-    live.snapshot(&run_id).ok_or_else(|| "unknown run".to_string())
+    live.snapshot(&run_id)
+        .ok_or_else(|| "unknown run".to_string())
 }
 
 #[tauri::command]
@@ -298,10 +299,7 @@ fn run_preview_action(
 }
 
 #[tauri::command]
-fn run_capture(
-    live: State<'_, Arc<Live>>,
-    run_id: String,
-) -> Result<BrowserEvidence, String> {
+fn run_capture(live: State<'_, Arc<Live>>, run_id: String) -> Result<BrowserEvidence, String> {
     live.capture(&run_id)
 }
 
@@ -316,14 +314,19 @@ fn run_teardown(live: State<'_, Arc<Live>>, run_id: String) -> Result<(), String
 fn agent_begin(
     agent: State<'_, Arc<Agent>>,
     task: String,
+    provider: Option<String>,
+    model: Option<String>,
     budgets: Option<Budgets>,
 ) -> Result<AgentSnapshot, String> {
-    agent.begin(&task, "gemini", budgets)
+    let provider = provider.as_deref().unwrap_or("gemini");
+    agent.begin_with_model(&task, provider, model.as_deref(), budgets)
 }
 
 #[tauri::command]
 fn agent_snapshot(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<AgentSnapshot, String> {
-    agent.snapshot(&run_id).ok_or_else(|| "unknown run".to_string())
+    agent
+        .snapshot(&run_id)
+        .ok_or_else(|| "unknown run".to_string())
 }
 
 /// Trusted UI decision. Only this command can release a prepared write.
