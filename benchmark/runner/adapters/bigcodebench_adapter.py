@@ -4,7 +4,8 @@
 Dataset: HF bigcode/bigcodebench, config v0.1.4, pinned commit
 b74c0d0bf70d2c0bc459be537895cca163007f1a (no HF tags exist; the sha is the pin).
 Full = 1140 tasks; --hard filters to the official BigCodeBench-Hard 148
-(task ids read from bigcode/bigcodebench-hard at its pinned commit).
+(task ids read from bigcode/bigcodebench-hard pinned commit
+298d2cc7b96612e15e47313c3603ee124cee0c1f, last modified 2025-02-23).
 
 Tasks need the PyPI libs each task names (field `libs`); the scoring sandbox
 must have them installed (see runner README - env pin records the lib set).
@@ -37,7 +38,7 @@ def main():
     split = ds["v0.1.4"]
     hard_ids = None
     if a.hard:
-        hard = load_dataset("bigcode/bigcodebench-hard", revision="b74c0d0bf70d2c0bc459be537895cca163007f1a")
+        hard = load_dataset("bigcode/bigcodebench-hard", revision="298d2cc7b96612e15e47313c3603ee124cee0c1f")
         hsplit = hard[list(hard.keys())[0]]
         hard_ids = set(hsplit["task_id"])
     os.makedirs(a.out, exist_ok=True)

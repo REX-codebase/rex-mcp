@@ -55,10 +55,26 @@ def main():
     complete, incomplete = [], []
     for cell, modes in sorted(cells.items()):
         (complete if all(m in modes for m in MODES) else incomplete).append(cell)
-    envs = {env_key(r) for cell in complete for r in cells[cell].values()}
-    if len(envs) > 1:
-        print(f"FATAL: mixed env pins across completed cells: {sorted(envs)}", file=sys.stderr)
-        sys.exit(2)
+    # Group completed cells by env pin: each suite pins its own dataset
+    # version, so comparability is per env group, never across groups.
+    groups = defaultdict(list)
+    for cell in complete:
+        groups[env_key(cells[cell][MODES[0]])].append(cell)
+    if len(groups) > 1:
+        print(f"note: {len(groups)} env groups; aggregating each separately "
+              f"(cross-group pooling would mix dataset versions)", file=sys.stderr)
+    reports = {}
+    for env in sorted(groups):
+        reports[env] = aggregate_block(cells, groups[env], incomplete)
+    report = {"env_groups": {str(env): rep for env, rep in reports.items()},
+              "n_incomplete_cells": len(incomplete),
+              "incomplete_cells": [{"suite": c[0], "task_id": c[1], "seed": c[2],
+                                    "modes_present": sorted(cells[c])} for c in incomplete]}
+    if a.json_out:
+        with open(a.json_out, "w") as fh:
+            json.dump(report, fh, indent=2, default=str)
+
+def aggregate_block(cells, complete, incomplete):
     per_mode = {m: [] for m in MODES}
     tokens = {m: [] for m in MODES}
     wall = {m: [] for m in MODES}
@@ -83,10 +99,7 @@ def main():
         deltas.sort()
         return (sum(per_mode[m1]) / n - sum(per_mode[m2]) / n,
                 deltas[250], deltas[9750])
-    report = {"n_complete_triplets": n, "n_incomplete_cells": len(incomplete),
-              "incomplete_cells": [{"suite": c[0], "task_id": c[1], "seed": c[2],
-                                    "modes_present": sorted(cells[c])} for c in incomplete],
-              "env": sorted(envs), "modes": {}}
+    report = {"n_complete_triplets": n, "modes": {}}
     print(f"completed triplets: {n}   incomplete cells excluded: {len(incomplete)}")
     for m in MODES:
         k = sum(per_mode[m])
@@ -104,9 +117,7 @@ def main():
         report["uplift"][f"{m1}_minus_{m2}"] = {"delta": d, "boot95": [lo, hi]}
         if n:
             print(f"  {m1} - {m2}: {d:+.1%} (boot95 {lo:+.1%}..{hi:+.1%})")
-    if a.json_out:
-        with open(a.json_out, "w") as fh:
-            json.dump(report, fh, indent=2)
+    return report
 
 if __name__ == "__main__":
     main()

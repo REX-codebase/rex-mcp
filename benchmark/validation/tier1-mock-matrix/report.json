@@ -1,0 +1,390 @@
+{
+  "env_groups": {
+    "('UNVERIFIED-mock-model', '4416080ac5cb80bdf7576aefb8f9a0b4d5426a44', '46c12ec66aad01d8ecff2a381fa5e4d47a18217d')": {
+      "n_complete_triplets": 6,
+      "modes": {
+        "raw": {
+          "passed": 2,
+          "total": 6,
+          "pass_rate": 0.3333333333333333,
+          "wilson95": [
+            0.09677141021353448,
+            0.7000066870052566
+          ],
+          "tokens_median": 1651.0,
+          "wall_ms_median": 9509.0,
+          "steps_median": 7.0
+        },
+        "simple": {
+          "passed": 6,
+          "total": 6,
+          "pass_rate": 1.0,
+          "wilson95": [
+            0.6096657083436264,
+            1.0
+          ],
+          "tokens_median": 3476.0,
+          "wall_ms_median": 15862.0,
+          "steps_median": 2.0
+        },
+        "ultra": {
+          "passed": 4,
+          "total": 6,
+          "pass_rate": 0.6666666666666666,
+          "wilson95": [
+            0.29999331299474324,
+            0.9032285897864654
+          ],
+          "tokens_median": 3447.0,
+          "wall_ms_median": 14525.0,
+          "steps_median": 7.0
+        }
+      },
+      "uplift": {
+        "ultra_minus_raw": {
+          "delta": 0.3333333333333333,
+          "boot95": [
+            0.0,
+            0.6666666666666666
+          ]
+        },
+        "ultra_minus_simple": {
+          "delta": -0.33333333333333337,
+          "boot95": [
+            -0.6666666666666666,
+            0.0
+          ]
+        },
+        "simple_minus_raw": {
+          "delta": 0.6666666666666667,
+          "boot95": [
+            0.3333333333333333,
+            1.0
+          ]
+        }
+      }
+    },
+    "('UNVERIFIED-mock-model', 'b74c0d0+298d2cc7', '46c12ec66aad01d8ecff2a381fa5e4d47a18217d')": {
+      "n_complete_triplets": 6,
+      "modes": {
+        "raw": {
+          "passed": 4,
+          "total": 6,
+          "pass_rate": 0.6666666666666666,
+          "wilson95": [
+            0.29999331299474324,
+            0.9032285897864654
+          ],
+          "tokens_median": 1665.0,
+          "wall_ms_median": 15300.0,
+          "steps_median": 4.0
+        },
+        "simple": {
+          "passed": 4,
+          "total": 6,
+          "pass_rate": 0.6666666666666666,
+          "wilson95": [
+            0.29999331299474324,
+            0.9032285897864654
+          ],
+          "tokens_median": 2323.0,
+          "wall_ms_median": 15088.0,
+          "steps_median": 9.0
+        },
+        "ultra": {
+          "passed": 6,
+          "total": 6,
+          "pass_rate": 1.0,
+          "wilson95": [
+            0.6096657083436264,
+            1.0
+          ],
+          "tokens_median": 3318.0,
+          "wall_ms_median": 2955.0,
+          "steps_median": 6.0
+        }
+      },
+      "uplift": {
+        "ultra_minus_raw": {
+          "delta": 0.33333333333333337,
+          "boot95": [
+            0.0,
+            0.6666666666666666
+          ]
+        },
+        "ultra_minus_simple": {
+          "delta": 0.33333333333333337,
+          "boot95": [
+            0.0,
+            0.6666666666666666
+          ]
+        },
+        "simple_minus_raw": {
+          "delta": 0.0,
+          "boot95": [
+            -0.6666666666666666,
+            0.6666666666666666
+          ]
+        }
+      }
+    },
+    "('UNVERIFIED-mock-model', 'evalplus==0.3.1/humanevalplus-v0.1.10', '46c12ec66aad01d8ecff2a381fa5e4d47a18217d')": {
+      "n_complete_triplets": 6,
+      "modes": {
+        "raw": {
+          "passed": 4,
+          "total": 6,
+          "pass_rate": 0.6666666666666666,
+          "wilson95": [
+            0.29999331299474324,
+            0.9032285897864654
+          ],
+          "tokens_median": 2386.0,
+          "wall_ms_median": 7252.0,
+          "steps_median": 5.0
+        },
+        "simple": {
+          "passed": 2,
+          "total": 6,
+          "pass_rate": 0.3333333333333333,
+          "wilson95": [
+            0.09677141021353448,
+            0.7000066870052566
+          ],
+          "tokens_median": 1229.0,
+          "wall_ms_median": 9840.0,
+          "steps_median": 2.0
+        },
+        "ultra": {
+          "passed": 2,
+          "total": 6,
+          "pass_rate": 0.3333333333333333,
+          "wilson95": [
+            0.09677141021353448,
+            0.7000066870052566
+          ],
+          "tokens_median": 2464.0,
+          "wall_ms_median": 14252.0,
+          "steps_median": 7.0
+        }
+      },
+      "uplift": {
+        "ultra_minus_raw": {
+          "delta": -0.3333333333333333,
+          "boot95": [
+            -0.6666666666666666,
+            0.0
+          ]
+        },
+        "ultra_minus_simple": {
+          "delta": 0.0,
+          "boot95": [
+            -0.6666666666666666,
+            0.6666666666666666
+          ]
+        },
+        "simple_minus_raw": {
+          "delta": -0.3333333333333333,
+          "boot95": [
+            -1.0,
+            0.3333333333333333
+          ]
+        }
+      }
+    },
+    "('UNVERIFIED-mock-model', 'evalplus==0.3.1/mbppplus-v0.2.0', '46c12ec66aad01d8ecff2a381fa5e4d47a18217d')": {
+      "n_complete_triplets": 6,
+      "modes": {
+        "raw": {
+          "passed": 2,
+          "total": 6,
+          "pass_rate": 0.3333333333333333,
+          "wilson95": [
+            0.09677141021353448,
+            0.7000066870052566
+          ],
+          "tokens_median": 2003.0,
+          "wall_ms_median": 13378.0,
+          "steps_median": 11.0
+        },
+        "simple": {
+          "passed": 2,
+          "total": 6,
+          "pass_rate": 0.3333333333333333,
+          "wilson95": [
+            0.09677141021353448,
+            0.7000066870052566
+          ],
+          "tokens_median": 1964.0,
+          "wall_ms_median": 15828.0,
+          "steps_median": 6.0
+        },
+        "ultra": {
+          "passed": 6,
+          "total": 6,
+          "pass_rate": 1.0,
+          "wilson95": [
+            0.6096657083436264,
+            1.0
+          ],
+          "tokens_median": 2088.0,
+          "wall_ms_median": 4484.0,
+          "steps_median": 4.0
+        }
+      },
+      "uplift": {
+        "ultra_minus_raw": {
+          "delta": 0.6666666666666667,
+          "boot95": [
+            0.3333333333333333,
+            1.0
+          ]
+        },
+        "ultra_minus_simple": {
+          "delta": 0.6666666666666667,
+          "boot95": [
+            0.3333333333333333,
+            1.0
+          ]
+        },
+        "simple_minus_raw": {
+          "delta": 0.0,
+          "boot95": [
+            -0.6666666666666666,
+            0.6666666666666666
+          ]
+        }
+      }
+    },
+    "('UNVERIFIED-mock-model', 'raw-jsonl-sha256-8368b810', '46c12ec66aad01d8ecff2a381fa5e4d47a18217d')": {
+      "n_complete_triplets": 6,
+      "modes": {
+        "raw": {
+          "passed": 2,
+          "total": 6,
+          "pass_rate": 0.3333333333333333,
+          "wilson95": [
+            0.09677141021353448,
+            0.7000066870052566
+          ],
+          "tokens_median": 2556.0,
+          "wall_ms_median": 8558.0,
+          "steps_median": 10.0
+        },
+        "simple": {
+          "passed": 6,
+          "total": 6,
+          "pass_rate": 1.0,
+          "wilson95": [
+            0.6096657083436264,
+            1.0
+          ],
+          "tokens_median": 1900.0,
+          "wall_ms_median": 15744.0,
+          "steps_median": 5.0
+        },
+        "ultra": {
+          "passed": 4,
+          "total": 6,
+          "pass_rate": 0.6666666666666666,
+          "wilson95": [
+            0.29999331299474324,
+            0.9032285897864654
+          ],
+          "tokens_median": 2389.0,
+          "wall_ms_median": 13813.0,
+          "steps_median": 4.0
+        }
+      },
+      "uplift": {
+        "ultra_minus_raw": {
+          "delta": 0.3333333333333333,
+          "boot95": [
+            -0.3333333333333333,
+            1.0
+          ]
+        },
+        "ultra_minus_simple": {
+          "delta": -0.33333333333333337,
+          "boot95": [
+            -0.6666666666666666,
+            0.0
+          ]
+        },
+        "simple_minus_raw": {
+          "delta": 0.6666666666666667,
+          "boot95": [
+            0.3333333333333333,
+            1.0
+          ]
+        }
+      }
+    },
+    "('UNVERIFIED-mock-model', 'test.jsonl+test2..test6-1055', '46c12ec66aad01d8ecff2a381fa5e4d47a18217d')": {
+      "n_complete_triplets": 6,
+      "modes": {
+        "raw": {
+          "passed": 4,
+          "total": 6,
+          "pass_rate": 0.6666666666666666,
+          "wilson95": [
+            0.29999331299474324,
+            0.9032285897864654
+          ],
+          "tokens_median": 3479.0,
+          "wall_ms_median": 12546.0,
+          "steps_median": 5.0
+        },
+        "simple": {
+          "passed": 4,
+          "total": 6,
+          "pass_rate": 0.6666666666666666,
+          "wilson95": [
+            0.29999331299474324,
+            0.9032285897864654
+          ],
+          "tokens_median": 2779.0,
+          "wall_ms_median": 5212.0,
+          "steps_median": 2.0
+        },
+        "ultra": {
+          "passed": 6,
+          "total": 6,
+          "pass_rate": 1.0,
+          "wilson95": [
+            0.6096657083436264,
+            1.0
+          ],
+          "tokens_median": 2961.0,
+          "wall_ms_median": 14423.0,
+          "steps_median": 4.0
+        }
+      },
+      "uplift": {
+        "ultra_minus_raw": {
+          "delta": 0.33333333333333337,
+          "boot95": [
+            0.0,
+            0.6666666666666666
+          ]
+        },
+        "ultra_minus_simple": {
+          "delta": 0.33333333333333337,
+          "boot95": [
+            0.0,
+            0.6666666666666666
+          ]
+        },
+        "simple_minus_raw": {
+          "delta": 0.0,
+          "boot95": [
+            -0.6666666666666666,
+            0.6666666666666666
+          ]
+        }
+      }
+    }
+  },
+  "n_incomplete_cells": 0,
+  "incomplete_cells": []
+}
