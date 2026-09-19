@@ -1,0 +1,28 @@
+Live Gemini Flash Lite native proof - 2026-09-19
+
+Credential path
+- Agrim's existing Gemini API credential was filled from the secure vault into an ephemeral HTTPS bridge and written directly into FileSecretStore outside the repository.
+- The key never entered chat, logs, git, evidence, or the recording. The bridge and tunnel were stopped and deleted immediately after import.
+- Store permissions were 0700 for the directory and 0600 for secrets.json.
+
+Live provider path
+- ProviderService::refresh fetched the current Gemini model catalog from Google's API using the Rust UreqTransport.
+- 41 generateContent-capable models were returned.
+- The run selected the actually available gemini-3.5-flash-lite.
+- The model produced a native create_file functionCall for index.html with 15,480 content bytes.
+
+Trusted tool path
+- AgentLoop normalized the Gemini functionCall into rex-tools and emitted ApprovalRequired for create_file.
+- The trusted controller approved once. ToolRuntime executed the write and emitted a receipt for index.html: 15,488 bytes written, diff preserved, zero redactions.
+
+Native preview path
+- PreviewSupervisor served the real generated file on a reserved 127.0.0.1 port and attached its Rust-owned CDP runtime.
+- Real screenshots, DOM, accessibility and viewport evidence were captured at desktop and 390x844 mobile sizes.
+- Iteration 1 was preserved as rejected because it had no mobile evidence.
+- Iteration 2 was accepted after mobile capture and a real CDP pointer click changed the interface from Hourly Temperature to Weekly outlook.
+- Final clicked evidence: DOM 15,471 bytes; accessibility 32,801 bytes; no console error evidence; no network failure evidence.
+
+Verification
+- cargo test --workspace --all-targets --locked passed all 86 tests through the extracted rootless Tauri GTK/WebKitGTK sysroot.
+- npm test passed 9/9; npm run build passed.
+- The proof recording is H.264/yuv420p, 1280x800, 30 fps, 9.0 seconds, faststart and visually inspected.
