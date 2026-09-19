@@ -49,6 +49,8 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .shortcut-list dd{font-size:12px;color:var(--color-faint)}
 .reset-button{min-height:36px;border:1px solid color-mix(in srgb,var(--color-line) 82%,transparent);border-radius:8px;background:transparent;padding:0 14px;font-size:12px;font-weight:500;color:var(--color-muted);transition:color 150ms,border-color 150ms}
 .reset-button:hover{color:var(--color-text);border-color:var(--color-line)}
+.support-link{color:var(--color-muted);text-decoration:underline;text-underline-offset:3px;text-decoration-color:color-mix(in srgb,var(--color-line) 90%,transparent);transition:color 150ms,text-decoration-color 150ms}
+.support-link:hover{color:var(--color-text);text-decoration-color:var(--color-muted)}
 
 /* Forced reduced motion (user override) */
 .reduced-fx *,.reduced-fx *::before,.reduced-fx *::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
@@ -364,3 +366,4 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 
 /* Keep the connect dialog inside short viewports */
 .connect-dialog{max-height:calc(100vh - 48px);overflow-y:auto}
+
