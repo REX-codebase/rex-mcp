@@ -7,14 +7,17 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::io;
 use std::net::{IpAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::DefaultConnector;
-use ureq::{Error as UreqError, ResponseExt};
+use ureq::Error as UreqError;
 use url::Url;
 
-pub const USER_AGENT: &str = "REX-search/0.1 (+https://github.com/REX-codebase/rex-harness)";
+pub const USER_AGENT: &str = "REX-search/0.2 (+https://github.com/REX-codebase/rex-harness)";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
@@ -26,6 +29,10 @@ pub struct SearchRequest {
     pub max_results: usize,
     #[serde(default)]
     pub allow_subdomains: bool,
+    #[serde(default = "default_true")]
+    pub discover_sitemaps: bool,
+    #[serde(default = "default_true")]
+    pub discover_feeds: bool,
 }
 fn default_max_pages() -> usize {
     24
@@ -33,12 +40,17 @@ fn default_max_pages() -> usize {
 fn default_max_results() -> usize {
     8
 }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryKind {
     Seed,
     Link,
+    Sitemap,
+    Feed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +60,9 @@ pub enum FetchState {
     RobotsDenied,
     InvalidUrl,
     UnsafeAddress,
+    OutOfScopeRedirect,
+    RedirectMissingLocation,
+    RedirectLimit,
     UnsupportedContent,
     HttpError,
     RateLimited,
@@ -59,6 +74,7 @@ pub enum FetchState {
 pub struct Evidence {
     pub url: String,
     pub final_url: String,
+    pub redirect_chain: Vec<String>,
     pub title: Option<String>,
     pub excerpt: Option<String>,
     pub content: Option<String>,
@@ -80,6 +96,9 @@ pub struct Coverage {
     pub pages_attempted: usize,
     pub pages_fetched: usize,
     pub pages_denied: usize,
+    pub redirects_followed: usize,
+    pub sitemap_urls_discovered: usize,
+    pub feed_urls_discovered: usize,
     pub truncated_by_budget: bool,
     pub disclaimer: String,
 }
@@ -99,6 +118,9 @@ pub struct SearchConfig {
     pub max_body_bytes: usize,
     pub max_content_chars: usize,
     pub max_links_per_page: usize,
+    pub max_redirects: usize,
+    pub max_discovery_documents: usize,
+    pub max_discovered_urls: usize,
 }
 impl Default for SearchConfig {
     fn default() -> Self {
@@ -108,6 +130,9 @@ impl Default for SearchConfig {
             max_body_bytes: 2 * 1024 * 1024,
             max_content_chars: 24_000,
             max_links_per_page: 32,
+            max_redirects: 5,
+            max_discovery_documents: 8,
+            max_discovered_urls: 128,
         }
     }
 }
@@ -121,9 +146,8 @@ impl SearchEngine {
     pub fn new(config: SearchConfig) -> Self {
         let http_config = ureq::Agent::config_builder()
             .timeout_global(Some(config.timeout))
-            // Redirects stay disabled in 0.1. Following them safely also requires
-            // re-applying crawl scope and robots policy at every hop.
             .max_redirects(0)
+            .http_status_as_error(false)
             .user_agent(USER_AGENT)
             .build();
         let agent = ureq::Agent::with_parts(
@@ -141,11 +165,15 @@ impl SearchEngine {
         let query_terms = terms(&request.query);
         let mut queue = VecDeque::new();
         let mut seen = HashSet::new();
+        let mut discovery_seen = HashSet::new();
         let mut roots = Vec::new();
         let mut evidence = Vec::new();
         let mut failures = Vec::new();
         let mut robots: HashMap<String, RobotsRules> = HashMap::new();
         let mut last_request: HashMap<String, Instant> = HashMap::new();
+        let mut redirects_followed = 0;
+        let mut sitemap_urls_discovered = 0;
+        let mut feed_urls_discovered = 0;
 
         for seed in &request.seeds {
             match normalize_public_url(seed) {
@@ -164,38 +192,76 @@ impl SearchEngine {
             }
         }
 
-        while evidence.len() + failures.len() < request.max_pages {
+        if request.discover_sitemaps {
+            let initial_roots = roots.clone();
+            for root in initial_roots {
+                if discovery_seen.len() >= self.config.max_discovery_documents {
+                    break;
+                }
+                for sitemap in self.sitemap_candidates(&root, &mut robots) {
+                    if discovery_seen.len() >= self.config.max_discovery_documents {
+                        break;
+                    }
+                    if !same_scope(&root, &sitemap, request.allow_subdomains)
+                        || !discovery_seen.insert(canonical_key(&sitemap))
+                    {
+                        continue;
+                    }
+                    match self.fetch_discovery(
+                        &sitemap,
+                        &roots,
+                        request.allow_subdomains,
+                        &mut robots,
+                        &mut last_request,
+                    ) {
+                        Ok((final_url, body, hops)) => {
+                            redirects_followed += hops;
+                            for discovered in parse_sitemap_urls(&body, &final_url)
+                                .into_iter()
+                                .take(self.config.max_discovered_urls)
+                            {
+                                if roots
+                                    .iter()
+                                    .any(|r| same_scope(r, &discovered, request.allow_subdomains))
+                                {
+                                    sitemap_urls_discovered += 1;
+                                    queue.push_back((
+                                        discovered,
+                                        DiscoveryKind::Sitemap,
+                                        Some(final_url.to_string()),
+                                    ));
+                                }
+                            }
+                        }
+                        Err(item) => failures.push(item),
+                    }
+                }
+            }
+        }
+
+        while seen.len() < request.max_pages {
             let Some((url, discovery, from)) = queue.pop_front() else {
                 break;
             };
-            let key = canonical_key(&url);
-            if !seen.insert(key) {
+            if !seen.insert(canonical_key(&url)) {
                 continue;
             }
-            let origin = origin_key(&url);
-
-            let rules = robots
-                .entry(origin.clone())
-                .or_insert_with(|| self.load_robots(&url));
-            if !rules.allowed(url.path()) {
-                failures.push(
-                    failure(
-                        url.as_str(),
-                        FetchState::RobotsDenied,
-                        "robots.txt disallows this path".into(),
-                        discovery,
-                        from,
-                    )
-                    .with_robots(false),
-                );
-                continue;
-            }
-
-            throttle(&mut last_request, &origin, self.config.per_origin_delay);
-            match self.fetch_html(&url, discovery.clone(), from.clone()) {
-                Ok((mut item, links)) => {
-                    item.robots_allowed = Some(true);
+            match self.fetch_html(
+                &url,
+                discovery.clone(),
+                from.clone(),
+                &roots,
+                request.allow_subdomains,
+                &mut robots,
+                &mut last_request,
+            ) {
+                Ok((mut item, links, feeds, hops)) => {
+                    redirects_followed += hops;
                     item.score = rank(item.title.as_deref(), item.content.as_deref(), &query_terms);
+                    item.excerpt = item
+                        .content
+                        .as_deref()
+                        .and_then(|c| make_excerpt(c, &query_terms));
                     let parent = item.final_url.clone();
                     evidence.push(item);
                     for link in links.into_iter().take(self.config.max_links_per_page) {
@@ -206,41 +272,93 @@ impl SearchEngine {
                             queue.push_back((link, DiscoveryKind::Link, Some(parent.clone())));
                         }
                     }
+                    if request.discover_feeds {
+                        for feed in feeds.into_iter().take(4) {
+                            if discovery_seen.len() >= self.config.max_discovery_documents {
+                                break;
+                            }
+                            if !roots
+                                .iter()
+                                .any(|r| same_scope(r, &feed, request.allow_subdomains))
+                                || !discovery_seen.insert(canonical_key(&feed))
+                            {
+                                continue;
+                            }
+                            match self.fetch_discovery(
+                                &feed,
+                                &roots,
+                                request.allow_subdomains,
+                                &mut robots,
+                                &mut last_request,
+                            ) {
+                                Ok((final_url, body, feed_hops)) => {
+                                    redirects_followed += feed_hops;
+                                    for discovered in parse_feed_urls(&body, &final_url)
+                                        .into_iter()
+                                        .take(self.config.max_discovered_urls)
+                                    {
+                                        if roots.iter().any(|r| {
+                                            same_scope(r, &discovered, request.allow_subdomains)
+                                        }) {
+                                            feed_urls_discovered += 1;
+                                            queue.push_back((
+                                                discovered,
+                                                DiscoveryKind::Feed,
+                                                Some(final_url.to_string()),
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(item) => failures.push(item),
+                            }
+                        }
+                    }
                 }
-                Err(mut item) => {
-                    item.robots_allowed = Some(true);
-                    failures.push(item);
-                }
+                Err(item) => failures.push(item),
             }
         }
 
-        evidence.sort_by(|a, b| b.score.total_cmp(&a.score));
-        evidence.truncate(request.max_results);
-        let pages_fetched = evidence.len();
-        let pages_denied = failures
-            .iter()
-            .filter(|e| e.state == FetchState::RobotsDenied)
-            .count();
         let attempted = seen.len()
             + failures
                 .iter()
                 .filter(|e| e.state == FetchState::InvalidUrl)
                 .count();
-        let truncated = !queue.is_empty() && attempted >= request.max_pages;
+        let pages_denied = failures
+            .iter()
+            .filter(|e| e.state == FetchState::RobotsDenied)
+            .count();
+        let pages_fetched = evidence.len();
+        let truncated = !queue.is_empty() && seen.len() >= request.max_pages;
+        evidence.sort_by(|a, b| b.score.total_cmp(&a.score));
+        evidence.truncate(request.max_results);
         SearchResponse {
-            query: request.query,
-            evidence,
-            failures,
+            query: request.query, evidence, failures,
             coverage: Coverage {
-                model: "bounded_seed_crawl".into(),
-                seeds_received: seed_count,
-                pages_attempted: attempted,
-                pages_fetched,
-                pages_denied,
-                truncated_by_budget: truncated,
-                disclaimer: "REX-search searched only the supplied public seeds and a bounded set of allowed links. It is live evidence retrieval, not a complete index of the web.".into(),
+                model: "bounded_seed_discovery".into(), seeds_received: seed_count,
+                pages_attempted: attempted, pages_fetched, pages_denied, redirects_followed,
+                sitemap_urls_discovered, feed_urls_discovered, truncated_by_budget: truncated,
+                disclaimer: "REX-search searched supplied public seeds plus bounded, in-scope sitemap/feed/link discovery. It is not a complete index of the web.".into(),
             },
         }
+    }
+
+    fn sitemap_candidates(
+        &self,
+        root: &Url,
+        robots: &mut HashMap<String, RobotsRules>,
+    ) -> Vec<Url> {
+        let rules = robots
+            .entry(origin_key(root))
+            .or_insert_with(|| self.load_robots(root));
+        let mut out = rules.sitemaps.clone();
+        // A robots failure is fail-closed for the origin; do not probe a
+        // conventional sitemap when robots itself could not be read safely.
+        if !rules.deny_all {
+            if let Ok(url) = root.join("/sitemap.xml") {
+                out.push(url);
+            }
+        }
+        dedupe_urls(out)
     }
 
     fn load_robots(&self, page: &Url) -> RobotsRules {
@@ -257,14 +375,209 @@ impl SearchEngine {
             .call()
         {
             Ok(response) if response.status().as_u16() == 200 => {
-                let body = response.into_body().read_to_string().unwrap_or_default();
-                RobotsRules::parse(&body)
+                let body = response
+                    .into_body()
+                    .with_config()
+                    .limit(512 * 1024)
+                    .read_to_string()
+                    .unwrap_or_default();
+                RobotsRules::parse_with_base(&body, &robots_url)
             }
             Ok(response) if response.status().as_u16() >= 500 => RobotsRules::deny_all(),
             Ok(_) => RobotsRules::allow_all(),
-            Err(ureq::Error::StatusCode(code)) if code >= 500 => RobotsRules::deny_all(),
             Err(_) => RobotsRules::deny_all(),
         }
+    }
+
+    fn policy_for(
+        &self,
+        url: &Url,
+        roots: &[Url],
+        allow_subdomains: bool,
+        robots: &mut HashMap<String, RobotsRules>,
+    ) -> Result<(), (FetchState, String)> {
+        reject_local_hostname(url).map_err(|e| (FetchState::UnsafeAddress, e))?;
+        if !roots.iter().any(|r| same_scope(r, url, allow_subdomains)) {
+            return Err((
+                FetchState::OutOfScopeRedirect,
+                "redirect leaves operator-approved crawl scope".into(),
+            ));
+        }
+        let rules = robots
+            .entry(origin_key(url))
+            .or_insert_with(|| self.load_robots(url));
+        if !rules.allowed(&url_path_query(url)) {
+            return Err((
+                FetchState::RobotsDenied,
+                "robots.txt disallows this path".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn request_following_redirects(
+        &self,
+        start: &Url,
+        roots: &[Url],
+        allow_subdomains: bool,
+        accept: &str,
+        robots: &mut HashMap<String, RobotsRules>,
+        last: &mut HashMap<String, Instant>,
+        discovery: DiscoveryKind,
+        from: Option<String>,
+    ) -> Result<(ureq::http::Response<ureq::Body>, Url, Vec<String>), Evidence> {
+        let mut current = start.clone();
+        let mut chain = vec![current.to_string()];
+        for hop in 0..=self.config.max_redirects {
+            if let Err((state, detail)) = self.policy_for(&current, roots, allow_subdomains, robots)
+            {
+                return Err(failure_with_chain(
+                    start.as_str(),
+                    current.as_str(),
+                    chain,
+                    state,
+                    detail,
+                    discovery,
+                    from,
+                ));
+            }
+            let origin = origin_key(&current);
+            throttle(last, &origin, self.config.per_origin_delay);
+            let response = self
+                .agent
+                .get(current.as_str())
+                .header("Accept", accept)
+                .call()
+                .map_err(|e| {
+                    failure_with_chain(
+                        start.as_str(),
+                        current.as_str(),
+                        chain.clone(),
+                        FetchState::NetworkError,
+                        e.to_string(),
+                        discovery.clone(),
+                        from.clone(),
+                    )
+                })?;
+            let status = response.status().as_u16();
+            if (300..400).contains(&status) {
+                if hop == self.config.max_redirects {
+                    return Err(failure_with_chain(
+                        start.as_str(),
+                        current.as_str(),
+                        chain,
+                        FetchState::RedirectLimit,
+                        format!("redirect limit {} exceeded", self.config.max_redirects),
+                        discovery,
+                        from,
+                    )
+                    .with_status(status));
+                }
+                let location = response
+                    .headers()
+                    .get("location")
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or_else(|| {
+                        failure_with_chain(
+                            start.as_str(),
+                            current.as_str(),
+                            chain.clone(),
+                            FetchState::RedirectMissingLocation,
+                            "redirect response has no valid Location header".into(),
+                            discovery.clone(),
+                            from.clone(),
+                        )
+                        .with_status(status)
+                    })?;
+                let next = current.join(location).map_err(|e| {
+                    failure_with_chain(
+                        start.as_str(),
+                        current.as_str(),
+                        chain.clone(),
+                        FetchState::InvalidUrl,
+                        format!("invalid redirect location: {e}"),
+                        discovery.clone(),
+                        from.clone(),
+                    )
+                    .with_status(status)
+                })?;
+                chain.push(next.to_string());
+                current = next;
+                continue;
+            }
+            if status >= 400 {
+                let state = if status == 429 {
+                    FetchState::RateLimited
+                } else {
+                    FetchState::HttpError
+                };
+                return Err(failure_with_chain(
+                    start.as_str(),
+                    current.as_str(),
+                    chain,
+                    state,
+                    format!("HTTP {status}"),
+                    discovery,
+                    from,
+                )
+                .with_status(status));
+            }
+            return Ok((response, current, chain));
+        }
+        unreachable!()
+    }
+
+    fn fetch_discovery(
+        &self,
+        url: &Url,
+        roots: &[Url],
+        allow_subdomains: bool,
+        robots: &mut HashMap<String, RobotsRules>,
+        last: &mut HashMap<String, Instant>,
+    ) -> Result<(Url, String, usize), Evidence> {
+        let (response, final_url, chain) = self.request_following_redirects(
+            url,
+            roots,
+            allow_subdomains,
+            "application/xml,text/xml,application/rss+xml,application/atom+xml;q=0.9",
+            robots,
+            last,
+            DiscoveryKind::Sitemap,
+            None,
+        )?;
+        if response
+            .headers()
+            .get("content-length")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .is_some_and(|n| n > self.config.max_body_bytes)
+        {
+            return Err(failure_with_chain(
+                url.as_str(),
+                final_url.as_str(),
+                chain,
+                FetchState::TooLarge,
+                "declared discovery document exceeds body limit".into(),
+                DiscoveryKind::Sitemap,
+                None,
+            ));
+        }
+        let body = response
+            .into_body()
+            .with_config()
+            .limit(self.config.max_body_bytes as u64)
+            .read_to_string()
+            .map_err(|e| {
+                failure(
+                    url.as_str(),
+                    FetchState::NetworkError,
+                    format!("discovery read failed: {e}"),
+                    DiscoveryKind::Sitemap,
+                    None,
+                )
+            })?;
+        let hops = chain.len().saturating_sub(1);
+        Ok((final_url, body, hops))
     }
 
     fn fetch_html(
@@ -272,50 +585,23 @@ impl SearchEngine {
         url: &Url,
         discovery: DiscoveryKind,
         from: Option<String>,
-    ) -> Result<(Evidence, Vec<Url>), Evidence> {
-        if let Err(detail) = reject_private_destination(url) {
-            return Err(failure(
-                url.as_str(),
-                FetchState::UnsafeAddress,
-                detail,
-                discovery,
-                from,
-            ));
-        }
+        roots: &[Url],
+        allow_subdomains: bool,
+        robots: &mut HashMap<String, RobotsRules>,
+        last: &mut HashMap<String, Instant>,
+    ) -> Result<(Evidence, Vec<Url>, Vec<Url>, usize), Evidence> {
         let now = now_ms();
-        let response = match self
-            .agent
-            .get(url.as_str())
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml;q=0.9,text/plain;q=0.5",
-            )
-            .call()
-        {
-            Ok(r) => r,
-            Err(ureq::Error::StatusCode(code)) => {
-                let state = if code == 429 {
-                    FetchState::RateLimited
-                } else {
-                    FetchState::HttpError
-                };
-                return Err(
-                    failure(url.as_str(), state, format!("HTTP {code}"), discovery, from)
-                        .with_status(code),
-                );
-            }
-            Err(e) => {
-                return Err(failure(
-                    url.as_str(),
-                    FetchState::NetworkError,
-                    e.to_string(),
-                    discovery,
-                    from,
-                ))
-            }
-        };
+        let (response, effective, chain) = self.request_following_redirects(
+            url,
+            roots,
+            allow_subdomains,
+            "text/html,application/xhtml+xml;q=0.9,text/plain;q=0.5",
+            robots,
+            last,
+            discovery.clone(),
+            from.clone(),
+        )?;
         let status = response.status().as_u16();
-        let final_url = response.get_uri().to_string();
         let content_type = response
             .headers()
             .get("content-type")
@@ -326,8 +612,10 @@ impl SearchEngine {
             || content_type.contains("application/xhtml+xml")
             || content_type.contains("text/plain"))
         {
-            return Err(failure(
+            return Err(failure_with_chain(
                 url.as_str(),
+                effective.as_str(),
+                chain,
                 FetchState::UnsupportedContent,
                 format!("unsupported content type: {content_type}"),
                 discovery,
@@ -342,8 +630,10 @@ impl SearchEngine {
             .and_then(|s| s.parse::<usize>().ok())
             .is_some_and(|n| n > self.config.max_body_bytes)
         {
-            return Err(failure(
+            return Err(failure_with_chain(
                 url.as_str(),
+                effective.as_str(),
+                chain,
                 FetchState::TooLarge,
                 "declared response exceeds body limit".into(),
                 discovery,
@@ -366,18 +656,19 @@ impl SearchEngine {
                 )
                 .with_status(status)
             })?;
-        let effective = url.clone();
         let title = extract_title(&body);
         let mut content = html_to_text(&body);
         content.truncate(char_boundary(&content, self.config.max_content_chars));
-        let excerpt = make_excerpt(&content, &[]);
         let links = extract_links(&body, &effective);
+        let feeds = extract_feed_links(&body, &effective);
+        let hops = chain.len().saturating_sub(1);
         Ok((
             Evidence {
                 url: url.to_string(),
-                final_url,
+                final_url: effective.to_string(),
+                redirect_chain: chain,
                 title,
-                excerpt,
+                excerpt: None,
                 content: Some(content),
                 retrieved_at_unix_ms: now,
                 http_status: Some(status),
@@ -390,13 +681,128 @@ impl SearchEngine {
                 robots_allowed: Some(true),
             },
             links,
+            feeds,
+            hops,
         ))
     }
 }
-
 impl Default for SearchEngine {
     fn default() -> Self {
         Self::new(SearchConfig::default())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedDocument {
+    pub id: String,
+    pub url: String,
+    pub title: Option<String>,
+    pub content: String,
+    pub indexed_at_unix_ms: u128,
+    pub provenance: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexHit {
+    pub document: IndexedDocument,
+    pub score: f32,
+    pub excerpt: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub struct LocalIndex {
+    path: PathBuf,
+}
+impl LocalIndex {
+    pub fn open(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+    pub fn upsert(&self, mut document: IndexedDocument) -> io::Result<()> {
+        if document.id.trim().is_empty() || document.url.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "index id and URL are required",
+            ));
+        }
+        document.indexed_at_unix_ms = now_ms();
+        let mut documents = self.load()?;
+        if let Some(slot) = documents.iter_mut().find(|d| d.id == document.id) {
+            *slot = document;
+        } else {
+            documents.push(document);
+        }
+        self.store(&documents)
+    }
+    pub fn remove(&self, id: &str) -> io::Result<bool> {
+        let mut documents = self.load()?;
+        let before = documents.len();
+        documents.retain(|d| d.id != id);
+        if before != documents.len() {
+            self.store(&documents)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn query(&self, query: &str, limit: usize) -> io::Result<Vec<IndexHit>> {
+        let terms = terms(query);
+        let mut hits: Vec<_> = self
+            .load()?
+            .into_iter()
+            .filter_map(|d| {
+                let score = rank(d.title.as_deref(), Some(&d.content), &terms);
+                (score > 0.0 || terms.is_empty()).then(|| {
+                    let excerpt = make_excerpt(&d.content, &terms);
+                    IndexHit {
+                        document: d,
+                        score,
+                        excerpt,
+                    }
+                })
+            })
+            .collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.truncate(limit.clamp(1, 50));
+        Ok(hits)
+    }
+    fn load(&self) -> io::Result<Vec<IndexedDocument>> {
+        if let Ok(meta) = fs::symlink_metadata(&self.path) {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "local index must not be a symlink",
+                ));
+            }
+        }
+        match fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(vec![]),
+            Err(e) => Err(e),
+        }
+    }
+    fn store(&self, documents: &[IndexedDocument]) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(documents).map_err(io::Error::other)?;
+        if let Ok(meta) = fs::symlink_metadata(&self.path) {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "local index must not be a symlink",
+                ));
+            }
+        }
+        fs::write(&tmp, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::rename(tmp, &self.path)
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -416,10 +822,16 @@ struct RobotsGroup {
 #[derive(Debug, Clone)]
 struct RobotsRules {
     rules: Vec<RobotsRule>,
+    sitemaps: Vec<Url>,
+    deny_all: bool,
 }
 impl RobotsRules {
     fn allow_all() -> Self {
-        Self { rules: vec![] }
+        Self {
+            rules: vec![],
+            sitemaps: vec![],
+            deny_all: false,
+        }
     }
     fn deny_all() -> Self {
         Self {
@@ -428,14 +840,23 @@ impl RobotsRules {
                 pattern: "/".into(),
                 specificity: 1,
             }],
+            sitemaps: vec![],
+            deny_all: true,
         }
     }
 
+    #[cfg(test)]
     fn parse(text: &str) -> Self {
+        let base = Url::parse("https://invalid.example/robots.txt").unwrap();
+        Self::parse_with_base(text, &base)
+    }
+
+    fn parse_with_base(text: &str, base: &Url) -> Self {
         let mut groups: Vec<RobotsGroup> = Vec::new();
         let mut agents: Vec<String> = Vec::new();
         let mut rules: Vec<RobotsRule> = Vec::new();
         let mut saw_rule = false;
+        let mut sitemaps = Vec::new();
 
         let flush = |groups: &mut Vec<RobotsGroup>,
                      agents: &mut Vec<String>,
@@ -458,7 +879,13 @@ impl RobotsRules {
             };
             let name = name.trim();
             let value = value.trim();
-            if name.eq_ignore_ascii_case("user-agent") {
+            if name.eq_ignore_ascii_case("sitemap") {
+                if let Ok(url) = base.join(value) {
+                    if matches!(url.scheme(), "http" | "https") {
+                        sitemaps.push(url);
+                    }
+                }
+            } else if name.eq_ignore_ascii_case("user-agent") {
                 if saw_rule {
                     flush(&mut groups, &mut agents, &mut rules);
                     saw_rule = false;
@@ -505,6 +932,8 @@ impl RobotsRules {
         });
         Self {
             rules: selected.flat_map(|g| g.rules).collect(),
+            sitemaps: dedupe_urls(sitemaps),
+            deny_all: false,
         }
     }
 
@@ -588,7 +1017,7 @@ impl Resolver for PublicResolver {
     }
 }
 
-fn reject_private_destination(url: &Url) -> Result<(), String> {
+fn reject_local_hostname(url: &Url) -> Result<(), String> {
     let host = url
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
@@ -598,6 +1027,18 @@ fn reject_private_destination(url: &Url) -> Result<(), String> {
     {
         return Err("local hostnames are blocked".into());
     }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !is_public_ip(ip) {
+            return Err(format!("non-public destination {ip} is blocked"));
+        }
+    }
+    Ok(())
+}
+fn reject_private_destination(url: &Url) -> Result<(), String> {
+    reject_local_hostname(url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
     let port = url.port_or_known_default().unwrap_or(80);
     let addrs = (host, port)
         .to_socket_addrs()
@@ -742,6 +1183,109 @@ fn extract_links(html: &str, base: &Url) -> Vec<Url> {
     }
     out
 }
+fn url_path_query(url: &Url) -> String {
+    let mut value = url.path().to_string();
+    if let Some(query) = url.query() {
+        value.push('?');
+        value.push_str(query);
+    }
+    value
+}
+fn dedupe_urls(urls: Vec<Url>) -> Vec<Url> {
+    let mut seen = HashSet::new();
+    urls.into_iter()
+        .filter(|u| seen.insert(canonical_key(u)))
+        .collect()
+}
+fn extract_xml_values(text: &str, tag: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let open = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(p) = lower[at..].find(&open) {
+        let a = at + p;
+        let Some(gt) = lower[a..].find('>') else {
+            break;
+        };
+        let start = a + gt + 1;
+        let Some(end_rel) = lower[start..].find(&close) else {
+            break;
+        };
+        let end = start + end_rel;
+        let value = decode_entities(text[start..end].trim());
+        if !value.is_empty() {
+            out.push(value)
+        }
+        at = end + close.len();
+    }
+    out
+}
+fn parse_sitemap_urls(xml: &str, base: &Url) -> Vec<Url> {
+    dedupe_urls(
+        extract_xml_values(xml, "loc")
+            .into_iter()
+            .filter_map(|v| base.join(&v).ok())
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .collect(),
+    )
+}
+fn parse_feed_urls(xml: &str, base: &Url) -> Vec<Url> {
+    let mut out: Vec<Url> = extract_xml_values(xml, "link")
+        .into_iter()
+        .filter_map(|v| base.join(&v).ok())
+        .collect();
+    let lower = xml.to_ascii_lowercase();
+    let mut at = 0;
+    while let Some(p) = lower[at..].find("href=") {
+        let i = at + p + 5;
+        let bytes = xml.as_bytes();
+        if i >= bytes.len() {
+            break;
+        };
+        let q = bytes[i] as char;
+        let (a, b) = if q == '\'' || q == '"' {
+            let a = i + 1;
+            let Some(n) = xml[a..].find(q) else { break };
+            (a, a + n)
+        } else {
+            let b = xml[i..]
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .map(|n| i + n)
+                .unwrap_or(xml.len());
+            (i, b)
+        };
+        if let Ok(u) = base.join(xml[a..b].trim()) {
+            out.push(u)
+        }
+        at = b.saturating_add(1);
+    }
+    dedupe_urls(
+        out.into_iter()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .collect(),
+    )
+}
+fn extract_feed_links(html: &str, base: &Url) -> Vec<Url> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(p) = lower[at..].find("<link") {
+        let a = at + p;
+        let end = lower[a..].find('>').map(|n| a + n).unwrap_or(html.len());
+        let tag = &html[a..end];
+        let tl = tag.to_ascii_lowercase();
+        if (tl.contains("application/rss+xml") || tl.contains("application/atom+xml"))
+            && tl.contains("rel=")
+        {
+            for u in extract_links(tag, base) {
+                out.push(u)
+            }
+        }
+        at = end.saturating_add(1);
+    }
+    dedupe_urls(out)
+}
 fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len().min(32_000));
     let mut tag = false;
@@ -836,6 +1380,7 @@ fn failure(
     Evidence {
         url: url.into(),
         final_url: url.into(),
+        redirect_chain: vec![url.into()],
         title: None,
         excerpt: None,
         content: None,
@@ -850,13 +1395,23 @@ fn failure(
         robots_allowed: None,
     }
 }
+fn failure_with_chain(
+    url: &str,
+    final_url: &str,
+    redirect_chain: Vec<String>,
+    state: FetchState,
+    detail: String,
+    discovery: DiscoveryKind,
+    from: Option<String>,
+) -> Evidence {
+    let mut item = failure(url, state, detail, discovery, from);
+    item.final_url = final_url.into();
+    item.redirect_chain = redirect_chain;
+    item
+}
 impl Evidence {
     fn with_status(mut self, status: u16) -> Self {
         self.http_status = Some(status);
-        self
-    }
-    fn with_robots(mut self, allowed: bool) -> Self {
-        self.robots_allowed = Some(allowed);
         self
     }
 }
@@ -939,4 +1494,47 @@ mod tests {
             rank(Some("Rust agents"), Some("x"), &q) > rank(Some("x"), Some("rust agents"), &q)
         );
     }
+    #[test]
+    fn robots_sitemap_directives_are_collected() {
+        let base = Url::parse("https://example.com/robots.txt").unwrap();
+        let r = RobotsRules::parse_with_base("User-agent: *\nAllow: /\nSitemap: /map.xml\n", &base);
+        assert_eq!(r.sitemaps[0].as_str(), "https://example.com/map.xml");
     }
+    #[test]
+    fn sitemap_and_feed_discovery_are_bounded_to_parsed_urls() {
+        let base = Url::parse("https://example.com/feed.xml").unwrap();
+        let map = parse_sitemap_urls(
+            "<urlset><url><loc>https://example.com/a</loc></url><url><loc>/b</loc></url></urlset>",
+            &base,
+        );
+        assert_eq!(map.len(), 2);
+        let feed = parse_feed_urls("<feed><entry><link href=\"/post\"/></entry></feed>", &base);
+        assert_eq!(feed[0].as_str(), "https://example.com/post");
+    }
+    #[test]
+    fn robots_matching_includes_query() {
+        let r = RobotsRules::parse("User-agent: *\nDisallow: /*?secret$\n");
+        let u = Url::parse("https://example.com/path?secret").unwrap();
+        assert!(!r.allowed(&url_path_query(&u)));
+    }
+    #[test]
+    fn local_index_is_operator_controlled_and_deletable() {
+        let path = std::env::temp_dir().join(format!("rex-index-test-{}.json", std::process::id()));
+        let index = LocalIndex::open(&path);
+        index
+            .upsert(IndexedDocument {
+                id: "one".into(),
+                url: "https://example.com/one".into(),
+                title: Some("Rust agents".into()),
+                content: "bounded local evidence".into(),
+                indexed_at_unix_ms: 0,
+                provenance: "operator".into(),
+            })
+            .unwrap();
+        let hits = index.query("rust", 5).unwrap();
+        assert_eq!(hits[0].document.id, "one");
+        assert!(index.remove("one").unwrap());
+        assert!(index.query("rust", 5).unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+}

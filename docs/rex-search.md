@@ -1,52 +1,49 @@
-# REX-search 0.1 architecture
+# REX-search 0.2 architecture
 
-REX-search is a native Rust live-evidence layer for agents. It is separate from the browser and uses no commercial search API. Version 0.1 is an honest **bounded seed crawler**, not a web-scale search engine: an agent supplies public seed URLs from task context, user input, feeds, or a future local index; REX-search discovers allowed same-site links, fetches current pages, extracts readable text, ranks it, and returns structured evidence.
+REX-search is a native Rust evidence layer for agents. It is an honest, bounded crawler and operator-controlled local index, not a web-scale search engine.
 
-## Contract
+## Live retrieval contract
 
-Input: query, explicit seed URLs, page/result budgets, and whether subdomains are in scope.
+An agent supplies public seed URLs, a query, page/result budgets, and a subdomain policy. REX-search can discover same-scope URLs from ordinary links, robots-declared or conventional sitemaps, and RSS/Atom links declared by fetched HTML. Every candidate still goes through the same crawl budget, destination safety, scope, robots, rate-limit, and body-size controls before it becomes evidence.
 
-Output per page:
-- requested and final URL
-- title, relevant excerpt, bounded extracted content
-- retrieval timestamp, HTTP status, content type
-- discovery kind and parent URL
-- robots decision
-- relevance score
-- exact fetch state and non-secret error
+Each result records the requested URL, final URL, full redirect chain, title, relevant excerpt, bounded content, retrieval time, HTTP status, content type, discovery kind and parent, robots decision, score, and exact failure state. The response reports attempts, denials, redirects, sitemap/feed discoveries, budget truncation, and its partial-coverage warning.
 
-The response also states its coverage model, attempts, denials, budget truncation, and the warning that this is not complete-web coverage. Failures remain first-class evidence instead of disappearing.
+## Redirect and network safety
 
-## Safety and protocol policy
+- Automatic HTTP redirects are disabled in the client. REX-search handles at most five hops itself.
+- Before every redirect hop, it rechecks HTTP(S), the operator-approved host/subdomain scope, that hop's origin-specific robots policy, and the public destination constraint. Out-of-scope, private, malformed, missing-location, over-limit, robots-denied, and HTTP failures remain separate states.
+- The custom resolver returns only the public IP addresses it validated directly to the connector. There is no second DNS lookup between policy validation and connect. TLS still verifies the original hostname.
+- Loopback, private, link-local, `.local`, and `.internal` targets are blocked. A named user-agent is sent. Requests time out after 15 seconds, bodies are capped at 2 MiB, crawl budget is capped at 64 pages, discovery documents and extracted URLs are separately capped, and each origin is delayed at least 750 ms.
+- A 5xx, timeout, or unreachable robots file fails closed. Rules support named/wildcard groups, merged equally specific groups, `*`, terminal `$`, query matching, longest specificity, and Allow on ties.
 
-- HTTP(S) only; loopback, link-local, private, `.local`, and `.internal` targets are blocked. The HTTP resolver returns only the public IP addresses it validated to the connector, preventing a second DNS lookup between validation and connect while preserving TLS verification against the original hostname.
-- `robots.txt` is checked per origin. A 5xx, timeout, or unreachable robots file fails closed for the current run. Rules use longest-match precedence for the `REX-search` and `*` groups.
-- A named user-agent is sent, bodies are capped at 2 MiB, redirects are disabled in 0.1, requests time out after 15 seconds, crawl budget is capped at 64 pages, and each origin is delayed at least 750 ms. Redirect support stays off until every hop can be checked against destination safety, crawl scope, and robots policy.
-- Only text/HTML is extracted. Scripts, styles, and noscript blocks are discarded. REX-search does not execute JavaScript, submit forms, log in, bypass paywalls, solve challenges, or fetch private networks.
-- Rate limits and HTTP/network/content failures have separate states. The engine never labels a partial crawl as the whole web.
-- Stored indexing is intentionally absent in 0.1. Any later index needs retention, deletion, recrawl, canonicalization, copyright, privacy, and operator-control policy before it ships.
+## Discovery boundary
 
-## Discovery boundaries
+Sitemap and feed ingestion improve discovery only inside sites the operator already selected. They do not discover the whole web. Sitemap indexes are parsed as bounded URL lists rather than recursively expanded without limit. Feeds are fetched only when an in-scope HTML page declares RSS/Atom. REX-search does not execute JavaScript, submit forms, log in, bypass paywalls, solve challenges, scrape a human search engine, or fetch private networks.
 
-Direct crawling is good at fresh retrieval within known sites and bad at global discovery. Scraping a human search engine would be fragile and against the goal. Querying a public index or self-hosted metasearch can be added later only as an explicitly named discovery source; it must not be presented as native coverage. A responsible path is:
+## Operator-controlled local index
 
-1. 0.1: explicit seeds + bounded same-site discovery (implemented).
-2. 0.2: sitemap and RSS/Atom seed ingestion, with the same robots and fetch policy.
-3. 0.3: optional local index over operator-selected sources, with recrawl and deletion controls.
-4. Optional public-index adapter (for example Common Crawl), labeled as third-party discovery and followed by a live origin fetch before evidence is returned.
+`LocalIndex` stores only documents explicitly added by the operator or agent through the desktop commands:
+
+- `search_index_upsert`: add or replace an identified document with URL, content, timestamp, and provenance.
+- `search_index_query`: rank and excerpt only those local documents.
+- `search_index_remove`: immediately remove one document.
+
+The index is a private JSON file under the app configuration directory, written through a temporary file and rename. There is no background crawling, automatic retention, hidden global corpus, or claim of complete coverage. The operator owns source selection, refresh, and deletion.
+
+## Verification
+
+- `cargo test -p rex-search --locked`
+- `cargo test -p rex-providers --all-targets --locked`
+- `cargo metadata --locked`
+- `scripts/tauri-linux-env.sh cargo check --workspace --all-targets --locked`
+- `npm run build`
+
+Tests cover robots behavior, private targets, scope, safe text extraction, ranking, sitemap/feed URL extraction, query-aware robots matching, and local-index upsert/query/deletion. Redirect integration is additionally exercised by the typed full workspace check. A production deployment should add a local adversarial HTTP fixture to exercise each hop and DNS outcome end to end.
 
 ## Standards and sources (checked 2026-09-19)
 
 - Robots Exclusion Protocol, RFC 9309: https://www.rfc-editor.org/rfc/rfc9309.html
-- HTTP semantics including 429 and Retry-After, RFC 9110: https://datatracker.ietf.org/doc/html/rfc9110
-- HTTP caching, RFC 9111: https://www.rfc-editor.org/rfc/rfc9111.html
+- HTTP semantics, RFC 9110: https://datatracker.ietf.org/doc/html/rfc9110
 - Sitemap protocol: https://www.sitemaps.org/protocol.html
-- Robots meta and `X-Robots-Tag`: https://developers.google.com/search/docs/crawling-indexing/robots-meta-tag
-- W3C Ethical Web Principles: https://www.w3.org/TR/2024/STMT-ethical-web-principles-20241212/
-- Common Crawl public index (future optional discovery, not used by 0.1): https://commoncrawl.org/get-started
-
-## Verification
-
-`cargo test -p rex-search`
-
-Tests cover robots precedence, wildcard and end-anchor matching, named-agent group selection and merging, private-target rejection, origin/subdomain scope, safe text extraction, and query ranking. The Rust core tests were executed with Rust 1.98.1. Building the Linux Tauri shell additionally requires the documented GTK/WebKit system packages.
+- RSS 2.0: https://www.rssboard.org/rss-specification
+- Atom, RFC 4287: https://www.rfc-editor.org/rfc/rfc4287.html

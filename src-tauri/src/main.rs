@@ -4,13 +4,21 @@
 // only - key material never crosses the bridge.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use rex_providers::{FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, UreqTransport};
-use rex_search::{SearchEngine, SearchRequest, SearchResponse};
+use rex_providers::{
+    FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, UreqTransport,
+};
+use rex_search::{
+    IndexHit, IndexedDocument, LocalIndex, SearchEngine, SearchRequest, SearchResponse,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
 
 type Service = ProviderService<FileSecretStore, UreqTransport>;
+
+fn search_index() -> LocalIndex {
+    LocalIndex::open(config_dir().join("search-index.json"))
+}
 
 fn config_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
@@ -38,12 +46,18 @@ fn provider_set_key(
 }
 
 #[tauri::command]
-fn provider_clear_key(service: State<'_, Arc<Service>>, provider: String) -> Result<(), ProviderError> {
+fn provider_clear_key(
+    service: State<'_, Arc<Service>>,
+    provider: String,
+) -> Result<(), ProviderError> {
     service.clear_key(&provider)
 }
 
 #[tauri::command]
-fn provider_refresh(service: State<'_, Arc<Service>>, provider: String) -> Result<ModelCatalog, ProviderError> {
+fn provider_refresh(
+    service: State<'_, Arc<Service>>,
+    provider: String,
+) -> Result<ModelCatalog, ProviderError> {
     service.refresh(&provider)
 }
 
@@ -61,14 +75,38 @@ fn search_live(request: SearchRequest) -> SearchResponse {
     SearchEngine::default().search(request)
 }
 
+/// Add or replace one operator-selected document in the private local index.
+#[tauri::command]
+fn search_index_upsert(document: IndexedDocument) -> Result<(), String> {
+    search_index().upsert(document).map_err(|e| e.to_string())
+}
+
+/// Delete one document from the local index. There is no implicit retention.
+#[tauri::command]
+fn search_index_remove(id: String) -> Result<bool, String> {
+    search_index().remove(&id).map_err(|e| e.to_string())
+}
+
+/// Query only the local documents the operator explicitly indexed.
+#[tauri::command]
+fn search_index_query(query: String, limit: usize) -> Result<Vec<IndexHit>, String> {
+    search_index()
+        .query(&query, limit)
+        .map_err(|e| e.to_string())
+}
+
 fn provider_bridge_smoke() -> bool {
     if std::env::args().any(|arg| arg == "--verify-provider-bridge") {
         let dir = std::env::temp_dir().join(format!("rex-harness-smoke-{}", std::process::id()));
-        let store = FileSecretStore::new(dir.clone()).expect("could not open smoke credential store");
+        let store =
+            FileSecretStore::new(dir.clone()).expect("could not open smoke credential store");
         let service = ProviderService::new(store, UreqTransport::new());
         let summaries = service.summaries();
         assert!(!summaries.is_empty(), "provider registry must not be empty");
-        println!("{}", serde_json::to_string(&summaries).expect("provider summaries must serialize"));
+        println!(
+            "{}",
+            serde_json::to_string(&summaries).expect("provider summaries must serialize")
+        );
         let _ = std::fs::remove_dir_all(dir);
         return true;
     }
@@ -95,6 +133,9 @@ fn main() {
             provider_refresh,
             provider_catalog,
             search_live,
+            search_index_upsert,
+            search_index_remove,
+            search_index_query,
         ])
         .run(tauri::generate_context!())
         .expect("error while running REX Harness");
