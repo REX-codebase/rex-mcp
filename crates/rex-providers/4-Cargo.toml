@@ -1,0 +1,15 @@
+[package]
+name = "rex-providers"
+version = "0.1.0"
+edition = "2021"
+description = "REX Harness provider core: live model catalogs, credentials, and provider status"
+license = "Proprietary"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+rex-tools = { path = "../rex-tools" }
+rex-search = { path = "../rex-search" }
+url = "2"
+
