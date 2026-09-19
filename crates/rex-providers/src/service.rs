@@ -147,6 +147,12 @@ impl<S: SecretStore, T: Transport> ProviderService<S, T> {
         Ok(())
     }
 
+    /// Read a stored key for a provider call inside the backend. The value
+    /// is never serialized, logged, or returned across the frontend bridge.
+    pub fn get_key(&self, provider: &str) -> Result<Option<String>, ProviderError> {
+        self.secrets.get_key(provider)
+    }
+
     pub fn transport(&self) -> &T {
         &self.transport
     }

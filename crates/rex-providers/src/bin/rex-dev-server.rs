@@ -15,7 +15,8 @@
 //!   rex-dev-server [--port 8787] [--store-file <dir>] [--replay gemini=path.json]...
 
 use rex_providers::{
-    FileSecretStore, MemorySecretStore, ModelCatalog, ProviderService, SecretStore, UreqTransport,
+    FileSecretStore, LiveRunService, MemorySecretStore, ModelCatalog, ProviderService, SecretStore,
+    UreqTransport,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -47,7 +48,7 @@ impl SecretStore for Store {
     }
 }
 
-type Service = ProviderService<Store, UreqTransport>;
+type Live = LiveRunService<Store, UreqTransport>;
 
 fn main() {
     let mut port: u16 = 8787;
@@ -81,13 +82,20 @@ fn main() {
         i += 1;
     }
 
+    let runs_root = match &store_dir {
+        Some(dir) => std::path::PathBuf::from(dir).join("runs"),
+        None => std::env::temp_dir().join("rex-dev-runs"),
+    };
     let store = match store_dir {
         Some(dir) => {
             Store::File(FileSecretStore::new(dir.into()).expect("could not open dev secret store"))
         }
         None => Store::Memory(MemorySecretStore::new()),
     };
-    let service = Arc::new(ProviderService::new(store, UreqTransport::new()));
+    let live = Arc::new(LiveRunService::new(
+        ProviderService::new(store, UreqTransport::new()),
+        runs_root,
+    ));
 
     for (provider, path) in &replays {
         let text = std::fs::read_to_string(path).expect("replay fixture unreadable");
@@ -96,7 +104,7 @@ fn main() {
         let body: serde_json::Value = serde_json::from_str(&text).expect("replay fixture invalid");
         let models = normalize_replay(provider, &body);
         let catalog = ModelCatalog::live(provider, now_unix(), models);
-        service.seed_replay(provider, catalog);
+        live.service().seed_replay(provider, catalog);
     }
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("could not bind dev server");
@@ -111,9 +119,9 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let service = Arc::clone(&service);
+                let live = Arc::clone(&live);
                 std::thread::spawn(move || {
-                    let _ = handle(stream, service);
+                    let _ = handle(stream, live);
                 });
             }
             Err(_) => continue,
@@ -174,7 +182,7 @@ fn json_response(status: u16, body: &str) -> String {
     )
 }
 
-fn handle(stream: std::net::TcpStream, service: Arc<Service>) -> std::io::Result<()> {
+fn handle(stream: std::net::TcpStream, live: Arc<Live>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -202,13 +210,14 @@ fn handle(stream: std::net::TcpStream, service: Arc<Service>) -> std::io::Result
     reader.read_exact(&mut body)?;
     let body = String::from_utf8_lossy(&body).to_string();
 
-    let response = route(&method, &path, &body, &service);
+    let response = route(&method, &path, &body, &live);
     let mut stream = reader.into_inner();
     stream.write_all(response.as_bytes())?;
     stream.flush()
 }
 
-fn route(method: &str, path: &str, body: &str, service: &Arc<Service>) -> String {
+fn route(method: &str, path: &str, body: &str, live: &Arc<Live>) -> String {
+    let service = live.service();
     if method == "OPTIONS" {
         return json_response(200, "{}");
     }
@@ -266,6 +275,68 @@ fn route(method: &str, path: &str, body: &str, service: &Arc<Service>) -> String
         ("GET", ["api", "providers", id, "catalog"]) => match service.catalog(id) {
             Some(catalog) => json_response(200, &serde_json::to_string(&catalog).unwrap()),
             None => json_response(404, "{\"error\":{\"kind\":\"not_configured\"}}"),
+        },
+        ("POST", ["api", "runs"]) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let task = parsed.get("task").and_then(|t| t.as_str()).unwrap_or("");
+            let provider = parsed
+                .get("provider")
+                .and_then(|p| p.as_str())
+                .unwrap_or("gemini");
+            match live.begin(task, provider) {
+                Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("GET", ["api", "runs", id]) => match live.snapshot(id) {
+            Some(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
+            None => json_response(404, "{\"error\":\"unknown run\"}"),
+        },
+        ("POST", ["api", "runs", id, "decision"]) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let approved = parsed
+                .get("approved")
+                .and_then(|a| a.as_bool())
+                .unwrap_or(false);
+            match live.decide(id, approved) {
+                Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("POST", ["api", "runs", id, "action"]) => {
+            let parsed: Result<rex_preview::BrowserAction, _> = serde_json::from_str(body);
+            match parsed {
+                Ok(action) => match live.preview_action(id, &action) {
+                    Ok(()) => json_response(200, "{\"ok\":true}"),
+                    Err(detail) => json_response(
+                        200,
+                        &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                    ),
+                },
+                Err(_) => json_response(200, "{\"error\":\"invalid browser action\"}"),
+            }
+        }
+        ("POST", ["api", "runs", id, "capture"]) => match live.capture(id) {
+            Ok(evidence) => json_response(200, &serde_json::to_string(&evidence).unwrap()),
+            Err(detail) => json_response(
+                200,
+                &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+            ),
+        },
+        ("POST", ["api", "runs", id, "teardown"]) => match live.teardown(id) {
+            Ok(()) => json_response(200, "{\"ok\":true}"),
+            Err(detail) => json_response(
+                200,
+                &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+            ),
         },
         _ => json_response(
             404,

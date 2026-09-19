@@ -18,6 +18,8 @@ import { NativePreviewView } from "./components/NativePreviewView";
 import { ToolApprovalPreview } from "./components/ToolApprovalPreview";
 import "./preview-runtime.css";
 import { PAST_SESSIONS, newSession, startMockTurn, type Session } from "./data/mock";
+import { LiveRunView } from "./components/LiveRunView";
+import { liveRunAvailable, runBegin, runDecide, runTeardown, type RunSnapshot } from "./data/liveRun";
 
 // The hero starter composer exists only while there is no session. The moment
 // the first run starts it settles - a brief blur + downward travel while its
@@ -35,6 +37,15 @@ export default function App() {
   const fastTimer = useRef<number | null>(null);
   const [task, setTask] = useState("");
   const [session, setSession] = useState<Session | null>(null);
+  const [liveCapable, setLiveCapable] = useState(false);
+  const [liveRun, setLiveRun] = useState<RunSnapshot | null>(null);
+  const [liveStarting, setLiveStarting] = useState(false);
+  const [liveDeciding, setLiveDeciding] = useState(false);
+  useEffect(() => {
+    let active = true;
+    liveRunAvailable().then((ok) => { if (active) setLiveCapable(ok); }).catch(() => undefined);
+    return () => { active = false; };
+  }, []);
   const [hero, setHero] = useState<"shown" | "settling" | "gone">("shown");
   const cancel = useRef<(() => void) | null>(null);
   const settleTimer = useRef<number | null>(null);
@@ -90,6 +101,18 @@ export default function App() {
     cancel.current?.();
     const label = task.trim();
     if (!label) return;
+    if (liveCapable) {
+      // Real path: catalog refresh -> provider turn -> trusted approval ->
+      // Rust write -> native preview. Nothing executes before the decision.
+      setLiveRun(null);
+      setLiveStarting(true);
+      beginSettle();
+      runBegin(label)
+        .then((snap) => setLiveRun(snap))
+        .catch((e) => setLiveRun({ id: "run-failed", task: label, status: "failed", model: "", catalog_count: 0, events: [], approval: null, result: null, preview: null, error: String(e) }))
+        .finally(() => setLiveStarting(false));
+      return;
+    }
     const s = newSession(label);
     cancel.current = startMockTurn(s, label, "task", setSession, reduced);
     if (ultra) {
@@ -97,6 +120,15 @@ export default function App() {
       setBrowserPhase("active");
     }
     beginSettle();
+  };
+
+  const onLiveDecision = (approved: boolean) => {
+    if (!liveRun || liveDeciding) return;
+    setLiveDeciding(true);
+    runDecide(liveRun.id, approved)
+      .then((snap) => setLiveRun(snap))
+      .catch((e) => setLiveRun((prev) => (prev ? { ...prev, status: "failed", error: String(e) } : prev)))
+      .finally(() => setLiveDeciding(false));
   };
 
   const onFollowUp = (request: string) => {
@@ -108,6 +140,10 @@ export default function App() {
   const onNewTask = () => {
     cancel.current?.();
     if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
+    if (liveRun && !liveRun.id.startsWith("run-failed")) runTeardown(liveRun.id).catch(() => undefined);
+    setLiveRun(null);
+    setLiveStarting(false);
+    setLiveDeciding(false);
     setSession(null);
     setTask("");
     setHero("shown");
@@ -164,7 +200,8 @@ export default function App() {
             )}
             <StateRail state={state} blockedReason={latest?.blockedReason} />
             {import.meta.env.DEV && new URLSearchParams(window.location.search).has("approval-preview") && <ToolApprovalPreview />}
-            {nativeProject ? <NativePreviewView projectDir={nativeProject} /> : session && previewTask && <PreviewRuntimeView />}
+            {(liveRun || liveStarting) && <LiveRunView run={liveRun} deciding={liveDeciding} onDecide={onLiveDecision} />}
+            {!liveRun && !liveStarting && (nativeProject ? <NativePreviewView projectDir={nativeProject} /> : session && previewTask && <PreviewRuntimeView />)}
             {ultra && session && !previewTask && browserPhase === "active" && (
               <BrowserView
                 key={browserRun}
@@ -183,7 +220,7 @@ export default function App() {
                 <span>Review</span>
               </button>
             )}
-            {session ? (
+            {!liveRun && !liveStarting && (session ? (
               <SessionView
                 key={session.id}
                 session={session}
@@ -197,7 +234,7 @@ export default function App() {
                 <span className="empty-mark" />
                 <p>Receipts and checks will appear here after a run.</p>
               </div>
-            )}
+            ))}
             <HistoryList
               sessions={PAST_SESSIONS}
               selectedId={session?.id}

@@ -9,8 +9,8 @@ use rex_preview::{
     ProductionReport, SupervisorSummary,
 };
 use rex_providers::{
-    FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, SearchProvider,
-    SearchProviderSummary, SearchRouter, UreqTransport,
+    FileSecretStore, LiveRunService, ModelCatalog, ProviderError, ProviderService, ProviderSummary,
+    RunSnapshot, SearchProvider, SearchProviderSummary, SearchRouter, UreqTransport,
 };
 use rex_search::{IndexHit, IndexedDocument, LocalIndex, SearchRequest, SearchResponse};
 use rex_tools::{CallState, PreparedCall, ToolRequest, ToolResult, ToolRuntime};
@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tauri::State;
 
 type Service = ProviderService<FileSecretStore, UreqTransport>;
+type Live = LiveRunService<FileSecretStore, UreqTransport>;
 type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 type LocalTools = ToolRuntime;
 type NativePreview = PreviewSupervisor;
@@ -303,12 +304,20 @@ fn main() {
         Arc::new(ToolRuntime::new(workspace.clone()).expect("could not open local tool workspace"));
     let preview =
         Arc::new(PreviewSupervisor::new(workspace).expect("could not open preview workspace"));
+    let live = Arc::new(LiveRunService::new(
+        ProviderService::new(
+            FileSecretStore::new(config_dir()).expect("could not open the credential store"),
+            UreqTransport::new(),
+        ),
+        config_dir().join("runs"),
+    ));
 
     tauri::Builder::default()
         .manage(service)
         .manage(search_service)
         .manage(tools)
         .manage(preview)
+        .manage(live)
         .invoke_handler(tauri::generate_handler![
             provider_summaries,
             provider_set_key,
@@ -338,6 +347,12 @@ fn main() {
             preview_finish,
             preview_cancel,
             preview_teardown,
+            run_begin,
+            run_decide,
+            run_snapshot,
+            run_preview_action,
+            run_capture,
+            run_teardown,
         ])
         .run(tauri::generate_context!())
         .expect("error while running REX Harness");
