@@ -266,6 +266,48 @@ fn preview_teardown(
     preview.teardown(&session_id).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn run_begin(live: State<'_, Arc<Live>>, task: String) -> Result<RunSnapshot, String> {
+    live.begin(&task, "gemini")
+}
+
+/// Trusted UI decision for a live run. Model output cannot invoke this path.
+#[tauri::command]
+fn run_decide(
+    live: State<'_, Arc<Live>>,
+    run_id: String,
+    approved: bool,
+) -> Result<RunSnapshot, String> {
+    live.decide(&run_id, approved)
+}
+
+#[tauri::command]
+fn run_snapshot(live: State<'_, Arc<Live>>, run_id: String) -> Result<RunSnapshot, String> {
+    live.snapshot(&run_id).ok_or_else(|| "unknown run".to_string())
+}
+
+#[tauri::command]
+fn run_preview_action(
+    live: State<'_, Arc<Live>>,
+    run_id: String,
+    action: BrowserAction,
+) -> Result<(), String> {
+    live.preview_action(&run_id, &action)
+}
+
+#[tauri::command]
+fn run_capture(
+    live: State<'_, Arc<Live>>,
+    run_id: String,
+) -> Result<BrowserEvidence, String> {
+    live.capture(&run_id)
+}
+
+#[tauri::command]
+fn run_teardown(live: State<'_, Arc<Live>>, run_id: String) -> Result<(), String> {
+    live.teardown(&run_id)
+}
+
 fn provider_bridge_smoke() -> bool {
     if std::env::args().any(|arg| arg == "--verify-provider-bridge") {
         let dir = std::env::temp_dir().join(format!("rex-harness-smoke-{}", std::process::id()));
