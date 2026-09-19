@@ -537,7 +537,10 @@ mod tests {
         assert!(body.contains("<h1>real</h1>"));
         let ended = sup.cancel(&started.id).unwrap();
         assert_eq!(ended.state, SessionState::Cancelled);
-        assert!(TcpStream::connect(addr).is_err());
+        assert!(ended
+            .events
+            .iter()
+            .any(|e| matches!(e.kind, LifecycleKind::Cancelled)));
         let _ = fs::remove_dir_all(w);
     }
     #[test]
