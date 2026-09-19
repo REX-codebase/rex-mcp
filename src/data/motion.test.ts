@@ -67,7 +67,7 @@ describe("subscribeSystemReducedMotion", () => {
       addEventListener: (_: "change", l: () => void) => listeners.add(l),
       removeEventListener: (_: "change", l: () => void) => listeners.delete(l),
     };
-    const spy = vi.spyOn(window, "matchMedia").mockReturnValue(mql as unknown as MediaQueryList);
+    vi.stubGlobal("matchMedia", vi.fn(() => mql as unknown as MediaQueryList));
     const onChange = vi.fn();
     const off = subscribeSystemReducedMotion(onChange);
     expect(listeners.size).toBe(1);
@@ -75,7 +75,7 @@ describe("subscribeSystemReducedMotion", () => {
     expect(onChange).toHaveBeenCalledTimes(1);
     off();
     expect(listeners.size).toBe(0);
-    spy.mockRestore();
+    vi.unstubAllGlobals();
   });
 
   it("supports the legacy addListener interface", () => {
@@ -85,11 +85,11 @@ describe("subscribeSystemReducedMotion", () => {
       addListener: (l: () => void) => listeners.add(l),
       removeListener: (l: () => void) => listeners.delete(l),
     };
-    const spy = vi.spyOn(window, "matchMedia").mockReturnValue(mql as unknown as MediaQueryList);
+    vi.stubGlobal("matchMedia", vi.fn(() => mql as unknown as MediaQueryList));
     const off = subscribeSystemReducedMotion(() => {});
     expect(listeners.size).toBe(1);
     off();
     expect(listeners.size).toBe(0);
-    spy.mockRestore();
+    vi.unstubAllGlobals();
   });
 });

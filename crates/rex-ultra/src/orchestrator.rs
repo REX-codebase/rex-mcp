@@ -991,6 +991,184 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
         }
 
         if reasons.is_empty() {
+            // Phase 5 binds the whole institution to a fresh repository model and
+            // independent reconstruction. It sees no builder narrative.
+            let phase5_result = (|| -> Result<(), String> {
+                use crate::phase5;
+                use std::collections::BTreeSet;
+                let twin = phase5::build_twin(&ctx.workspace)?;
+                let index = phase5::build_index(&ctx.workspace, &twin)?;
+                let audit = phase5::audit(&ctx.workspace, &twin)?;
+                if audit.findings.iter().any(|f| f.severity == "critical") {
+                    return Err(format!(
+                        "critical static/security findings: {:?}",
+                        audit.findings
+                    ));
+                }
+                let source_bytes = twin.files.iter().map(|f| f.bytes).sum::<u64>();
+                let profiles = phase5::profile(
+                    &twin,
+                    vec![
+                        phase5::ProfileSample {
+                            name: "repository_bytes".into(),
+                            value: source_bytes,
+                            unit: "bytes".into(),
+                            budget: 512 * 1024 * 1024,
+                            command: "digital-twin deterministic byte census".into(),
+                        },
+                        phase5::ProfileSample {
+                            name: "repository_files".into(),
+                            value: twin.files.len() as u64,
+                            unit: "files".into(),
+                            budget: 20_000,
+                            command: "digital-twin deterministic file census".into(),
+                        },
+                        phase5::ProfileSample {
+                            name: "semantic_symbols".into(),
+                            value: index.symbols.len() as u64,
+                            unit: "symbols".into(),
+                            budget: 100_000,
+                            command: "semantic-index bounded parse".into(),
+                        },
+                    ],
+                );
+                let synth_input = twin
+                    .files
+                    .iter()
+                    .find(|f| f.path == "Cargo.toml")
+                    .or_else(|| twin.files.first())
+                    .ok_or_else(|| "empty repository".to_string())?
+                    .path
+                    .clone();
+                let synthesis = phase5::synthesize_use_discard(
+                    &phase5::SynthToolSpec {
+                        name: "phase5-content-hasher".into(),
+                        capability: phase5::SynthCapability::HashFile,
+                        inputs: vec![synth_input],
+                        allow_network: false,
+                        allow_process_spawn: false,
+                        allowed_root: ctx
+                            .workspace
+                            .canonicalize()
+                            .map_err(|e| e.to_string())?
+                            .display()
+                            .to_string(),
+                    },
+                    &ctx.workspace,
+                )?;
+                let manifest = evidence.manifest_text();
+                let known_evidence = manifest
+                    .lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<crate::evidence::EvidenceEntry>(line)
+                            .ok()
+                            .map(|e| e.id)
+                    })
+                    .collect::<BTreeSet<_>>();
+                let worker_route = phase5::ModelRoute {
+                    provider: ctx.provider.clone(),
+                    model: worker_model.clone(),
+                    explicitly_configured: true,
+                    safe_provider: true,
+                };
+                let configured_route = match (&ctx.options.judge_provider, &ctx.options.judge_model)
+                {
+                    (Some(p), Some(m)) => Some(phase5::ModelRoute {
+                        provider: p.clone(),
+                        model: m.clone(),
+                        explicitly_configured: true,
+                        safe_provider: true,
+                    }),
+                    _ => None,
+                };
+                let critic_policy = phase5::choose_critic(&worker_route, configured_route.as_ref());
+                let (recon_provider, recon_model) = if critic_policy.same_model {
+                    (&ctx.provider, &worker_model)
+                } else {
+                    let r = configured_route
+                        .as_ref()
+                        .ok_or_else(|| "cross-model route disappeared".to_string())?;
+                    (&r.provider, &r.model)
+                };
+                let prompt =
+                    phase5::reconstruction_prompt(&ctx.task, &twin, &acceptance, &manifest);
+                let answer = oneshot::complete_text(inner.service(), recon_provider, recon_model,
+                    "You are a fresh reconstruction judge. JSON only. You have no access to builder reasoning.", &prompt)?;
+                let answer_ev = evidence.put_bytes("reconstruction_answer", answer.text.as_bytes());
+                let mut reconstruction_evidence = known_evidence.clone();
+                reconstruction_evidence.insert(answer_ev.id);
+                let reconstruction = phase5::parse_reconstruction(
+                    &answer.text,
+                    &format!("{recon_provider}/{recon_model}"),
+                    critic_policy.same_model,
+                    &acceptance,
+                    &reconstruction_evidence,
+                )?;
+                let worlds = phase5::WorldLinks {
+                    builder: "ultra/evidence/manifest.jsonl".into(),
+                    adversary: "ultra/adversary.json".into(),
+                    shadow: "ultra/phase3.json".into(),
+                    recovery: "ultra/phase4.json".into(),
+                    clean_room: "ultra/reconstruction.json".into(),
+                    phase3: "ultra/phase3.json".into(),
+                    phase4: "ultra/phase4.json".into(),
+                };
+                let mut proof_evidence = reconstruction_evidence;
+                if let Some(j) = &judge_result {
+                    for v in &j.verdicts {
+                        for id in &v.evidence {
+                            proof_evidence.insert(id.clone());
+                        }
+                    }
+                }
+                let mut linked_report = report.clone();
+                if let Some(j) = &judge_result {
+                    for outcome in &mut linked_report.outcomes {
+                        if outcome.evidence_ids.is_empty() {
+                            if let Some(v) = j
+                                .verdicts
+                                .iter()
+                                .find(|v| v.obligation_id == outcome.obligation_id)
+                            {
+                                outcome.evidence_ids = v.evidence.clone();
+                            }
+                        }
+                    }
+                }
+                let gate = phase5::promotion_gate(
+                    &acceptance,
+                    &linked_report,
+                    &reconstruction,
+                    &worlds,
+                    &proof_evidence,
+                );
+                let bundle = phase5::Phase5Bundle {
+                    twin,
+                    index,
+                    audit,
+                    profiles,
+                    visual: None,
+                    synthesis: Some(synthesis),
+                    reconstruction,
+                    critic_policy,
+                    worlds,
+                    gate,
+                };
+                let _ = phase5::seal_bundle(
+                    &ctx.workspace,
+                    &ultra_dir,
+                    &bundle,
+                    &mut ledger,
+                    &mut evidence,
+                )?;
+                Ok(())
+            })();
+            if let Err(e) = phase5_result {
+                reasons.push(format!("phase 5 failed: {e}"));
+            }
+        }
+
+        if reasons.is_empty() {
             let bundle = serde_json::json!({
                 "task": ctx.task,
                 "worker_model": format!("{}/{}", ctx.provider, worker_model),
@@ -1002,6 +1180,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                 "evidence": "ultra/evidence/manifest.jsonl",
                 "phase3": "ultra/phase3.json",
                 "phase4": "ultra/phase4.json",
+                "phase5": "ultra/phase5.json",
             });
             let entry = evidence.put_bytes("proof_bundle", bundle.to_string().as_bytes());
             ledger.record(
@@ -1189,6 +1368,10 @@ mod tests {
                     text_turn(
                         r#"{"verdicts":[{"obligation_id":"page","verdict":"pass","reason":"fresh verification passed","evidence":[]}]}"#,
                     ),
+                    // Fresh reconstruction sees only task, final twin and evidence manifest.
+                    text_turn(
+                        r#"{"reconstructed":true,"obligation_ids":["page"],"evidence_ids":["ev-0001"],"explanation":"The final repository twin and content-addressed evidence cover the requested page."}"#,
+                    ),
                 ])),
             },
         );
@@ -1217,6 +1400,7 @@ mod tests {
         assert!(ultra_dir.join("ledger.jsonl").is_file());
         assert!(ultra_dir.join("phase4.json").is_file());
         assert!(ultra_dir.join("phase4-checkpoint.json").is_file());
+        assert!(ultra_dir.join("phase5.json").is_file());
         assert!(ultra_dir.join("evidence").join("manifest.jsonl").is_file());
         let judge = done.judge.expect("judge report");
         assert!(judge.same_model_as_worker);
