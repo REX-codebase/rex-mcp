@@ -14,6 +14,7 @@ serde_json = { workspace = true }
 rex-providers = { path = "../crates/rex-providers" }
 rex-search = { path = "../crates/rex-search" }
 rex-tools = { path = "../crates/rex-tools" }
+rex-ultra = { path = "../crates/rex-ultra" }
 rex-preview = { path = "../crates/rex-preview" }
 rex-installed-agents = { path = "../crates/rex-installed-agents" }
 

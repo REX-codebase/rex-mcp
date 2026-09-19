@@ -389,6 +389,12 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         self.runs_root.join(id)
     }
 
+    /// The provider core behind this run service. Ultra's one-shot roles
+    /// (contract drafting, judge) call through the same safe routes.
+    pub fn service(&self) -> &ProviderService<S, T> {
+        &self.service
+    }
+
     fn snapshot_of(&self, id: &str, handle: &RunHandle) -> AgentSnapshot {
         let brief = read_json::<TaskBrief>(&self.run_dir(id).join("state").join("brief.json")).ok();
         let state = handle.shared.lock().expect("run state poisoned");
@@ -440,6 +446,20 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         requested_model: Option<&str>,
         budgets: Option<Budgets>,
     ) -> Result<AgentSnapshot, String> {
+        self.begin_in_workspace(task, provider, requested_model, budgets, None)
+    }
+
+    /// Start a run in a caller-provided workspace. Ultra uses this so the
+    /// builder, the adversary and the verifier all operate on one shared,
+    /// disposable workspace. The workspace must sit under the runs root.
+    pub fn begin_in_workspace(
+        &self,
+        task: &str,
+        provider: &str,
+        requested_model: Option<&str>,
+        budgets: Option<Budgets>,
+        workspace: Option<PathBuf>,
+    ) -> Result<AgentSnapshot, String> {
         let task = task.trim();
         if task.is_empty() {
             return Err("task is empty".into());
@@ -477,7 +497,23 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         let id = format!("agent-{}-{:x}", std::process::id(), now_ms());
         let run_dir = self.run_dir(&id);
         let state_dir = run_dir.join("state");
-        let workspace = run_dir.join("workspace");
+        let workspace = match workspace {
+            Some(dir) => {
+                let root = self.runs_root.canonicalize().map_err(|e| e.to_string())?;
+                let canon = if dir.exists() {
+                    dir.canonicalize().map_err(|e| e.to_string())?
+                } else {
+                    let parent = dir.parent().ok_or_else(|| "invalid workspace path".to_string())?;
+                    let parent = parent.canonicalize().map_err(|e| e.to_string())?;
+                    parent.join(dir.file_name().ok_or_else(|| "invalid workspace path".to_string())?)
+                };
+                if !canon.starts_with(&root) {
+                    return Err("workspace must live under the runs root".into());
+                }
+                canon
+            }
+            None => run_dir.join("workspace"),
+        };
         fs::create_dir_all(state_dir.join("evidence")).map_err(|e| e.to_string())?;
         fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
         let brief = TaskBrief {

@@ -403,7 +403,7 @@ fn measured_failures(ev: &BrowserEvidence) -> Vec<ProductionGate> {
     out
 }
 
-pub(crate) fn pick_flash_lite(ids: &[&str]) -> Option<String> {
+pub fn pick_flash_lite(ids: &[&str]) -> Option<String> {
     ids.iter()
         .find(|id| **id == "gemini-3.5-flash-lite")
         .map(|s| s.to_string())

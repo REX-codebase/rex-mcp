@@ -24,6 +24,7 @@ pub mod service;
 
 pub mod live;
 pub mod autonomous;
+pub mod oneshot;
 
 pub use agent_loop::{AgentLoop, LoopEvent, DEFAULT_MAX_STEPS, HARD_MAX_STEPS};
 pub use live::{LiveRunService, RunSnapshot, RunStatus};

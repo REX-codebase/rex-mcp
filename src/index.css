@@ -480,3 +480,17 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .run-stderr-toggle{font-size:11px;color:var(--color-faint)}
 .run-stderr pre{margin-top:8px;max-height:200px;overflow:auto;border-radius:10px;background:var(--color-bg);padding:12px;font:11px/1.6 "JetBrains Mono",monospace;color:var(--color-muted);white-space:pre-wrap}
 .live-cancel{border:1px solid var(--color-line);border-radius:9px;padding:6px 12px;font-size:11px;font-weight:650;color:var(--color-muted)}
+
+/* Ultra verification surface: same quiet system, information only. */
+.ultra-run { display: flex; flex-direction: column; gap: 16px; }
+.ultra-run-head { display: flex; flex-direction: column; gap: 4px; }
+.ultra-run-head strong { font-size: 15px; font-weight: 600; }
+.ultra-run-head small { color: var(--muted, #6b7280); font-size: 12px; }
+.ultra-obligations { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.ultra-obligation { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+.ultra-obligation em { font-style: normal; font-size: 11px; color: var(--muted, #6b7280); }
+.ultra-obligation.is-proven > span:first-child { color: #15803d; }
+.ultra-obligation.is-failed > span:first-child { color: #b91c1c; }
+.ultra-adversary, .ultra-rejected { font-size: 13px; color: #92400e; display: flex; flex-direction: column; gap: 4px; }
+.ultra-rejected { color: #b91c1c; }
+.ultra-waiting { font-size: 13px; color: var(--muted, #6b7280); }

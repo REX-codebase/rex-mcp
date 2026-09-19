@@ -20,6 +20,7 @@ use rex_providers::{
 };
 use rex_search::{IndexHit, IndexedDocument, LocalIndex, SearchRequest, SearchResponse};
 use rex_tools::{CallState, PreparedCall, ToolRequest, ToolResult, ToolRuntime};
+use rex_ultra::orchestrator::{UltraOptions, UltraRunService, UltraSnapshot};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
@@ -27,6 +28,7 @@ use tauri::State;
 type Service = ProviderService<FileSecretStore, UreqTransport>;
 type Live = LiveRunService<FileSecretStore, UreqTransport>;
 type Agent = AutonomousRunService<FileSecretStore, UreqTransport>;
+type Ultra = UltraRunService<FileSecretStore, UreqTransport>;
 type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 type LocalTools = ToolRuntime;
 type NativePreview = PreviewSupervisor;
@@ -436,6 +438,48 @@ fn agent_teardown(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<(), St
     agent.teardown(&run_id)
 }
 
+/// Ultra run: the same worker model wrapped in contract compilation,
+/// deterministic re-verification, an adversary pass and a clean-room judge.
+/// The judge/adversary default to the worker identity unless configured by
+/// REX_ULTRA_JUDGE_PROVIDER / REX_ULTRA_JUDGE_MODEL (and _ADVERSARY_).
+#[tauri::command]
+fn ultra_begin(
+    ultra: State<'_, Arc<Ultra>>,
+    task: String,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<UltraSnapshot, String> {
+    let provider = provider.as_deref().unwrap_or("gemini");
+    let options = UltraOptions {
+        judge_provider: std::env::var("REX_ULTRA_JUDGE_PROVIDER").ok(),
+        judge_model: std::env::var("REX_ULTRA_JUDGE_MODEL").ok(),
+        adversary_provider: std::env::var("REX_ULTRA_ADVERSARY_PROVIDER").ok(),
+        adversary_model: std::env::var("REX_ULTRA_ADVERSARY_MODEL").ok(),
+        adversary_enabled: None,
+    };
+    ultra.begin(&task, provider, model.as_deref(), options)
+}
+
+#[tauri::command]
+fn ultra_snapshot(ultra: State<'_, Arc<Ultra>>, run_id: String) -> Result<UltraSnapshot, String> {
+    ultra.snapshot(&run_id).ok_or_else(|| "unknown run".to_string())
+}
+
+/// Trusted UI decision for the currently active builder/adversary sub-run.
+#[tauri::command]
+fn ultra_decide(
+    ultra: State<'_, Arc<Ultra>>,
+    run_id: String,
+    approved: bool,
+) -> Result<UltraSnapshot, String> {
+    ultra.decide(&run_id, approved)
+}
+
+#[tauri::command]
+fn ultra_cancel(ultra: State<'_, Arc<Ultra>>, run_id: String) -> Result<UltraSnapshot, String> {
+    ultra.cancel(&run_id)
+}
+
 fn provider_bridge_smoke() -> bool {
     if std::env::args().any(|arg| arg == "--verify-provider-bridge") {
         let dir = std::env::temp_dir().join(format!("rex-harness-smoke-{}", std::process::id()));
@@ -496,6 +540,9 @@ fn main() {
         )),
         config_dir().join("agent-runs"),
     ));
+    // Ultra shares the Simple run service: one provider core, one approval
+    // channel, one runs root. Ultra adds its verification phases on top.
+    let ultra = Arc::new(UltraRunService::new(agent.clone(), config_dir().join("agent-runs")));
 
     tauri::Builder::default()
         .manage(service)
@@ -504,6 +551,7 @@ fn main() {
         .manage(preview)
         .manage(live)
         .manage(agent)
+        .manage(ultra)
         .manage(installed_runs)
         .invoke_handler(tauri::generate_handler![
             installed_agent_summaries,
@@ -554,6 +602,10 @@ fn main() {
             agent_preview_action,
             agent_capture,
             agent_teardown,
+            ultra_begin,
+            ultra_snapshot,
+            ultra_decide,
+            ultra_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running REX Harness");

@@ -19,6 +19,8 @@ import { ToolApprovalPreview } from "./components/ToolApprovalPreview";
 import "./preview-runtime.css";
 import { PAST_SESSIONS, newSession, startMockTurn, type Session } from "./data/mock";
 import { AgentRunView } from "./components/AgentRunView";
+import { UltraRunView } from "./components/UltraRunView";
+import { ultraBegin, ultraSnapshot, ultraDecide, ultraCancel, type UltraSnapshot } from "./data/ultraRun";
 import { liveRunAvailable } from "./data/liveRun";
 import {
   agentBegin,
@@ -50,6 +52,8 @@ export default function App() {
   const [browserPhase, setBrowserPhase] = useState<"closed" | "active" | "collapsed">("closed");
   const [browserRun, setBrowserRun] = useState(0);
   const [ultra, setUltra] = useState(false);
+  const [ultraRun, setUltraRun] = useState<UltraSnapshot | null>(null);
+  const ultraPoll = useRef<number | null>(null);
   const [ultraPulse, setUltraPulse] = useState(0);
   const [fast, setFast] = useState(false);
   const [fastPulse, setFastPulse] = useState(0);
@@ -137,6 +141,21 @@ export default function App() {
 
   // Poll the Rust loop while it is non-terminal; the snapshot is the whole
   // truth, so rendering never depends on event timing.
+  const startUltraPolling = (id: string) => {
+    if (ultraPoll.current !== null) window.clearInterval(ultraPoll.current);
+    ultraPoll.current = window.setInterval(() => {
+      ultraSnapshot(id)
+        .then((snap) => {
+          setUltraRun(snap);
+          if (snap.terminal && ultraPoll.current !== null) {
+            window.clearInterval(ultraPoll.current);
+            ultraPoll.current = null;
+          }
+        })
+        .catch(() => undefined);
+    }, 900);
+  };
+
   const startPolling = (id: string) => {
     if (livePoll.current !== null) window.clearInterval(livePoll.current);
     livePoll.current = window.setInterval(() => {
@@ -221,6 +240,45 @@ export default function App() {
         .finally(() => setInstalledStarting(false));
       return;
     }
+    if (liveCapable && ultra) {
+      // Ultra path: contract -> build -> verify -> adversary -> judge.
+      setUltraRun(null);
+      setLiveRun(null);
+      setLiveStarting(true);
+      beginSettle();
+      ultraBegin(label)
+        .then((snap) => {
+          setUltraRun(snap);
+          startUltraPolling(snap.id);
+        })
+        .catch((e) => {
+          setUltraRun(null);
+          setLiveRun({
+            id: "run-failed",
+            task: label,
+            status: "failed",
+            terminal_reason: { kind: "provider_error", detail: String(e) },
+            provider: "gemini",
+            model: "",
+            plan: [],
+            step: 0,
+            max_steps: 0,
+            tool_calls: 0,
+            max_tool_calls: 0,
+            tokens_used: 0,
+            max_tokens: 0,
+            elapsed_ms: 0,
+            max_wall_ms: 0,
+            pending_approval: null,
+            events: [],
+            preview: null,
+            completion_summary: null,
+            error: String(e),
+          });
+        })
+        .finally(() => setLiveStarting(false));
+      return;
+    }
     if (liveCapable) {
       // Real path: the autonomous Rust loop plans, acts through trusted
       // approvals, verifies its own work against gates, and stops truthfully.
@@ -269,6 +327,15 @@ export default function App() {
   };
 
   const onLiveDecision = (approved: boolean) => {
+    if (ultraRun && !ultraRun.terminal) {
+      if (liveDeciding) return;
+      setLiveDeciding(true);
+      ultraDecide(ultraRun.id, approved)
+        .then((snap) => setUltraRun(snap))
+        .catch(() => undefined)
+        .finally(() => setLiveDeciding(false));
+      return;
+    }
     if (!liveRun || liveDeciding) return;
     setLiveDeciding(true);
     agentDecide(liveRun.id, approved)
@@ -278,6 +345,15 @@ export default function App() {
   };
 
   const onLiveCancel = () => {
+    if (ultraRun && !ultraRun.terminal) {
+      if (liveCancelling) return;
+      setLiveCancelling(true);
+      ultraCancel(ultraRun.id)
+        .then((snap) => setUltraRun(snap))
+        .catch(() => undefined)
+        .finally(() => setLiveCancelling(false));
+      return;
+    }
     if (!liveRun || liveCancelling) return;
     setLiveCancelling(true);
     agentCancel(liveRun.id)
@@ -348,7 +424,7 @@ export default function App() {
       )}
       <div className="ultra-atmosphere" aria-hidden="true"><span className="ultra-horizon" /><span className="ultra-scan" /></div>
       <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={toggleFast} live={liveCapable} />
-      <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Premium preview engaged" : "Premium preview offline"}</b><small>No extra capabilities are active</small></div>
+      <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Verification tier engaged" : "Verification tier offline"}</b><small>{ultra ? "Contract, adversary and clean-room judge active" : "No extra capabilities are active"}</small></div>
       <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "TEMPO PROFILE ARMED" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small><i aria-hidden="true" /></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
         {view === "settings" ? (
@@ -403,6 +479,15 @@ export default function App() {
                   <span className="live-status-text">Starting the vendor CLI…</span>
                 </div>
               </section>
+            )}
+            {(ultraRun || liveStarting) && ultraRun && (
+              <UltraRunView
+                run={ultraRun}
+                deciding={liveDeciding}
+                cancelling={liveCancelling}
+                onDecide={onLiveDecision}
+                onCancel={onLiveCancel}
+              />
             )}
             {(liveRun || liveStarting) && liveRun && (
               <AgentRunView
