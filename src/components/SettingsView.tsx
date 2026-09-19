@@ -1,5 +1,6 @@
 import { SearchProviderSettings } from "./SearchProviderSettings";
-export type MotionPref = "system" | "reduce" | "full";
+import type { MotionPref } from "../data/motion";
+export type { MotionPref };
 const MOTION_OPTIONS: { id: MotionPref; label: string; hint: string }[] = [
   { id: "system", label: "System", hint: "Follow the device setting" },
   { id: "reduce", label: "Reduce", hint: "Minimal animation" },

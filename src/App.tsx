@@ -4,11 +4,16 @@ import { Composer } from "./components/Composer";
 import { StateRail } from "./components/StateRail";
 import { SessionView } from "./components/SessionView";
 import { HistoryList } from "./components/HistoryList";
-import { SettingsView, type MotionPref } from "./components/SettingsView";
+import { SettingsView } from "./components/SettingsView";
+import {
+  MOTION_KEY,
+  loadMotionPref,
+  resolveReduced,
+  useSystemReducedMotion,
+  type MotionPref,
+} from "./data/motion";
 import { BrowserView } from "./components/BrowserView";
 import { PAST_SESSIONS, newSession, startMockTurn, type Session } from "./data/mock";
-
-const MOTION_KEY = "rex-harness-motion";
 
 // The hero starter composer exists only while there is no session. The moment
 // the first run starts it settles - a brief blur + downward travel while its
@@ -29,17 +34,11 @@ export default function App() {
   const [hero, setHero] = useState<"shown" | "settling" | "gone">("shown");
   const cancel = useRef<(() => void) | null>(null);
   const settleTimer = useRef<number | null>(null);
-  const systemReduce =
-    typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const [motion, setMotion] = useState<MotionPref>(() => {
-    try {
-      const v = window.localStorage.getItem(MOTION_KEY);
-      return v === "reduce" || v === "full" ? v : "system";
-    } catch {
-      return "system";
-    }
-  });
-  const reduced = motion === "system" ? systemReduce : motion === "reduce";
+  const systemReduce = useSystemReducedMotion();
+  const [motion, setMotion] = useState<MotionPref>(() =>
+    loadMotionPref((key) => window.localStorage.getItem(key))
+  );
+  const reduced = resolveReduced(motion, systemReduce);
   useEffect(() => {
     try {
       window.localStorage.setItem(MOTION_KEY, motion);
@@ -109,7 +108,7 @@ export default function App() {
   };
 
   return (
-    <div className={`harness-shell min-h-full ${ultra ? "ultra-on" : ""} ${fast ? "fast-on" : ""} ${fastPhase !== "idle" ? `fast-${fastPhase}` : ""} ${reduced ? "reduced-fx" : ""}`} data-ultra={ultra ? "on" : "off"}>
+    <div className={`harness-shell min-h-full motion-${motion} ${ultra ? "ultra-on" : ""} ${fast ? "fast-on" : ""} ${fastPhase !== "idle" ? `fast-${fastPhase}` : ""} ${reduced ? "reduced-fx" : ""}`} data-motion={motion} data-ultra={ultra ? "on" : "off"}>
       <div className="ultra-transition" key={ultraPulse} aria-hidden="true"><span /><span /><span /><span /></div>
       {fastPhase !== "idle" && (
         <div className="fast-transition" key={fastPulse} aria-hidden="true">
