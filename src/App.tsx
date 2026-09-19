@@ -18,8 +18,17 @@ import { NativePreviewView } from "./components/NativePreviewView";
 import { ToolApprovalPreview } from "./components/ToolApprovalPreview";
 import "./preview-runtime.css";
 import { PAST_SESSIONS, newSession, startMockTurn, type Session } from "./data/mock";
-import { LiveRunView } from "./components/LiveRunView";
-import { liveRunAvailable, runBegin, runDecide, runTeardown, type RunSnapshot } from "./data/liveRun";
+import { AgentRunView } from "./components/AgentRunView";
+import { liveRunAvailable } from "./data/liveRun";
+import {
+  agentBegin,
+  agentCancel,
+  agentDecide,
+  agentSnapshot,
+  agentTeardown,
+  type AgentSnapshot,
+} from "./data/agentRun";
+import { terminalActive } from "./data/agentTypes";
 
 // The hero starter composer exists only while there is no session. The moment
 // the first run starts it settles - a brief blur + downward travel while its
@@ -38,13 +47,30 @@ export default function App() {
   const [task, setTask] = useState("");
   const [session, setSession] = useState<Session | null>(null);
   const [liveCapable, setLiveCapable] = useState(false);
-  const [liveRun, setLiveRun] = useState<RunSnapshot | null>(null);
+  const [liveRun, setLiveRun] = useState<AgentSnapshot | null>(null);
   const [liveStarting, setLiveStarting] = useState(false);
   const [liveDeciding, setLiveDeciding] = useState(false);
+  const [liveCancelling, setLiveCancelling] = useState(false);
+  const livePoll = useRef<number | null>(null);
   useEffect(() => {
     let active = true;
     liveRunAvailable().then((ok) => { if (active) setLiveCapable(ok); }).catch(() => undefined);
     return () => { active = false; };
+  }, []);
+  // Deep link: #run=<id> reattaches to an existing agent loop run (e.g.
+  // after a reload). Read-only viewers and the original driver share the
+  // same snapshot stream.
+  useEffect(() => {
+    const m = window.location.hash.match(/^#run=(.+)$/);
+    if (!m) return;
+    const id = m[1];
+    agentSnapshot(id)
+      .then((snap) => {
+        setLiveRun(snap);
+        if (!terminalActive(snap)) startPolling(id);
+      })
+      .catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const [hero, setHero] = useState<"shown" | "settling" | "gone">("shown");
   const cancel = useRef<(() => void) | null>(null);
@@ -71,9 +97,27 @@ export default function App() {
       cancel.current?.();
       if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
       if (fastTimer.current !== null) window.clearTimeout(fastTimer.current);
+      if (livePoll.current !== null) window.clearInterval(livePoll.current);
     },
     []
   );
+
+  // Poll the Rust loop while it is non-terminal; the snapshot is the whole
+  // truth, so rendering never depends on event timing.
+  const startPolling = (id: string) => {
+    if (livePoll.current !== null) window.clearInterval(livePoll.current);
+    livePoll.current = window.setInterval(() => {
+      agentSnapshot(id)
+        .then((snap) => {
+          setLiveRun(snap);
+          if (terminalActive(snap) && livePoll.current !== null) {
+            window.clearInterval(livePoll.current);
+            livePoll.current = null;
+          }
+        })
+        .catch(() => undefined);
+    }, 900);
+  };
 
   const latest = session?.turns[session.turns.length - 1];
   const state = latest?.state ?? "idle";
@@ -102,14 +146,40 @@ export default function App() {
     const label = task.trim();
     if (!label) return;
     if (liveCapable) {
-      // Real path: catalog refresh -> provider turn -> trusted approval ->
-      // Rust write -> native preview. Nothing executes before the decision.
+      // Real path: the autonomous Rust loop plans, acts through trusted
+      // approvals, verifies its own work against gates, and stops truthfully.
       setLiveRun(null);
       setLiveStarting(true);
       beginSettle();
-      runBegin(label)
-        .then((snap) => setLiveRun(snap))
-        .catch((e) => setLiveRun({ id: "run-failed", task: label, status: "failed", model: "", catalog_count: 0, events: [], approval: null, result: null, preview: null, error: String(e) }))
+      agentBegin(label)
+        .then((snap) => {
+          setLiveRun(snap);
+          startPolling(snap.id);
+        })
+        .catch((e) =>
+          setLiveRun({
+            id: "run-failed",
+            task: label,
+            status: "failed",
+            terminal_reason: { kind: "provider_error", detail: String(e) },
+            provider: "gemini",
+            model: "",
+            plan: [],
+            step: 0,
+            max_steps: 0,
+            tool_calls: 0,
+            max_tool_calls: 0,
+            tokens_used: 0,
+            max_tokens: 0,
+            elapsed_ms: 0,
+            max_wall_ms: 0,
+            pending_approval: null,
+            events: [],
+            preview: null,
+            completion_summary: null,
+            error: String(e),
+          })
+        )
         .finally(() => setLiveStarting(false));
       return;
     }
@@ -125,10 +195,19 @@ export default function App() {
   const onLiveDecision = (approved: boolean) => {
     if (!liveRun || liveDeciding) return;
     setLiveDeciding(true);
-    runDecide(liveRun.id, approved)
+    agentDecide(liveRun.id, approved)
       .then((snap) => setLiveRun(snap))
-      .catch((e) => setLiveRun((prev) => (prev ? { ...prev, status: "failed", error: String(e) } : prev)))
+      .catch((e) => setLiveRun((prev) => (prev ? { ...prev, error: String(e) } : prev)))
       .finally(() => setLiveDeciding(false));
+  };
+
+  const onLiveCancel = () => {
+    if (!liveRun || liveCancelling) return;
+    setLiveCancelling(true);
+    agentCancel(liveRun.id)
+      .then((snap) => setLiveRun(snap))
+      .catch(() => undefined)
+      .finally(() => setLiveCancelling(false));
   };
 
   const onFollowUp = (request: string) => {
@@ -140,7 +219,11 @@ export default function App() {
   const onNewTask = () => {
     cancel.current?.();
     if (settleTimer.current !== null) window.clearTimeout(settleTimer.current);
-    if (liveRun && !liveRun.id.startsWith("run-failed")) runTeardown(liveRun.id).catch(() => undefined);
+    if (livePoll.current !== null) {
+      window.clearInterval(livePoll.current);
+      livePoll.current = null;
+    }
+    if (liveRun && !liveRun.id.startsWith("run-failed")) agentTeardown(liveRun.id).catch(() => undefined);
     setLiveRun(null);
     setLiveStarting(false);
     setLiveDeciding(false);
@@ -200,7 +283,24 @@ export default function App() {
             )}
             <StateRail state={state} blockedReason={latest?.blockedReason} />
             {import.meta.env.DEV && new URLSearchParams(window.location.search).has("approval-preview") && <ToolApprovalPreview />}
-            {(liveRun || liveStarting) && <LiveRunView run={liveRun} deciding={liveDeciding} onDecide={onLiveDecision} />}
+            {(liveRun || liveStarting) && liveRun && (
+              <AgentRunView
+                run={liveRun}
+                deciding={liveDeciding}
+                cancelling={liveCancelling}
+                onDecide={onLiveDecision}
+                onCancel={onLiveCancel}
+              />
+            )}
+            {(liveRun || liveStarting) && !liveRun && (
+              <section className="live-run" aria-label="Starting the agent loop">
+                <div className="live-status" role="status">
+                  <span className="live-dot" aria-hidden="true" />
+                  <span className="eyebrow">Agent loop</span>
+                  <span className="live-status-text">Contacting the live model catalog…</span>
+                </div>
+              </section>
+            )}
             {!liveRun && !liveStarting && (nativeProject ? <NativePreviewView projectDir={nativeProject} /> : session && previewTask && <PreviewRuntimeView />)}
             {ultra && session && !previewTask && browserPhase === "active" && (
               <BrowserView

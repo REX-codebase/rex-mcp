@@ -9,8 +9,9 @@ use rex_preview::{
     ProductionReport, SupervisorSummary,
 };
 use rex_providers::{
-    FileSecretStore, LiveRunService, ModelCatalog, ProviderError, ProviderService, ProviderSummary,
-    RunSnapshot, SearchProvider, SearchProviderSummary, SearchRouter, UreqTransport,
+    AgentSnapshot, AutonomousRunService, Budgets, FileSecretStore, LiveRunService, ModelCatalog,
+    ProviderError, ProviderService, ProviderSummary, RunSnapshot, SearchProvider,
+    SearchProviderSummary, SearchRouter, UreqTransport,
 };
 use rex_search::{IndexHit, IndexedDocument, LocalIndex, SearchRequest, SearchResponse};
 use rex_tools::{CallState, PreparedCall, ToolRequest, ToolResult, ToolRuntime};
@@ -20,6 +21,7 @@ use tauri::State;
 
 type Service = ProviderService<FileSecretStore, UreqTransport>;
 type Live = LiveRunService<FileSecretStore, UreqTransport>;
+type Agent = AutonomousRunService<FileSecretStore, UreqTransport>;
 type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 type LocalTools = ToolRuntime;
 type NativePreview = PreviewSupervisor;
@@ -308,6 +310,61 @@ fn run_teardown(live: State<'_, Arc<Live>>, run_id: String) -> Result<(), String
     live.teardown(&run_id)
 }
 
+/// Autonomous Simple Mode run: many bounded model turns, visible plan,
+/// trusted approvals, concrete completion gates, truthful terminal reasons.
+#[tauri::command]
+fn agent_begin(
+    agent: State<'_, Arc<Agent>>,
+    task: String,
+    budgets: Option<Budgets>,
+) -> Result<AgentSnapshot, String> {
+    agent.begin(&task, "gemini", budgets)
+}
+
+#[tauri::command]
+fn agent_snapshot(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<AgentSnapshot, String> {
+    agent.snapshot(&run_id).ok_or_else(|| "unknown run".to_string())
+}
+
+/// Trusted UI decision. Only this command can release a prepared write.
+#[tauri::command]
+fn agent_decide(
+    agent: State<'_, Arc<Agent>>,
+    run_id: String,
+    approved: bool,
+) -> Result<AgentSnapshot, String> {
+    agent.decide(&run_id, approved)
+}
+
+#[tauri::command]
+fn agent_cancel(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<AgentSnapshot, String> {
+    agent.cancel(&run_id)
+}
+
+#[tauri::command]
+fn agent_resume(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<AgentSnapshot, String> {
+    agent.resume(&run_id)
+}
+
+#[tauri::command]
+fn agent_preview_action(
+    agent: State<'_, Arc<Agent>>,
+    run_id: String,
+    action: BrowserAction,
+) -> Result<(), String> {
+    agent.preview_action(&run_id, &action)
+}
+
+#[tauri::command]
+fn agent_capture(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<BrowserEvidence, String> {
+    agent.capture(&run_id)
+}
+
+#[tauri::command]
+fn agent_teardown(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<(), String> {
+    agent.teardown(&run_id)
+}
+
 fn provider_bridge_smoke() -> bool {
     if std::env::args().any(|arg| arg == "--verify-provider-bridge") {
         let dir = std::env::temp_dir().join(format!("rex-harness-smoke-{}", std::process::id()));
@@ -353,6 +410,17 @@ fn main() {
         ),
         config_dir().join("runs"),
     ));
+    let agent = Arc::new(AutonomousRunService::new(
+        ProviderService::new(
+            FileSecretStore::new(config_dir()).expect("could not open the credential store"),
+            UreqTransport::new(),
+        ),
+        Some(SearchRouter::new(
+            FileSecretStore::new(config_dir()).expect("could not open search credential store"),
+            UreqTransport::new(),
+        )),
+        config_dir().join("agent-runs"),
+    ));
 
     tauri::Builder::default()
         .manage(service)
@@ -360,6 +428,7 @@ fn main() {
         .manage(tools)
         .manage(preview)
         .manage(live)
+        .manage(agent)
         .invoke_handler(tauri::generate_handler![
             provider_summaries,
             provider_set_key,
@@ -395,6 +464,14 @@ fn main() {
             run_preview_action,
             run_capture,
             run_teardown,
+            agent_begin,
+            agent_snapshot,
+            agent_decide,
+            agent_cancel,
+            agent_resume,
+            agent_preview_action,
+            agent_capture,
+            agent_teardown,
         ])
         .run(tauri::generate_context!())
         .expect("error while running REX Harness");

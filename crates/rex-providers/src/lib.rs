@@ -23,9 +23,14 @@ pub mod secrets;
 pub mod service;
 
 pub mod live;
+pub mod autonomous;
 
 pub use agent_loop::{AgentLoop, LoopEvent, DEFAULT_MAX_STEPS, HARD_MAX_STEPS};
 pub use live::{LiveRunService, RunSnapshot, RunStatus};
+pub use autonomous::{
+    AgentEvent, AgentPreview, AgentSnapshot, AgentStatus, AutonomousRunService, Budgets,
+    PlanItem, PlanStatus, TerminalReason,
+};
 pub use catalog::{CatalogSource, ModelCatalog, ModelInfo};
 pub use conversation::{
     decode_turn, encode_tool_outcomes, NormalizedToolCall, NormalizedTurn, ToolOutcome,
