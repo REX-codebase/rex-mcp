@@ -17,6 +17,7 @@ pub mod judge;
 pub mod ledger;
 pub mod orchestrator;
 pub mod phase3;
+pub mod phase4;
 pub mod verify;
 
 pub fn now_ms() -> u128 {

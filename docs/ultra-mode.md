@@ -114,3 +114,13 @@ The semantic catalog covers stale cache, wrong account or target, partial writes
 Ultra captures old and new observables for workspace files, fresh command obligations, and process outcomes before the adversary can add its own inspection artifacts. Both traces carry the same provider, model, and deterministic seed. Every difference must map to a real acceptance obligation and an explicit allowed-difference record. Missing, incomplete, unreplayed, non-reproducible, survived, inconclusive, or unexplained evidence fails closed.
 
 `ultra/phase3.json` is sealed into the evidence store and epistemic ledger and referenced by the proof bundle. Phase 2 qualification requires it before a candidate can be selected. Simple mode does not import or call this subsystem.
+
+## Phase 4: causal replay and recovery
+
+Ultra completion now carries a fail-closed Phase 4 bundle. Its canonical trace uses stable, content-derived event IDs and validated parent links from the contract and model decision through the worker result, fresh verifier evidence and the completion decision. Payloads are hash-bound, sequence-checked and bounded. Missing, future, duplicated or forged parents invalidate the run.
+
+Replay bundles pin provider, model, seed, trace hash, redacted inputs and expected observables. Inputs containing secrets are redacted and truthfully mark the run non-reproducible rather than pretending that hidden data can be replayed. Checkpoints are versioned, size-bounded, hash-verified and atomically replaced. Every effect has a request-bound idempotency key, so recovery suppresses a second application and rejects key reuse for a different request.
+
+The fault harness has deterministic seams for process death, timeout, network interruption, truncated or reordered streams, disk failure, corrupt state or checkpoint, and cancellation races. Campaign count, time and trace sizes are bounded and cancellation is explicit. Workspace snapshots reject symlinks and unsafe paths, capture a deterministic tree, and restore every changed or added file to the exact pre-run tree. Non-promoted runs automatically trigger that rollback guard. A separate rollback rehearsal must pass before promotion.
+
+Regression isolation performs bounded prefix bisection followed by a single-change proof. If the baseline fails, the head cannot reproduce, the probe budget expires, or the failure depends on an interaction, it refuses a culprit instead of making a false attribution. Phase 4 results are sealed into `ultra/phase4.json`, entered in the epistemic ledger, and linked from the proof bundle. Simple mode does not call this module.

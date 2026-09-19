@@ -13,6 +13,10 @@ use crate::contract::{self, AcceptanceContract};
 use crate::evidence::EvidenceStore;
 use crate::judge::{self, JudgeReport};
 use crate::ledger::{EpistemicLedger, FactClass};
+use crate::phase4::{
+    self, CausalTrace, CheckpointState, EventKind, Phase4Bundle, Phase4Gate, ReplayBundle,
+    WorkspaceSnapshot,
+};
 use crate::verify::{self, ObligationStatus, VerificationReport};
 use rex_providers::autonomous::{AgentSnapshot, AutonomousRunService, Budgets};
 use rex_providers::http::Transport;
@@ -243,7 +247,6 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
             options,
             run_dir,
             workspace,
-            inner: self.inner.clone(),
             handle,
         };
         let inner = self.inner.clone();
@@ -306,7 +309,27 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
     }
 }
 
-struct DriveCtx<S: SecretStore + 'static, T: Transport + 'static> {
+struct RollbackGuard {
+    workspace: PathBuf,
+    snapshot: WorkspaceSnapshot,
+    armed: bool,
+}
+
+impl RollbackGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RollbackGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.snapshot.restore(&self.workspace);
+        }
+    }
+}
+
+struct DriveCtx {
     id: String,
     task: String,
     provider: String,
@@ -314,7 +337,6 @@ struct DriveCtx<S: SecretStore + 'static, T: Transport + 'static> {
     options: UltraOptions,
     run_dir: PathBuf,
     workspace: PathBuf,
-    inner: Arc<AutonomousRunService<S, T>>,
     handle: Arc<RunHandle>,
 }
 
@@ -376,9 +398,26 @@ fn await_subrun<S: SecretStore + 'static, T: Transport + 'static>(
 }
 
 fn drive<S: SecretStore + 'static, T: Transport + 'static>(
-    ctx: DriveCtx<S, T>,
+    ctx: DriveCtx,
     inner: Arc<AutonomousRunService<S, T>>,
 ) {
+    let pre_run = match WorkspaceSnapshot::capture(&ctx.workspace) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            finish(
+                &ctx.handle,
+                UltraTerminal::ProviderError {
+                    detail: format!("pre-run snapshot failed: {e}"),
+                },
+            );
+            return;
+        }
+    };
+    let mut rollback = RollbackGuard {
+        workspace: ctx.workspace.clone(),
+        snapshot: pre_run.clone(),
+        armed: true,
+    };
     let ultra_dir = ctx.run_dir.join("ultra");
     let mut ledger = match EpistemicLedger::open(&ultra_dir) {
         Ok(l) => l,
@@ -832,6 +871,126 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
         }
 
         if reasons.is_empty() {
+            let mut trace = CausalTrace::new(&ctx.id);
+            let contract_event = trace.append(
+                EventKind::PhaseDecision,
+                vec![],
+                serde_json::json!({"phase":"contracting","contract":acceptance}),
+            );
+            let model_event = contract_event.and_then(|parent| trace.append(EventKind::ModelDecision, vec![parent], serde_json::json!({"provider":ctx.provider,"model":worker_model,"judge":judge_model,"adversary":adversary_model})));
+            let builder_event = model_event.and_then(|parent| {
+                trace.append(
+                    EventKind::ToolResult,
+                    vec![parent],
+                    serde_json::to_value(&built).unwrap_or_default(),
+                )
+            });
+            let verifier_event = builder_event.and_then(|parent| {
+                trace.append(
+                    EventKind::VerifierEvidence,
+                    vec![parent],
+                    serde_json::to_value(&report).unwrap_or_default(),
+                )
+            });
+            let completion_event = verifier_event.and_then(|parent| trace.append(EventKind::CompletionDecision, vec![parent], serde_json::json!({"decision":"promote","repairs":ctx.handle.shared.lock().map(|s|s.repair).unwrap_or(MAX_REPAIRS)})));
+            if let Err(e) = completion_event {
+                reasons.push(format!("phase 4 causal trace failed: {e}"));
+            }
+
+            if reasons.is_empty() {
+                let replay = ReplayBundle::build(
+                    &trace,
+                    &ctx.provider,
+                    &worker_model,
+                    phase3_seed,
+                    vec![
+                        ("task".into(), serde_json::json!({"task":ctx.task})),
+                        (
+                            "contract".into(),
+                            serde_json::to_value(&acceptance).unwrap_or_default(),
+                        ),
+                    ],
+                    phase3_new_trace
+                        .observables
+                        .iter()
+                        .map(|o| {
+                            (
+                                format!("{:?}:{}", o.kind, o.key),
+                                format!("{}:{}", o.sha256, o.outcome),
+                            )
+                        })
+                        .collect(),
+                );
+                let checkpoint_path = ultra_dir.join("phase4-checkpoint.json");
+                let mut checkpoint = CheckpointState {
+                    phase: "completion".into(),
+                    cursor: trace.events.len() as u64,
+                    effects: Vec::new(),
+                    state: serde_json::json!({"run_id":ctx.id}),
+                };
+                let mut effects_exactly_once = true;
+                for event in &trace.events {
+                    if phase4::apply_effect_once(
+                        &mut checkpoint,
+                        &event.id,
+                        event.payload_sha256.as_bytes(),
+                        || Ok(event.id.clone()),
+                    )
+                    .is_err()
+                    {
+                        effects_exactly_once = false;
+                        break;
+                    }
+                }
+                if phase4::write_checkpoint(&checkpoint_path, 1, &checkpoint).is_err() {
+                    effects_exactly_once = false;
+                }
+                let checkpoint_recovered = phase4::read_checkpoint(&checkpoint_path)
+                    .map(|(_, recovered)| recovered == checkpoint)
+                    .unwrap_or(false);
+                if let Some(first) = trace.events.first() {
+                    let duplicate_suppressed = phase4::apply_effect_once(
+                        &mut checkpoint,
+                        &first.id,
+                        first.payload_sha256.as_bytes(),
+                        || Ok(first.id.clone()),
+                    )
+                    .is_err();
+                    effects_exactly_once &= duplicate_suppressed;
+                }
+                let rehearsal = ultra_dir.join("rollback-rehearsal");
+                let rollback_verified = fs::create_dir_all(&rehearsal).is_ok()
+                    && fs::write(rehearsal.join("mutation"), b"phase4").is_ok()
+                    && pre_run.restore(&rehearsal).is_ok()
+                    && WorkspaceSnapshot::capture(&rehearsal)
+                        .map(|s| s.tree_sha256 == pre_run.tree_sha256)
+                        .unwrap_or(false);
+                let cleanup_complete =
+                    fs::remove_dir_all(&rehearsal).is_ok() || !rehearsal.exists();
+                let mut phase4_bundle = Phase4Bundle {
+                    trace,
+                    replay,
+                    checkpoint_recovered,
+                    effects_exactly_once,
+                    rollback_verified,
+                    bisect: None,
+                    cleanup_complete,
+                    gate: Phase4Gate {
+                        promotable: false,
+                        reasons: vec![],
+                    },
+                };
+                if let Err(e) =
+                    phase4::seal_bundle(&ultra_dir, &mut phase4_bundle, &mut ledger, &mut evidence)
+                {
+                    reasons.push(format!("phase 4 seal failed: {e}"));
+                } else if !phase4_bundle.gate.promotable {
+                    reasons.extend(phase4_bundle.gate.reasons);
+                }
+            }
+        }
+
+        if reasons.is_empty() {
             let bundle = serde_json::json!({
                 "task": ctx.task,
                 "worker_model": format!("{}/{}", ctx.provider, worker_model),
@@ -842,6 +1001,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                 "ledger": "ultra/ledger.jsonl",
                 "evidence": "ultra/evidence/manifest.jsonl",
                 "phase3": "ultra/phase3.json",
+                "phase4": "ultra/phase4.json",
             });
             let entry = evidence.put_bytes("proof_bundle", bundle.to_string().as_bytes());
             ledger.record(
@@ -850,6 +1010,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                     evidence_id: entry.id,
                 },
             );
+            rollback.disarm();
             finish(&ctx.handle, UltraTerminal::Promoted);
             return;
         }
@@ -1054,6 +1215,8 @@ mod tests {
         assert!(ultra_dir.join("adversary.json").is_file());
         assert!(ultra_dir.join("verdicts.json").is_file());
         assert!(ultra_dir.join("ledger.jsonl").is_file());
+        assert!(ultra_dir.join("phase4.json").is_file());
+        assert!(ultra_dir.join("phase4-checkpoint.json").is_file());
         assert!(ultra_dir.join("evidence").join("manifest.jsonl").is_file());
         let judge = done.judge.expect("judge report");
         assert!(judge.same_model_as_worker);
