@@ -9,12 +9,14 @@ use rex_providers::{
     SearchProviderSummary, SearchRouter, UreqTransport,
 };
 use rex_search::{IndexHit, IndexedDocument, LocalIndex, SearchRequest, SearchResponse};
+use rex_tools::{CallState, PreparedCall, ToolRequest, ToolResult, ToolRuntime};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
 
 type Service = ProviderService<FileSecretStore, UreqTransport>;
 type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
+type LocalTools = ToolRuntime;
 
 fn search_index() -> LocalIndex {
     LocalIndex::open(config_dir().join("search-index.json"))
@@ -125,6 +127,29 @@ fn search_index_query(query: String, limit: usize) -> Result<Vec<IndexHit>, Stri
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn tool_prepare(
+    tools: State<'_, Arc<LocalTools>>,
+    request: ToolRequest,
+) -> Result<PreparedCall, rex_tools::ToolError> {
+    tools.prepare(request)
+}
+
+/// Trusted UI decision. Model tool payloads cannot call this through the agent dispatcher.
+#[tauri::command]
+fn tool_resolve_approval(
+    tools: State<'_, Arc<LocalTools>>,
+    call_id: String,
+    approved: bool,
+) -> Result<CallState, rex_tools::ToolError> {
+    tools.resolve_approval(&call_id, approved)
+}
+
+#[tauri::command]
+fn tool_execute(tools: State<'_, Arc<LocalTools>>, call_id: String) -> ToolResult {
+    tools.execute(&call_id)
+}
+
 fn provider_bridge_smoke() -> bool {
     if std::env::args().any(|arg| arg == "--verify-provider-bridge") {
         let dir = std::env::temp_dir().join(format!("rex-harness-smoke-{}", std::process::id()));
@@ -156,10 +181,15 @@ fn main() {
     let search_store =
         FileSecretStore::new(config_dir()).expect("could not open search credential store");
     let search_service = Arc::new(SearchRouter::new(search_store, UreqTransport::new()));
+    let workspace = std::env::var("REX_WORKSPACE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| config_dir().join("workspace"));
+    let tools = Arc::new(ToolRuntime::new(workspace).expect("could not open local tool workspace"));
 
     tauri::Builder::default()
         .manage(service)
         .manage(search_service)
+        .manage(tools)
         .invoke_handler(tauri::generate_handler![
             provider_summaries,
             provider_set_key,
@@ -174,6 +204,9 @@ fn main() {
             search_index_upsert,
             search_index_remove,
             search_index_query,
+            tool_prepare,
+            tool_resolve_approval,
+            tool_execute,
         ])
         .run(tauri::generate_context!())
         .expect("error while running REX Harness");

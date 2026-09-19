@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rex-providers = { path = "../crates/rex-providers" }
 rex-search = { path = "../crates/rex-search" }
+rex-tools = { path = "../crates/rex-tools" }
 
 [features]
 default = ["custom-protocol"]

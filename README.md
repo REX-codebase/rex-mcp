@@ -69,3 +69,13 @@ The first real backend slice lives in `crates/rex-providers` (workspace root `Ca
 - **Frontend** - the prompt-box model dropdown is driven by the backend: live catalogs, selection, refresh, disconnect, and a working Connect-API dialog. With no backend reachable it stays the labeled preview.
 
 Tests: `cargo test -p rex-providers` (26 tests, including policy guards, a real-socket status mapping, and the recorded live Gemini response).
+
+## Backend: local agent tools (Rust)
+
+`crates/rex-tools` is the capability boundary for local work. Connected models
+use a normalized protocol to read/search files, request exact creates/edits,
+and request bounded argv-based commands inside one explicit workspace. Rust
+owns path and symlink defenses, hard command denials, separate trusted-UI
+approval for every write/command, time/resource/output limits, process-tree
+cancellation, secret redaction, truthful typed errors, and audit receipts with
+bounded diffs. See `docs/local-tools.md`.

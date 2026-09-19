@@ -2519,6 +2519,7 @@ version = "0.1.0"
 dependencies = [
  "rex-providers",
  "rex-search",
+ "rex-tools",
  "serde",
  "serde_json",
  "tauri",
@@ -2544,6 +2545,16 @@ dependencies = [
  "serde_json",
  "ureq",
  "url",
+]
+
+[[package]]
+name = "rex-tools"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

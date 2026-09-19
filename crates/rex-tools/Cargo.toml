@@ -1,0 +1,12 @@
+[package]
+name = "rex-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Capability-scoped local tool runtime for REX Harness"
+license = "Proprietary"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = "1"
+libc = "0.2"
