@@ -2518,6 +2518,7 @@ name = "rex-harness"
 version = "0.1.0"
 dependencies = [
  "rex-providers",
+ "rex-search",
  "serde",
  "serde_json",
  "tauri",
@@ -2531,6 +2532,16 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "rex-search"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ureq",
+ "url",
 ]
 
 [[package]]
