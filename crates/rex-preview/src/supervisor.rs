@@ -1,6 +1,7 @@
 use crate::{
-    browser::BrowserRuntime, detect_project, BrowserAction, Framework, LaunchPlan, PreviewError,
-    PreviewRecipe, SessionState, PORT_MAX, PORT_MIN,
+    browser::BrowserRuntime, detect_project, BrowserAction, Framework, IterationReceipt,
+    LaunchPlan, PreviewError, PreviewRecipe, PreviewSession, ProductionReport, SessionState,
+    PORT_MAX, PORT_MIN,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -95,6 +96,7 @@ struct Runtime {
     stop: Arc<AtomicBool>,
     static_thread: Option<thread::JoinHandle<()>>,
     browser: Option<BrowserRuntime>,
+    iteration: PreviewSession,
 }
 
 impl Runtime {
@@ -273,7 +275,9 @@ impl PreviewSupervisor {
             stop: Arc::new(AtomicBool::new(false)),
             static_thread: None,
             browser: None,
+            iteration: PreviewSession::new(id.clone(), plan.clone(), SystemTime::now()),
         };
+        runtime.iteration.start()?;
         runtime.event(
             LifecycleKind::Starting,
             format!("{} {:?}", plan.bind, recipe.framework),
@@ -300,6 +304,7 @@ impl PreviewSupervisor {
             }
             if ready(plan.bind, &recipe.readiness_path) {
                 runtime.state = SessionState::Running;
+                runtime.iteration.ready()?;
                 runtime.event(LifecycleKind::Ready, url.clone());
                 break;
             }
@@ -341,14 +346,68 @@ impl PreviewSupervisor {
         if r.browser.is_none() {
             r.browser = Some(BrowserRuntime::launch(&r.url)?);
         }
-        r.browser
+        let evidence = r
+            .browser
             .as_mut()
             .ok_or(PreviewError::NotRunning)?
-            .capture()
+            .capture()?;
+        for item in evidence.items.iter().cloned() {
+            r.iteration.push_evidence(item)?;
+        }
+        Ok(evidence)
+    }
+    pub fn begin_iteration(&self, id: &str) -> Result<u8, PreviewError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions
+            .get_mut(id)
+            .ok_or(PreviewError::NotRunning)?
+            .iteration
+            .begin_iteration()
+    }
+    pub fn record_iteration(
+        &self,
+        id: &str,
+        receipt: IterationReceipt,
+    ) -> Result<(), PreviewError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions
+            .get_mut(id)
+            .ok_or(PreviewError::NotRunning)?
+            .iteration
+            .record_iteration(receipt)
+    }
+    pub fn production_report(&self, id: &str) -> Result<ProductionReport, PreviewError> {
+        let sessions = self.sessions.lock().unwrap();
+        let runtime = sessions.get(id).ok_or(PreviewError::NotRunning)?;
+        let mut gates = BTreeMap::new();
+        for item in &runtime.iteration.evidence {
+            if let crate::Evidence::Gate { name, passed, .. } = item {
+                gates.insert(*name, *passed);
+            }
+        }
+        Ok(ProductionReport {
+            gates,
+            receipts: runtime.iteration.receipts.clone(),
+        })
+    }
+    pub fn finish(&self, id: &str) -> Result<(), PreviewError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let runtime = sessions.get_mut(id).ok_or(PreviewError::NotRunning)?;
+        let mut gates = BTreeMap::new();
+        for item in &runtime.iteration.evidence {
+            if let crate::Evidence::Gate { name, passed, .. } = item {
+                gates.insert(*name, *passed);
+            }
+        }
+        runtime.iteration.finish(&ProductionReport {
+            gates,
+            receipts: runtime.iteration.receipts.clone(),
+        })
     }
     pub fn cancel(&self, id: &str) -> Result<SupervisorSummary, PreviewError> {
         let mut s = self.sessions.lock().unwrap();
         let r = s.get_mut(id).ok_or(PreviewError::NotRunning)?;
+        r.iteration.cancel();
         r.terminate(LifecycleKind::Cancelled);
         Ok(r.summary())
     }
@@ -580,6 +639,7 @@ mod tests {
         .unwrap();
         let sup = PreviewSupervisor::new(&w).unwrap();
         let started = sup.start(Path::new("app")).unwrap();
+        assert_eq!(sup.begin_iteration(&started.id).unwrap(), 1);
         let first = sup.capture(&started.id).unwrap();
         assert!(first.dom_text.contains("press"));
         assert!(first
@@ -608,6 +668,23 @@ mod tests {
         .unwrap();
         let second = sup.capture(&started.id).unwrap();
         assert!(second.dom_text.contains("clicked"));
+        sup.record_iteration(
+            &started.id,
+            crate::IterationReceipt {
+                iteration: 1,
+                accepted: false,
+                diff_id: "diff-1".into(),
+                evidence_ids: vec![],
+                failed_gates: vec![crate::ProductionGate::MobileViewport],
+                reason: "mobile evidence missing".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sup.production_report(&started.id).unwrap().receipts.len(),
+            1
+        );
+        assert_eq!(sup.begin_iteration(&started.id).unwrap(), 2);
         sup.teardown(&started.id).unwrap();
         let _ = fs::remove_dir_all(w);
     }

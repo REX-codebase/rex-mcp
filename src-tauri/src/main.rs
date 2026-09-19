@@ -5,7 +5,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use rex_preview::{
-    BrowserAction, BrowserEvidence, PreviewRecipe, PreviewSupervisor, SupervisorSummary,
+    BrowserAction, BrowserEvidence, IterationReceipt, PreviewRecipe, PreviewSupervisor,
+    ProductionReport, SupervisorSummary,
 };
 use rex_providers::{
     FileSecretStore, ModelCatalog, ProviderError, ProviderService, ProviderSummary, SearchProvider,
@@ -210,6 +211,45 @@ fn preview_capture(
 }
 
 #[tauri::command]
+fn preview_begin_iteration(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+) -> Result<u8, String> {
+    preview
+        .begin_iteration(&session_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_record_iteration(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+    receipt: IterationReceipt,
+) -> Result<(), String> {
+    preview
+        .record_iteration(&session_id, receipt)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_production_report(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+) -> Result<ProductionReport, String> {
+    preview
+        .production_report(&session_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn preview_finish(
+    preview: State<'_, Arc<NativePreview>>,
+    session_id: String,
+) -> Result<(), String> {
+    preview.finish(&session_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn preview_cancel(
     preview: State<'_, Arc<NativePreview>>,
     session_id: String,
@@ -292,6 +332,10 @@ fn main() {
             preview_status,
             preview_action,
             preview_capture,
+            preview_begin_iteration,
+            preview_record_iteration,
+            preview_production_report,
+            preview_finish,
             preview_cancel,
             preview_teardown,
         ])
