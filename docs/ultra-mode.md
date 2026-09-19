@@ -104,3 +104,13 @@ acceptance contract.
 - The judge is labelled with the exact provider/model that rendered verdicts;
   when it is the same model as the worker, the bundle says so.
 - A phase that has not landed does not appear in the product.
+
+## Phase 3: counterexamples, mutation, and behavioral differential
+
+Ultra now generates a deterministic, replayable counterexample manifest from each validated acceptance obligation. Each mutation runs in a private copied candidate world with byte, count, wall-time, cancellation, and cleanup limits. Results are `killed`, `survived`, or `inconclusive`; only real verifier evidence can kill a mutation, and inconclusive results block promotion.
+
+The semantic catalog covers stale cache, wrong account or target, partial writes, duplicate and reordered events, expired authorization, corrupt checkpoints, cancellation races, and unsupported provider responses. File obligations have concrete mutation seams now. Command and behavior obligations without an explicit fixture seam stay inconclusive rather than claiming a fake kill.
+
+Ultra captures old and new observables for workspace files, fresh command obligations, and process outcomes before the adversary can add its own inspection artifacts. Both traces carry the same provider, model, and deterministic seed. Every difference must map to a real acceptance obligation and an explicit allowed-difference record. Missing, incomplete, unreplayed, non-reproducible, survived, inconclusive, or unexplained evidence fails closed.
+
+`ultra/phase3.json` is sealed into the evidence store and epistemic ledger and referenced by the proof bundle. Phase 2 qualification requires it before a candidate can be selected. Simple mode does not import or call this subsystem.

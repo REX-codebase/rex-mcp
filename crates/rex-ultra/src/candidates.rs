@@ -243,6 +243,7 @@ fn bundle_hashes(bundle: &Path) -> Result<BTreeMap<String, String>, String> {
         "verdicts.json",
         "ledger.jsonl",
         "evidence/manifest.jsonl",
+        "phase3.json",
     ];
     let mut hashes = BTreeMap::new();
     for rel in required {
@@ -289,6 +290,22 @@ fn qualify(record: &mut CandidateRecord) {
             return;
         }
     };
+    let phase3: crate::phase3::Phase3Bundle = match read_json(&record.bundle.join("phase3.json")) {
+        Ok(v) => v,
+        Err(e) => {
+            record.disqualifications.push(e);
+            return;
+        }
+    };
+    if !phase3.gate.promotable
+        || phase3.mutations.survived > 0
+        || phase3.mutations.inconclusive > 0
+        || phase3.differential.unexplained > 0
+    {
+        record
+            .disqualifications
+            .push("Phase 3 counterexample/mutation/differential gate did not pass".into());
+    }
     let judge: JudgeReport = match read_json(&record.bundle.join("verdicts.json")) {
         Ok(v) => v,
         Err(e) => {

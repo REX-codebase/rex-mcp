@@ -15,9 +15,9 @@ use crate::judge::{self, JudgeReport};
 use crate::ledger::{EpistemicLedger, FactClass};
 use crate::verify::{self, ObligationStatus, VerificationReport};
 use rex_providers::autonomous::{AgentSnapshot, AutonomousRunService, Budgets};
+use rex_providers::http::Transport;
 use rex_providers::oneshot;
 use rex_providers::secrets::SecretStore;
-use rex_providers::http::Transport;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -63,12 +63,20 @@ pub enum UltraTerminal {
     /// Every gate agreed, with the proof bundle on disk.
     Promoted,
     /// Verification, adversary or judge still disagree after the repair loop.
-    Rejected { reasons: Vec<String> },
+    Rejected {
+        reasons: Vec<String>,
+    },
     /// The builder run itself ended without completing.
-    BuilderFailed { detail: String },
+    BuilderFailed {
+        detail: String,
+    },
     /// No valid contract after bounded drafting.
-    ContractFailed { errors: Vec<String> },
-    ProviderError { detail: String },
+    ContractFailed {
+        errors: Vec<String>,
+    },
+    ProviderError {
+        detail: String,
+    },
     Cancelled,
 }
 
@@ -190,7 +198,12 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
             }
             let active = runs
                 .values()
-                .filter(|h| h.shared.lock().map(|s| s.terminal.is_none()).unwrap_or(false))
+                .filter(|h| {
+                    h.shared
+                        .lock()
+                        .map(|s| s.terminal.is_none())
+                        .unwrap_or(false)
+                })
                 .count();
             if active >= MAX_ACTIVE_RUNS {
                 return Err("too many active Ultra runs; finish one first".into());
@@ -273,7 +286,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
         if let Some(builder_id) = builder_id {
             self.inner.decide(&builder_id, approved)?;
         }
-        self.snapshot(run_id).ok_or_else(|| "run vanished".to_string())
+        self.snapshot(run_id)
+            .ok_or_else(|| "run vanished".to_string())
     }
 
     pub fn cancel(&self, run_id: &str) -> Result<UltraSnapshot, String> {
@@ -287,7 +301,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
         if let Some(builder_id) = builder_id {
             let _ = self.inner.cancel(&builder_id);
         }
-        self.snapshot(run_id).ok_or_else(|| "run vanished".to_string())
+        self.snapshot(run_id)
+            .ok_or_else(|| "run vanished".to_string())
     }
 }
 
@@ -320,6 +335,11 @@ fn finish(handle: &RunHandle, terminal: UltraTerminal) {
         _ => UltraPhase::Failed,
     };
     state.terminal = Some(terminal);
+}
+
+fn sha256_seed(text: &str) -> u64 {
+    let hex = crate::evidence::sha256_hex(text.as_bytes());
+    u64::from_str_radix(&hex[..16], 16).unwrap_or(0)
 }
 
 fn write_json(path: &PathBuf, value: &impl Serialize) {
@@ -405,11 +425,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
             return;
         }
     };
-    ctx.handle
-        .shared
-        .lock()
-        .expect("state poisoned")
-        .model = worker_model.clone();
+    ctx.handle.shared.lock().expect("state poisoned").model = worker_model.clone();
     ledger.record(
         &format!("worker model resolved to {worker_model}"),
         FactClass::Observed {
@@ -448,7 +464,10 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
         match contract::parse_contract(&draft, &ctx.task) {
             Ok(c) => {
                 let fact = ledger.record(
-                    &format!("acceptance contract compiled with {} obligations", c.obligations.len()),
+                    &format!(
+                        "acceptance contract compiled with {} obligations",
+                        c.obligations.len()
+                    ),
                     FactClass::Observed {
                         evidence_id: entry.id.clone(),
                     },
@@ -465,11 +484,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
         return;
     };
     write_json(&ultra_dir.join("contract.json"), &acceptance);
-    ctx.handle
-        .shared
-        .lock()
-        .expect("state poisoned")
-        .contract = Some(acceptance.clone());
+    ctx.handle.shared.lock().expect("state poisoned").contract = Some(acceptance.clone());
 
     let judge_provider = ctx
         .options
@@ -501,6 +516,14 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
     // Build -> verify -> adversary -> judge, with bounded repairs.
     let mut repair_digest = String::new();
     loop {
+        let phase3_seed = sha256_seed(&format!("{}|{}|{}", ctx.task, ctx.provider, worker_model));
+        let phase3_old_trace = crate::phase3::capture_trace(
+            &ctx.provider,
+            &worker_model,
+            phase3_seed,
+            &ctx.workspace,
+            None,
+        );
         // Building.
         set_phase(&ctx.handle, UltraPhase::Building);
         let mut brief = format!(
@@ -566,6 +589,13 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
         set_phase(&ctx.handle, UltraPhase::Verifying);
         let artifacts = evidence.snapshot_workspace(&ctx.workspace);
         let report = verify::verify_contract(&acceptance, &ctx.workspace, &mut evidence);
+        let phase3_new_trace = crate::phase3::capture_trace(
+            &ctx.provider,
+            &worker_model,
+            phase3_seed,
+            &ctx.workspace,
+            Some(&report),
+        );
         write_json(&ultra_dir.join("verification.json"), &report);
         for outcome in &report.outcomes {
             ledger.record(
@@ -583,7 +613,10 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
             );
         }
         ledger.record(
-            &format!("workspace artifact manifest hashed: {} files", artifacts.len()),
+            &format!(
+                "workspace artifact manifest hashed: {} files",
+                artifacts.len()
+            ),
             FactClass::Observed {
                 evidence_id: "evidence-manifest".into(),
             },
@@ -599,127 +632,131 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
         let mut adversary_report: Option<AdversaryReport> = None;
         let mut judge_result: Option<JudgeReport> = None;
         if report.executable_all_proven {
-        // Adversary world: a separate run with one job - prove it wrong.
-        let mut adversary_report_inner = AdversaryReport::clean(&format!("{adversary_provider}/{adversary_model}"));
-        if adversary_enabled {
-            set_phase(&ctx.handle, UltraPhase::Adversary);
-            let brief = adversary::adversary_brief(&ctx.task, &acceptance, &report);
-            match inner.begin_in_workspace(
-                &brief,
-                &adversary_provider,
-                Some(&adversary_model),
-                Some(ultra_budgets()),
-                Some(ctx.workspace.clone()),
-            ) {
-                Ok(run) => {
-                    ctx.handle
-                        .shared
-                        .lock()
-                        .expect("state poisoned")
-                        .builder_run_id = Some(run.id.clone());
-                    let attacked = await_subrun(&inner, &ctx.handle, &run.id);
-                    if cancelled(&ctx.handle) {
-                        finish(&ctx.handle, UltraTerminal::Cancelled);
-                        return;
-                    }
-                    let summary = attacked.completion_summary.unwrap_or_default();
-                    adversary_report_inner = parse_and_record(
-                        &summary,
-                        &format!("{adversary_provider}/{adversary_model}"),
-                        &mut ledger,
-                    );
-                }
-                Err(e) => {
-                    adversary_report_inner = AdversaryReport {
-                        defects: Vec::new(),
-                        inconclusive: true,
-                        adversary_model: format!("{adversary_provider}/{adversary_model} (failed to start: {e})"),
-                    };
-                }
-            }
-            write_json(&ultra_dir.join("adversary.json"), &adversary_report_inner);
-            ctx.handle
-                .shared
-                .lock()
-                .expect("state poisoned")
-                .adversary = Some(adversary_report_inner.clone());
-        }
-        adversary_report = Some(adversary_report_inner);
-
-        // Judging: the clean-room pass over contract + evidence, never the
-        // builder's narrative.
-        set_phase(&ctx.handle, UltraPhase::Judging);
-        let manifest = evidence.manifest_text();
-        let adversary_for_judge = adversary_report.clone().unwrap_or_else(|| AdversaryReport::clean("not-run"));
-        let prompt = judge::judge_prompt(&ctx.task, &acceptance, &report, &adversary_for_judge, &manifest);
-        let mut judge_report: Option<JudgeReport> = None;
-        let mut judge_error = String::new();
-        for _ in 0..JUDGE_ATTEMPTS {
-            if cancelled(&ctx.handle) {
-                finish(&ctx.handle, UltraTerminal::Cancelled);
-                return;
-            }
-            let mut p = prompt.clone();
-            if !judge_error.is_empty() {
-                p.push_str(&format!(
-                    "\n\nYour previous answer was rejected: {judge_error}. Answer with the JSON object only."
-                ));
-            }
-            match oneshot::complete_text(
-                inner.service(),
-                &judge_provider,
-                &judge_model,
-                "You are a hostile clean-room judge. Answer with JSON only.",
-                &p,
-            ) {
-                Ok(out) => {
-                    let entry = evidence.put_bytes("judge_answer", out.text.as_bytes());
-                    let _ = entry;
-                    match judge::parse_verdicts(
-                        &out.text,
-                        &acceptance,
-                        &report,
-                        &format!("{judge_provider}/{judge_model}"),
-                        judge_provider == ctx.provider && judge_model == worker_model,
-                    ) {
-                        Ok(r) => {
-                            judge_report = Some(r);
-                            break;
+            // Adversary world: a separate run with one job - prove it wrong.
+            let mut adversary_report_inner =
+                AdversaryReport::clean(&format!("{adversary_provider}/{adversary_model}"));
+            if adversary_enabled {
+                set_phase(&ctx.handle, UltraPhase::Adversary);
+                let brief = adversary::adversary_brief(&ctx.task, &acceptance, &report);
+                match inner.begin_in_workspace(
+                    &brief,
+                    &adversary_provider,
+                    Some(&adversary_model),
+                    Some(ultra_budgets()),
+                    Some(ctx.workspace.clone()),
+                ) {
+                    Ok(run) => {
+                        ctx.handle
+                            .shared
+                            .lock()
+                            .expect("state poisoned")
+                            .builder_run_id = Some(run.id.clone());
+                        let attacked = await_subrun(&inner, &ctx.handle, &run.id);
+                        if cancelled(&ctx.handle) {
+                            finish(&ctx.handle, UltraTerminal::Cancelled);
+                            return;
                         }
-                        Err(e) => judge_error = e,
+                        let summary = attacked.completion_summary.unwrap_or_default();
+                        adversary_report_inner = parse_and_record(
+                            &summary,
+                            &format!("{adversary_provider}/{adversary_model}"),
+                            &mut ledger,
+                        );
+                    }
+                    Err(e) => {
+                        adversary_report_inner = AdversaryReport {
+                            defects: Vec::new(),
+                            inconclusive: true,
+                            adversary_model: format!(
+                                "{adversary_provider}/{adversary_model} (failed to start: {e})"
+                            ),
+                        };
                     }
                 }
-                Err(e) => {
-                    finish(&ctx.handle, UltraTerminal::ProviderError { detail: e });
+                write_json(&ultra_dir.join("adversary.json"), &adversary_report_inner);
+                ctx.handle.shared.lock().expect("state poisoned").adversary =
+                    Some(adversary_report_inner.clone());
+            }
+            adversary_report = Some(adversary_report_inner);
+
+            // Judging: the clean-room pass over contract + evidence, never the
+            // builder's narrative.
+            set_phase(&ctx.handle, UltraPhase::Judging);
+            let manifest = evidence.manifest_text();
+            let adversary_for_judge = adversary_report
+                .clone()
+                .unwrap_or_else(|| AdversaryReport::clean("not-run"));
+            let prompt = judge::judge_prompt(
+                &ctx.task,
+                &acceptance,
+                &report,
+                &adversary_for_judge,
+                &manifest,
+            );
+            let mut judge_report: Option<JudgeReport> = None;
+            let mut judge_error = String::new();
+            for _ in 0..JUDGE_ATTEMPTS {
+                if cancelled(&ctx.handle) {
+                    finish(&ctx.handle, UltraTerminal::Cancelled);
                     return;
                 }
+                let mut p = prompt.clone();
+                if !judge_error.is_empty() {
+                    p.push_str(&format!(
+                    "\n\nYour previous answer was rejected: {judge_error}. Answer with the JSON object only."
+                ));
+                }
+                match oneshot::complete_text(
+                    inner.service(),
+                    &judge_provider,
+                    &judge_model,
+                    "You are a hostile clean-room judge. Answer with JSON only.",
+                    &p,
+                ) {
+                    Ok(out) => {
+                        let entry = evidence.put_bytes("judge_answer", out.text.as_bytes());
+                        let _ = entry;
+                        match judge::parse_verdicts(
+                            &out.text,
+                            &acceptance,
+                            &report,
+                            &format!("{judge_provider}/{judge_model}"),
+                            judge_provider == ctx.provider && judge_model == worker_model,
+                        ) {
+                            Ok(r) => {
+                                judge_report = Some(r);
+                                break;
+                            }
+                            Err(e) => judge_error = e,
+                        }
+                    }
+                    Err(e) => {
+                        finish(&ctx.handle, UltraTerminal::ProviderError { detail: e });
+                        return;
+                    }
+                }
             }
-        }
-        let Some(judge_found) = judge_report else {
-            finish(
-                &ctx.handle,
-                UltraTerminal::Rejected {
-                    reasons: vec![format!("judge answer unusable: {judge_error}")],
-                },
-            );
-            return;
-        };
-        judge_result = Some(judge_found);
-        let judge_ref = judge_result.clone().expect("judge");
-        write_json(&ultra_dir.join("verdicts.json"), &judge_ref);
-        for v in &judge_ref.verdicts {
-            ledger.record(
-                &format!("judge {:?} on {}: {}", v.verdict, v.obligation_id, v.reason),
-                FactClass::Inferred {
-                    from: v.evidence.clone(),
-                },
-            );
-        }
-        ctx.handle
-            .shared
-            .lock()
-            .expect("state poisoned")
-            .judge = judge_result.clone();
+            let Some(judge_found) = judge_report else {
+                finish(
+                    &ctx.handle,
+                    UltraTerminal::Rejected {
+                        reasons: vec![format!("judge answer unusable: {judge_error}")],
+                    },
+                );
+                return;
+            };
+            judge_result = Some(judge_found);
+            let judge_ref = judge_result.clone().expect("judge");
+            write_json(&ultra_dir.join("verdicts.json"), &judge_ref);
+            for v in &judge_ref.verdicts {
+                ledger.record(
+                    &format!("judge {:?} on {}: {}", v.verdict, v.obligation_id, v.reason),
+                    FactClass::Inferred {
+                        from: v.evidence.clone(),
+                    },
+                );
+            }
+            ctx.handle.shared.lock().expect("state poisoned").judge = judge_result.clone();
         } // end if executable_all_proven
 
         // Promotion decision: every world that ran must agree.
@@ -752,6 +789,49 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
         }
 
         if reasons.is_empty() {
+            // Phase 3 is entirely deterministic and fail closed. The old trace is the
+            // acceptance baseline (pre-build verification); the new trace is the fresh
+            // post-build verification. Provider/model/seed remain fixed.
+            let manifest = crate::phase3::generate_manifest(
+                &acceptance,
+                &ctx.provider,
+                &worker_model,
+                phase3_seed,
+            );
+            write_json(&ultra_dir.join("phase3-manifest.json"), &manifest);
+            let new_trace = phase3_new_trace.clone();
+            let allowed = crate::phase3::contract_allowed_differences(&acceptance);
+            let differential =
+                crate::phase3::compare_traces(&phase3_old_trace, &new_trace, &allowed, &acceptance);
+            let mutations = crate::phase3::execute_mutations(
+                &acceptance,
+                &ctx.workspace,
+                &ultra_dir.join("phase3"),
+                &manifest,
+                &ctx.handle.cancel,
+                None,
+            );
+            let gate =
+                crate::phase3::gate(&mutations, &differential, manifest.counterexamples.len());
+            let phase3_bundle = crate::phase3::Phase3Bundle {
+                manifest,
+                mutations,
+                differential,
+                gate,
+            };
+            let _ =
+                crate::phase3::seal_bundle(&ultra_dir, &phase3_bundle, &mut ledger, &mut evidence);
+            if !phase3_bundle.gate.promotable {
+                #[cfg(test)]
+                eprintln!(
+                    "phase3 gate reasons: {:?}; differential={:?}; mutations={:?}",
+                    phase3_bundle.gate.reasons, phase3_bundle.differential, phase3_bundle.mutations
+                );
+                reasons.extend(phase3_bundle.gate.reasons.clone());
+            }
+        }
+
+        if reasons.is_empty() {
             let bundle = serde_json::json!({
                 "task": ctx.task,
                 "worker_model": format!("{}/{}", ctx.provider, worker_model),
@@ -761,6 +841,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                 "verdicts": "ultra/verdicts.json",
                 "ledger": "ultra/ledger.jsonl",
                 "evidence": "ultra/evidence/manifest.jsonl",
+                "phase3": "ultra/phase3.json",
             });
             let entry = evidence.put_bytes("proof_bundle", bundle.to_string().as_bytes());
             ledger.record(
@@ -781,7 +862,10 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
             set_phase(&ctx.handle, UltraPhase::Repairing);
             repair_digest = reasons.iter().map(|r| format!("- {r}\n")).collect();
             ledger.record(
-                &format!("repair pass {n} started on {} gate failure(s)", reasons.len()),
+                &format!(
+                    "repair pass {n} started on {} gate failure(s)",
+                    reasons.len()
+                ),
                 FactClass::Observed {
                     evidence_id: "gate-failures".into(),
                 },
@@ -800,11 +884,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
     }
 }
 
-fn parse_and_record(
-    summary: &str,
-    model: &str,
-    ledger: &mut EpistemicLedger,
-) -> AdversaryReport {
+fn parse_and_record(summary: &str, model: &str, ledger: &mut EpistemicLedger) -> AdversaryReport {
     let report = adversary::parse_defects(summary, model);
     if report.inconclusive {
         ledger.record(
@@ -945,12 +1025,19 @@ mod tests {
                         complete_call("{\"defects\":[]}"),
                     ]),
                     // Judge: pass.
-                    text_turn(r#"{"verdicts":[{"obligation_id":"page","verdict":"pass","reason":"fresh verification passed","evidence":[]}]}"#),
+                    text_turn(
+                        r#"{"verdicts":[{"obligation_id":"page","verdict":"pass","reason":"fresh verification passed","evidence":[]}]}"#,
+                    ),
                 ])),
             },
         );
         let snap = svc
-            .begin("build a tea house page", "gemini", None, UltraOptions::default())
+            .begin(
+                "build a tea house page",
+                "gemini",
+                None,
+                UltraOptions::default(),
+            )
             .unwrap();
         let done = wait_ultra(&svc, &snap.id, 180_000);
         assert_eq!(
@@ -1001,7 +1088,10 @@ mod tests {
         let done = wait_ultra(&svc, &snap.id, 180_000);
         match done.terminal {
             Some(UltraTerminal::Rejected { ref reasons }) => {
-                assert!(reasons.iter().any(|r| r.contains("verification failed")), "{reasons:?}");
+                assert!(
+                    reasons.iter().any(|r| r.contains("verification failed")),
+                    "{reasons:?}"
+                );
             }
             other => panic!("expected rejection, got {other:?}"),
         }
@@ -1028,6 +1118,9 @@ mod tests {
             .begin("anything", "gemini", None, UltraOptions::default())
             .unwrap();
         let done = wait_ultra(&svc, &snap.id, 60_000);
-        assert!(matches!(done.terminal, Some(UltraTerminal::ContractFailed { .. })));
+        assert!(matches!(
+            done.terminal,
+            Some(UltraTerminal::ContractFailed { .. })
+        ));
     }
 }
