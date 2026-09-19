@@ -146,7 +146,25 @@ fn detect(s: Spec) -> InstalledAgentSummary {
                 None
             }
         });
-    InstalledAgentSummary{id:s.id,name:s.name,executable:s.executable,state:if found.is_none(){DetectionState::Missing}else if version.is_some(){DetectionState::InstalledAuthUnknown}else{DetectionState::UnsupportedVersion},version,automation:s.automation,auth_boundary:s.auth_boundary,docs_url:s.docs_url,approval_boundary:"REX owns approval. The child never receives a skip-permissions flag and runs against an isolated staging copy.",compatibility:CompatibilityContract{verified_on:"2026-09-19",documented_interface:s.automation,entitlement_note:s.entitlement_note,fail_closed:true}}
+    let state = if found.is_none() {
+        DetectionState::Missing
+    } else if s.id == InstalledAgentId::GoogleAntigravity {
+        match version.as_deref() {
+            Some(value)
+                if value
+                    .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                    .any(|part| part == "1.2.7") =>
+            {
+                DetectionState::InstalledAuthUnknown
+            }
+            _ => DetectionState::UnsupportedVersion,
+        }
+    } else if version.is_some() {
+        DetectionState::InstalledAuthUnknown
+    } else {
+        DetectionState::UnsupportedVersion
+    };
+    InstalledAgentSummary{id:s.id,name:s.name,executable:s.executable,state,version,automation:s.automation,auth_boundary:s.auth_boundary,docs_url:s.docs_url,approval_boundary:"REX owns approval. The child never receives a skip-permissions flag and runs against an isolated staging copy.",compatibility:CompatibilityContract{verified_on:"2026-09-19",documented_interface:s.automation,entitlement_note:s.entitlement_note,fail_closed:true}}
 }
 
 fn find_on_path(exe: &str) -> Option<PathBuf> {
@@ -314,15 +332,20 @@ fn collect_child(
         if line.trim().is_empty() {
             continue;
         }
-        let payload: Value = serde_json::from_str(&line)
-            .map_err(|e| InstalledAgentError::Invalid(format!("malformed agent event: {e}")))?;
+        let payload: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(error) if id == InstalledAgentId::GoogleAntigravity => {
+                return Err(InstalledAgentError::Invalid(format!(
+                    "malformed agent event: {error}"
+                )))
+            }
+            Err(_) => Value::String(line),
+        };
         let event = payload
             .get("event")
             .or_else(|| payload.get("type"))
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                InstalledAgentError::Invalid("agent event has no event/type field".into())
-            })?
+            .unwrap_or("output")
             .to_string();
         events.push(AgentEvent { event, payload });
     }
@@ -378,6 +401,20 @@ fn validate_antigravity_stream(
                         "init appeared after stream start".into(),
                     ));
                 }
+                let init = event
+                    .payload
+                    .get("init")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        InstalledAgentError::Invalid("init payload is invalid".into())
+                    })?;
+                if !init.get("cwd").is_some_and(Value::is_string)
+                    || !init.get("tools").is_some_and(Value::is_array)
+                {
+                    return Err(InstalledAgentError::Invalid(
+                        "init omitted cwd or tools".into(),
+                    ));
+                }
                 let mode = event
                     .payload
                     .pointer("/init/permission_mode")
@@ -404,10 +441,25 @@ fn validate_antigravity_stream(
                     .ok_or_else(|| {
                         InstalledAgentError::Invalid("step_update payload is invalid".into())
                     })?;
-                if !step.contains_key("state") || !step.contains_key("step_type") {
+                if !step.get("state").is_some_and(Value::is_string)
+                    || !step.get("step_type").is_some_and(Value::is_string)
+                {
                     return Err(InstalledAgentError::Invalid(
                         "step_update omitted state or step_type".into(),
                     ));
+                }
+                if step.get("step_type").and_then(Value::as_str) == Some("tool") {
+                    let info = step
+                        .get("tool_info")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| {
+                            InstalledAgentError::Invalid("tool step omitted tool_info".into())
+                        })?;
+                    if info.contains_key("error") {
+                        return Err(InstalledAgentError::Child(
+                            "Antigravity tool step reported an error".into(),
+                        ));
+                    }
                 }
             }
             "result" => {
@@ -422,14 +474,18 @@ fn validate_antigravity_stream(
                     .pointer("/result/status")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                if event
+                let result = event
                     .payload
                     .get("result")
                     .and_then(Value::as_object)
-                    .is_none()
+                    .ok_or_else(|| {
+                        InstalledAgentError::Invalid("result payload is invalid".into())
+                    })?;
+                if !result.get("response").is_some_and(Value::is_string)
+                    || !result.get("usage").is_some_and(Value::is_object)
                 {
                     return Err(InstalledAgentError::Invalid(
-                        "result payload is invalid".into(),
+                        "result omitted response or usage".into(),
                     ));
                 }
             }
@@ -458,6 +514,8 @@ fn validate_antigravity_stream(
         "permission denied",
         "requires approval",
         "not allowed by permissions",
+        "denied by permission",
+        "was denied",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
@@ -596,6 +654,13 @@ mod tests {
             validate_antigravity_stream(&valid_events(), "", Some(0)).unwrap(),
             "completed"
         );
+    }
+    #[test]
+    fn tool_error_is_not_completion() {
+        let mut events = valid_events();
+        events[1].payload["step_update"]["tool_info"]["error"] =
+            serde_json::json!({"type":"permission","message":"denied"});
+        assert!(validate_antigravity_stream(&events, "", Some(0)).is_err());
     }
     #[test]
     fn denial_with_zero_exit_is_not_completion() {
