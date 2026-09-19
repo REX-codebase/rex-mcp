@@ -454,3 +454,29 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
   font-size: 12.5px;
   color: #c22f2f;
 }
+
+/* Installed-agent run lifecycle */
+.tool-approval-copy{margin-top:10px;font-size:12px;line-height:1.6;color:var(--color-muted)}
+.tool-approval-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:16px}
+.tool-approval-actions button{border-radius:10px;padding:9px 14px;font-size:12px;font-weight:650}
+.tool-approval-actions .approve{background:#f0a43b;color:#15120d}
+.tool-approval-actions .deny{border:1px solid var(--color-line);color:var(--color-muted)}
+.diff-list{list-style:none;margin:14px 0 0;padding:0;display:grid;gap:6px;max-height:240px;overflow:auto}
+.diff-entry{display:flex;align-items:center;gap:10px;border-radius:9px;background:color-mix(in srgb,var(--color-bg) 82%,transparent);padding:8px 11px;font:11.5px/1.4 "JetBrains Mono",monospace}
+.diff-entry .diff-kind{width:64px;flex:none;font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+.diff-entry.is-added .diff-kind{color:#50c878}
+.diff-entry.is-modified .diff-kind{color:#f0a43b}
+.diff-entry.is-deleted .diff-kind{color:#e05d5d}
+.diff-entry .diff-path{flex:1;overflow-wrap:anywhere;color:var(--color-text)}
+.diff-entry .diff-bytes{color:var(--color-faint);font-size:10px}
+.installed-options{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px 12px 12px}
+.installed-options label{display:grid;gap:4px}
+.installed-options label span{font-size:10px;color:var(--color-faint)}
+.installed-options input{border:1px solid var(--color-line);border-radius:8px;background:var(--color-bg);padding:7px 9px;font-size:12px;color:var(--color-text)}
+.installed-options .api-hint{grid-column:1/-1}
+.run-completion{margin-top:16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.run-completion-line{margin:0;font-size:12px;color:var(--color-muted)}
+.run-stderr{margin-top:12px}
+.run-stderr-toggle{font-size:11px;color:var(--color-faint)}
+.run-stderr pre{margin-top:8px;max-height:200px;overflow:auto;border-radius:10px;background:var(--color-bg);padding:12px;font:11px/1.6 "JetBrains Mono",monospace;color:var(--color-muted);white-space:pre-wrap}
+.live-cancel{border:1px solid var(--color-line);border-radius:9px;padding:6px 12px;font-size:11px;font-weight:650;color:var(--color-muted)}
