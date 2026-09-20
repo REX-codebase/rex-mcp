@@ -1,0 +1,45 @@
+<!doctype html>
+<!-- REX benchmark key entry: local-only page. Opens on Agrim's own laptop and
+     POSTs the Gemini API key to the rex-dev-server sidecar on 127.0.0.1:8787.
+     The key goes nowhere else: this page makes exactly one request, to
+     localhost. Save nowhere, no telemetry, no third-party origin. -->
+<meta charset="utf-8">
+<title>REX - enter Gemini API key</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 34em; margin: 4em auto; padding: 0 1em; }
+  input { width: 100%; font-size: 1.1em; padding: .5em; }
+  button { margin-top: 1em; padding: .5em 1.2em; font-size: 1em; }
+  #out { margin-top: 1em; white-space: pre-wrap; }
+</style>
+<h2>REX benchmark: Gemini API key</h2>
+<p>This page talks only to the local REX sidecar at 127.0.0.1:8787. The key is written to the 0600 credential store on this machine and never leaves it.</p>
+<input id="k" type="password" placeholder="Gemini API key" autocomplete="off">
+<br><button id="save">Save to local REX store</button>
+<button id="check" type="button">Check store</button>
+<div id="out"></div>
+<script>
+const out = document.getElementById('out');
+document.getElementById('save').onclick = async () => {
+  const key = document.getElementById('k').value.trim();
+  if (!key) { out.textContent = 'paste the key first'; return; }
+  try {
+    const r = await fetch('http://127.0.0.1:8787/api/providers/gemini/key', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({key})
+    });
+    const j = await r.json();
+    out.textContent = j.ok ? 'saved (key stored locally, has_key=true)' : ('error: ' + j.error);
+    if (j.ok) document.getElementById('k').value = '';
+  } catch (e) {
+    out.textContent = 'sidecar not reachable - start rex-dev-server first (see setup.sh)';
+  }
+};
+document.getElementById('check').onclick = async () => {
+  try {
+    const r = await fetch('http://127.0.0.1:8787/api/providers');
+    const list = await r.json();
+    const g = list.find(p => p.id === 'gemini');
+    out.textContent = 'gemini has_key = ' + (g && g.has_key);
+  } catch (e) { out.textContent = 'sidecar not reachable'; }
+};
+</script>
