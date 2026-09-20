@@ -28,13 +28,13 @@
     {
       "label": "bench-restart-key-fill",
       "type": "shell",
-      "command": "pkill -f rex-key-fill; sleep 1; nohup $HOME/bin/rex-key-fill --port 8788 --provider gemini >>$HOME/bench/rex-key-fill.log 2>&1 & sleep 1; curl -s 127.0.0.1:8788/health",
+      "command": "pkill -x rex-key-fill; sleep 1; nohup $HOME/bin/rex-key-fill --port 8788 --provider gemini >>$HOME/bench/rex-key-fill.log 2>&1 & sleep 1; curl -s 127.0.0.1:8788/health",
       "problemMatcher": []
     },
     {
       "label": "bench-stop-key-fill",
       "type": "shell",
-      "command": "pkill -f rex-key-fill; sleep 1; pgrep -f rex-key-fill || echo KEY-FILL-STOPPED",
+      "command": "pkill -x rex-key-fill; sleep 1; pgrep -x rex-key-fill || echo KEY-FILL-STOPPED",
       "problemMatcher": []
     },
     {
