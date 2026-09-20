@@ -61,6 +61,6 @@ Canary value "CANARY-*" through the full browser path, then verify:
 - [x] Local sandbox canary (2026-09-20 08:57 IST): all checks pass
   (token 32 hex chars, one-shot exit, 0600/0700, zero log hits, 403 on
   bad token, server alive for retry).
-- [ ] Codespace canary through cloud browser
-- [ ] Real vault fill + has_key=true readback
-- [ ] Fill route removed (process exit verified)
+- [x] Codespace canary through cloud browser (2026-09-20 09:39 IST): CANARY-KEY-12345 via private forwarded-port form; stored 0600, server self-exited; bench-verify-canary: 0 hits in app logs/shell history/process args/env/repo/home artifacts; store cleaned after
+- [x] Real vault fill + has_key=true readback (2026-09-20 09:44 IST): entry "Gemini API key (AI Studio, Zapia project)" login/password via one-shot masked form; response {"ok":true,"stored":true,"perms":"0600","server":"exiting"}; /api/providers has_key=true for gemini only; no value echo anywhere
+- [x] Fill route removed (process exit verified): one-shot server self-terminated after real fill ("fill complete; exiting (route closed)" in log); bench-stop-key-fill confirmed KEY-FILL-STOPPED; /health dead; unauthenticated external access 302 to GitHub login (Private visibility)
