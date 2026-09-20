@@ -2608,6 +2608,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rex-custody"
+version = "0.1.0"
+dependencies = [
+ "rex-tools",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "rex-harness"
 version = "0.1.0"
 dependencies = [

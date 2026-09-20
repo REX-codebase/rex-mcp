@@ -1,0 +1,15 @@
+[package]
+name = "rex-custody"
+version = "0.1.0"
+edition = "2021"
+description = "Task-scoped custody kernel for REX agent-operator mode"
+license = "Proprietary"
+
+[dependencies]
+rex-tools = { path = "../rex-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
