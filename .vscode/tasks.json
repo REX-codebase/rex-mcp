@@ -45,6 +45,12 @@
       "runOptions": {
         "runOn": "default"
       }
+    },
+    {
+      "label": "bench-pip",
+      "type": "shell",
+      "command": "python3 -m pip install --user --break-system-packages -q 'evalplus==0.3.1' requests datasets && python3 -c \"import evalplus; print('EVALPLUS-OK')\"",
+      "problemMatcher": []
     }
   ]
 }

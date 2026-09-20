@@ -28,7 +28,7 @@ if ! python3 -c 'import evalplus' 2>/dev/null; then
   else
     step "SETUP-WARN apt failed (pip may still work)"
   fi
-  if python3 -m pip install --user -q 'evalplus==0.3.1' requests datasets >>"$STATUS" 2>&1; then
+  if python3 -m pip install --user -q --break-system-packages 'evalplus==0.3.1' requests datasets >>"$STATUS" 2>&1; then
     step "pip OK"
   else
     step "SETUP-WARN pip failed (smoke scorers may be unavailable)"
