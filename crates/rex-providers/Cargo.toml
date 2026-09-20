@@ -8,6 +8,7 @@ license = "Proprietary"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+rex-prompt = { path = "../rex-prompt" }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 rex-tools = { path = "../rex-tools" }
 rex-search = { path = "../rex-search" }

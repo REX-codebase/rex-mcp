@@ -38,6 +38,9 @@ use rex_preview::{
     BrowserAction, BrowserEvidence, IterationReceipt, PreviewSupervisor, ProductionGate,
 };
 use rex_search::SearchRequest;
+use rex_prompt::roles::{Role, ToolPolicy};
+use rex_prompt::tools::ToolSpec;
+use rex_prompt::{Assembler, ModuleKind};
 use rex_tools::{PreparedCall, ToolRequest, ToolResult, ToolRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -235,6 +238,9 @@ pub struct AgentSnapshot {
     pub elapsed_ms: u64,
     pub max_wall_ms: u64,
     pub pending_approval: Option<PreparedCall>,
+    /// Prompt-architecture identity this run is executing under.
+    pub prompt_version: String,
+    pub prompt_hash: String,
     pub events: Vec<AgentEvent>,
     pub preview: Option<AgentPreview>,
     pub completion_summary: Option<String>,
@@ -250,6 +256,23 @@ struct TaskBrief {
     provider: String,
     budgets: Budgets,
     created_at_ms: u128,
+    /// Prompt-architecture identity this run started under. Briefs written
+    /// before prompt versioning deserialize as "legacy-unknown".
+    #[serde(default = "legacy_prompt_marker")]
+    prompt_version: String,
+    #[serde(default = "legacy_prompt_marker")]
+    prompt_hash: String,
+    /// Role the run executes under (worker, builder, adversary, ...).
+    #[serde(default)]
+    role: Option<String>,
+    /// Least-authority tool scope. `None` = the full offering (and every
+    /// legacy brief); `Some` = only these tool names may execute.
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+}
+
+fn legacy_prompt_marker() -> String {
+    "legacy-unknown".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -295,6 +318,12 @@ struct Checkpoint {
     model: String,
     digest: Vec<DigestEntry>,
     last_pair: Option<TurnPair>,
+    /// Prompt identity when the checkpoint was written. Resuming across a
+    /// different identity fails closed; a missing (legacy) identity migrates.
+    #[serde(default = "legacy_prompt_marker")]
+    prompt_version: String,
+    #[serde(default = "legacy_prompt_marker")]
+    prompt_hash: String,
 }
 
 struct RunShared {
@@ -421,6 +450,14 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             elapsed_ms: state.elapsed_ms,
             max_wall_ms: brief.as_ref().map(|b| b.budgets.max_wall_ms).unwrap_or(0),
             pending_approval: state.pending_approval.clone(),
+            prompt_version: brief
+                .as_ref()
+                .map(|b| b.prompt_version.clone())
+                .unwrap_or_else(legacy_prompt_marker),
+            prompt_hash: brief
+                .as_ref()
+                .map(|b| b.prompt_hash.clone())
+                .unwrap_or_else(legacy_prompt_marker),
             events: state.events.iter().cloned().collect(),
             preview: state.preview.clone(),
             completion_summary: state.completion_summary.clone(),
@@ -459,6 +496,28 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         requested_model: Option<&str>,
         budgets: Option<Budgets>,
         workspace: Option<PathBuf>,
+    ) -> Result<AgentSnapshot, String> {
+        self.begin_in_workspace_with_role(
+            task,
+            provider,
+            requested_model,
+            budgets,
+            workspace,
+            Role::Worker,
+        )
+    }
+
+    /// Start a run under an explicit REX role. The role selects the
+    /// assembled system prompt and the least-authority tool scope: an
+    /// adversary run, for example, can read but never write.
+    pub fn begin_in_workspace_with_role(
+        &self,
+        task: &str,
+        provider: &str,
+        requested_model: Option<&str>,
+        budgets: Option<Budgets>,
+        workspace: Option<PathBuf>,
+        role: Role,
     ) -> Result<AgentSnapshot, String> {
         let task = task.trim();
         if task.is_empty() {
@@ -516,12 +575,18 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         };
         fs::create_dir_all(state_dir.join("evidence")).map_err(|e| e.to_string())?;
         fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let (scoped_tools, allowed_tools) = scoped_tools_for(role);
+        let (system_prompt, prompt_version, prompt_hash) = assemble_run_prompt(role, &scoped_tools);
         let brief = TaskBrief {
             id: id.clone(),
             task: task.to_string(),
             provider: provider.to_string(),
             budgets,
             created_at_ms: now_ms(),
+            prompt_version,
+            prompt_hash,
+            role: Some(role.name().to_string()),
+            allowed_tools,
         };
         write_brief(&state_dir, &brief)?;
         write_json(&state_dir.join("plan.json"), &Vec::<PlanItem>::new())?;
@@ -555,17 +620,21 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             .map_err(|_| "run registry poisoned")?
             .insert(id.clone(), handle.clone());
 
+        let checkpoint = Checkpoint {
+            model: requested_model.unwrap_or_default().trim().to_string(),
+            prompt_version: brief.prompt_version.clone(),
+            prompt_hash: brief.prompt_hash.clone(),
+            ..Checkpoint::default()
+        };
         let loop_ctx = LoopCtx {
+            system_prompt,
             brief,
             handle: handle.clone(),
             service: self.service.clone(),
             search: self.search.clone(),
             state_dir,
             workspace,
-            checkpoint: Checkpoint {
-                model: requested_model.unwrap_or_default().trim().to_string(),
-                ..Checkpoint::default()
-            },
+            checkpoint,
         };
         std::thread::spawn(move || drive(loop_ctx));
         Ok(self.snapshot_of(&id, &handle))
@@ -638,6 +707,18 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         }
         let checkpoint = read_json::<Checkpoint>(&state_dir.join("checkpoint.json"))
             .map_err(|_| "no checkpoint to resume from".to_string())?;
+        let role = brief
+            .role
+            .as_deref()
+            .and_then(Role::from_name)
+            .unwrap_or(Role::Worker);
+        let (scoped_tools, _) = scoped_tools_for(role);
+        let (system_prompt, current_version, current_hash) = assemble_run_prompt(role, &scoped_tools);
+        // Prompt-identity gate. A checkpoint written under different prompt
+        // semantics must never resume into them silently: fail closed. A
+        // legacy checkpoint (no identity) migrates onto the current one and
+        // the run log says so.
+        let migrated_legacy = check_resume_identity(&checkpoint, &current_version, &current_hash)?;
         let plan: Vec<PlanItem> = read_json(&state_dir.join("plan.json")).unwrap_or_default();
         let workspace = run_dir.join("workspace");
         if !workspace.is_dir() {
@@ -677,7 +758,19 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 message: format!("resumed from checkpoint at step {}", checkpoint.step),
             },
         );
+        if migrated_legacy {
+            RunHandle::push_event(
+                &handle.shared,
+                AgentEvent::Info {
+                    message: format!(
+                        "legacy checkpoint without prompt metadata migrated to rex-prompt/{}#{:.12}",
+                        current_version, current_hash
+                    ),
+                },
+            );
+        }
         let loop_ctx = LoopCtx {
+            system_prompt,
             brief,
             handle: handle.clone(),
             service: self.service.clone(),
@@ -770,6 +863,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
 
 struct LoopCtx<S: SecretStore + 'static, T: Transport + 'static> {
     brief: TaskBrief,
+    system_prompt: String,
     handle: Arc<RunHandle>,
     service: Arc<ProviderService<S, T>>,
     search: Option<Arc<SearchRouter<S, T>>>,
@@ -996,7 +1090,13 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
 
         // ---- dynamic context build ---------------------------------------
         let state_msg = build_state_message(&ctx.brief, &cp, budgets, current_plan(&ctx.handle));
-        let request_body = build_request(protocol, &model, &state_msg, cp.last_pair.as_ref());
+        let request_body = build_request(
+            protocol,
+            &model,
+            &ctx.system_prompt,
+            &state_msg,
+            cp.last_pair.as_ref(),
+        );
         let turn_no = cp.step + 1;
         let _ = fs::write(
             ctx.state_dir
@@ -1192,9 +1292,94 @@ fn build_state_message(
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
 }
 
+/// The loop's actual tool offering, mirrored into the prompt's tool
+/// contract. `tool_definitions_match_contract` pins this list to the wire
+/// definitions so the model is never told about tools it does not have -
+/// or given tools it was never told about.
+fn offered_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec::new("update_plan", "Replace the visible todo plan.", false, false),
+        ToolSpec::new("read_file", "Read a file inside the selected workspace.", false, false),
+        ToolSpec::new("create_file", "Create a file inside the workspace.", true, true),
+        ToolSpec::new("edit_file", "Replace exact text in a workspace file.", true, true),
+        ToolSpec::new("search_files", "Search file contents inside the workspace.", false, false),
+        ToolSpec::new("run_command", "Run an allowed command inside the workspace.", true, true),
+        ToolSpec::new("web_search", "Search the public web for grounded facts.", false, false),
+        ToolSpec::new("complete_task", "Declare the task finished; harness gates verify the claim.", false, false),
+    ]
+}
+
+/// Apply a role's tool policy to the actual offering. Returns the scoped
+/// specs plus the enforced allowlist (`None` = full offering, nothing to
+/// enforce).
+fn scoped_tools_for(role: Role) -> (Vec<ToolSpec>, Option<Vec<String>>) {
+    let scoped = rex_prompt::tools::filter_for_policy(&offered_tool_specs(), role.tool_policy());
+    let allowlist = match role.tool_policy() {
+        ToolPolicy::All => None,
+        _ => Some(scoped.iter().map(|s| s.name.clone()).collect()),
+    };
+    (scoped, allowlist)
+}
+
+/// Assemble the modular system prompt for an autonomous run under `role`
+/// from the tools actually enabled for it: constitution, role card, the
+/// least-authority tool contract and the completion gate.
+fn assemble_run_prompt(role: Role, specs: &[ToolSpec]) -> (String, String, String) {
+    let assembly = Assembler::new()
+        .constitution()
+        .role(role)
+        .module(
+            ModuleKind::ToolContract,
+            rex_prompt::tools::render_contract(specs),
+        )
+        .expect("role allows its tool contract")
+        .module(ModuleKind::CompletionGate, rex_prompt::gate::COMPLETION_GATE)
+        .expect("role allows the completion gate")
+        .assemble();
+    (assembly.system, assembly.version, assembly.prompt_hash)
+}
+
+/// The resume identity gate. Returns Ok(true) when a legacy checkpoint
+/// (no prompt metadata) migrated onto the current identity, Ok(false) when
+/// the identity matched, and Err when the checkpoint belongs to different
+/// prompt semantics - which must never resume silently.
+fn check_resume_identity(
+    checkpoint: &Checkpoint,
+    current_version: &str,
+    current_hash: &str,
+) -> Result<bool, String> {
+    if checkpoint.prompt_hash == legacy_prompt_marker() {
+        return Ok(true);
+    }
+    if checkpoint.prompt_hash != current_hash {
+        return Err(format!(
+            "checkpoint was written under prompt identity rex-prompt/{}#{:.12}; this build assembles rex-prompt/{}#{:.12}. Refusing to mix prompt semantics mid-run.",
+            checkpoint.prompt_version, checkpoint.prompt_hash, current_version, current_hash
+        ));
+    }
+    Ok(false)
+}
+
+/// The prompt identity the Simple worker runs under: version + hash of the
+/// assembled system prompt for the full offering. Benchmark records pin
+/// this so comparisons stay honest across prompt iterations.
+pub fn worker_prompt_identity() -> (String, String) {
+    let (_, version, hash) = assemble_run_prompt(Role::Worker, &offered_tool_specs());
+    (version, hash)
+}
+
+/// The prompt identity any role runs under. Ultra pins the builder and
+/// adversary identities in its run records for the same reason.
+pub fn role_prompt_identity(role: Role) -> (String, String) {
+    let (scoped, _) = scoped_tools_for(role);
+    let (_, version, hash) = assemble_run_prompt(role, &scoped);
+    (version, hash)
+}
+
 fn build_request(
     protocol: ProviderProtocol,
     model: &str,
+    system: &str,
     state_msg: &str,
     prev: Option<&TurnPair>,
 ) -> String {
@@ -1210,6 +1395,7 @@ fn build_request(
                 }
             }
             json!({"contents": contents, "tools": gemini_tool_definitions(),
+                "systemInstruction": {"parts":[{"text": system}]},
                 "toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},
                 "generationConfig":{"temperature":0.2,"maxOutputTokens":8192}})
             .to_string()
@@ -1226,12 +1412,12 @@ fn build_request(
             }
             messages.push(json!({"role":"user","content":state_msg}));
             json!({"model":model,"max_tokens":8192,"temperature":0.2,
-                "system":"You are REX. Use the provided tools until the task is verifiably complete.",
+                "system":system,
                 "messages":messages,"tools":anthropic_tool_definitions()}).to_string()
         }
         ProviderProtocol::OpenAiCompatible => {
             let mut messages = vec![
-                json!({"role":"system","content":"You are REX. Use the provided tools until the task is verifiably complete."}),
+                json!({"role":"system","content":system}),
             ];
             if let Some(pair) = prev {
                 if !pair.model_parts.is_empty() {
@@ -1924,6 +2110,38 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
             }
             AgentCall::Tool { id, request } => {
                 let tool_name = tool_name_of(&request);
+                // Least-authority scope: a role-limited run (e.g. read-only
+                // adversary) gets a harness-level refusal, not just prose.
+                if let Some(allowed) = &ctx.brief.allowed_tools {
+                    if !allowed.iter().any(|t| t == tool_name) {
+                        let content = format!(
+                            "tool {tool_name} is not enabled for this run's role; use only the tools listed in your tool contract"
+                        );
+                        RunHandle::push_event(
+                            &ctx.handle.shared,
+                            AgentEvent::Info {
+                                message: format!(
+                                    "refused out-of-scope tool {tool_name} under this run's role"
+                                ),
+                            },
+                        );
+                        out.digest_actions.push(DigestAction {
+                            tool: tool_name.into(),
+                            ok: false,
+                            target: None,
+                            error_kind: Some("out_of_scope".into()),
+                        });
+                        push_model_part(
+                            &mut model_parts,
+                            raw,
+                            json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}),
+                        );
+                        response_parts.push(function_response(
+                            protocol, tool_name, &id, false, &content,
+                        ));
+                        continue;
+                    }
+                }
                 let sig = call_signature(
                     tool_name,
                     &serde_json::to_value(&request).unwrap_or_default(),
@@ -2203,7 +2421,16 @@ fn verify_gates<S: SecretStore + 'static, T: Transport + 'static>(
             ));
         }
     }
-    if !cp.any_mutating_success {
+    // The mutation gate applies only to roles that may mutate. A read-only
+    // role (adversary, shadow) can never create a file - its output is the
+    // inspection itself - so requiring one would make completion impossible.
+    let role_can_mutate = match &ctx.brief.allowed_tools {
+        None => true,
+        Some(allowed) => ["create_file", "edit_file", "run_command"]
+            .iter()
+            .any(|t| allowed.iter().any(|a| a == t)),
+    };
+    if role_can_mutate && !cp.any_mutating_success {
         failures.push("no file was created, edited, or built by an approved tool".to_string());
     }
     let index = ctx.workspace.join("index.html");
@@ -2567,6 +2794,7 @@ mod tests {
         let request = build_request(
             ProviderProtocol::Anthropic,
             "claude-test",
+            "sys",
             "state",
             Some(&pair),
         );
@@ -2603,6 +2831,7 @@ mod tests {
         let request = build_request(
             ProviderProtocol::OpenAiCompatible,
             "gpt-test",
+            "sys",
             "state",
             Some(&pair),
         );
@@ -2613,10 +2842,11 @@ mod tests {
 
     #[test]
     fn provider_specific_requests_keep_credentials_out_of_evidence() {
-        let anthropic = build_request(ProviderProtocol::Anthropic, "claude-test", "state", None);
+        let anthropic = build_request(ProviderProtocol::Anthropic, "claude-test", "sys", "state", None);
         let openai = build_request(
             ProviderProtocol::OpenAiCompatible,
             "gpt-test",
+            "sys",
             "state",
             None,
         );
@@ -2637,6 +2867,10 @@ mod tests {
             provider: "gemini".into(),
             budgets: Budgets::default(),
             created_at_ms: 1,
+            prompt_version: legacy_prompt_marker(),
+            prompt_hash: legacy_prompt_marker(),
+            role: None,
+            allowed_tools: None,
         };
         write_brief(&dir, &brief).unwrap();
         let mut changed = brief.clone();
@@ -3007,6 +3241,122 @@ mod tests {
         assert!(evidence.join("turn-1-request.json").exists());
         assert!(evidence.join("turn-2-response.json").exists());
         svc.teardown(&snap.id).unwrap();
+    }
+
+    #[test]
+    fn gemini_request_carries_the_assembled_system_instruction() {
+        let (system, _, _) = assemble_run_prompt(Role::Worker, &offered_tool_specs());
+        let request = build_request(ProviderProtocol::Gemini, "gemini-test", &system, "state", None);
+        let value: Value = serde_json::from_str(&request).unwrap();
+        let text = value["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .expect("gemini request carries a system instruction");
+        assert!(text.contains("REX CONSTITUTION"));
+        assert!(text.contains("ROLE: REX WORKER"));
+        assert!(text.contains("TOOLS ENABLED FOR THIS CALL"));
+        assert!(text.contains("COMPLETION GATE"));
+        // same semantics reach the other protocols' system fields
+        let anthropic = build_request(ProviderProtocol::Anthropic, "m", &system, "state", None);
+        assert!(anthropic.contains("REX CONSTITUTION"));
+        let openai = build_request(ProviderProtocol::OpenAiCompatible, "m", &system, "state", None);
+        assert!(openai.contains("REX CONSTITUTION"));
+    }
+
+    #[test]
+    fn tool_definitions_match_contract() {
+        // The wire definitions and the prompt's tool contract must describe
+        // the same offering: no phantom tools, no undocumented ones.
+        let declared = gemini_tool_definitions()[0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let contracted = offered_tool_specs()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(declared, contracted);
+    }
+
+    #[test]
+    fn read_only_role_scope_excludes_mutating_tools() {
+        let (scoped, allowlist) = scoped_tools_for(Role::Adversary);
+        let allowed = allowlist.expect("adversary runs are scoped");
+        for gone in ["create_file", "edit_file", "run_command"] {
+            assert!(!allowed.iter().any(|t| t == gone), "{gone} must not be allowed");
+        }
+        for kept in ["read_file", "search_files", "web_search"] {
+            assert!(allowed.iter().any(|t| t == kept), "{kept} stays");
+        }
+        let contract = rex_prompt::tools::render_contract(&scoped);
+        assert!(!contract.contains("create_file"));
+        // the worker keeps the full offering with no enforced allowlist
+        let (_, worker_allow) = scoped_tools_for(Role::Worker);
+        assert!(worker_allow.is_none());
+    }
+
+    #[test]
+    fn resume_identity_gate_fails_closed_on_mismatch_and_migrates_legacy() {
+        let (_, version, hash) = assemble_run_prompt(Role::Worker, &offered_tool_specs());
+        let mut cp = Checkpoint {
+            prompt_version: version.clone(),
+            prompt_hash: hash.clone(),
+            ..Checkpoint::default()
+        };
+        assert_eq!(check_resume_identity(&cp, &version, &hash), Ok(false));
+        cp.prompt_hash = "0000deadbeef".into();
+        let err = check_resume_identity(&cp, &version, &hash).unwrap_err();
+        assert!(err.contains("Refusing to mix prompt semantics"), "{err}");
+        cp.prompt_version = legacy_prompt_marker();
+        cp.prompt_hash = legacy_prompt_marker();
+        assert_eq!(check_resume_identity(&cp, &version, &hash), Ok(true));
+    }
+
+    #[test]
+    fn read_only_role_cannot_write_but_can_complete() {
+        // An adversary-scoped run: the model tries create_file, the harness
+        // refuses it as out of scope, and the run still completes on the
+        // strength of its read-only inspection.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![
+                    plan_call(vec![("1", "inspect", "in_progress")]),
+                    create_call("notes.md", "try to write"),
+                ]),
+                call_turn(vec![
+                    plan_call(vec![("1", "inspect", "done")]),
+                    complete_call("{\"defects\":[]}"),
+                ]),
+            ]),
+        ));
+        let snap = svc
+            .begin_in_workspace_with_role(
+                "inspect the workspace",
+                "gemini",
+                None,
+                Some(budgets()),
+                None,
+                Role::Adversary,
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "got {:?}",
+            done.terminal_reason
+        );
+        assert!(done.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Info { message } if message.contains("refused out-of-scope tool create_file")
+        )));
+        // nothing was written
+        assert!(std::fs::read_dir(tmp.path().join("runs").join(&snap.id).join("workspace"))
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false));
     }
 
     #[test]

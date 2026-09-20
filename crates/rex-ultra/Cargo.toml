@@ -5,6 +5,7 @@ edition = "2021"
 description = "REX Ultra mode: contract-driven, adversarially verified agent runs"
 
 [dependencies]
+rex-prompt = { path = "../rex-prompt" }
 rex-providers = { path = "../rex-providers" }
 rex-tools = { path = "../rex-tools" }
 serde = { workspace = true }

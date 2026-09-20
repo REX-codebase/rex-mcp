@@ -15,7 +15,8 @@ use rex_providers::secrets::FileSecretStore;
 use rex_providers::service::ProviderService;
 use rex_providers::http::UreqTransport;
 use rex_ultra::bench::{self, BenchMode, BenchTask, TaskResult};
-use rex_ultra::orchestrator::{UltraOptions, UltraRunService};
+use rex_ultra::evidence::sha256_hex;
+use rex_ultra::orchestrator::{ultra_prompt_identity, UltraOptions, UltraRunService};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +28,23 @@ use std::time::{Duration, Instant};
 const SCORING_EXECUTABLES: &[&str] = &[
     "python3", "python", "pytest", "node", "cargo", "go", "java", "javac", "ruby",
 ];
+
+/// The system prompt raw mode has always used. Raw stays raw: this text is
+/// part of the pinned identity below and must never change.
+const RAW_SYSTEM: &str = "You produce complete file-based solutions.";
+
+/// The prompt identity a mode runs under, pinned into every TaskResult so
+/// benchmark comparisons across prompt iterations fail closed.
+fn prompt_identity_for(mode: BenchMode) -> (String, String) {
+    match mode {
+        BenchMode::Raw => (
+            "raw-fixed/1".to_string(),
+            sha256_hex(format!("{RAW_SYSTEM}\n{}", bench::RAW_FORMAT_SUFFIX).as_bytes()),
+        ),
+        BenchMode::Simple => rex_providers::autonomous::worker_prompt_identity(),
+        BenchMode::Ultra => ultra_prompt_identity(),
+    }
+}
 
 struct Args {
     command: String,
@@ -106,6 +124,7 @@ fn run_task(
     service: &ProviderService<FileSecretStore, UreqTransport>,
 ) -> TaskResult {
     let started = Instant::now();
+    let (prompt_version, prompt_hash) = prompt_identity_for(args.mode);
     let workspace = args.runs_root.join(format!("{}-workspace", task.id));
     let _ = std::fs::remove_dir_all(&workspace);
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -122,6 +141,8 @@ fn run_task(
                         return TaskResult {
                             task_id: task.id.clone(),
                             mode: args.mode,
+                            prompt_version,
+                            prompt_hash,
                             passed: false,
                             checks: Vec::new(),
                             tokens_used: 0,
@@ -137,7 +158,7 @@ fn run_task(
                 service,
                 &args.provider,
                 &model,
-                "You produce complete file-based solutions.",
+                RAW_SYSTEM,
                 &bench::raw_prompt(task),
             ) {
                 Ok(out) => {
@@ -216,6 +237,8 @@ fn run_task(
             return TaskResult {
                 task_id: task.id.clone(),
                 mode: args.mode,
+                prompt_version,
+                prompt_hash,
                 passed: false,
                 checks: Vec::new(),
                 tokens_used: tokens,
@@ -235,6 +258,8 @@ fn run_task(
     TaskResult {
         task_id: task.id.clone(),
         mode: args.mode,
+        prompt_version,
+        prompt_hash,
         passed: report.executable_all_proven
             && matches!(args.mode, BenchMode::Raw | BenchMode::Simple)
             || (matches!(args.mode, BenchMode::Ultra)
@@ -250,6 +275,10 @@ fn run_task(
 }
 
 fn report(files: &[PathBuf]) -> Result<(), String> {
+    let mut identities: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<(String, String)>,
+    > = std::collections::BTreeMap::new();
     for file in files {
         let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let mut results: Vec<TaskResult> = Vec::new();
@@ -278,6 +307,34 @@ fn report(files: &[PathBuf]) -> Result<(), String> {
                 *wall as f64 / 1000.0 / (*total).max(1) as f64
             );
         }
+        for r in &results {
+            let key = format!("{:?}", r.mode).to_lowercase();
+            identities
+                .entry(key)
+                .or_default()
+                .insert((r.prompt_version.clone(), r.prompt_hash.clone()));
+        }
+    }
+    // Fail closed: a mode whose records were produced under different prompt
+    // identities must never be averaged into one number. "legacy-unknown"
+    // counts as its own identity, so old files conflict loudly with new ones.
+    let mut conflicts = Vec::new();
+    for (mode, set) in &identities {
+        if set.len() > 1 {
+            conflicts.push(format!(
+                "  {mode}: {}",
+                set.iter()
+                    .map(|(v, h)| format!("rex-prompt-alias {v}#{:.12}", h))
+                    .collect::<Vec<_>>()
+                    .join(" vs ")
+            ));
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "prompt identity mismatch - refusing to compare runs produced under different prompt semantics:\n{}\nRerun the mismatched modes under one prompt version, or report the files separately.",
+            conflicts.join("\n")
+        ));
     }
     Ok(())
 }

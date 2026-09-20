@@ -21,6 +21,8 @@ use crate::verify::{self, ObligationStatus, VerificationReport};
 use rex_providers::autonomous::{AgentSnapshot, AutonomousRunService, Budgets};
 use rex_providers::http::Transport;
 use rex_providers::oneshot;
+use rex_prompt::roles::Role;
+use rex_prompt::{sha256_hex as prompt_sha256_hex, Assembler};
 use rex_providers::secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -37,6 +39,31 @@ const MAX_ACTIVE_RUNS: usize = 2;
 const POLL_MS: u64 = 250;
 
 /// Ultra budgets are materially larger than Simple's defaults, still bounded.
+/// Assemble the modular system prompt for an Ultra one-shot role
+/// (spec compiler, clean-room judge, reconstruction judge): immutable
+/// constitution plus the role card. These calls have no tools, and their
+/// role allowlists keep builder narrative and stale state out.
+pub fn ultra_oneshot_system(role: Role) -> String {
+    Assembler::new().constitution().role(role).assemble().system
+}
+
+/// The prompt identity an Ultra run pins in its records: one hash over the
+/// assembled system prompts of every model-facing phase - spec compiler,
+/// builder, adversary, clean-room judge and reconstruction judge - so a
+/// benchmark comparison across prompt iterations fails closed instead of
+/// silently mixing semantics.
+pub fn ultra_prompt_identity() -> (String, String) {
+    let mut material = String::from("ultra-prompt-identity\n");
+    material.push_str(&ultra_oneshot_system(Role::ContractDrafter));
+    material.push('\n');
+    let builder = rex_providers::autonomous::role_prompt_identity(Role::Builder);
+    let adversary = rex_providers::autonomous::role_prompt_identity(Role::Adversary);
+    material.push_str(&format!("builder:{}:{}\n", builder.0, builder.1));
+    material.push_str(&format!("adversary:{}:{}\n", adversary.0, adversary.1));
+    material.push_str(&ultra_oneshot_system(Role::CleanRoomJudge));
+    (rex_prompt::PROMPT_VERSION.to_string(), prompt_sha256_hex(material.as_bytes()))
+}
+
 pub fn ultra_budgets() -> Budgets {
     Budgets {
         max_steps: 48,
@@ -490,7 +517,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
             inner.service(),
             &ctx.provider,
             &worker_model,
-            "You compile tasks into acceptance contracts. Answer with JSON only.",
+            &ultra_oneshot_system(Role::ContractDrafter),
             &prompt,
         ) {
             Ok(out) => out.text,
@@ -578,12 +605,13 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                 "\nPREVIOUS ATTEMPT FAILED THESE GATES - repair them:\n{repair_digest}"
             ));
         }
-        let builder_run = match inner.begin_in_workspace(
+        let builder_run = match inner.begin_in_workspace_with_role(
             &brief,
             &ctx.provider,
             Some(&worker_model),
             Some(ultra_budgets()),
             Some(ctx.workspace.clone()),
+            Role::Builder,
         ) {
             Ok(snap) => snap,
             Err(e) => {
@@ -677,12 +705,13 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
             if adversary_enabled {
                 set_phase(&ctx.handle, UltraPhase::Adversary);
                 let brief = adversary::adversary_brief(&ctx.task, &acceptance, &report);
-                match inner.begin_in_workspace(
+                match inner.begin_in_workspace_with_role(
                     &brief,
                     &adversary_provider,
                     Some(&adversary_model),
                     Some(ultra_budgets()),
                     Some(ctx.workspace.clone()),
+                    Role::Adversary,
                 ) {
                     Ok(run) => {
                         ctx.handle
@@ -749,7 +778,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                     inner.service(),
                     &judge_provider,
                     &judge_model,
-                    "You are a hostile clean-room judge. Answer with JSON only.",
+                    &ultra_oneshot_system(Role::CleanRoomJudge),
                     &p,
                 ) {
                     Ok(out) => {
@@ -1093,7 +1122,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                 let prompt =
                     phase5::reconstruction_prompt(&ctx.task, &twin, &acceptance, &manifest);
                 let answer = oneshot::complete_text(inner.service(), recon_provider, recon_model,
-                    "You are a fresh reconstruction judge. JSON only. You have no access to builder reasoning.", &prompt)?;
+                    &ultra_oneshot_system(Role::CleanRoomJudge), &prompt)?;
                 let answer_ev = evidence.put_bytes("reconstruction_answer", answer.text.as_bytes());
                 let mut reconstruction_evidence = known_evidence.clone();
                 reconstruction_evidence.insert(answer_ev.id);
@@ -1296,6 +1325,10 @@ mod tests {
         json!({"functionCall":{"name":"update_plan","args":{"items": items.iter().map(|(id, title, status)| json!({"id": id, "title": title, "status": status})).collect::<Vec<_>>()}}})
     }
 
+    fn read_call(path: &str) -> Value {
+        json!({"functionCall":{"name":"read_file","args":{"path": path}}})
+    }
+
     fn create_call(path: &str, content: &str) -> Value {
         json!({"functionCall":{"name":"create_file","args":{"path": path, "content": content, "overwrite": true}}})
     }
@@ -1355,10 +1388,12 @@ mod tests {
                         plan_call(vec![("1", "build page", "done")]),
                         complete_call("page built"),
                     ]),
-                    // Adversary: read-only inspection + clean report.
+                    // Adversary: read-only inspection + clean report. The
+                    // adversary role is harness-enforced read-only now, so a
+                    // write would be refused; it reads instead.
                     call_turn(vec![
                         plan_call(vec![("1", "attack", "in_progress")]),
-                        create_call("adversary-notes.md", "inspected the page"),
+                        read_call("index.html"),
                     ]),
                     call_turn(vec![
                         plan_call(vec![("1", "attack", "done")]),

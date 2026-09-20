@@ -38,6 +38,30 @@ def env_key(r):
     e = r.get("env", {})
     return (e.get("model"), e.get("dataset_version"), e.get("harness_version"))
 
+def prompt_identity(r):
+    # Records from before prompt versioning read as "legacy-unknown" and
+    # conflict loudly with any versioned record instead of pooling silently.
+    return (r.get("prompt_version") or "legacy-unknown",
+            r.get("prompt_hash") or "legacy-unknown")
+
+def guard_prompt_identities(recs):
+    """Fail closed: within one aggregation input, every mode must have been
+    produced under exactly one prompt identity. Mixed identities mean the
+    comparison would silently blend different prompt semantics."""
+    per_mode = defaultdict(set)
+    for (suite, task, seed, mode), rs in recs.items():
+        for r in rs:
+            if r["status"] in ("pass", "fail"):
+                per_mode[mode].add(prompt_identity(r))
+    conflicts = {m: ids for m, ids in per_mode.items() if len(ids) > 1}
+    if conflicts:
+        detail = "; ".join(f"{m}: " + " vs ".join(f"{v}#{h[:12]}" for v, h in sorted(ids))
+                           for m, ids in sorted(conflicts.items()))
+        print(f"PROMPT IDENTITY CONFLICT - refusing to aggregate: {detail}\n"
+              f"Rerun the mismatched modes under one prompt version, or aggregate the files separately.",
+              file=sys.stderr)
+        sys.exit(2)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True, nargs="+")
@@ -47,6 +71,7 @@ def main():
     for path in a.results:
         for k, v in load(path).items():
             recs.setdefault(k, []).extend(v)
+    guard_prompt_identities(recs)
     cells = defaultdict(dict)  # (suite, task, seed) -> mode -> best record
     for (suite, task, seed, mode), rs in recs.items():
         good = [r for r in rs if r["status"] in ("pass", "fail")]

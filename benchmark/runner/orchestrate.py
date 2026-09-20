@@ -75,6 +75,8 @@ def run_one(rex_bench, plan, run, args, attempt):
     return {"run_id": run["run_id"], "attempt": attempt, "status": status,
             "tokens_used": result.get("tokens_used"), "wall_ms": result.get("wall_ms"),
             "steps": result.get("steps"), "approvals": result.get("approvals"),
+            "prompt_version": result.get("prompt_version"),
+            "prompt_hash": result.get("prompt_hash"),
             "terminal": terminal, "checks": result.get("checks"),
             "stdout_tail": proc.stdout[-1000:],
             "started_at": started.isoformat(), "finished_at": finished.isoformat()}

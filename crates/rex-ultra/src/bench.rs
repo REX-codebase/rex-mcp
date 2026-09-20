@@ -56,10 +56,21 @@ pub enum BenchMode {
     Ultra,
 }
 
+fn legacy_prompt_marker() -> String {
+    "legacy-unknown".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub task_id: String,
     pub mode: BenchMode,
+    /// Prompt-architecture identity the run executed under. Result files
+    /// from before prompt versioning deserialize as "legacy-unknown" and
+    /// fail closed against any versioned record at comparison time.
+    #[serde(default = "legacy_prompt_marker")]
+    pub prompt_version: String,
+    #[serde(default = "legacy_prompt_marker")]
+    pub prompt_hash: String,
     pub passed: bool,
     pub checks: Vec<ObligationOutcome>,
     pub tokens_used: u64,
@@ -168,12 +179,13 @@ pub fn extract_raw_files(text: &str) -> Vec<(String, String)> {
     files
 }
 
+/// The fixed raw-mode output contract. Pinned verbatim: raw stays raw, and
+/// its identity hash covers this exact text.
+pub const RAW_FORMAT_SUFFIX: &str = "Produce the complete solution as fenced code blocks, one per file, \
+each opened with an info string of exactly `file:<relative path>`. No prose between blocks.";
+
 pub fn raw_prompt(task: &BenchTask) -> String {
-    format!(
-        "{}\n\nProduce the complete solution as fenced code blocks, one per file, \
-each opened with an info string of exactly `file:<relative path>`. No prose between blocks.",
-        task.prompt
-    )
+    format!("{}\n\n{RAW_FORMAT_SUFFIX}", task.prompt)
 }
 
 pub fn write_files(workspace: &Path, files: &[(String, String)]) -> Result<(), String> {
@@ -219,6 +231,35 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         fs::write(&path, "# only a comment\n").unwrap();
         assert!(load_suite(&path).is_err());
+    }
+
+    #[test]
+    fn raw_prompt_is_pinned_verbatim() {
+        let task = BenchTask {
+            id: "t".into(),
+            prompt: "write add".into(),
+            checks: vec![Proof::FileExists { path: "x".into() }],
+        };
+        assert_eq!(
+            raw_prompt(&task),
+            "write add\n\nProduce the complete solution as fenced code blocks, one per file, \
+each opened with an info string of exactly `file:<relative path>`. No prose between blocks."
+        );
+    }
+
+    #[test]
+    fn held_out_checks_never_enter_the_raw_prompt() {
+        // The raw prompt is built from the task text alone; suite checks
+        // (the held-out answers) have no path into it.
+        let task = BenchTask {
+            id: "t".into(),
+            prompt: "write add".into(),
+            checks: vec![Proof::FileContains {
+                path: "solution.py".into(),
+                needle: "SECRET_EXPECTED_MARKER_9147".into(),
+            }],
+        };
+        assert!(!raw_prompt(&task).contains("SECRET_EXPECTED_MARKER_9147"));
     }
 
     #[test]
