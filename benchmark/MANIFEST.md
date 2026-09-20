@@ -16,3 +16,10 @@ suites and staged tests are generated locally by the adapters.
 Validation artifacts in validation/ come from the deterministic mock and
 hand-written smoke tasks only - they prove pipeline mechanics and are NOT
 model results.
+
+## Verified model + quota (2026-09-20 ~08:02 IST)
+
+- Model identifier (first-party docs https://ai.google.dev/gemini-api/docs/models): `gemini-3.5-flash-lite` ("Gemini 3.5 Flash-Lite"). Exact string to be passed to plan.py --model for all real shards.
+- Free-tier limits from the account's live AI Studio rate-limit page (https://aistudio.google.com/rate-limit, project "Project Ori" project-ori-ccd9e, Free tier, billing NOT set up): Gemini 3.5 Flash Lite = 15 RPM, 250K TPM, 500 RPD, current usage 0. Agrim's stated 500 req/day confirmed against the live page.
+- Rate limits are per project, not per key; RPD resets at midnight Pacific. The AI Studio account has exactly one project (Project Ori); the vault entry's "Zapia project" label has no separate project in AI Studio, so these limits are the operative ones for any AI Studio key from this account.
+- Docs page no longer publishes a static per-model free-tier table; the AI Studio page is the authoritative source and was read live.
