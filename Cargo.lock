@@ -2647,10 +2647,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rex-prompt"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "rex-providers"
 version = "0.1.0"
 dependencies = [
  "rex-preview",
+ "rex-prompt",
  "rex-search",
  "rex-tools",
  "serde",
@@ -2684,6 +2694,7 @@ dependencies = [
 name = "rex-ultra"
 version = "0.1.0"
 dependencies = [
+ "rex-prompt",
  "rex-providers",
  "rex-tools",
  "serde",
