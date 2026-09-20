@@ -103,3 +103,35 @@ $REX_STATE_DIR/
 
 Both directories are append-safe and crash-recoverable: on open, custody
 recovery suspends lapsed leases and the daemon reloads every task record.
+
+## Update
+
+```sh
+git pull && scripts/rex-mcp-install.sh   # rebuild and reinstall in place
+```
+
+Hosts pick up the new binary on their next MCP session start. Durable
+tasks in `$REX_STATE_DIR` survive; a stored task with an incompatible
+major protocol version refuses to load instead of being mangled.
+
+## Uninstall
+
+```sh
+scripts/rex-mcp-uninstall.sh            # removes the binary
+claude mcp remove rex                   # Claude Code config
+# Antigravity: delete the "rex" entry from ~/.antigravity/mcp_config.json
+rm -rf ~/.rex/harness                   # optional: durable tasks, custody, audits
+```
+
+Removing state is irreversible: events.jsonl and the custody audit chain
+are the only proof of what happened. Archive them first if they matter.
+
+## Release gates (current status)
+
+- Unit + integration tests: green (`cargo test` across the workspace).
+- End-to-end stdio lifecycle: green (crates/rex-mcp/tests/stdio.rs).
+- Clean-machine proof: green (fresh clone, `rex-mcp-install.sh` with an
+  empty target dir, full lifecycle against the installed binary).
+- Not yet done: Tauri Human/Agent picker UI, SBOM/dependency scan,
+  fuzzing, secret scan, malicious-workspace corpus, external review.
+  Do not claim release readiness before those land.
