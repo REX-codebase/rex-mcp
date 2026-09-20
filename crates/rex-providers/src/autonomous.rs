@@ -30,6 +30,7 @@
 //! truthful terminal reasons.
 
 use crate::http::Transport;
+use crate::provider_failure::structured_http_failure;
 use crate::providers::{find_spec, ProviderProtocol};
 use crate::search::SearchRouter;
 use crate::secrets::SecretStore;
@@ -1533,7 +1534,10 @@ fn generate_with_retry<T: Transport>(
         match result {
             Ok((status, text)) if status / 100 == 2 => return Ok(text),
             Ok((status, text)) => {
-                let detail = format!("provider HTTP {status}: {}", &text[..text.len().min(240)]);
+                let detail = format!(
+                    "provider HTTP {status}: {}",
+                    structured_http_failure(status, &text)
+                );
                 if !retryable || attempt >= PROVIDER_RETRIES {
                     return Err(detail);
                 }

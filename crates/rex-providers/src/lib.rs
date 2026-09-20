@@ -17,6 +17,7 @@ pub mod conversation;
 pub mod error;
 pub mod http;
 pub mod policy;
+mod provider_failure;
 pub mod providers;
 pub mod search;
 pub mod secrets;

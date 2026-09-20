@@ -8,6 +8,7 @@
 
 use crate::conversation::decode_turn;
 use crate::http::Transport;
+use crate::provider_failure::structured_http_failure;
 use crate::providers::{find_spec, ProviderProtocol};
 use crate::service::ProviderService;
 use crate::secrets::SecretStore;
@@ -157,7 +158,7 @@ pub fn complete_text<S: SecretStore, T: Transport>(
             }
             Ok((status, text)) => {
                 if !retryable || attempt >= RETRIES {
-                    let detail = &text[..text.len().min(240)];
+                    let detail = structured_http_failure(status, &text);
                     return Err(format!("provider HTTP {status}: {detail}"));
                 }
             }
