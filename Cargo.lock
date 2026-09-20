@@ -2670,6 +2670,7 @@ dependencies = [
 name = "rex-providers"
 version = "0.1.0"
 dependencies = [
+ "rex-custody",
  "rex-preview",
  "rex-prompt",
  "rex-search",

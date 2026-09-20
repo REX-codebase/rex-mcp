@@ -644,6 +644,18 @@ impl CustodyRegistry {
         Ok(())
     }
 
+    /// Host-side budget release: the supervised runtime hit a budget wall
+    /// it was given by this grant. Needs no token - the host is the
+    /// authority that enforced the budget in the first place.
+    pub fn release_budget_exhausted(
+        &mut self,
+        grant_id: &str,
+        which: crate::state::BudgetKind,
+        now_ms: u128,
+    ) -> Result<(), CustodyError> {
+        self.release(grant_id, ReleaseReason::BudgetExhausted { which }, now_ms)
+    }
+
     /// Human-only: clear a task's tombstone so it can be offered again.
     pub fn reopen_task(&mut self, task_id: &str, now_ms: u128) -> Result<(), CustodyError> {
         if self.index.active.contains_key(task_id) {

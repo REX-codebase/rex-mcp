@@ -14,6 +14,7 @@
 pub mod agent_loop;
 pub mod catalog;
 pub mod conversation;
+pub mod custody_link;
 pub mod error;
 pub mod http;
 pub mod policy;
