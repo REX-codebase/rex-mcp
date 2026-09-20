@@ -1,0 +1,14 @@
+{
+  "split_seed": "rex-pool-v1",
+  "comment": "Pool assignments for the improvement loop (see ../improvement-loop.md). dev = tuning pool; heldout = final/milestone pool; split = deterministic 50/50 hash partition per task id. Changing an assignment is a committed, justified event.",
+  "suites": {
+    "evalplus-humanevalplus": "heldout",
+    "evalplus-mbppplus": "split",
+    "cruxeval-output": "dev",
+    "cruxeval-input": "dev",
+    "ds1000": "split",
+    "bigcodebench-full": "split",
+    "bigcodebench-hard": "heldout",
+    "livecodebench": "heldout"
+  }
+}

@@ -23,3 +23,11 @@ model results.
 - Free-tier limits from the account's live AI Studio rate-limit page (https://aistudio.google.com/rate-limit, project "Project Ori" project-ori-ccd9e, Free tier, billing NOT set up): Gemini 3.5 Flash Lite = 15 RPM, 250K TPM, 500 RPD, current usage 0. Agrim's stated 500 req/day confirmed against the live page.
 - Rate limits are per project, not per key; RPD resets at midnight Pacific. The AI Studio account has exactly one project (Project Ori); the vault entry's "Zapia project" label has no separate project in AI Studio, so these limits are the operative ones for any AI Studio key from this account.
 - Docs page no longer publishes a static per-model free-tier table; the AI Studio page is the authoritative source and was read live.
+
+## Execution status (2026-09-20 ~08:49 IST)
+
+- Owner redirected execution: NO Colab, no laptop (PC broken). Benchmarks run through REX itself; checkpoints/results save directly to private Drive.
+- Colab route dismantled: runtime deleted, GEMINI_API_KEY removed from Colab Secrets, notebook + package + unused notebook permanently deleted from Drive. Zero real runs ever executed there; no benchmark content existed on the runtime.
+- laptop-setup/ removed: route discarded by owner.
+- Exact remaining blocker for real runs: vault fill is browser-input-only; the REX execution environment (sandbox) is not browser-reachable; the vault has no export-to-file path. See improvement-loop.md section 6.
+- Non-key work continues: improvement-loop.md design v1, runner/pools.json + plan.py --pool support (dev/heldout/split, deterministic, tested).
