@@ -1,0 +1,16 @@
+[package]
+name = "rex-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "REX Harness daemon core: durable task store and scoped execution for host agents"
+license = "Proprietary"
+
+[dependencies]
+rex-protocol = { path = "../rex-protocol" }
+rex-custody = { path = "../rex-custody" }
+rex-tools = { path = "../rex-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

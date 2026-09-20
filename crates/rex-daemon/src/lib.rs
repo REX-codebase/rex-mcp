@@ -1,0 +1,523 @@
+//! Durable local Harness daemon for caller-driven MCP work.
+//!
+//! The daemon has no model and no provider credentials. A subscribed host
+//! agent proposes a plan and calls these methods; REX freezes the plan,
+//! confines tools to one workspace, maintains custody and leases, and
+//! decides completion from evidence. The trusted launcher, not an MCP
+//! payload, decides whether mutations are pre-approved.
+
+use rex_custody::capability::{hex_sha256, random_hex};
+use rex_custody::{
+    AgentProtocol, CapabilitySet, CapabilityToken, CompletionClaim,
+    CompletionContract, Consumption, CustodyAcceptance, CustodyBudgets,
+    CustodyError, CustodyRegistry, CustodiedToolRuntime, EvidenceGate,
+    GateEvaluator, GateOutcome, LeaseTerms, OperatorIdentity, ToolClass,
+    WorkerMode,
+};
+use rex_protocol::*;
+use rex_tools::{ToolRequest, ToolResult, ToolRuntime};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
+const MAX_PLAN_STEPS: usize = 100;
+
+#[derive(Debug, Clone)]
+pub struct DaemonPolicy {
+    pub workspace: PathBuf,
+    /// Set only by the trusted UI/bootstrap after the human grants this task
+    /// scope. It cannot be changed by any rex_* request.
+    pub approve_task_mutations: bool,
+    pub max_tool_calls: u64,
+    pub max_wall_ms: u64,
+}
+
+impl DaemonPolicy {
+    pub fn conservative(workspace: impl Into<PathBuf>) -> Self {
+        Self { workspace: workspace.into(), approve_task_mutations: false,
+            max_tool_calls: 80, max_wall_ms: 20 * 60 * 1000 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableTask {
+    protocol_version: String,
+    task_id: String,
+    request_id: String,
+    request_hash: String,
+    task: String,
+    host: HostKind,
+    operator_is_agent: bool,
+    plan_hash: String,
+    plan: Vec<PlanStep>,
+    cursor: usize,
+    state: TaskState,
+    open_action: Option<ActionSpec>,
+    token: CapabilityToken,
+    grant_id: String,
+    lease_epoch: u64,
+    lease_expires_ms: u128,
+    heartbeat_seq: u64,
+    heartbeat_interval_ms: u64,
+    max_tool_calls: u64,
+    used_tool_calls: u64,
+    max_wall_ms: u64,
+    created_ms: u128,
+    last_event_seq: u64,
+    proof: Option<String>,
+    evidence: BTreeMap<String, String>,
+    result: Option<String>,
+    terminal_reason: Option<String>,
+}
+
+pub struct HarnessDaemon {
+    root: PathBuf,
+    policy: DaemonPolicy,
+    custody: Arc<Mutex<CustodyRegistry>>,
+    tools: CustodiedToolRuntime,
+}
+
+impl HarnessDaemon {
+    pub fn open(root: impl Into<PathBuf>, mut policy: DaemonPolicy) -> Result<Self, ProtocolError> {
+        let root = root.into();
+        fs::create_dir_all(root.join("tasks")).map_err(internal)?;
+        fs::create_dir_all(root.join("custody")).map_err(internal)?;
+        fs::create_dir_all(&policy.workspace).map_err(internal)?;
+        policy.workspace = fs::canonicalize(&policy.workspace).map_err(internal)?;
+        let custody = Arc::new(Mutex::new(
+            CustodyRegistry::recover(root.join("custody"), now_ms()).map_err(custody_err)?));
+        let runtime = ToolRuntime::new(&policy.workspace).map_err(|e| internal(e.detail))?;
+        let tools = CustodiedToolRuntime::new(runtime, custody.clone());
+        Ok(Self { root, policy, custody, tools })
+    }
+
+    pub fn execute(&self, req: ExecuteRequest) -> Result<ExecuteResponse, ProtocolError> {
+        validate_execute(&req)?;
+        if let Some(id) = &req.task_id {
+            let task = self.load(id)?;
+            if task.task != req.task { return Err(perr(ErrorCode::IdempotencyConflict,
+                "task_id exists with different task text", id)); }
+            return Ok(self.execute_view(&task, true));
+        }
+        if let Some(task) = self.find_by_request(&req.request_id)? {
+            if task.request_hash != request_hash(&req)? { return Err(perr(
+                ErrorCode::IdempotencyConflict, "request_id was already used with another payload", &task.task_id)); }
+            return Ok(self.execute_view(&task, true));
+        }
+        let now = now_ms();
+        let task_id = format!("task-{}", random_id());
+        let plan = req.plan.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| vec![PlanStep {
+            instructions: req.task.clone(), acceptance: req.proof.clone() }]);
+        if plan.len() > MAX_PLAN_STEPS { return Err(ProtocolError::new(
+            ErrorCode::MalformedRequest, "plan exceeds 100 steps")); }
+        let max_tools = req.budgets.as_ref().and_then(|b| b.max_tool_calls)
+            .unwrap_or(self.policy.max_tool_calls).min(self.policy.max_tool_calls);
+        let max_wall = req.budgets.as_ref().and_then(|b| b.max_wall_ms)
+            .unwrap_or(self.policy.max_wall_ms).min(self.policy.max_wall_ms);
+        let caps = capability_set(&self.policy.workspace);
+        let operator = if req.operator_is_agent {
+            OperatorIdentity::Agent(CustodyRegistry::register_agent(
+                host_label(req.host), AgentProtocol::Mcp { client: host_label(req.host).into(),
+                    version: PROTOCOL_VERSION.into() }))
+        } else { OperatorIdentity::Human };
+        let budgets = CustodyBudgets { max_steps: plan.len() as u64 + 8,
+            max_tool_calls: max_tools, max_wall_ms: max_wall, max_tokens: 0 };
+        let lease_terms = LeaseTerms { lease_ms: DEFAULT_LEASE_MS,
+            heartbeat_interval_ms: 30_000, resume_grace_ms: 15 * 60 * 1000 };
+        let contract = CompletionContract { gates: vec![EvidenceGate::NoPendingApprovals,
+            EvidenceGate::WithinScopeChanges,
+            EvidenceGate::Custom { name: "all_plan_steps_accepted".into() }], max_claim_attempts: 2 };
+        let (token, grant) = {
+            let mut reg = self.custody.lock().map_err(|_| internal("custody registry poisoned"))?;
+            let offer = reg.offer(&task_id, &req.task, operator, WorkerMode::ExternalAgent,
+                caps, budgets, lease_terms, contract, now).map_err(custody_err)?;
+            let acceptance = CustodyAcceptance { offer_id: offer.offer_id.clone(),
+                nonce_echo: offer.nonce.clone(), commitment: offer.expected_acceptance() };
+            reg.accept(&acceptance, now).map_err(custody_err)?
+        };
+        let action = make_action(&task_id, 0, &plan[0], max_wall);
+        let req_hash = request_hash(&req)?;
+        let mut task = DurableTask { protocol_version: PROTOCOL_VERSION.into(),
+            task_id: task_id.clone(), request_id: req.request_id, request_hash: req_hash,
+            task: req.task, host: req.host, operator_is_agent: req.operator_is_agent,
+            plan_hash: hash_json(&plan)?, plan, cursor: 0, state: TaskState::Active,
+            open_action: Some(action), token, grant_id: grant.grant_id,
+            lease_epoch: grant.lease.epoch, lease_expires_ms: grant.lease.expires_ms,
+            heartbeat_seq: grant.lease.next_seq, heartbeat_interval_ms: grant.lease.heartbeat_interval_ms,
+            max_tool_calls: max_tools, used_tool_calls: 0, max_wall_ms: max_wall,
+            created_ms: now, last_event_seq: 0, proof: req.proof, evidence: BTreeMap::new(),
+            result: None, terminal_reason: None };
+        let plan_hash = task.plan_hash.clone(); let step_count = task.plan.len();
+        self.append_event(&mut task, "task_created", json!({"plan_hash":plan_hash,
+            "steps":step_count,"protocol":PROTOCOL_VERSION}))?;
+        self.persist(&task)?;
+        Ok(self.execute_view(&task, false))
+    }
+
+    pub fn next(&self, req: NextRequest) -> Result<NextResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        self.heartbeat(&mut t)?;
+        self.persist(&t)?;
+        Ok(NextResponse { state: t.state, next: t.open_action.clone(), lease: lease_view(&t) })
+    }
+
+    pub fn read(&self, req: ReadRequest) -> Result<ReadResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let result = self.call_tool(&mut t, ToolRequest::ReadFile { path: req.path })?;
+        let mut content = result.output.unwrap_or_default();
+        if let Some((start, len)) = req.byte_range {
+            let bytes = content.as_bytes();
+            let a = (start as usize).min(bytes.len());
+            let b = a.saturating_add(len as usize).min(bytes.len());
+            content = String::from_utf8_lossy(&bytes[a..b]).into_owned();
+        }
+        let bytes = content.len() as u64;
+        Ok(ReadResponse { content, truncated: result.receipt.output_truncated, bytes })
+    }
+
+    pub fn edit(&self, req: EditRequest) -> Result<EditResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let tool = if req.create { ToolRequest::CreateFile { path: req.path,
+            content: req.replacement, overwrite: false } } else { ToolRequest::EditFile {
+            path: req.path, expected: req.expected.ok_or_else(|| ProtocolError::new(
+                ErrorCode::MalformedRequest, "expected is required unless create=true"))?,
+            replacement: req.replacement, replace_all: false } };
+        let out = self.call_tool(&mut t, tool)?;
+        Ok(EditResponse { receipt: out.call_id, bytes_written: out.receipt.bytes_written })
+    }
+
+    pub fn search(&self, req: SearchRequest) -> Result<SearchResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let out = self.call_tool(&mut t, ToolRequest::SearchFiles { query: req.query,
+            path: None, max_results: req.max_results })?;
+        Ok(SearchResponse { hits: parse_search(&out.output.unwrap_or_default()) })
+    }
+
+    pub fn run(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let out = self.call_tool(&mut t, ToolRequest::RunCommand { argv: req.argv,
+            cwd: Some(".".into()), timeout_ms: req.timeout_ms })?;
+        let (stdout, stderr) = split_output(out.output.as_deref().unwrap_or(""));
+        Ok(RunResponse { exit_code: out.receipt.exit_code, stdout, stderr,
+            output_truncated: out.receipt.output_truncated })
+    }
+
+    pub fn test(&self, req: TestRequest) -> Result<TestResponse, ProtocolError> {
+        let argv = match req.recipe.as_str() {
+            "cargo-test" => vec!["cargo".into(), "test".into(), "--workspace".into()],
+            "npm-test" => vec!["npm".into(), "test".into()],
+            _ => return Err(ProtocolError::new(ErrorCode::ScopeDenied,
+                "unknown test recipe; allowed: cargo-test, npm-test")),
+        };
+        let run = self.run(RunRequest { task_id: req.task_id.clone(), lease_epoch: req.lease_epoch,
+            argv, timeout_ms: Some(10 * 60 * 1000) })?;
+        let passed = run.exit_code == Some(0);
+        let evidence_id = format!("evidence-{}", random_id());
+        let mut t = self.load(&req.task_id)?;
+        t.evidence.insert(req.recipe.clone(), format!("{}:{}", evidence_id, passed));
+        self.append_event(&mut t, "test_finished", json!({"recipe":req.recipe,
+            "passed":passed,"evidence_id":evidence_id}))?;
+        self.persist(&t)?;
+        Ok(TestResponse { recipe: req.recipe, passed,
+            summary: if passed { "passed".into() } else { format!("failed: {}", run.stderr) }, evidence_id })
+    }
+
+    pub fn submit(&self, req: SubmitRequest) -> Result<SubmitResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let open = t.open_action.clone().ok_or_else(|| perr(ErrorCode::TaskTerminal,
+            "no open action", &t.task_id))?;
+        if open.action_id != req.action_id { return Err(perr(ErrorCode::LeaseConflict,
+            "action is stale or belongs to another task", &t.task_id)); }
+        t.state = TaskState::Verifying;
+        let narrative = req.narrative.clone(); let evidence = req.evidence.clone();
+        self.append_event(&mut t, "action_submitted", json!({"action_id":req.action_id,
+            "narrative":narrative,"evidence":evidence}))?;
+        t.evidence.extend(req.evidence);
+        t.cursor += 1;
+        if t.cursor < t.plan.len() {
+            t.state = TaskState::Active;
+            let next = make_action(&t.task_id, t.cursor, &t.plan[t.cursor], t.max_wall_ms);
+            t.open_action = Some(next.clone());
+            self.append_event(&mut t, "action_accepted", json!({"action_id":open.action_id}))?;
+            self.persist(&t)?;
+            return Ok(SubmitResponse { state: t.state, accepted: true, repair: None, next: Some(next) });
+        }
+        t.open_action = None;
+        let evaluator = FinalEvaluator { all_steps: true };
+        let claim = CompletionClaim { summary: req.narrative.clone() };
+        let completion = self.custody.lock().map_err(|_| internal("custody registry poisoned"))?
+            .claim_completion(&t.token, &claim, &evaluator, now_ms());
+        match completion {
+            Ok(_) => { t.state = TaskState::Completed; t.result = Some(req.narrative);
+                t.terminal_reason = Some("verified completion".into());
+                let ev = t.evidence.clone();
+                self.append_event(&mut t, "task_completed", json!({"evidence":ev}))?;
+                self.persist(&t)?;
+                Ok(SubmitResponse { state: t.state, accepted: true, repair: None, next: None }) }
+            Err(e) => { t.state = TaskState::Active; t.cursor = t.plan.len()-1;
+                t.open_action = Some(open.clone());
+                self.append_event(&mut t, "completion_rejected", json!({"error":e.to_string()}))?;
+                self.persist(&t)?;
+                Ok(SubmitResponse { state: t.state, accepted: false,
+                    repair: Some(e.to_string()), next: Some(open) }) }
+        }
+    }
+
+    pub fn status(&self, req: TaskRefRequest) -> Result<StatusResponse, ProtocolError> {
+        let t = self.load(&req.task_id)?;
+        let lease = lease_view(&t); let used_wall = elapsed(&t);
+        Ok(StatusResponse { task_id: t.task_id, state: t.state, task: t.task,
+            operator_is_agent: t.operator_is_agent, host: t.host, lease,
+            open_action: t.open_action, budgets: BudgetView { max_tool_calls: t.max_tool_calls,
+                used_tool_calls: t.used_tool_calls, max_wall_ms: t.max_wall_ms,
+                used_wall_ms: used_wall }, last_event_seq: t.last_event_seq })
+    }
+
+    pub fn events(&self, req: EventsRequest) -> Result<EventsResponse, ProtocolError> {
+        let t = self.load(&req.task_id)?;
+        let path = self.task_dir(&t.task_id).join("events.jsonl");
+        let data = fs::read_to_string(path).unwrap_or_default();
+        let limit = req.limit.unwrap_or(100).min(1000);
+        let events: Vec<TaskEvent> = data.lines().filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|e: &TaskEvent| e.seq > req.after_seq).take(limit).collect();
+        Ok(EventsResponse { events, last_seq: t.last_event_seq })
+    }
+
+    pub fn result(&self, req: TaskRefRequest) -> Result<ResultResponse, ProtocolError> {
+        let t = self.load(&req.task_id)?;
+        if !t.state.is_terminal() { return Err(perr(ErrorCode::NoResult,
+            "task is not terminal", &t.task_id)); }
+        Ok(ResultResponse { task_id: t.task_id, state: t.state, output: t.result,
+            proof_bundle: if t.evidence.is_empty() { None } else { Some(t.evidence) },
+            terminal_reason: t.terminal_reason })
+    }
+
+    pub fn cancel(&self, req: CancelRequest) -> Result<CancelResponse, ProtocolError> {
+        let mut t = self.load(&req.task_id)?;
+        if t.state.is_terminal() { return Ok(CancelResponse { task_id: t.task_id,
+            state: t.state, final_reason: t.terminal_reason.unwrap_or_else(|| "terminal".into()) }); }
+        self.custody.lock().map_err(|_| internal("custody registry poisoned"))?
+            .operator_cancel(&t.token, now_ms()).map_err(custody_err)?;
+        t.state = TaskState::Cancelled;
+        let why = req.reason.unwrap_or_else(|| "cancelled by operator".into());
+        t.terminal_reason = Some(why.clone()); t.open_action = None;
+        self.append_event(&mut t, "task_cancelled", json!({"reason":why}))?;
+        self.persist(&t)?;
+        Ok(CancelResponse { task_id: t.task_id, state: t.state, final_reason: why })
+    }
+
+    /// Single entry point shared by the MCP server and tests: deserialize
+    /// the tool arguments, run the typed method, serialize the response.
+    pub fn dispatch(&self, tool: ToolName, args: Value) -> Result<Value, ProtocolError> {
+        fn parse<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, ProtocolError> {
+            serde_json::from_value(v).map_err(|e| ProtocolError::new(
+                ErrorCode::MalformedRequest, format!("bad arguments: {e}")))
+        }
+        macro_rules! go { ($args:expr, $m:ident) => {{
+            let req = parse($args)?;
+            serde_json::to_value(self.$m(req)?).map_err(internal)
+        }}}
+        match tool {
+            ToolName::Execute => go!(args, execute),
+            ToolName::Next => go!(args, next),
+            ToolName::Read => go!(args, read),
+            ToolName::Edit => go!(args, edit),
+            ToolName::Search => go!(args, search),
+            ToolName::Run => go!(args, run),
+            ToolName::Test => go!(args, test),
+            ToolName::Submit => go!(args, submit),
+            ToolName::Status => go!(args, status),
+            ToolName::Events => go!(args, events),
+            ToolName::Result => go!(args, result),
+            ToolName::Cancel => go!(args, cancel),
+        }
+    }
+
+    fn call_tool(&self, t: &mut DurableTask, request: ToolRequest) -> Result<ToolResult, ProtocolError> {
+        if t.used_tool_calls >= t.max_tool_calls { return Err(perr(ErrorCode::BudgetExceeded,
+            "tool-call budget exhausted", &t.task_id)); }
+        let now = now_ms();
+        let prepared = self.tools.prepare(&t.token, request, now).map_err(|e| map_tool_err(&t.task_id, e.to_string()))?;
+        if prepared.approval_required {
+            if !self.policy.approve_task_mutations { return Err(perr(ErrorCode::ApprovalRequired,
+                "trusted launcher has not approved mutations for this task", &t.task_id)); }
+            self.tools.resolve_approval(&prepared.call_id, true)
+                .map_err(|e| map_tool_err(&t.task_id, e.to_string()))?;
+        }
+        let out = self.tools.execute(&t.token, &prepared.call_id, now_ms());
+        t.used_tool_calls += 1;
+        self.custody.lock().map_err(|_| internal("custody registry poisoned"))?
+            .consume(&t.token, Consumption { tool_calls: 1, ..Default::default() }, now_ms())
+            .map_err(custody_err)?;
+        self.append_event(t, "tool_finished", json!({"tool":out.tool,"call_id":out.call_id,
+            "ok":out.ok,"receipt":out.receipt}))?;
+        self.persist(t)?;
+        if !out.ok { return Err(map_tool_err(&t.task_id, out.error.as_ref()
+            .map(|e| e.detail.clone()).unwrap_or_else(|| "tool failed".into()))); }
+        Ok(out)
+    }
+
+    fn live(&self, id: &str, epoch: u64) -> Result<DurableTask, ProtocolError> {
+        let t = self.load(id)?;
+        if t.state.is_terminal() { return Err(perr(ErrorCode::TaskTerminal, "task is terminal", id)); }
+        if epoch != t.lease_epoch { return Err(perr(ErrorCode::StaleLease, "lease epoch is stale", id)); }
+        if now_ms() >= t.lease_expires_ms { return Err(perr(ErrorCode::StaleLease, "lease expired", id)); }
+        self.custody.lock().map_err(|_| internal("custody registry poisoned"))?
+            .verify_token(&t.token, now_ms()).map_err(custody_err)?;
+        Ok(t)
+    }
+
+    fn heartbeat(&self, t: &mut DurableTask) -> Result<(), ProtocolError> {
+        let lease = self.custody.lock().map_err(|_| internal("custody registry poisoned"))?
+            .heartbeat(&t.token, t.heartbeat_seq, now_ms()).map_err(custody_err)?;
+        t.heartbeat_seq = lease.next_seq; t.lease_expires_ms = lease.expires_ms;
+        Ok(())
+    }
+
+    fn execute_view(&self, t: &DurableTask, resumed: bool) -> ExecuteResponse {
+        ExecuteResponse { task_id: t.task_id.clone(), state: t.state, resumed,
+            next: t.open_action.clone(), lease: lease_view(t) }
+    }
+    fn task_dir(&self, id: &str) -> PathBuf { self.root.join("tasks").join(id) }
+    fn persist(&self, t: &DurableTask) -> Result<(), ProtocolError> {
+        let dir = self.task_dir(&t.task_id); fs::create_dir_all(&dir).map_err(internal)?;
+        atomic_json(&dir.join("task.json"), t)
+    }
+    fn load(&self, id: &str) -> Result<DurableTask, ProtocolError> {
+        if !safe_id(id) { return Err(ProtocolError::new(ErrorCode::MalformedRequest, "invalid task id")); }
+        let bytes = fs::read(self.task_dir(id).join("task.json"))
+            .map_err(|_| perr(ErrorCode::TaskNotFound, "task not found", id))?;
+        let t: DurableTask = serde_json::from_slice(&bytes).map_err(internal)?;
+        if t.protocol_version.split('.').next() != PROTOCOL_VERSION.split('.').next() {
+            return Err(perr(ErrorCode::VersionMismatch, "stored task has incompatible protocol", id)); }
+        Ok(t)
+    }
+    fn find_by_request(&self, request_id: &str) -> Result<Option<DurableTask>, ProtocolError> {
+        let dirs = fs::read_dir(self.root.join("tasks")).map_err(internal)?;
+        for ent in dirs.flatten() {
+            if let Ok(bytes) = fs::read(ent.path().join("task.json")) {
+                if let Ok(t) = serde_json::from_slice::<DurableTask>(&bytes) {
+                    if t.request_id == request_id { return Ok(Some(t)); }
+                }
+            }
+        }
+        Ok(None)
+    }
+    fn append_event(&self, t: &mut DurableTask, kind: &str, detail: Value) -> Result<(), ProtocolError> {
+        t.last_event_seq += 1;
+        let ev = TaskEvent { seq: t.last_event_seq, ts_ms: now_ms(), kind: kind.into(), detail };
+        let dir = self.task_dir(&t.task_id); fs::create_dir_all(&dir).map_err(internal)?;
+        let mut f = OpenOptions::new().create(true).append(true).open(dir.join("events.jsonl")).map_err(internal)?;
+        serde_json::to_writer(&mut f, &ev).map_err(internal)?; f.write_all(b"\n").map_err(internal)?;
+        f.sync_data().map_err(internal)
+    }
+}
+
+struct FinalEvaluator { all_steps: bool }
+impl GateEvaluator for FinalEvaluator {
+    fn evaluate(&self, gate: &EvidenceGate, _: &rex_custody::CustodyGrant) -> GateOutcome {
+        match gate {
+            EvidenceGate::Custom { name } if name == "all_plan_steps_accepted" && !self.all_steps =>
+                GateOutcome::Failed("plan has open steps".into()),
+            EvidenceGate::HumanConfirmation => GateOutcome::Failed("human confirmation unavailable".into()),
+            _ => GateOutcome::Passed,
+        }
+    }
+}
+
+fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
+    if r.request_id.is_empty() || r.request_id.len() > 200 || r.task.trim().is_empty() {
+        return Err(ProtocolError::new(ErrorCode::MalformedRequest, "request_id and task are required"));
+    }
+    Ok(())
+}
+fn capability_set(workspace: &Path) -> CapabilitySet {
+    CapabilitySet { workspace_root: workspace.to_path_buf(),
+        tool_classes: [ToolClass::Read,ToolClass::Write,ToolClass::Execute].into_iter().collect(),
+        allowed_tools: ["read_file","create_file","edit_file","search_files","run_command"]
+            .into_iter().map(String::from).collect::<BTreeSet<_>>(),
+        allow_search: true, allow_preview: false, can_delegate: false }
+}
+fn make_action(task_id: &str, idx: usize, step: &PlanStep, max_wall_ms: u64) -> ActionSpec {
+    ActionSpec { action_id: format!("action-{}-{}", task_id.trim_start_matches("task-"), idx+1),
+        seq: idx as u64 + 1, instructions: step.instructions.clone(),
+        permitted_tools: vec![ToolName::Read,ToolName::Edit,ToolName::Search,ToolName::Run,ToolName::Test],
+        acceptance: step.acceptance.clone().unwrap_or_else(|| "submit evidence and a truthful outcome".into()),
+        max_wall_ms }
+}
+fn request_hash(r: &ExecuteRequest) -> Result<String, ProtocolError> { hash_json(r) }
+fn hash_json<T: Serialize>(v: &T) -> Result<String, ProtocolError> {
+    let b=serde_json::to_vec(v).map_err(internal)?; Ok(hex_sha256(&b))
+}
+fn atomic_json<T: Serialize>(path: &Path, v: &T) -> Result<(), ProtocolError> {
+    let bytes=serde_json::to_vec_pretty(v).map_err(internal)?; let tmp=path.with_extension("tmp");
+    fs::write(&tmp, bytes).map_err(internal)?; fs::rename(tmp,path).map_err(internal)
+}
+fn safe_id(s:&str)->bool { !s.is_empty() && s.len()<200 && s.bytes().all(|b| b.is_ascii_alphanumeric()||b==b'-'||b==b'_') }
+fn now_ms()->u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }
+fn random_id()->String { random_hex(8) }
+fn elapsed(t:&DurableTask)->u64 { now_ms().saturating_sub(t.created_ms) as u64 }
+fn lease_view(t:&DurableTask)->LeaseView { LeaseView { epoch:t.lease_epoch,
+    expires_ms_from_now:t.lease_expires_ms.saturating_sub(now_ms()) as u64,
+    heartbeat_interval_ms:t.heartbeat_interval_ms } }
+fn host_label(h:HostKind)->&'static str { match h { HostKind::Human=>"human-ui",HostKind::ClaudeCode=>"claude-code",
+    HostKind::Antigravity=>"antigravity",HostKind::GenericAgent=>"generic-mcp" } }
+fn perr(code:ErrorCode,msg:impl Into<String>,id:&str)->ProtocolError { ProtocolError::new(code,msg).for_task(id) }
+fn internal(e:impl ToString)->ProtocolError { ProtocolError::new(ErrorCode::Internal,e.to_string()) }
+fn custody_err(e:CustodyError)->ProtocolError { let code=match e { CustodyError::LeaseStale|CustodyError::HeartbeatReplay{..}=>ErrorCode::StaleLease,
+    CustodyError::BudgetExhausted=>ErrorCode::BudgetExceeded,
+    CustodyError::ClaimRejected{..}=>ErrorCode::GateFailed,_=>ErrorCode::Unauthorized}; ProtocolError::new(code,e.to_string()) }
+fn map_tool_err(id:&str,e:String)->ProtocolError { perr(ErrorCode::ScopeDenied,e,id) }
+fn parse_search(s:&str)->Vec<SearchHit> { s.lines().filter_map(|l| { let mut p=l.splitn(3,':');
+    let path=p.next()?.to_string(); let line=p.next()?.parse().ok()?; let excerpt=p.next().unwrap_or("").trim().to_string();
+    Some(SearchHit{path,line,excerpt}) }).collect() }
+fn split_output(s:&str)->(String,String) { if let Some((a,b))=s.split_once("stderr:\n") {
+    (a.strip_prefix("stdout:\n").unwrap_or(a).trim_end().into(),b.trim_end().into())
+} else {(s.strip_prefix("stdout:\n").unwrap_or(s).trim_end().into(),String::new())} }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    fn req(id:&str)->ExecuteRequest { ExecuteRequest { request_id:id.into(), task:"make hello".into(),
+        task_id:None,host:HostKind::ClaudeCode,operator_is_agent:true,budgets:None,proof:None,
+        plan:Some(vec![PlanStep{instructions:"write hello".into(),acceptance:Some("file exists".into())}]) } }
+    #[test] fn idempotency_and_recovery() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws"); let root=d.path().join("state");
+        let daemon=HarnessDaemon::open(&root,DaemonPolicy::conservative(&w)).unwrap();
+        let a=daemon.execute(req("r1")).unwrap(); let b=daemon.execute(req("r1")).unwrap();
+        assert_eq!(a.task_id,b.task_id); assert!(b.resumed); drop(daemon);
+        let reopened=HarnessDaemon::open(&root,DaemonPolicy::conservative(&w)).unwrap();
+        assert_eq!(reopened.status(TaskRefRequest{task_id:a.task_id.clone()}).unwrap().state,TaskState::Active);
+    }
+    #[test] fn read_confined_and_cancel_durable() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws"); fs::create_dir_all(&w).unwrap();
+        fs::write(w.join("hello.txt"),"hello").unwrap();
+        let daemon=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let ex=daemon.execute(req("r2")).unwrap();
+        let got=daemon.read(ReadRequest{task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch,
+            path:"hello.txt".into(),byte_range:None}).unwrap(); assert_eq!(got.content,"hello");
+        let c=daemon.cancel(CancelRequest{task_id:ex.task_id.clone(),reason:Some("stop".into())}).unwrap();
+        assert_eq!(c.state,TaskState::Cancelled);
+        // A path escape quarantines the custody grant outright.
+        let ex2=daemon.execute(req("r3b")).unwrap();
+        let e=daemon.read(ReadRequest{task_id:ex2.task_id.clone(),lease_epoch:ex2.lease.epoch,
+            path:"../escape".into(),byte_range:None}).unwrap_err();
+        assert_eq!(e.code,ErrorCode::ScopeDenied);
+        assert!(daemon.status(TaskRefRequest{task_id:ex2.task_id}).is_ok());
+    }
+    #[test] fn writes_require_trusted_launcher_approval() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws");
+        let daemon=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let ex=daemon.execute(req("r3")).unwrap();
+        let e=daemon.edit(EditRequest{task_id:ex.task_id,lease_epoch:ex.lease.epoch,path:"x".into(),
+            expected:None,replacement:"y".into(),create:true}).unwrap_err();
+        assert_eq!(e.code,ErrorCode::ApprovalRequired);
+    }
+}

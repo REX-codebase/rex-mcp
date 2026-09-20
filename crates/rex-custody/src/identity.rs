@@ -21,6 +21,11 @@ pub enum AgentProtocol {
     /// A locally installed vendor CLI driven through its documented
     /// automation interface (the rex-installed-agents route).
     InstalledCli { backend: String },
+    /// A host agent connected to the local REX MCP server over stdio
+    /// (Claude Code, Antigravity, any MCP client). Authentication is the
+    /// local process boundary; REX never sees the host's account or
+    /// credentials.
+    Mcp { client: String, version: String },
 }
 
 /// An external agent asking to operate a task.

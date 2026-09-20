@@ -2619,6 +2619,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rex-daemon"
+version = "0.1.0"
+dependencies = [
+ "rex-custody",
+ "rex-protocol",
+ "rex-tools",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "rex-harness"
 version = "0.1.0"
 dependencies = [
@@ -2643,6 +2655,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rex-mcp"
+version = "0.1.0"
+dependencies = [
+ "rex-daemon",
+ "rex-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "rex-preview"
 version = "0.1.0"
 dependencies = [
@@ -2664,6 +2687,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "rex-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
