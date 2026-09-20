@@ -72,6 +72,9 @@ struct DurableTask {
     last_event_seq: u64,
     proof: Option<String>,
     evidence: BTreeMap<String, String>,
+    /// Harness-registered evidence ids (tool receipts, test evidence ids).
+    /// A completion claim may only cite these.
+    registered_evidence: BTreeSet<String>,
     result: Option<String>,
     terminal_reason: Option<String>,
 }
@@ -152,7 +155,7 @@ impl HarnessDaemon {
             heartbeat_seq: grant.lease.next_seq, heartbeat_interval_ms: grant.lease.heartbeat_interval_ms,
             max_tool_calls: max_tools, used_tool_calls: 0, max_wall_ms: max_wall,
             created_ms: now, last_event_seq: 0, proof: req.proof, evidence: BTreeMap::new(),
-            result: None, terminal_reason: None };
+            registered_evidence: BTreeSet::new(), result: None, terminal_reason: None };
         let plan_hash = task.plan_hash.clone(); let step_count = task.plan.len();
         self.append_event(&mut task, "task_created", json!({"plan_hash":plan_hash,
             "steps":step_count,"protocol":PROTOCOL_VERSION}))?;
@@ -178,7 +181,8 @@ impl HarnessDaemon {
             content = String::from_utf8_lossy(&bytes[a..b]).into_owned();
         }
         let bytes = content.len() as u64;
-        Ok(ReadResponse { content, truncated: result.receipt.output_truncated, bytes })
+        Ok(ReadResponse { content, truncated: result.receipt.output_truncated, bytes,
+            receipt: Some(result.call_id) })
     }
 
     pub fn edit(&self, req: EditRequest) -> Result<EditResponse, ProtocolError> {
@@ -196,7 +200,8 @@ impl HarnessDaemon {
         let mut t = self.live(&req.task_id, req.lease_epoch)?;
         let out = self.call_tool(&mut t, ToolRequest::SearchFiles { query: req.query,
             path: None, max_results: req.max_results })?;
-        Ok(SearchResponse { hits: parse_search(&out.output.unwrap_or_default()) })
+        Ok(SearchResponse { hits: parse_search(&out.output.unwrap_or_default()),
+            receipt: Some(out.call_id) })
     }
 
     pub fn run(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
@@ -205,7 +210,7 @@ impl HarnessDaemon {
             cwd: Some(".".into()), timeout_ms: req.timeout_ms })?;
         let (stdout, stderr) = split_output(out.output.as_deref().unwrap_or(""));
         Ok(RunResponse { exit_code: out.receipt.exit_code, stdout, stderr,
-            output_truncated: out.receipt.output_truncated })
+            output_truncated: out.receipt.output_truncated, receipt: Some(out.call_id) })
     }
 
     pub fn test(&self, req: TestRequest) -> Result<TestResponse, ProtocolError> {
@@ -220,6 +225,7 @@ impl HarnessDaemon {
         let passed = run.exit_code == Some(0);
         let evidence_id = format!("evidence-{}", random_id());
         let mut t = self.load(&req.task_id)?;
+        t.registered_evidence.insert(evidence_id.clone());
         t.evidence.insert(req.recipe.clone(), format!("{}:{}", evidence_id, passed));
         self.append_event(&mut t, "test_finished", json!({"recipe":req.recipe,
             "passed":passed,"evidence_id":evidence_id}))?;
@@ -236,6 +242,7 @@ impl HarnessDaemon {
             "action is stale or belongs to another task", &t.task_id)); }
         t.state = TaskState::Verifying;
         let narrative = req.narrative.clone(); let evidence = req.evidence.clone();
+        let cited: Vec<String> = req.evidence.values().cloned().collect();
         self.append_event(&mut t, "action_submitted", json!({"action_id":req.action_id,
             "narrative":narrative,"evidence":evidence}))?;
         t.evidence.extend(req.evidence);
@@ -247,6 +254,18 @@ impl HarnessDaemon {
             self.append_event(&mut t, "action_accepted", json!({"action_id":open.action_id}))?;
             self.persist(&t)?;
             return Ok(SubmitResponse { state: t.state, accepted: true, repair: None, next: Some(next) });
+        }
+        // Fable completion gate: the claim may only cite evidence the
+        // harness actually registered, and it must cite some.
+        if let Err(failures) = rex_prompt::gate::validate_completion_claim(
+            &req.narrative, &cited, &t.registered_evidence) {
+            t.state = TaskState::Active; t.cursor = t.plan.len()-1;
+            t.open_action = Some(open.clone());
+            let repair = failures.join("; ");
+            self.append_event(&mut t, "completion_rejected", json!({"failures":failures}))?;
+            self.persist(&t)?;
+            return Ok(SubmitResponse { state: t.state, accepted: false,
+                repair: Some(repair), next: Some(open) });
         }
         t.open_action = None;
         let evaluator = FinalEvaluator { all_steps: true };
@@ -302,8 +321,16 @@ impl HarnessDaemon {
         let mut t = self.load(&req.task_id)?;
         if t.state.is_terminal() { return Ok(CancelResponse { task_id: t.task_id,
             state: t.state, final_reason: t.terminal_reason.unwrap_or_else(|| "terminal".into()) }); }
-        self.custody.lock().map_err(|_| internal("custody registry poisoned"))?
-            .operator_cancel(&t.token, now_ms()).map_err(custody_err)?;
+        {
+            let mut reg = self.custody.lock().map_err(|_| internal("custody registry poisoned"))?;
+            if t.operator_is_agent {
+                reg.operator_cancel(&t.token, now_ms()).map_err(custody_err)?;
+            } else {
+                // The human stop button: terminal fence in every phase,
+                // never gated on operator state.
+                reg.human_stop(&t.grant_id, now_ms()).map_err(custody_err)?;
+            }
+        }
         t.state = TaskState::Cancelled;
         let why = req.reason.unwrap_or_else(|| "cancelled by operator".into());
         t.terminal_reason = Some(why.clone()); t.open_action = None;
@@ -352,6 +379,7 @@ impl HarnessDaemon {
         }
         let out = self.tools.execute(&t.token, &prepared.call_id, now_ms());
         t.used_tool_calls += 1;
+        t.registered_evidence.insert(out.call_id.clone());
         self.custody.lock().map_err(|_| internal("custody registry poisoned"))?
             .consume(&t.token, Consumption { tool_calls: 1, ..Default::default() }, now_ms())
             .map_err(custody_err)?;
@@ -382,7 +410,8 @@ impl HarnessDaemon {
 
     fn execute_view(&self, t: &DurableTask, resumed: bool) -> ExecuteResponse {
         ExecuteResponse { task_id: t.task_id.clone(), state: t.state, resumed,
-            next: t.open_action.clone(), lease: lease_view(t) }
+            next: t.open_action.clone(), lease: lease_view(t),
+            discipline: Some(operator_discipline()) }
     }
     fn task_dir(&self, id: &str) -> PathBuf { self.root.join("tasks").join(id) }
     fn persist(&self, t: &DurableTask) -> Result<(), ProtocolError> {
@@ -417,6 +446,12 @@ impl HarnessDaemon {
         serde_json::to_writer(&mut f, &ev).map_err(internal)?; f.write_all(b"\n").map_err(internal)?;
         f.sync_data().map_err(internal)
     }
+}
+
+/// The Fable completion discipline, delivered through the protocol because
+/// host agents never see REX's own system prompt.
+fn operator_discipline() -> String {
+    rex_prompt::gate::COMPLETION_GATE.to_string()
 }
 
 struct FinalEvaluator { all_steps: bool }
@@ -511,6 +546,20 @@ mod tests {
             path:"../escape".into(),byte_range:None}).unwrap_err();
         assert_eq!(e.code,ErrorCode::ScopeDenied);
         assert!(daemon.status(TaskRefRequest{task_id:ex2.task_id}).is_ok());
+    }
+    #[test] fn human_stop_is_final_and_discipline_is_delivered() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws");
+        let daemon=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let mut r=req("r4"); r.operator_is_agent=false; r.host=HostKind::Human;
+        let ex=daemon.execute(r).unwrap();
+        // Hosts receive the Fable completion discipline at task start.
+        let disc=ex.discipline.unwrap();
+        assert!(disc.contains("declare completion") && disc.contains("evidence"));
+        // Human cancel goes through the terminal human-stop fence.
+        let c=daemon.cancel(CancelRequest{task_id:ex.task_id.clone(),reason:Some("stop button".into())}).unwrap();
+        assert_eq!(c.state,TaskState::Cancelled);
+        let e=daemon.next(NextRequest{task_id:ex.task_id,lease_epoch:ex.lease.epoch}).unwrap_err();
+        assert_eq!(e.code,ErrorCode::TaskTerminal);
     }
     #[test] fn writes_require_trusted_launcher_approval() {
         let d=tempdir().unwrap(); let w=d.path().join("ws");

@@ -9,6 +9,7 @@ license = "Proprietary"
 rex-protocol = { path = "../rex-protocol" }
 rex-custody = { path = "../rex-custody" }
 rex-tools = { path = "../rex-tools" }
+rex-prompt = { path = "../rex-prompt" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

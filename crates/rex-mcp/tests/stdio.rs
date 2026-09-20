@@ -75,9 +75,20 @@ fn full_caller_driven_lifecycle_over_stdio() {
         "argv":["cat","note.txt"]}));
     assert!(run["stdout"].as_str().unwrap().contains("world"));
 
-    // Complete: final submit passes custody gates; result carries output.
+    // Fable completion gate: a final claim citing no harness evidence is
+    // rejected with repair feedback, and the action stays open.
+    let bogus = s.tool("rex_submit", json!({"task_id":task_id,"lease_epoch":epoch,
+        "action_id":action2,"narrative":"trust me"}));
+    assert_eq!(bogus["accepted"], false);
+    assert!(bogus["repair"].as_str().unwrap().contains("cites no evidence"));
+
+    // Complete: final submit cites the edit and run receipts the harness
+    // actually registered; custody gates pass; result carries output.
+    let edit_receipt = edit["receipt"].as_str().unwrap();
+    let run_receipt = run["receipt"].as_str().unwrap();
     let sub2 = s.tool("rex_submit", json!({"task_id":task_id,"lease_epoch":epoch,
-        "action_id":action2,"narrative":"appended and verified"}));
+        "action_id":action2,"narrative":"appended and verified",
+        "evidence":{"edit":edit_receipt,"run":run_receipt}}));
     assert_eq!(sub2["state"], "completed");
     let res = s.tool("rex_result", json!({"task_id":task_id}));
     assert_eq!(res["output"], "appended and verified");

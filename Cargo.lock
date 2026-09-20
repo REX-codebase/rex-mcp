@@ -2623,6 +2623,7 @@ name = "rex-daemon"
 version = "0.1.0"
 dependencies = [
  "rex-custody",
+ "rex-prompt",
  "rex-protocol",
  "rex-tools",
  "serde",

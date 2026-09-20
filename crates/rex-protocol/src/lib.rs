@@ -248,6 +248,11 @@ pub struct ExecuteResponse {
     pub resumed: bool,
     pub next: Option<ActionSpec>,
     pub lease: LeaseView,
+    /// The Fable completion discipline every operator must honor. Host
+    /// agents never see REX's system prompt, so the rules travel here.
+    /// Added in protocol 1.0; absent means a pre-discipline daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discipline: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +292,9 @@ pub struct ReadResponse {
     pub content: String,
     pub truncated: bool,
     pub bytes: u64,
+    /// Harness receipt id; cite it as evidence at submit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +335,9 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
+    /// Harness receipt id; cite it as evidence at submit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +355,9 @@ pub struct RunResponse {
     pub stdout: String,
     pub stderr: String,
     pub output_truncated: bool,
+    /// Harness receipt id; cite it as evidence at submit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
