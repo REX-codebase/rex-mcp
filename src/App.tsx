@@ -41,6 +41,8 @@ import {
   type InstalledRunSnapshot,
 } from "./data/installedAgentRun";
 import { loadInstalledAgentOptions } from "./components/ModelStatus";
+import { OperatorModeChip, OperatorModeGate } from "./components/OperatorModeGate";
+import { loadOperatorMode, saveOperatorMode, type OperatorMode } from "./data/operatorMode";
 import type { InstalledAgentId } from "./data/backend";
 
 // The hero starter composer exists only while there is no session. The moment
@@ -48,6 +50,13 @@ import type { InstalledAgentId } from "./data/backend";
 // wrapper collapses - and unmounts, leaving exactly one composer at the
 // bottom of the session. Reduced motion swaps it instantly.
 export default function App() {
+  const [operatorMode, setOperatorMode] = useState<OperatorMode | null>(() =>
+    loadOperatorMode((k) => window.localStorage.getItem(k))
+  );
+  const chooseOperatorMode = (mode: OperatorMode) => {
+    try { saveOperatorMode(mode); } catch { /* storage unavailable */ }
+    setOperatorMode(mode);
+  };
   const [view, setView] = useState<"task" | "settings">("task");
   const [browserPhase, setBrowserPhase] = useState<"closed" | "active" | "collapsed">("closed");
   const [browserRun, setBrowserRun] = useState(0);
@@ -411,6 +420,14 @@ export default function App() {
     setBrowserPhase("closed");
   };
 
+  if (operatorMode === null) {
+    return (
+      <div className="harness-shell min-h-full">
+        <OperatorModeGate onChoose={chooseOperatorMode} />
+      </div>
+    );
+  }
+
   return (
     <div className={`harness-shell min-h-full motion-${motion} ${ultra ? "ultra-on" : ""} ${fast ? "fast-on" : ""} ${fastPhase !== "idle" ? `fast-${fastPhase}` : ""} ${reduced ? "reduced-fx" : ""}`} data-motion={motion} data-ultra={ultra ? "on" : "off"}>
       <div className="ultra-transition" key={ultraPulse} aria-hidden="true"><span /><span /><span /><span /></div>
@@ -425,6 +442,9 @@ export default function App() {
       <div className="ultra-atmosphere" aria-hidden="true"><span className="ultra-horizon" /><span className="ultra-scan" /></div>
       <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={toggleFast} live={liveCapable} />
       <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Verification tier engaged" : "Verification tier offline"}</b><small>{ultra ? "Contract, adversary and clean-room judge active" : "No extra capabilities are active"}</small></div>
+      <div className="mx-auto w-full max-w-[820px] px-5 pt-3 sm:px-8">
+        <OperatorModeChip mode={operatorMode} onSwitch={chooseOperatorMode} />
+      </div>
       <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "TEMPO PROFILE ARMED" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small><i aria-hidden="true" /></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
         {view === "settings" ? (
