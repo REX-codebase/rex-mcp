@@ -5,3 +5,4 @@ src-tauri/gen/
 .fable/
 *.log
 target/
+bench-out/

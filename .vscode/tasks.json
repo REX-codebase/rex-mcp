@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "bench-status",
+      "type": "shell",
+      "command": "echo '== health =='; curl -s 127.0.0.1:8788/health; echo; echo '== dev =='; curl -s 127.0.0.1:8787/api/status; echo; echo '== providers =='; curl -s 127.0.0.1:8787/api/providers; echo; echo '== procs =='; pgrep -fa 'rex-key-fill|rex-dev-server' | sed 's/ .*rex/ rex/'",
+      "problemMatcher": []
+    },
+    {
+      "label": "bench-verify-canary",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/benchmark/codespace/verify-canary.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "bench-restart-key-fill",
+      "type": "shell",
+      "command": "pkill -f rex-key-fill; sleep 1; nohup $HOME/bin/rex-key-fill --port 8788 --provider gemini >>$HOME/bench/rex-key-fill.log 2>&1 & sleep 1; curl -s 127.0.0.1:8788/health",
+      "problemMatcher": []
+    },
+    {
+      "label": "bench-stop-key-fill",
+      "type": "shell",
+      "command": "pkill -f rex-key-fill; sleep 1; pgrep -f rex-key-fill || echo KEY-FILL-STOPPED",
+      "problemMatcher": []
+    },
+    {
+      "label": "bench-smoke",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/benchmark/codespace/smoke.sh",
+      "problemMatcher": [],
+      "runOptions": { "runOn": "default" }
+    }
+  ]
+}
