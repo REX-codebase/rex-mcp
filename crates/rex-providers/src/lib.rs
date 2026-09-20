@@ -34,6 +34,9 @@ pub use autonomous::{
     AgentEvent, AgentPreview, AgentSnapshot, AgentStatus, AutonomousRunService, Budgets,
     PlanItem, PlanStatus, TerminalReason,
 };
+pub use custody_link::{
+    ui_managed_request, CustodiedRun, CustodiedRunView, CustodyRunService, ManagedTaskRequest,
+};
 pub use catalog::{CatalogSource, ModelCatalog, ModelInfo};
 pub use conversation::{
     decode_turn, encode_tool_outcomes, NormalizedToolCall, NormalizedTurn, ToolOutcome,

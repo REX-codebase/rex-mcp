@@ -68,12 +68,14 @@ export function AgentRunView({
   cancelling,
   onDecide,
   onCancel,
+  custody,
 }: {
   run: AgentSnapshot;
   deciding: boolean;
   cancelling: boolean;
   onDecide: (approved: boolean) => void;
   onCancel: () => void;
+  custody?: { grantId: string; phase: string; operator: string } | null;
 }) {
   const phase = phaseOf(run);
   const [shot, setShot] = useState<string | null>(null);
@@ -152,6 +154,11 @@ export function AgentRunView({
           </button>
         )}
       </div>
+      {custody && (
+        <p className="custody-line">
+          Custody {custody.phase.replace(/_/g, " ")} · operator {custody.operator} · grant {custody.grantId.slice(0, 18)}
+        </p>
+      )}
 
       <div className="agent-budgets" aria-label="Budgets">
         <span>Step {run.step}/{run.max_steps}</span>

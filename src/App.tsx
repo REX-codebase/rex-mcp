@@ -22,8 +22,10 @@ import { AgentRunView } from "./components/AgentRunView";
 import { UltraRunView } from "./components/UltraRunView";
 import { ultraBegin, ultraSnapshot, ultraDecide, ultraCancel, type UltraSnapshot } from "./data/ultraRun";
 import { liveRunAvailable } from "./data/liveRun";
+import { custodyBegin, custodyStop } from "./data/custodyRun";
+import { rexTaskBegin } from "./data/rexTasks";
+import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
-  agentBegin,
   agentCancel,
   agentDecide,
   agentSnapshot,
@@ -72,6 +74,8 @@ export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [liveCapable, setLiveCapable] = useState(false);
   const [liveRun, setLiveRun] = useState<AgentSnapshot | null>(null);
+  const [custody, setCustody] = useState<{ grantId: string; phase: string; operator: string } | null>(null);
+  const [rexTaskId, setRexTaskId] = useState<string | null>(null);
   const [liveStarting, setLiveStarting] = useState(false);
   const [liveDeciding, setLiveDeciding] = useState(false);
   const [liveCancelling, setLiveCancelling] = useState(false);
@@ -291,13 +295,56 @@ export default function App() {
     if (liveCapable) {
       // Real path: the autonomous Rust loop plans, acts through trusted
       // approvals, verifies its own work against gates, and stops truthfully.
+      // The operator mode picked at the gate decides who is accountable:
+      // human mode runs under a custody grant recording operator:human;
+      // agent mode opens a durable REX task an external host drives through
+      // rex-mcp, and this UI supervises with the permanent human Stop.
       setLiveRun(null);
+      setCustody(null);
       setLiveStarting(true);
       beginSettle();
-      agentBegin(label)
-        .then((snap) => {
-          setLiveRun(snap);
-          startPolling(snap.id);
+      if (operatorMode === "agent") {
+        rexTaskBegin(label)
+          .then((res) => {
+            const id = res?.task_id;
+            if (id) {
+              setRexTaskId(id);
+            } else {
+              throw new Error("rex-mcp returned no task id");
+            }
+          })
+          .catch((e) =>
+            setLiveRun({
+              id: "run-failed",
+              task: label,
+              status: "failed",
+              terminal_reason: { kind: "provider_error", detail: String(e) },
+              provider: "gemini",
+              model: "",
+              plan: [],
+              step: 0,
+              max_steps: 0,
+              tool_calls: 0,
+              max_tool_calls: 0,
+              tokens_used: 0,
+              max_tokens: 0,
+              elapsed_ms: 0,
+              max_wall_ms: 0,
+              pending_approval: null,
+              events: [],
+              preview: null,
+              completion_summary: null,
+              error: String(e),
+            })
+          )
+          .finally(() => setLiveStarting(false));
+        return;
+      }
+      custodyBegin(label)
+        .then((view) => {
+          setCustody({ grantId: view.grant_id, phase: view.phase, operator: view.operator });
+          setLiveRun(view.snapshot);
+          startPolling(view.snapshot.id);
         })
         .catch((e) =>
           setLiveRun({
@@ -364,6 +411,20 @@ export default function App() {
       return;
     }
     if (!liveRun || liveCancelling) return;
+    if (custody) {
+      // Custodied run: the Stop lands in custody first (terminal fence),
+      // then the run loop is cancelled. Late success cannot win.
+      setLiveCancelling(true);
+      custodyStop(custody.grantId, liveRun.id)
+        .then(() => agentSnapshot(liveRun.id))
+        .then((snap) => {
+          setLiveRun(snap);
+          setCustody((prev) => (prev ? { ...prev, phase: "released" } : prev));
+        })
+        .catch(() => undefined)
+        .finally(() => setLiveCancelling(false));
+      return;
+    }
     setLiveCancelling(true);
     agentCancel(liveRun.id)
       .then((snap) => setLiveRun(snap))
@@ -516,7 +577,14 @@ export default function App() {
                 cancelling={liveCancelling}
                 onDecide={onLiveDecision}
                 onCancel={onLiveCancel}
+                custody={custody}
               />
+            )}
+            {rexTaskId && (
+              <RexTaskView taskId={rexTaskId} onClose={() => setRexTaskId(null)} />
+            )}
+            {!rexTaskId && operatorMode === "agent" && !liveRun && !liveStarting && (
+              <RexTaskList onPick={setRexTaskId} />
             )}
             {(liveRun || liveStarting) && !liveRun && (
               <section className="live-run" aria-label="Starting the agent loop">

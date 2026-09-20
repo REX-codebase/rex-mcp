@@ -503,3 +503,18 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .operator-chip:hover{color:var(--color-text);border-color:color-mix(in srgb,var(--color-accent) 45%,var(--color-line))}
 .operator-chip-dot{width:6px;height:6px;border-radius:50%;background:var(--color-done)}
 .operator-chip-dot[data-mode="agent"]{background:var(--color-accent)}
+
+/* Custody and REX task supervision */
+.custody-line{margin:6px 0 0;font-size:11px;color:var(--color-faint);letter-spacing:.02em}
+.rex-task-body{margin:10px 0 0}
+.rex-task-text{margin:0;font-size:13px;color:var(--color-text)}
+.rex-task-id{margin:4px 0 0;font-size:11px;color:var(--color-faint)}
+.rex-task-action{margin:6px 0 0;font-size:12px;color:var(--color-muted)}
+.rex-task-events{margin-top:10px}
+.rex-close{margin-left:8px;font-size:11px;padding:4px 10px;border:1px solid var(--color-line);border-radius:6px;background:transparent;color:var(--color-faint);cursor:pointer}
+.rex-close:hover{border-color:var(--color-faint);color:var(--color-text)}
+.rex-task-list{margin:14px 0 0;padding:12px 14px;border:1px solid var(--color-line);border-radius:10px}
+.rex-task-list ul{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
+.rex-task-list button{width:100%;display:flex;justify-content:space-between;gap:10px;align-items:baseline;text-align:left;padding:8px 10px;border:1px solid var(--color-line);border-radius:8px;background:transparent;cursor:pointer;font-size:12px;color:var(--color-text)}
+.rex-task-list button:hover{border-color:var(--color-faint)}
+.rex-task-list-meta{font-size:11px;color:var(--color-faint);white-space:nowrap}

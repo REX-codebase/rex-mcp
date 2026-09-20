@@ -28,6 +28,7 @@ use tauri::State;
 type Service = ProviderService<FileSecretStore, UreqTransport>;
 type Live = LiveRunService<FileSecretStore, UreqTransport>;
 type Agent = AutonomousRunService<FileSecretStore, UreqTransport>;
+type CustodyRuns = rex_providers::CustodyRunService<FileSecretStore, UreqTransport>;
 type Ultra = UltraRunService<FileSecretStore, UreqTransport>;
 type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 type LocalTools = ToolRuntime;
@@ -378,6 +379,150 @@ fn run_teardown(live: State<'_, Arc<Live>>, run_id: String) -> Result<(), String
     live.teardown(&run_id)
 }
 
+// ---- custody-wired runs (human mode) --------------------------------------
+
+fn now_ms_u128() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Begin a Simple-mode run under custody. The operator identity chosen at
+/// the Human/Agent gate is recorded in the grant, the run's budgets are
+/// clamped to the grant, and completion must pass the grant's evidence
+/// gates. The capability token never leaves the backend.
+#[tauri::command]
+fn custody_begin(
+    custody_runs: State<'_, Arc<CustodyRuns>>,
+    task: String,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<rex_providers::CustodiedRunView, String> {
+    let task_id = format!("task-ui-{:x}", now_ms_u128());
+    // The custodied workspace sits under the agent runs root: the run
+    // service refuses explicit workspaces outside it.
+    let workspace = config_dir().join("agent-runs").join(&task_id);
+    std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+    let req = rex_providers::ui_managed_request(
+        task_id,
+        task,
+        rex_custody::OperatorIdentity::Human,
+        provider.unwrap_or_else(|| "gemini".into()),
+        model,
+        workspace,
+    );
+    let run = custody_runs.begin_managed_task(req)?;
+    Ok(custody_runs.view_of(&run))
+}
+
+/// Current custody phase for a grant (active, verifying, released, ...).
+#[tauri::command]
+fn custody_phase(
+    custody_runs: State<'_, Arc<CustodyRuns>>,
+    grant_id: String,
+) -> Option<rex_custody::CustodyPhase> {
+    custody_runs.phase_of(&grant_id)
+}
+
+/// The permanent human Stop for a custodied run: terminal fence first,
+/// then the run loop is cancelled. Late success cannot win.
+#[tauri::command]
+fn custody_stop(
+    custody_runs: State<'_, Arc<CustodyRuns>>,
+    grant_id: String,
+    run_id: String,
+) -> Result<String, String> {
+    custody_runs
+        .human_stop(&grant_id, &run_id)
+        .map(|reason| format!("{reason:?}"))
+}
+
+// ---- agent-mode supervision through rex-mcp (the host protocol) ---------
+
+/// The shell reaches host-driven REX tasks through the same rex-mcp stdio
+/// protocol hosts use, against the shared default state dir - never through
+/// a private side channel into the daemon.
+fn rex_shell_call(tool: &str, arguments: serde_json::Value) -> Result<serde_json::Value, String> {
+    let bin = rex_mcp::client::rex_mcp_bin()?;
+    let state = rex_mcp::client::default_state_dir();
+    let workspace = config_dir().join("agent-runs").join("rex-shell");
+    std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+    rex_mcp::client::call_tool_once(&bin, &state, &workspace, tool, arguments)
+}
+
+/// Open a durable REX task for an external host agent to drive. Custody
+/// records an agent operator from the start; the task waits active until a
+/// host session resumes it by id through rex-mcp.
+#[tauri::command]
+fn rex_task_begin(task: String) -> Result<serde_json::Value, String> {
+    rex_shell_call(
+        "rex_execute",
+        serde_json::json!({
+            "request_id": format!("ui-{:x}", now_ms_u128()),
+            "task": task,
+            "host": "generic_agent",
+            "operator_is_agent": true,
+        }),
+    )
+}
+
+/// Compact view of every durable REX task in the shared store: read-only
+/// directory scan, no daemon lock taken.
+#[tauri::command]
+fn rex_tasks() -> serde_json::Value {
+    let mut tasks = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(rex_mcp::client::default_state_dir().join("tasks")) {
+        for ent in entries.flatten() {
+            if let Ok(bytes) = std::fs::read(ent.path().join("task.json")) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    tasks.push(serde_json::json!({
+                        "task_id": v.get("task_id").cloned().unwrap_or(serde_json::Value::Null),
+                        "task": v.get("task").cloned().unwrap_or(serde_json::Value::Null),
+                        "state": v.get("state").cloned().unwrap_or(serde_json::Value::Null),
+                        "host": v.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                        "operator_is_agent": v.get("operator_is_agent").cloned().unwrap_or(serde_json::Value::Null),
+                    }));
+                }
+            }
+        }
+    }
+    tasks.sort_by(|a, b| {
+        let key = |v: &serde_json::Value| {
+            v.get("task_id").and_then(|t| t.as_str()).unwrap_or("").to_string()
+        };
+        key(a).cmp(&key(b))
+    });
+    serde_json::json!({ "tasks": tasks })
+}
+
+#[tauri::command]
+fn rex_task_status(task_id: String) -> Result<serde_json::Value, String> {
+    rex_shell_call("rex_status", serde_json::json!({ "task_id": task_id }))
+}
+
+#[tauri::command]
+fn rex_task_events(task_id: String, after_seq: Option<u64>) -> Result<serde_json::Value, String> {
+    rex_shell_call(
+        "rex_events",
+        serde_json::json!({
+            "task_id": task_id,
+            "after_seq": after_seq.unwrap_or(0),
+            "limit": 200,
+        }),
+    )
+}
+
+/// The permanent human Stop for an agent-driven task: cancel fences the
+/// lease and is final even against an agent operator.
+#[tauri::command]
+fn rex_task_stop(task_id: String) -> Result<serde_json::Value, String> {
+    rex_shell_call(
+        "rex_cancel",
+        serde_json::json!({ "task_id": task_id, "reason": "human stop from REX UI" }),
+    )
+}
+
 /// Autonomous Simple Mode run: many bounded model turns, visible plan,
 /// trusted approvals, concrete completion gates, truthful terminal reasons.
 #[tauri::command]
@@ -543,6 +688,15 @@ fn main() {
     // Ultra shares the Simple run service: one provider core, one approval
     // channel, one runs root. Ultra adds its verification phases on top.
     let ultra = Arc::new(UltraRunService::new(agent.clone(), config_dir().join("agent-runs")));
+    // Custody wraps the same run service: human-mode runs carry an operator
+    // grant, grant-clamped budgets and gated completion.
+    let custody_runs = Arc::new(CustodyRuns::new(
+        agent.clone(),
+        Arc::new(std::sync::Mutex::new(
+            rex_custody::CustodyRegistry::open(config_dir().join("custody"))
+                .expect("could not open the custody store"),
+        )),
+    ));
 
     tauri::Builder::default()
         .manage(service)
@@ -552,6 +706,7 @@ fn main() {
         .manage(live)
         .manage(agent)
         .manage(ultra)
+        .manage(custody_runs)
         .manage(installed_runs)
         .invoke_handler(tauri::generate_handler![
             installed_agent_summaries,
@@ -594,6 +749,14 @@ fn main() {
             run_preview_action,
             run_capture,
             run_teardown,
+            custody_begin,
+            custody_phase,
+            custody_stop,
+            rex_task_begin,
+            rex_tasks,
+            rex_task_status,
+            rex_task_events,
+            rex_task_stop,
             agent_begin,
             agent_snapshot,
             agent_decide,

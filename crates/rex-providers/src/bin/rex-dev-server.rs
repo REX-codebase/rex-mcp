@@ -50,6 +50,24 @@ impl SecretStore for Store {
 
 type Live = LiveRunService<Store, UreqTransport>;
 type Agent = AutonomousRunService<Store, UreqTransport>;
+type CustodyRuns = rex_providers::custody_link::CustodyRunService<Store, UreqTransport>;
+
+/// Agent-mode supervision context: where the shared rex-mcp state lives and
+/// which workspace shell-spawned server children confine themselves to.
+struct RexShell {
+    state_dir: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+}
+
+fn rex_call(
+    shell: &RexShell,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let bin = rex_mcp::client::rex_mcp_bin()?;
+    std::fs::create_dir_all(&shell.workspace).map_err(|e| e.to_string())?;
+    rex_mcp::client::call_tool_once(&bin, &shell.state_dir, &shell.workspace, tool, arguments)
+}
 
 fn main() {
     let mut port: u16 = 8787;
@@ -107,8 +125,31 @@ fn main() {
             make_store(&store_dir),
             UreqTransport::new(),
         )),
-        agent_runs_root,
+        agent_runs_root.clone(),
     ));
+
+    let custody_root = match &store_dir {
+        Some(dir) => std::path::PathBuf::from(dir).join("custody"),
+        None => std::env::temp_dir().join("rex-dev-custody"),
+    };
+    let custody = Arc::new(std::sync::Mutex::new(
+        rex_custody::CustodyRegistry::open(custody_root).expect("could not open custody store"),
+    ));
+    let custody_runs = Arc::new(CustodyRuns::new(Arc::clone(&agent), custody));
+
+    // Agent-mode supervision bridge: the shell reaches host-driven REX tasks
+    // through the same rex-mcp stdio protocol hosts use. With --store-file
+    // the state dir is scoped to that store (a development sandbox); without
+    // it, the default host state dir is shared so the UI supervises the real
+    // tasks Claude Code or Antigravity open on this machine.
+    let rex_state_dir = match &store_dir {
+        Some(dir) => std::path::PathBuf::from(dir).join("rex-harness"),
+        None => rex_mcp::client::default_state_dir(),
+    };
+    let rex_shell = Arc::new(RexShell {
+        state_dir: rex_state_dir,
+        workspace: agent_runs_root.join("rex-shell"),
+    });
 
     for (provider, path) in &replays {
         let text = std::fs::read_to_string(path).expect("replay fixture unreadable");
@@ -134,8 +175,11 @@ fn main() {
             Ok(stream) => {
                 let live = Arc::clone(&live);
                 let agent = Arc::clone(&agent);
+                let custody_runs = Arc::clone(&custody_runs);
+                let runs_root = agent_runs_root.clone();
+                let rex_shell = Arc::clone(&rex_shell);
                 std::thread::spawn(move || {
-                    let _ = handle(stream, live, agent);
+                    let _ = handle(stream, live, agent, custody_runs, runs_root, rex_shell);
                 });
             }
             Err(_) => continue,
@@ -196,7 +240,14 @@ fn json_response(status: u16, body: &str) -> String {
     )
 }
 
-fn handle(stream: std::net::TcpStream, live: Arc<Live>, agent: Arc<Agent>) -> std::io::Result<()> {
+fn handle(
+    stream: std::net::TcpStream,
+    live: Arc<Live>,
+    agent: Arc<Agent>,
+    custody_runs: Arc<CustodyRuns>,
+    agent_runs_root: std::path::PathBuf,
+    rex_shell: Arc<RexShell>,
+) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -224,18 +275,34 @@ fn handle(stream: std::net::TcpStream, live: Arc<Live>, agent: Arc<Agent>) -> st
     reader.read_exact(&mut body)?;
     let body = String::from_utf8_lossy(&body).to_string();
 
-    let response = route(&method, &path, &body, &live, &agent);
+    let response = route(&method, &path, &body, &live, &agent, &custody_runs, &agent_runs_root, &rex_shell);
     let mut stream = reader.into_inner();
     stream.write_all(response.as_bytes())?;
     stream.flush()
 }
 
-fn route(method: &str, path: &str, body: &str, live: &Arc<Live>, agent: &Arc<Agent>) -> String {
+fn route(
+    method: &str,
+    path: &str,
+    body: &str,
+    live: &Arc<Live>,
+    agent: &Arc<Agent>,
+    custody_runs: &Arc<CustodyRuns>,
+    agent_runs_root: &std::path::Path,
+    rex_shell: &Arc<RexShell>,
+) -> String {
     let service = live.service();
     if method == "OPTIONS" {
         return json_response(200, "{}");
     }
-    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+    let segments: Vec<&str> = path_only.trim_start_matches('/').split('/').collect();
+    let query_param = |key: &str| -> Option<String> {
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == key { Some(v.to_string()) } else { None }
+        })
+    };
     match (method, segments.as_slice()) {
         ("GET", ["api", "status"]) => json_response(
             200,
@@ -432,6 +499,199 @@ fn route(method: &str, path: &str, body: &str, live: &Arc<Live>, agent: &Arc<Age
                 &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
             ),
         },
+        ("POST", ["api", "agent", "custody", "runs"]) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let task = parsed.get("task").and_then(|t| t.as_str()).unwrap_or("");
+            let provider = parsed
+                .get("provider")
+                .and_then(|p| p.as_str())
+                .unwrap_or("gemini");
+            let model = parsed
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string());
+            // The operator identity is the caller's declaration, recorded
+            // for audit; custody decisions never trust the string.
+            let operator = match parsed.get("operator").and_then(|o| o.as_str()) {
+                Some("agent") => rex_custody::OperatorIdentity::Agent(
+                    rex_custody::CustodyRegistry::register_agent(
+                        parsed
+                            .get("agent_name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("rex-ui-agent"),
+                        rex_custody::AgentProtocol::Mcp {
+                            client: "rex-ui".into(),
+                            version: "ui-supervision".into(),
+                        },
+                    ),
+                ),
+                _ => rex_custody::OperatorIdentity::Human,
+            };
+            let task_id = format!(
+                "task-ui-{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            // Custodied workspaces must sit under the agent runs root: the
+            // autonomous service refuses explicit workspaces outside it.
+            let workspace = agent_runs_root.join(&task_id);
+            let store_workspace = match &std::fs::create_dir_all(&workspace) {
+                Ok(()) => Ok(workspace),
+                Err(e) => Err(e.to_string()),
+            };
+            match store_workspace {
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+                Ok(ws) => {
+                    let req = rex_providers::custody_link::ui_managed_request(
+                        task_id,
+                        task.to_string(),
+                        operator,
+                        provider.to_string(),
+                        model,
+                        ws,
+                    );
+                    match custody_runs.begin_managed_task(req) {
+                        Ok(run) => json_response(
+                            200,
+                            &serde_json::to_string(&custody_runs.view_of(&run)).unwrap(),
+                        ),
+                        Err(detail) => json_response(
+                            200,
+                            &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                        ),
+                    }
+                }
+            }
+        }
+        ("GET", ["api", "agent", "custody", "grants", gid]) => {
+            match custody_runs.phase_of(gid) {
+                Some(phase) => json_response(
+                    200,
+                    &serde_json::to_string(&serde_json::json!({"grant_id": gid, "phase": phase}))
+                        .unwrap(),
+                ),
+                None => json_response(404, "{\"error\":\"unknown grant\"}"),
+            }
+        }
+        ("POST", ["api", "agent", "custody", "runs", id, "stop"]) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let grant_id = parsed
+                .get("grant_id")
+                .and_then(|g| g.as_str())
+                .unwrap_or("");
+            match custody_runs.human_stop(grant_id, id) {
+                Ok(reason) => json_response(
+                    200,
+                    &serde_json::to_string(&serde_json::json!({"ok": true, "reason": reason}))
+                        .unwrap(),
+                ),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("GET", ["api", "rex", "tasks"]) => {
+            // Read-only scan of the shared task store; no daemon lock taken.
+            let mut tasks = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(rex_shell.state_dir.join("tasks")) {
+                for ent in entries.flatten() {
+                    if let Ok(bytes) = std::fs::read(ent.path().join("task.json")) {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            tasks.push(serde_json::json!({
+                                "task_id": v.get("task_id").cloned().unwrap_or(serde_json::Value::Null),
+                                "task": v.get("task").cloned().unwrap_or(serde_json::Value::Null),
+                                "state": v.get("state").cloned().unwrap_or(serde_json::Value::Null),
+                                "host": v.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                                "operator_is_agent": v.get("operator_is_agent").cloned().unwrap_or(serde_json::Value::Null),
+                            }));
+                        }
+                    }
+                }
+            }
+            tasks.sort_by(|a, b| {
+                let key = |v: &serde_json::Value| {
+                    v.get("task_id")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                key(a).cmp(&key(b))
+            });
+            json_response(200, &serde_json::to_string(&serde_json::json!({"tasks": tasks})).unwrap())
+        }
+        ("POST", ["api", "rex", "tasks"]) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let task = parsed.get("task").and_then(|t| t.as_str()).unwrap_or("");
+            let request_id = format!(
+                "ui-{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            // A task opened in agent mode waits for an external host to
+            // drive it; custody records an agent operator from the start.
+            let args = serde_json::json!({
+                "request_id": request_id,
+                "task": task,
+                "host": "generic_agent",
+                "operator_is_agent": true,
+            });
+            match rex_call(rex_shell, "rex_execute", args) {
+                Ok(v) => json_response(200, &serde_json::to_string(&v).unwrap()),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("GET", ["api", "rex", "tasks", id, "status"]) => {
+            match rex_call(rex_shell, "rex_status", serde_json::json!({"task_id": id})) {
+                Ok(v) => json_response(200, &serde_json::to_string(&v).unwrap()),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("GET", ["api", "rex", "tasks", id, "events"]) => {
+            let after = query_param("since").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            match rex_call(
+                rex_shell,
+                "rex_events",
+                serde_json::json!({"task_id": id, "after_seq": after, "limit": 200}),
+            ) {
+                Ok(v) => json_response(200, &serde_json::to_string(&v).unwrap()),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("POST", ["api", "rex", "tasks", id, "stop"]) => {
+            // The permanent human Stop: cancel fences the lease and is final
+            // even against an agent operator.
+            match rex_call(
+                rex_shell,
+                "rex_cancel",
+                serde_json::json!({"task_id": id, "reason": "human stop from REX UI"}),
+            ) {
+                Ok(v) => json_response(200, &serde_json::to_string(&v).unwrap()),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
         _ => json_response(
             404,
             "{\"error\":{\"kind\":\"invalid_response\",\"detail\":\"unknown route\"}}",

@@ -47,6 +47,76 @@ pub struct ManagedTaskRequest {
     pub contract: CompletionContract,
 }
 
+/// Flat view the shell returns when a custodied run starts or is polled:
+/// the grant the operator is accountable under, plus the run snapshot.
+/// The capability token never leaves the backend.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CustodiedRunView {
+    pub grant_id: String,
+    pub task_id: String,
+    pub operator: String,
+    pub worker: String,
+    pub phase: CustodyPhase,
+    pub snapshot: AgentSnapshot,
+}
+
+/// Custody terms for a run started from the desktop UI: confined to one
+/// workspace, conservative budgets, and only the evidence gates this
+/// integration can actually evaluate. Unwired gates fail closed, so
+/// offering one here would suspend every completion for human attention.
+pub fn ui_managed_request(
+    task_id: String,
+    task: String,
+    operator: OperatorIdentity,
+    provider: String,
+    model: Option<String>,
+    workspace: PathBuf,
+) -> ManagedTaskRequest {
+    let capabilities = CapabilitySet {
+        workspace_root: workspace.clone(),
+        tool_classes: [ToolClass::Read, ToolClass::Write, ToolClass::Execute]
+            .into_iter()
+            .collect(),
+        allowed_tools: ["read_file", "create_file", "edit_file", "search_files", "run_command"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        allow_search: true,
+        allow_preview: true,
+        can_delegate: false,
+    };
+    ManagedTaskRequest {
+        task_id,
+        task,
+        operator,
+        provider,
+        model,
+        workspace: Some(workspace),
+        capabilities,
+        budgets: CustodyBudgets {
+            max_steps: 24,
+            max_tool_calls: 128,
+            max_wall_ms: 30 * 60 * 1000,
+            max_tokens: 200_000,
+        },
+        lease_terms: LeaseTerms::default(),
+        contract: CompletionContract {
+            gates: vec![EvidenceGate::NoPendingApprovals, EvidenceGate::WithinScopeChanges],
+            max_claim_attempts: 1,
+        },
+    }
+}
+
+fn worker_label(worker: &WorkerMode) -> String {
+    match worker {
+        WorkerMode::ManagedModel { provider, model } => match model {
+            Some(m) => format!("managed_model:{provider}/{m}"),
+            None => format!("managed_model:{provider}"),
+        },
+        WorkerMode::ExternalAgent => "external_agent".to_string(),
+    }
+}
+
 /// Evidence for the gates the run service can see. Unknown or unwired
 /// gates fail closed.
 struct RunGateEvaluator<S: SecretStore + 'static, T: Transport + 'static> {
@@ -83,6 +153,23 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
 
     pub fn custody(&self) -> Arc<Mutex<CustodyRegistry>> {
         self.custody.clone()
+    }
+
+    /// Flat shell view of a started custodied run.
+    pub fn view_of(&self, run: &CustodiedRun) -> CustodiedRunView {
+        CustodiedRunView {
+            grant_id: run.grant.grant_id.clone(),
+            task_id: run.grant.task_id.clone(),
+            operator: run.grant.operator.label(),
+            worker: worker_label(&run.grant.worker),
+            phase: run.grant.phase,
+            snapshot: run.snapshot.clone(),
+        }
+    }
+
+    /// Current custody phase for a grant, for shell polling.
+    pub fn phase_of(&self, grant_id: &str) -> Option<CustodyPhase> {
+        self.custody.lock().ok()?.grant(grant_id).map(|g| g.phase)
     }
 
     /// Offer, accept and start a custodied managed-model task. The caller
@@ -546,4 +633,89 @@ mod tests {
         let grant = wait_custody_terminal(&rig.custody, &out.grant.grant_id, 30_000);
         assert!(matches!(grant.release, Some(ReleaseReason::HumanStop)));
     }
+
+    #[test]
+    fn ui_request_confines_scope_and_offers_only_wired_gates() {
+        let ws = PathBuf::from("/tmp/ui-managed-ws");
+        let req = ui_managed_request(
+            "task-ui".into(),
+            "build a page".into(),
+            OperatorIdentity::Human,
+            "gemini".into(),
+            None,
+            ws.clone(),
+        );
+        assert!(!req.capabilities.can_delegate, "custody never delegates");
+        assert_eq!(req.capabilities.workspace_root, ws);
+        assert_eq!(req.workspace.as_deref(), Some(ws.as_path()));
+        assert_eq!(req.operator, OperatorIdentity::Human);
+        // Unknown gates fail closed, so the default contract may only
+        // carry the two this integration actually evaluates.
+        assert_eq!(
+            req.contract.gates,
+            vec![EvidenceGate::NoPendingApprovals, EvidenceGate::WithinScopeChanges]
+        );
+    }
+
+    #[test]
+    fn view_reports_operator_phase_and_never_serializes_token() {
+        let (_tmp, rig) = rig(vec![]);
+        let ws = rig.workspace.clone();
+        let (token, grant) = {
+            let mut c = rig.custody.lock().unwrap();
+            let offer = c
+                .offer(
+                    "task-view",
+                    "build a page",
+                    OperatorIdentity::Human,
+                    WorkerMode::ManagedModel {
+                        provider: "gemini".into(),
+                        model: Some("gemini-3.5-flash-lite".into()),
+                    },
+                    caps(&ws),
+                    CustodyBudgets::default(),
+                    LeaseTerms::default(),
+                    CompletionContract {
+                        gates: vec![EvidenceGate::NoPendingApprovals],
+                        max_claim_attempts: 1,
+                    },
+                    1_000,
+                )
+                .unwrap();
+            c.accept_for_human(&offer.offer_id, 1_001).unwrap()
+        };
+        let snapshot = AgentSnapshot {
+            id: "run-1".into(),
+            task: "build a page".into(),
+            status: AgentStatus::Running,
+            terminal_reason: None,
+            provider: "gemini".into(),
+            model: "gemini-3.5-flash-lite".into(),
+            plan: vec![],
+            step: 1,
+            max_steps: 24,
+            tool_calls: 0,
+            max_tool_calls: 128,
+            tokens_used: 0,
+            max_tokens: 200_000,
+            elapsed_ms: 5,
+            max_wall_ms: 1_800_000,
+            pending_approval: None,
+            prompt_version: "test".into(),
+            prompt_hash: "hash".into(),
+            events: vec![],
+            preview: None,
+            completion_summary: None,
+            error: None,
+        };
+        let run = CustodiedRun { grant, token, snapshot };
+        let view = rig.service.view_of(&run);
+        assert_eq!(view.operator, "human");
+        assert_eq!(view.phase, CustodyPhase::Active);
+        assert_eq!(view.worker, "managed_model:gemini/gemini-3.5-flash-lite");
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.get("token").is_none(), "token must never leave the backend");
+        assert_eq!(rig.service.phase_of(&view.grant_id), Some(CustodyPhase::Active));
+    }
 }
+

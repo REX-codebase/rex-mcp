@@ -17,6 +17,8 @@ rex-tools = { path = "../crates/rex-tools" }
 rex-ultra = { path = "../crates/rex-ultra" }
 rex-preview = { path = "../crates/rex-preview" }
 rex-installed-agents = { path = "../crates/rex-installed-agents" }
+rex-custody = { path = "../crates/rex-custody" }
+rex-mcp = { path = "../crates/rex-mcp" }
 
 [features]
 default = ["custom-protocol"]

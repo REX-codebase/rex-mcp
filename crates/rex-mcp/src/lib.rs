@@ -3,6 +3,8 @@
 //! One JSON-RPC object per line. Notifications produce no response. REX
 //! exposes only ordinary MCP tools; it does not use sampling or draft Tasks.
 
+pub mod client;
+
 use rex_daemon::HarnessDaemon;
 use rex_protocol::{ErrorCode, ProtocolError, ToolName, PROTOCOL_VERSION};
 use serde_json::{json, Value};
