@@ -60,7 +60,7 @@ def main():
                 "checks": [
                     {"kind": "file_exists", "path": "solution.py"},
                     {"kind": "command_succeeds",
-                     "argv": ["pytest", "-q", "tests/test_solution.py"],
+                     "argv": ["python3", "-m", "pytest", "-q", "tests/test_solution.py"],
                      "timeout_ms": 120000},
                 ],
             }) + "\n")

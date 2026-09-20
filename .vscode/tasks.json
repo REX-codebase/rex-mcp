@@ -51,6 +51,12 @@
       "type": "shell",
       "command": "python3 -m pip install --user --break-system-packages -q 'evalplus==0.3.1' requests datasets && python3 -c \"import evalplus; print('EVALPLUS-OK')\"",
       "problemMatcher": []
+    },
+    {
+      "label": "bench-health-check",
+      "type": "shell",
+      "command": "python3 ${workspaceFolder}/benchmark/codespace/health_check.py",
+      "problemMatcher": []
     }
   ]
 }

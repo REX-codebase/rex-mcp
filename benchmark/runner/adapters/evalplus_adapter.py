@@ -85,7 +85,7 @@ def main():
     suite_name = f"evalplus-{a.dataset}"
     checks = [{"kind": "file_exists", "path": "solution.py"},
               {"kind": "command_succeeds",
-               "argv": ["pytest", "-q", "tests/test_solution.py"],
+               "argv": ["python3", "-m", "pytest", "-q", "tests/test_solution.py"],
                "timeout_ms": 120000}]
     n = 0
     for task_id in sorted(data, key=lambda x: int(x.split("/")[-1])):

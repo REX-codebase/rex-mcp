@@ -661,6 +661,14 @@ impl ToolRuntime {
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);
         }
+        // Suite checks run with HOME pointed at the disposable workspace, so
+        // Python user-site installs (pip --user, the default under
+        // --break-system-packages) are invisible unless the bench host
+        // exports PYTHONPATH to the real user site-packages. Pass it through
+        // like PATH; it only affects Python subprocesses of suite checks.
+        if let Ok(pythonpath) = std::env::var("PYTHONPATH") {
+            command.env("PYTHONPATH", pythonpath);
+        }
         command
             .env("HOME", &*self.root)
             .env("REX_WORKSPACE", &*self.root);
@@ -692,7 +700,17 @@ impl ToolRuntime {
                 Ok(())
             });
         }
-        let mut child = command.spawn().map_err(io_err)?;
+        let mut child = command.spawn().map_err(|e| {
+            let hint = if e.kind() == std::io::ErrorKind::NotFound {
+                "; suite checks must use an interpreter-prefixed argv such as [\"python3\", \"-m\", \"pytest\", ...]"
+            } else {
+                ""
+            };
+            err(
+                ErrorKind::Io,
+                &format!("failed to spawn scoring command '{}' ({e}){hint}", argv[0]),
+            )
+        })?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let out_handle = thread::spawn(move || read_capped(stdout, MAX_OUTPUT_BYTES));
