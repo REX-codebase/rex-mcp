@@ -57,7 +57,7 @@ def test_against_canonical_outputs():
 '''
 
 def emit(out_root, suite_name, task_id, prompt, checks, test_src):
-    stage_dir = os.path.join(out_root, "stage", task_id, "tests")
+    stage_dir = os.path.join(out_root, "stage", suite_name, task_id, "tests")
     os.makedirs(stage_dir, exist_ok=True)
     with open(os.path.join(stage_dir, "test_solution.py"), "w") as fh:
         fh.write(test_src)
