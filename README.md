@@ -38,6 +38,20 @@ npm run tauri dev
 npm run tauri build
 ```
 
+## Test
+
+```bash
+cargo test --workspace
+```
+
+The full suite runs on a clean Linux machine once the Tauri system
+prerequisites and a Rust toolchain are installed. One rex-preview test
+drives a real headless browser: install Chrome or Chromium
+(`google-chrome-stable`, `google-chrome`, `chromium`, or
+`chromium-browser` on PATH) first, or that single test is denied. On
+Ubuntu, `chromium-browser` is a snap shim; use the Google Chrome .deb in
+containers.
+
 ## Verify the frontend
 
 ```bash
