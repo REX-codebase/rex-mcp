@@ -398,6 +398,7 @@ impl HarnessDaemon {
             ToolName::UltraOpen => go!(args, ultra_open),
             ToolName::UltraSubmit => go!(args, ultra_submit),
             ToolName::UltraPromote => go!(args, ultra_promote),
+            ToolName::Proof => go!(args, proof_bundle),
         }
     }
 

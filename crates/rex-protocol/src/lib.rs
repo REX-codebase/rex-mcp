@@ -43,6 +43,7 @@ pub enum ToolName {
     UltraOpen,
     UltraSubmit,
     UltraPromote,
+    Proof,
 }
 
 impl ToolName {
@@ -63,6 +64,7 @@ impl ToolName {
             ToolName::UltraOpen => "rex_ultra_open",
             ToolName::UltraSubmit => "rex_ultra_submit",
             ToolName::UltraPromote => "rex_ultra_promote",
+            ToolName::Proof => "rex_proof",
         }
     }
 
@@ -83,6 +85,7 @@ impl ToolName {
             "rex_ultra_open" => ToolName::UltraOpen,
             "rex_ultra_submit" => ToolName::UltraSubmit,
             "rex_ultra_promote" => ToolName::UltraPromote,
+            "rex_proof" => ToolName::Proof,
             _ => return None,
         })
     }
@@ -104,6 +107,7 @@ impl ToolName {
             ToolName::UltraOpen,
             ToolName::UltraSubmit,
             ToolName::UltraPromote,
+            ToolName::Proof,
         ]
     }
 }
@@ -624,7 +628,7 @@ mod tests {
             vec![
                 "rex_execute", "rex_next", "rex_read", "rex_edit", "rex_search", "rex_run",
                 "rex_test", "rex_submit", "rex_status", "rex_events", "rex_result", "rex_cancel",
-                "rex_ultra_open", "rex_ultra_submit", "rex_ultra_promote",
+                "rex_ultra_open", "rex_ultra_submit", "rex_ultra_promote", "rex_proof",
             ]
         );
         for t in ToolName::all() {
