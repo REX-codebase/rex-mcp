@@ -18,9 +18,10 @@ use rex_providers::{
     AutonomousRunService, Budgets, FileSecretStore, LiveRunService, MemorySecretStore,
     ModelCatalog, ProviderService, SearchRouter, SecretStore, UreqTransport,
 };
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 enum Store {
     Memory(MemorySecretStore),
@@ -150,6 +151,7 @@ fn main() {
         state_dir: rex_state_dir,
         workspace: agent_runs_root.join("rex-shell"),
     });
+    let resume_handles = Arc::new(Mutex::new(HashMap::<String, String>::new()));
 
     for (provider, path) in &replays {
         let text = std::fs::read_to_string(path).expect("replay fixture unreadable");
@@ -178,8 +180,17 @@ fn main() {
                 let custody_runs = Arc::clone(&custody_runs);
                 let runs_root = agent_runs_root.clone();
                 let rex_shell = Arc::clone(&rex_shell);
+                let resume_handles = Arc::clone(&resume_handles);
                 std::thread::spawn(move || {
-                    let _ = handle(stream, live, agent, custody_runs, runs_root, rex_shell);
+                    let _ = handle(
+                        stream,
+                        live,
+                        agent,
+                        custody_runs,
+                        runs_root,
+                        rex_shell,
+                        resume_handles,
+                    );
                 });
             }
             Err(_) => continue,
@@ -247,6 +258,7 @@ fn handle(
     custody_runs: Arc<CustodyRuns>,
     agent_runs_root: std::path::PathBuf,
     rex_shell: Arc<RexShell>,
+    resume_handles: Arc<Mutex<HashMap<String, String>>>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
@@ -284,6 +296,7 @@ fn handle(
         &custody_runs,
         &agent_runs_root,
         &rex_shell,
+        &resume_handles,
     );
     let mut stream = reader.into_inner();
     stream.write_all(response.as_bytes())?;
@@ -302,6 +315,7 @@ fn route(
     custody_runs: &Arc<CustodyRuns>,
     agent_runs_root: &std::path::Path,
     rex_shell: &Arc<RexShell>,
+    resume_handles: &Arc<Mutex<HashMap<String, String>>>,
 ) -> String {
     let service = live.service();
     if method == "OPTIONS" {
@@ -664,7 +678,60 @@ fn route(
                 "operator_is_agent": true,
             });
             match rex_call(rex_shell, "rex_execute", args) {
-                Ok(v) => json_response(200, &serde_json::to_string(&v).unwrap()),
+                Ok(v) => {
+                    remember_resume_handle(resume_handles, &v);
+                    json_response(200, &task_response(&v))
+                }
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("POST", ["api", "rex", "tasks", id, "follow-up"]) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let follow_up = parsed
+                .get("task")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .trim();
+            let handle = resume_handles
+                .lock()
+                .ok()
+                .and_then(|handles| handles.get(*id).cloned());
+            let Some(handle) = handle else {
+                return json_response(200, &serde_json::json!({
+                    "error": "resume handle unavailable; reopen this task through its trusted host"
+                }).to_string());
+            };
+            let status = rex_call(rex_shell, "rex_status", serde_json::json!({"task_id": id}));
+            let task = match status.and_then(|value| {
+                value
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| "REX status returned no task text".to_string())
+            }) {
+                Ok(task) => task,
+                Err(detail) => {
+                    return json_response(200, &serde_json::json!({"error": detail}).to_string())
+                }
+            };
+            let args = serde_json::json!({
+                "request_id": format!("ui-follow-up-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)),
+                "task": task,
+                "task_id": id,
+                "resume_handle": handle,
+                "follow_up": follow_up,
+                "host": "generic_agent",
+                "operator_is_agent": true,
+            });
+            match rex_call(rex_shell, "rex_execute", args) {
+                Ok(v) => {
+                    remember_resume_handle(resume_handles, &v);
+                    json_response(200, &task_response(&v))
+                }
                 Err(detail) => json_response(
                     200,
                     &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
@@ -727,6 +794,26 @@ fn route(
             "{\"error\":{\"kind\":\"invalid_response\",\"detail\":\"unknown route\"}}",
         ),
     }
+}
+
+fn remember_resume_handle(handles: &Mutex<HashMap<String, String>>, response: &serde_json::Value) {
+    if let (Some(task_id), Some(handle)) = (
+        response.get("task_id").and_then(|v| v.as_str()),
+        response.get("host_resume_handle").and_then(|v| v.as_str()),
+    ) {
+        if let Ok(mut stored) = handles.lock() {
+            stored.insert(task_id.to_string(), handle.to_string());
+        }
+    }
+}
+
+fn task_response(response: &serde_json::Value) -> String {
+    serde_json::json!({
+        "task_id": response.get("task_id"),
+        "state": response.get("state"),
+        "resumed": response.get("resumed").unwrap_or(&serde_json::Value::Bool(false)),
+    })
+    .to_string()
 }
 
 /// Load the persisted proof bundle for a task. Task ids are confined to a

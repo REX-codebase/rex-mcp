@@ -146,6 +146,14 @@ impl HarnessDaemon {
                 ));
             }
             let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
+            if let Some(follow_up) = req
+                .follow_up
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
+                self.append_event(&mut task, "host_follow_up", json!({ "text": follow_up }))?;
+                self.persist(&task)?;
+            }
             return Ok(self.execute_view(&task, true, Some(handle)));
         }
         if let Some(task) = self.find_by_request(&req.request_id)? {
@@ -158,6 +166,14 @@ impl HarnessDaemon {
             }
             let mut task = task;
             let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
+            if let Some(follow_up) = req
+                .follow_up
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
+                self.append_event(&mut task, "host_follow_up", json!({ "text": follow_up }))?;
+                self.persist(&task)?;
+            }
             return Ok(self.execute_view(&task, true, Some(handle)));
         }
         let now = now_ms();
@@ -867,7 +883,8 @@ impl HarnessDaemon {
                 task_id: t.task_id.clone(),
                 after_seq: 0,
                 limit: None,
-            })?
+            })
+            .unwrap()
             .events;
         let bundle_hash = hash_json(&(
             &t.task_id,
@@ -1469,6 +1486,7 @@ mod tests {
             task: "make hello".into(),
             task_id: None,
             resume_handle: None,
+            follow_up: None,
             host: HostKind::ClaudeCode,
             operator_is_agent: true,
             budgets: None,
@@ -1978,6 +1996,112 @@ mod tests {
         current.resume_handle = Some(rotated);
         assert!(daemon.execute(current).unwrap().resumed);
     }
+
+    #[test]
+    fn follow_up_resumes_active_task_without_creating_a_task() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let first = daemon.execute(req("r-follow-active")).unwrap();
+        let first_handle = first.host_resume_handle.clone().unwrap();
+
+        let mut follow_up = req("r-follow-active");
+        follow_up.task_id = Some(first.task_id.clone());
+        follow_up.resume_handle = Some(first_handle.clone());
+        follow_up.follow_up = Some("Continue with the next active step".into());
+        let resumed = daemon.execute(follow_up).unwrap();
+
+        assert!(resumed.resumed);
+        assert_eq!(resumed.task_id, first.task_id);
+        let rotated = resumed.host_resume_handle.clone().unwrap();
+        assert_ne!(rotated, first_handle);
+        assert_eq!(fs::read_dir(root.join("tasks")).unwrap().count(), 1);
+        let events = daemon
+            .events(EventsRequest {
+                task_id: first.task_id.clone(),
+                after_seq: 0,
+                limit: None,
+            })
+            .unwrap();
+        assert!(events.events.iter().any(|event| {
+            event.kind == "host_follow_up"
+                && event.detail.get("text").and_then(|value| value.as_str())
+                    == Some("Continue with the next active step")
+        }));
+
+        let mut stale = req("r-follow-active");
+        stale.task_id = Some(first.task_id.clone());
+        stale.resume_handle = Some(first_handle);
+        assert_eq!(
+            daemon.execute(stale).unwrap_err().code,
+            ErrorCode::ScopeDenied
+        );
+
+        let mut next = req("r-follow-active");
+        next.task_id = Some(first.task_id);
+        next.resume_handle = Some(rotated);
+        assert!(daemon.execute(next).unwrap().resumed);
+    }
+
+    #[test]
+    fn follow_up_resumes_completed_task_without_creating_a_task() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let first = daemon.execute(req("r-follow-completed")).unwrap();
+        fs::write(w.join("proof.txt"), "verified").unwrap();
+        let receipt = daemon
+            .read(ReadRequest {
+                task_id: first.task_id.clone(),
+                lease_epoch: first.lease.epoch,
+                path: "proof.txt".into(),
+                byte_range: None,
+            })
+            .unwrap()
+            .receipt
+            .unwrap();
+        let completed = daemon
+            .submit(SubmitRequest {
+                task_id: first.task_id.clone(),
+                lease_epoch: first.lease.epoch,
+                action_id: first.next.unwrap().action_id,
+                narrative: "Completed after a verified run".into(),
+                evidence: [("run".into(), receipt)].into_iter().collect(),
+            })
+            .unwrap();
+        assert_eq!(completed.state, TaskState::Completed);
+
+        let mut follow_up = req("r-follow-completed");
+        follow_up.task_id = Some(first.task_id.clone());
+        follow_up.resume_handle = Some(first.host_resume_handle.unwrap());
+        follow_up.follow_up = Some("Revisit the completed result".into());
+        let resumed = daemon.execute(follow_up).unwrap();
+
+        assert!(resumed.resumed);
+        assert_eq!(resumed.task_id, first.task_id);
+        assert_eq!(resumed.state, TaskState::Completed);
+        assert!(resumed.host_resume_handle.is_some());
+        assert_eq!(fs::read_dir(root.join("tasks")).unwrap().count(), 1);
+        let events = daemon
+            .events(EventsRequest {
+                task_id: resumed.task_id,
+                after_seq: 0,
+                limit: None,
+            })
+            .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.kind == "task_completed"));
+        assert!(events.events.iter().any(|event| {
+            event.kind == "host_follow_up"
+                && event.detail.get("text").and_then(|value| value.as_str())
+                    == Some("Revisit the completed result")
+        }));
+    }
+
     #[test]
     fn proof_bundle_records_the_full_verified_journey() {
         let d = tempdir().unwrap();

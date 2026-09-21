@@ -21,8 +21,9 @@ use rex_providers::{
 use rex_search::{IndexHit, IndexedDocument, LocalIndex, SearchRequest, SearchResponse};
 use rex_tools::{CallState, PreparedCall, ToolRequest, ToolResult, ToolRuntime};
 use rex_ultra::orchestrator::{UltraOptions, UltraRunService, UltraSnapshot};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::State;
 
 type Service = ProviderService<FileSecretStore, UreqTransport>;
@@ -34,6 +35,12 @@ type SearchService = SearchRouter<FileSecretStore, UreqTransport>;
 type LocalTools = ToolRuntime;
 type NativePreview = PreviewSupervisor;
 type InstalledRuns = InstalledAgentManager;
+
+static REX_RESUME_HANDLES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn rex_resume_handles() -> &'static Mutex<HashMap<String, String>> {
+    REX_RESUME_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn search_index() -> LocalIndex {
     LocalIndex::open(config_dir().join("search-index.json"))
@@ -457,7 +464,7 @@ fn rex_shell_call(tool: &str, arguments: serde_json::Value) -> Result<serde_json
 /// host session resumes it by id through rex-mcp.
 #[tauri::command]
 fn rex_task_begin(task: String) -> Result<serde_json::Value, String> {
-    rex_shell_call(
+    let response = rex_shell_call(
         "rex_execute",
         serde_json::json!({
             "request_id": format!("ui-{:x}", now_ms_u128()),
@@ -465,7 +472,64 @@ fn rex_task_begin(task: String) -> Result<serde_json::Value, String> {
             "host": "generic_agent",
             "operator_is_agent": true,
         }),
-    )
+    )?;
+    remember_rex_resume_handle(&response)?;
+    Ok(task_response(&response))
+}
+
+#[tauri::command]
+fn rex_task_follow_up(task_id: String, task: String) -> Result<serde_json::Value, String> {
+    let handle = rex_resume_handles()
+        .lock()
+        .map_err(|_| "resume handle store unavailable".to_string())?
+        .get(&task_id)
+        .cloned()
+        .ok_or_else(|| {
+            "resume handle unavailable; reopen this task through its trusted host".to_string()
+        })?;
+    let original = rex_shell_call("rex_status", serde_json::json!({ "task_id": task_id }))?;
+    let original_task = original
+        .get("task")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "REX status returned no task text".to_string())?;
+    let response = rex_shell_call(
+        "rex_execute",
+        serde_json::json!({
+            "request_id": format!("ui-follow-up-{:x}", now_ms_u128()),
+            "task": original_task,
+            "task_id": task_id,
+            "resume_handle": handle,
+            "follow_up": task,
+            "host": "generic_agent",
+            "operator_is_agent": true,
+        }),
+    )?;
+    remember_rex_resume_handle(&response)?;
+    Ok(task_response(&response))
+}
+
+fn remember_rex_resume_handle(response: &serde_json::Value) -> Result<(), String> {
+    let task_id = response
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "rex-mcp returned no task id".to_string())?;
+    let handle = response
+        .get("host_resume_handle")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "rex-mcp returned no resume handle".to_string())?;
+    rex_resume_handles()
+        .lock()
+        .map_err(|_| "resume handle store unavailable".to_string())?
+        .insert(task_id.to_string(), handle.to_string());
+    Ok(())
+}
+
+fn task_response(response: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "task_id": response.get("task_id"),
+        "state": response.get("state"),
+        "resumed": response.get("resumed").unwrap_or(&serde_json::Value::Bool(false)),
+    })
 }
 
 /// Compact view of every durable REX task in the shared store: read-only
@@ -768,6 +832,7 @@ fn main() {
             custody_phase,
             custody_stop,
             rex_task_begin,
+            rex_task_follow_up,
             rex_tasks,
             rex_task_status,
             rex_task_events,

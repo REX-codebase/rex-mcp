@@ -75,6 +75,12 @@ async function get<T>(cmd: string, path: string, args?: Record<string, unknown>)
 export const rexTaskList = () => get<{ tasks: RexTaskSummary[] }>("rex_tasks", "/api/rex/tasks");
 export const rexTaskBegin = (task: string) =>
   post<{ task_id: string; state: string }>("rex_task_begin", "/api/rex/tasks", { task });
+export const rexTaskFollowUp = (taskId: string, task: string) =>
+  post<{ task_id: string; state: string; resumed: boolean }>(
+    "rex_task_follow_up",
+    `/api/rex/tasks/${taskId}/follow-up`,
+    { taskId, task }
+  );
 export const rexTaskStatus = (taskId: string) =>
   get<RexStatus>("rex_task_status", `/api/rex/tasks/${taskId}/status`, { taskId });
 export const rexTaskEvents = (taskId: string, since: number) =>

@@ -110,3 +110,39 @@ literal 1440x900 frame.
 
 With this, every acceptance bullet in section 12 is PASS except the
 owner-waived Drive archive.
+
+# REX follow-up composer closeout (2026-09-21)
+
+## Focused follow-up gates
+- `cargo test -p rex-daemon follow_up_resumes`: PASS, 2/2. Active and
+  completed tasks retain one task id, rotate the secured host handle, record
+  `host_follow_up`, reject the stale handle, and create no second task.
+- `npm test`: PASS, 32/32 across 7 files.
+- `npm run build`: PASS.
+- `cargo fmt --all -- --check`: PASS.
+- `cargo clippy --workspace --all-targets -- -D warnings`: PASS.
+
+## Follow-up visual verification
+The real `rex-dev-server` and Vite surface were started with explicit
+background PIDs and an isolated REX store. A fresh MCP stdio host seeded one
+active task and one completed task; the completed task was resumed with the
+same task id and a rotated handle before completion. Playwright captured and
+inspected the real React supervision surface at 1440x900 and 390x844:
+
+- `evidence/rex-follow-up/active-desktop-1440x900.png`
+- `evidence/rex-follow-up/completed-desktop-1440x900.png`
+- `evidence/rex-follow-up/active-phone-390x844.png`
+- `evidence/rex-follow-up/completed-phone-390x844.png`
+- `evidence/rex-follow-up/checks.json`
+- `verification/follow-up/closeout.log`
+
+All four captures show exactly one follow-up composer directly beneath the
+task. Active state retains Stop; completed state retains the composer and
+removes Stop. Pixel assertions report no horizontal overflow: content width
+equals the viewport at both 1440 and 390 pixels.
+
+The first visual retry failed before capture because the isolated workspace had
+no `Cargo.toml`: MCP returned `scope_denied` / `path not found`. An earlier
+attempt was also terminated by cleanup matching its own shell command. The
+workspace fixture was corrected, the verifier was rerun with explicit PIDs,
+and the final closeout completed with `VISUAL_RC=0`.

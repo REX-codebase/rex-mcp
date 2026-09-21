@@ -6,6 +6,7 @@ import {
   rexTaskProof,
   rexTaskStatus,
   rexTaskStop,
+  rexTaskFollowUp,
   type ProofPhase,
   type RexEvent,
   type RexProof,
@@ -65,6 +66,9 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
   const [proof, setProof] = useState<RexProof | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
+  const [followUp, setFollowUp] = useState("");
+  const [submittingFollowUp, setSubmittingFollowUp] = useState(false);
+  const [followUpError, setFollowUpError] = useState<string | null>(null);
   const cursor = useRef(0);
 
   useEffect(() => {
@@ -123,6 +127,20 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
       .finally(() => setStopping(false));
   };
 
+  const submitFollowUp = () => {
+    const task = followUp.trim();
+    if (!task || submittingFollowUp) return;
+    setSubmittingFollowUp(true);
+    setFollowUpError(null);
+    rexTaskFollowUp(taskId, task)
+      .then((result) => {
+        setFollowUp("");
+        setStatus((prev) => prev ? { ...prev, state: result.state } : prev);
+      })
+      .catch((e) => setFollowUpError(String(e)))
+      .finally(() => setSubmittingFollowUp(false));
+  };
+
   return (
     <section className="live-run rex-task" aria-label="Supervising a REX task">
       <div className="live-status" role="status">
@@ -151,6 +169,26 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
           {status.open_action && !terminal && (
             <p className="rex-task-action">Open action: {status.open_action.instructions}</p>
           )}
+          <form
+            className="rex-follow-up"
+            onSubmit={(event) => { event.preventDefault(); submitFollowUp(); }}
+          >
+            <label htmlFor="rex-follow-up-input">Follow up on this task</label>
+            <div className="rex-follow-up-row">
+              <input
+                id="rex-follow-up-input"
+                value={followUp}
+                onChange={(event) => setFollowUp(event.target.value)}
+                placeholder="Ask REX to continue with the same task"
+                disabled={submittingFollowUp}
+                aria-describedby={followUpError ? "rex-follow-up-error" : undefined}
+              />
+              <button type="submit" disabled={submittingFollowUp || followUp.trim() === ""}>
+                {submittingFollowUp ? "Sending…" : "Send"}
+              </button>
+            </div>
+            {followUpError && <p id="rex-follow-up-error" className="rex-follow-up-error" role="alert">{followUpError}</p>}
+          </form>
         </div>
       )}
       {phases.length > 0 && (

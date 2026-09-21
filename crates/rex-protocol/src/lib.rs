@@ -232,6 +232,9 @@ pub struct ExecuteRequest {
     /// Host resume handle issued at creation; required on every resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_handle: Option<String>,
+    /// Optional human follow-up recorded against the same durable task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<String>,
     pub host: HostKind,
     /// Operator identity declaration: human at the keyboard, or an agent
     /// operating under its own authority.

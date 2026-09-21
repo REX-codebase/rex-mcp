@@ -511,6 +511,14 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .rex-task-id{margin:4px 0 0;font-size:11px;color:var(--color-faint)}
 .rex-task-action{margin:6px 0 0;font-size:12px;color:var(--color-muted)}
 .rex-task-events{margin-top:10px}
+.rex-follow-up{margin-top:14px;padding-top:12px;border-top:1px solid var(--color-line)}
+.rex-follow-up label{display:block;margin-bottom:6px;font-size:11px;color:var(--color-muted)}
+.rex-follow-up-row{display:flex;gap:8px}
+.rex-follow-up input{min-width:0;flex:1;padding:8px 9px;border:1px solid var(--color-line);border-radius:6px;background:transparent;color:var(--color-text);font:inherit;font-size:12px}
+.rex-follow-up input:focus{outline:1px solid var(--color-accent);outline-offset:1px}
+.rex-follow-up button{padding:7px 11px;border:1px solid var(--color-accent);border-radius:6px;background:var(--color-accent);color:var(--color-bg);font:inherit;font-size:12px;cursor:pointer}
+.rex-follow-up button:disabled{opacity:.5;cursor:default}
+.rex-follow-up-error{margin:6px 0 0;font-size:11px;color:var(--color-danger)}
 .proof-journey{margin:14px 0 0;display:grid;grid-template-columns:200px 1fr;gap:16px;align-items:start;padding:12px 14px;border:1px solid var(--color-line);border-radius:10px}
 @media(max-width:640px){.proof-journey{grid-template-columns:1fr}}
 .proof-spine{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}

@@ -90,6 +90,20 @@ describe("rex task supervision bridge", () => {
     expect(JSON.parse(String(call?.[1]?.body)).task).toBe("supervise this");
   });
 
+  it("resumes the same durable task for a follow-up", async () => {
+    const fetchMock = sidecarFetch((url, init) =>
+      url === "http://127.0.0.1:8787/api/rex/tasks/task-9/follow-up" && init?.method === "POST"
+        ? new Response(JSON.stringify({ task_id: "task-9", state: "active", resumed: true }), { status: 200 })
+        : undefined
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { rexTaskFollowUp } = await import("./rexTasks");
+    const r = await rexTaskFollowUp("task-9", "continue with the next step");
+    expect(r.resumed).toBe(true);
+    const call = fetchMock.mock.calls.find(([u]) => String(u).endsWith("/task-9/follow-up"));
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ taskId: "task-9", task: "continue with the next step" });
+  });
+
   it("reads events with the cursor and stops with the human fence", async () => {
     const fetchMock = sidecarFetch((url, init) => {
       if (url === "http://127.0.0.1:8787/api/rex/tasks/task-9/events?since=3") {
