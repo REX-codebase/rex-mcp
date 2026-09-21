@@ -132,6 +132,7 @@ pub fn tool_descriptors() -> Vec<Value> {
             ToolName::Result => ("Read a terminal result and proof bundle.", task_ref_schema()),
             ToolName::Cancel => ("Cancel a non-terminal task.", extend(task_ref_schema(), json!({"reason":{"type":"string"}}), &[])),
             ToolName::UltraOpen => ("Open the Ultra external-host loop: fetch the open candidate or adversary/verifier/visual evidence requests.", task_epoch_schema()),
+            ToolName::UltraPromote => ("Promote the qualified Ultra candidate bundle into the task workspace with verified rollback.", task_epoch_schema()),
             ToolName::UltraSubmit => ("Submit one Ultra candidate response or one adversary/verifier/visual evidence item. For candidates, request_id and candidate_id are the answered candidate id.", extend(task_epoch_schema(), json!({"kind":{"enum":["candidate","adversary","verifier","visual"]},"request_id":{"type":"string"},"candidate_id":{"type":"string"},"response_hash":{"type":"string"},"content":{"type":"string"}}), &["kind","request_id","candidate_id","response_hash","content"])),
         };
         // All schemas are objects, even the helper-created ones.
@@ -164,7 +165,7 @@ mod tests {
         let mut out=Vec::new(); s.serve(std::io::Cursor::new(input),&mut out).unwrap();
         let rows:Vec<Value>=String::from_utf8(out).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect();
         assert_eq!(rows.len(),3); assert_eq!(rows[0]["result"]["protocolVersion"],MCP_PROTOCOL_VERSION);
-        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(),14);
+        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(),15);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"],"active");
         let task_id = rows[2]["result"]["structuredContent"]["task_id"].as_str().unwrap();
         let status = s.handle(rpc(4,"tools/call",json!({"name":"rex_status","arguments":{"task_id":task_id}}))).unwrap();

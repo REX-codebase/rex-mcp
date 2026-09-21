@@ -22,6 +22,7 @@ pub const DEFAULT_MINIMUM_CANDIDATES: usize = 2;
 pub enum BridgeError {
     InvalidTaskId,
     Adapter(AdapterError),
+    Promotion(crate::promotion::PromotionError),
     Io(String),
 }
 
@@ -135,6 +136,19 @@ impl UltraHostBridge {
         adapter.record_verifier(evidence).map_err(BridgeError::Adapter)?;
         adapter.finalize().map_err(BridgeError::Adapter)?;
         self.view(task_id, &mut adapter)
+    }
+
+    /// Promote the qualified candidate's sealed bundle into the destination
+    /// with the full section-J sequence and verified rollback.
+    pub fn promote(
+        &self,
+        task_id: &str,
+        contract: &AcceptanceContract,
+        destination: &std::path::Path,
+    ) -> Result<crate::promotion::PromotionReceipt, BridgeError> {
+        let adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
+        let store = crate::promotion::PromotionStore::open(&self.dir).map_err(BridgeError::Promotion)?;
+        store.promote(task_id, &adapter, contract, destination).map_err(BridgeError::Promotion)
     }
 
     pub fn record_visual(

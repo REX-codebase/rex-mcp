@@ -388,6 +388,7 @@ impl HarnessDaemon {
             ToolName::Cancel => go!(args, cancel),
             ToolName::UltraOpen => go!(args, ultra_open),
             ToolName::UltraSubmit => go!(args, ultra_submit),
+            ToolName::UltraPromote => go!(args, ultra_promote),
         }
     }
 
@@ -439,6 +440,39 @@ impl HarnessDaemon {
             "kernel_state":format!("{:?}",view.kernel_state)}))?;
         self.persist(&t)?;
         Ok(ultra_view(t.task_id.clone(), &view, self.skill_plan()))
+    }
+
+    /// Promote the qualified candidate into the task workspace. Live lease,
+    /// agent-operated tasks only; the kernel must be completed and the
+    /// rollback path is verified by the promotion store.
+    pub fn ultra_promote(&self, req: rex_protocol::UltraPromoteRequest) -> Result<rex_protocol::UltraPromoteResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        require_agent(&t)?;
+        let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
+        let contract = contract_from_plan(&t.task, &t.plan);
+        let receipt = bridge.promote(&t.task_id, &contract, &self.policy.workspace)
+            .map_err(|e| bridge_err(&t.task_id, e))?;
+        let state = match receipt.state {
+            rex_ultra::promotion::PromotionState::Prepared => "prepared",
+            rex_ultra::promotion::PromotionState::Committed => "committed",
+            rex_ultra::promotion::PromotionState::RolledBack => "rolled_back",
+            rex_ultra::promotion::PromotionState::CorruptState => "corrupt_state",
+        };
+        self.append_event(&mut t, "ultra_promotion", json!({"state":state,
+            "candidate_id":receipt.candidate_id,"bundle_hash":receipt.bundle_hash,
+            "staging_hash":receipt.staging_hash}))?;
+        self.persist(&t)?;
+        Ok(rex_protocol::UltraPromoteResponse {
+            task_id: t.task_id.clone(),
+            state: state.into(),
+            candidate_id: receipt.candidate_id,
+            bundle_hash: receipt.bundle_hash,
+            destination_hash_before: receipt.destination_hash_before,
+            staging_hash: receipt.staging_hash,
+            gates_rerun: receipt.gates_rerun,
+            gates_not_rerun: receipt.gates_not_rerun,
+            detail: receipt.detail,
+        })
     }
 
     fn skill_plan(&self) -> Option<SkillPlanView> {
@@ -588,6 +622,8 @@ fn bridge_err(task_id: &str, e: BridgeError) -> ProtocolError {
         BridgeError::InvalidTaskId => perr(ErrorCode::TaskNotFound, "invalid ultra task id", task_id),
         BridgeError::Adapter(a) => perr(ErrorCode::GateFailed,
             format!("ultra kernel rejected submission: {a:?}"), task_id),
+        BridgeError::Promotion(p) => perr(ErrorCode::GateFailed,
+            format!("ultra promotion rejected: {p:?}"), task_id),
         BridgeError::Io(m) => perr(ErrorCode::Internal, format!("ultra store: {m}"), task_id),
     }
 }
@@ -799,5 +835,45 @@ mod tests {
         let events=daemon.events(EventsRequest{task_id:ex.task_id.clone(),after_seq:0,limit:None}).unwrap();
         let bindings=events.events.iter().filter(|e| e.kind=="ultra_skill_plan").count();
         assert_eq!(bindings,1,"plan binding is recorded once per hash, not per open");
+    }    #[test] fn ultra_promotion_commits_the_winning_bundle_into_the_workspace() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws"); fs::create_dir_all(&w).unwrap();
+        let daemon=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let ex=daemon.execute(req("r-promote")).unwrap();
+        let open=daemon.ultra_open(UltraOpenRequest{task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        // promotion before completion fails closed
+        assert!(daemon.ultra_promote(rex_protocol::UltraPromoteRequest{
+            task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).is_err());
+        let mut view=open.clone();
+        for (i,c) in open.candidate_requests.iter().enumerate() {
+            let content=format!("{{\"files\":[{{\"path\":\"result.txt\",\"content\":\"PASS {i}\"}}]}}");
+            view=daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,UltraSubmissionKind::Candidate,
+                &c.candidate_id,&c.candidate_id,&content)).unwrap();
+        }
+        let candidate=view.evidence_requests[0].candidate_id.clone();
+        let pending: Vec<UltraEvidenceRequestView> = view.evidence_requests.iter()
+            .filter(|r| r.candidate_id==candidate).cloned().collect();
+        for r in &pending {
+            view = match r.kind.as_str() {
+                "adversary" => daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,
+                    UltraSubmissionKind::Adversary,&r.request_id,&r.candidate_id,"{\"defects\":[]}")).unwrap(),
+                _ => daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,
+                    UltraSubmissionKind::Verifier,&r.request_id,&r.candidate_id,
+                    "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"}]}")).unwrap(),
+            };
+        }
+        assert_eq!(view.kernel_state,"completed");
+        let receipt=daemon.ultra_promote(rex_protocol::UltraPromoteRequest{
+            task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        assert_eq!(receipt.state,"committed");
+        assert_eq!(receipt.candidate_id,candidate);
+        assert!(!receipt.staging_hash.is_empty());
+        assert!(fs::read_to_string(w.join("result.txt")).unwrap().starts_with("PASS"));
+        let events=daemon.events(EventsRequest{task_id:ex.task_id.clone(),after_seq:0,limit:None}).unwrap();
+        assert!(events.events.iter().any(|e| e.kind=="ultra_promotion"));
+        // a second promotion is deterministic and reports the same bundle
+        let again=daemon.ultra_promote(rex_protocol::UltraPromoteRequest{
+            task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        assert_eq!(again.state,"committed");
+        assert_eq!(again.bundle_hash,receipt.bundle_hash);
     }
 }

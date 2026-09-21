@@ -42,6 +42,7 @@ pub enum ToolName {
     Cancel,
     UltraOpen,
     UltraSubmit,
+    UltraPromote,
 }
 
 impl ToolName {
@@ -61,6 +62,7 @@ impl ToolName {
             ToolName::Cancel => "rex_cancel",
             ToolName::UltraOpen => "rex_ultra_open",
             ToolName::UltraSubmit => "rex_ultra_submit",
+            ToolName::UltraPromote => "rex_ultra_promote",
         }
     }
 
@@ -80,6 +82,7 @@ impl ToolName {
             "rex_cancel" => ToolName::Cancel,
             "rex_ultra_open" => ToolName::UltraOpen,
             "rex_ultra_submit" => ToolName::UltraSubmit,
+            "rex_ultra_promote" => ToolName::UltraPromote,
             _ => return None,
         })
     }
@@ -100,6 +103,7 @@ impl ToolName {
             ToolName::Cancel,
             ToolName::UltraOpen,
             ToolName::UltraSubmit,
+            ToolName::UltraPromote,
         ]
     }
 }
@@ -500,6 +504,28 @@ pub enum UltraSubmissionKind {
     Verifier,
     /// Pixel-level taste gate evidence for visual contracts.
     Visual,
+}
+
+/// rex_ultra_promote request: promote the qualified candidate's sealed
+/// bundle into the task workspace with verified rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UltraPromoteRequest {
+    pub task_id: String,
+    pub lease_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UltraPromoteResponse {
+    pub task_id: String,
+    /// committed | rolled_back | corrupt_state
+    pub state: String,
+    pub candidate_id: String,
+    pub bundle_hash: String,
+    pub destination_hash_before: String,
+    pub staging_hash: String,
+    pub gates_rerun: Vec<String>,
+    pub gates_not_rerun: Vec<String>,
+    pub detail: String,
 }
 
 /// rex_ultra_open request: fetch the open Ultra requests for a live task.
