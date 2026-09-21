@@ -2626,6 +2626,7 @@ dependencies = [
  "rex-prompt",
  "rex-protocol",
  "rex-tools",
+ "rex-ultra",
  "serde",
  "serde_json",
  "tempfile",
@@ -2661,8 +2662,11 @@ dependencies = [
 name = "rex-mcp"
 version = "0.1.0"
 dependencies = [
+ "rex-custody",
  "rex-daemon",
+ "rex-preview",
  "rex-protocol",
+ "rex-providers",
  "serde",
  "serde_json",
  "tempfile",
@@ -2707,7 +2711,6 @@ name = "rex-providers"
 version = "0.1.0"
 dependencies = [
  "rex-custody",
- "rex-mcp",
  "rex-preview",
  "rex-prompt",
  "rex-search",
