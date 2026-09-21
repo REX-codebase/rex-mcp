@@ -3,6 +3,24 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${REX_INSTALL_DIR:-$HOME/.rex/bin}"
+STATE_DIR="${REX_STATE_DIR:-$HOME/.rex/harness}"
+# Store-schema guard: never downgrade into a newer task store; notice legacy.
+if [ -d "$STATE_DIR/tasks" ]; then
+  for f in "$STATE_DIR"/tasks/*/task.json; do
+    [ -e "$f" ] || continue
+    v=$(grep -o '"store_schema_version":[0-9]*' "$f" | head -1 | grep -o '[0-9]*' || true)
+    if [ -n "$v" ] && [ "$v" -gt 2 ]; then
+      echo "Task store at $STATE_DIR was written by a newer REX (schema v$v)." >&2
+      echo "Install the newer server instead of downgrading onto it." >&2
+      exit 1
+    fi
+  done
+  legacy=$(grep -L store_schema_version "$STATE_DIR"/tasks/*/task.json 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$legacy" != "0" ]; then
+    echo "Note: $legacy task record(s) predate store schema v2 and migrate to"
+    echo "Standard mode on first load by the new server."
+  fi
+fi
 echo "Building rex-mcp (release)..."
 cargo build --release -p rex-mcp --manifest-path "$ROOT/Cargo.toml"
 mkdir -p "$DEST" "$HOME/.rex/harness"

@@ -97,6 +97,11 @@ struct DurableTask {
     /// never stored; it rotates on every accepted resume.
     #[serde(default)]
     host_resume_handle_hash: Option<String>,
+    /// Persisted store schema, independent of the wire protocol string.
+    /// Schema 1 records predate this field and migrate on load; unknown
+    /// future versions fail closed.
+    #[serde(default = "default_store_schema_version")]
+    store_schema_version: u32,
 }
 
 pub struct HarnessDaemon {
@@ -183,7 +188,8 @@ impl HarnessDaemon {
             branch_id: "main".into(), resume_nonce: grant.lease.next_seq,
             operation_status: if req.operator_is_agent { OperationStatus::ExternalHostRequired } else { OperationStatus::Prepared },
             ultra_skill_plan_hash: None,
-            host_resume_handle_hash: Some(hex_sha256(host_resume_handle.as_bytes())) };
+            host_resume_handle_hash: Some(hex_sha256(host_resume_handle.as_bytes())),
+            store_schema_version: STORE_SCHEMA_VERSION };
         let plan_hash = task.plan_hash.clone(); let step_count = task.plan.len();
         self.append_event(&mut task, "task_created", json!({"plan_hash":plan_hash,
             "steps":step_count,"protocol":PROTOCOL_VERSION}))?;
@@ -624,17 +630,40 @@ impl HarnessDaemon {
         if !safe_id(id) { return Err(ProtocolError::new(ErrorCode::MalformedRequest, "invalid task id")); }
         let bytes = fs::read(self.task_dir(id).join("task.json"))
             .map_err(|_| perr(ErrorCode::TaskNotFound, "task not found", id))?;
-        let t: DurableTask = serde_json::from_slice(&bytes).map_err(internal)?;
-        if t.protocol_version.split('.').next() != PROTOCOL_VERSION.split('.').next() {
-            return Err(perr(ErrorCode::VersionMismatch, "stored task has incompatible protocol", id)); }
+        self.parse_task(&bytes, id)
+    }
+
+    /// Store-schema gate, kept separate from the wire protocol version.
+    /// Schema 1 records (no version field) migrate in place with a durable
+    /// store_migrated event; unknown future versions fail closed so an older
+    /// server can never silently misread a newer store.
+    fn parse_task(&self, bytes: &[u8], id: &str) -> Result<DurableTask, ProtocolError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(internal)?;
+        let version = value.get("store_schema_version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        if version > STORE_SCHEMA_VERSION {
+            return Err(perr(ErrorCode::VersionMismatch,
+                &format!("stored task schema v{version} is newer than this server"), id));
+        }
+        let mut t: DurableTask = serde_json::from_value(value).map_err(internal)?;
+        // Migrate on the raw file version, not the serde default, so a
+        // schema-1 record (field absent) is detected and rewritten.
+        if version != STORE_SCHEMA_VERSION {
+            t.store_schema_version = STORE_SCHEMA_VERSION;
+            self.append_event(&mut t, "store_migrated",
+                json!({"from": version, "to": STORE_SCHEMA_VERSION}))?;
+            self.persist(&t)?;
+        }
         Ok(t)
     }
     fn find_by_request(&self, request_id: &str) -> Result<Option<DurableTask>, ProtocolError> {
         let dirs = fs::read_dir(self.root.join("tasks")).map_err(internal)?;
         for ent in dirs.flatten() {
             if let Ok(bytes) = fs::read(ent.path().join("task.json")) {
-                if let Ok(t) = serde_json::from_slice::<DurableTask>(&bytes) {
-                    if t.request_id == request_id { return Ok(Some(t)); }
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if v.get("request_id").and_then(|r| r.as_str()) == Some(request_id) {
+                        let id = v.get("task_id").and_then(|i| i.as_str()).unwrap_or("task");
+                        return self.parse_task(&bytes, id).map(Some);
+                    }
                 }
             }
         }
@@ -779,6 +808,10 @@ fn lease_view(t:&DurableTask)->LeaseView { LeaseView { epoch:t.lease_epoch,
     expires_ms_from_now:t.lease_expires_ms.saturating_sub(now_ms()) as u64,
     heartbeat_interval_ms:t.heartbeat_interval_ms } }
 fn default_branch_id() -> String { "main".into() }
+/// Current persisted task-store schema. Bump when DurableTask changes shape;
+/// never reuse the wire protocol version for storage decisions.
+const STORE_SCHEMA_VERSION: u32 = 2;
+fn default_store_schema_version() -> u32 { STORE_SCHEMA_VERSION }
 fn status_operation(t: &DurableTask) -> OperationStatus {
     if now_ms() >= t.lease_expires_ms && !t.state.is_terminal() {
         OperationStatus::Stale
@@ -808,6 +841,28 @@ mod tests {
     fn req(id:&str)->ExecuteRequest { ExecuteRequest { request_id:id.into(), task:"make hello".into(),
         task_id:None,resume_handle:None,host:HostKind::ClaudeCode,operator_is_agent:true,budgets:None,proof:None,
         plan:Some(vec![PlanStep{instructions:"write hello".into(),acceptance:Some("file exists".into())}]) } }
+    #[test] fn store_schema_v1_migrates_and_future_versions_fail_closed() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws"); let root=d.path().join("state");
+        let daemon=HarnessDaemon::open(&root,DaemonPolicy::conservative(&w)).unwrap();
+        let ex=daemon.execute(req("rmig")).unwrap();
+        let file=root.join("tasks").join(&ex.task_id).join("task.json");
+        let mut v:serde_json::Value=serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(v.get("store_schema_version").and_then(|s|s.as_u64()),Some(2));
+        // A schema-1 record predates the version field; loading migrates in place.
+        v.as_object_mut().unwrap().remove("store_schema_version");
+        fs::write(&file,serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+        let s1=daemon.status(TaskRefRequest{task_id:ex.task_id.clone()}).unwrap();
+        assert_eq!(s1.state,TaskState::Active);
+        let v2:serde_json::Value=serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(v2.get("store_schema_version").and_then(|s|s.as_u64()),Some(2));
+        let log=fs::read_to_string(root.join("tasks").join(&ex.task_id).join("events.jsonl")).unwrap();
+        assert!(log.contains("store_migrated"));
+        // An unknown future schema fails closed instead of being misread.
+        let mut v3=v2; v3.as_object_mut().unwrap().insert("store_schema_version".into(),serde_json::json!(99));
+        fs::write(&file,serde_json::to_vec_pretty(&v3).unwrap()).unwrap();
+        let e=daemon.status(TaskRefRequest{task_id:ex.task_id.clone()}).unwrap_err();
+        assert_eq!(e.code,ErrorCode::VersionMismatch);
+    }
     #[test] fn idempotency_and_recovery() {
         let d=tempdir().unwrap(); let w=d.path().join("ws"); let root=d.path().join("state");
         let daemon=HarnessDaemon::open(&root,DaemonPolicy::conservative(&w)).unwrap();
