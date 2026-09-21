@@ -131,8 +131,8 @@ pub fn tool_descriptors() -> Vec<Value> {
             ToolName::Events => ("Read the append-only task event stream.", extend(task_ref_schema(), json!({"after_seq":{"type":"integer"},"limit":{"type":"integer"}}), &[])),
             ToolName::Result => ("Read a terminal result and proof bundle.", task_ref_schema()),
             ToolName::Cancel => ("Cancel a non-terminal task.", extend(task_ref_schema(), json!({"reason":{"type":"string"}}), &[])),
-            ToolName::UltraOpen => ("Open the Ultra external-host loop: fetch the open candidate or adversary/verifier evidence requests.", task_epoch_schema()),
-            ToolName::UltraSubmit => ("Submit one Ultra candidate response or one adversary/verifier evidence item. For candidates, request_id and candidate_id are the answered candidate id.", extend(task_epoch_schema(), json!({"kind":{"enum":["candidate","adversary","verifier"]},"request_id":{"type":"string"},"candidate_id":{"type":"string"},"response_hash":{"type":"string"},"content":{"type":"string"}}), &["kind","request_id","candidate_id","response_hash","content"])),
+            ToolName::UltraOpen => ("Open the Ultra external-host loop: fetch the open candidate or adversary/verifier/visual evidence requests.", task_epoch_schema()),
+            ToolName::UltraSubmit => ("Submit one Ultra candidate response or one adversary/verifier/visual evidence item. For candidates, request_id and candidate_id are the answered candidate id.", extend(task_epoch_schema(), json!({"kind":{"enum":["candidate","adversary","verifier","visual"]},"request_id":{"type":"string"},"candidate_id":{"type":"string"},"response_hash":{"type":"string"},"content":{"type":"string"}}), &["kind","request_id","candidate_id","response_hash","content"])),
         };
         // All schemas are objects, even the helper-created ones.
         if schema.is_null() { schema=obj(); }

@@ -431,6 +431,9 @@ impl HarnessDaemon {
             UltraSubmissionKind::Verifier => bridge.record_verifier(&t.task_id, &contract,
                 VerifierEvidence { request_id: req.request_id.clone(), candidate_id: req.candidate_id,
                     response_hash: req.response_hash, content: req.content }),
+            UltraSubmissionKind::Visual => bridge.record_visual(&t.task_id, &contract,
+                rex_ultra::external_kernel::VisualEvidence { request_id: req.request_id.clone(), candidate_id: req.candidate_id,
+                    response_hash: req.response_hash, content: req.content }),
         }.map_err(|e| bridge_err(&t.task_id, e))?;
         self.append_event(&mut t, "ultra_submission", json!({"kind":format!("{:?}",req.kind),
             "kernel_state":format!("{:?}",view.kernel_state)}))?;
@@ -613,7 +616,8 @@ fn ultra_view(task_id: String, view: &UltraHostView, skill_plan: Option<SkillPla
             request_id: r.request_id.clone(), candidate_id: r.candidate_id.clone(),
             contract_hash: r.contract_hash.clone(),
             kind: match r.kind { EvidenceKind::Adversary => "adversary",
-                EvidenceKind::Verifier => "verifier" }.into(),
+                EvidenceKind::Verifier => "verifier",
+                EvidenceKind::Visual => "visual" }.into(),
             obligation_ids: r.obligation_ids.clone(),
             candidate_response_hash: r.candidate_response_hash.clone(),
         }).collect(),

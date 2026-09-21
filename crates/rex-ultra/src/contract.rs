@@ -53,9 +53,40 @@ pub struct ForbiddenRegression {
     pub statement: String,
 }
 
+/// Visual or general work. Visual work carries a pixel-evidence floor in the
+/// external kernel: no candidate qualifies without hash-bound screenshots at
+/// the mandatory viewports and a clean taste gate report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkKind {
+    #[default]
+    General,
+    Visual,
+}
+
+/// Deterministic work classification from the task text. Conservative toward
+/// Visual on purpose: a false positive demands more evidence, never less.
+pub fn classify_work_kind(task: &str) -> WorkKind {
+    const TOKENS: &[&str] = &[
+        "ui","3d","svg","css","webgl","canvas","shader","shaders","animation",
+        "animations","animate","motion","video","render","rendering","website",
+        "webpage","frontend","layout","design","visual","graphic","graphics",
+        "component","components","styling","screenshot","pixel",
+    ];
+    let lower = task.to_lowercase();
+    let token_hit = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| TOKENS.contains(&token));
+    let phrase_hit = ["landing page","front-end","front end","three.js","web page","user interface"]
+        .iter().any(|phrase| lower.contains(phrase));
+    if token_hit || phrase_hit { WorkKind::Visual } else { WorkKind::General }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AcceptanceContract {
     pub task: String,
+    #[serde(default)]
+    pub work_kind: WorkKind,
     pub obligations: Vec<Obligation>,
     #[serde(default)]
     pub forbidden_regressions: Vec<ForbiddenRegression>,
@@ -173,6 +204,7 @@ pub fn parse_contract(text: &str, task: &str) -> Result<AcceptanceContract, Vec<
     }
     if errors.is_empty() {
         Ok(AcceptanceContract {
+            work_kind: classify_work_kind(task),
             task: task.to_string(),
             obligations: raw.obligations,
             forbidden_regressions: raw.forbidden_regressions,
@@ -249,5 +281,12 @@ mod tests {
     #[test]
     fn no_json_rejected() {
         assert!(parse_contract("no json here", "t").is_err());
+    }
+    #[test]
+    fn visual_classification_is_conservative_and_deterministic() {
+        assert_eq!(classify_work_kind("build a marketing website with animation"), WorkKind::Visual);
+        assert_eq!(classify_work_kind("render the dashboard component"), WorkKind::Visual);
+        assert_eq!(classify_work_kind("fix the CSV parser overflow"), WorkKind::General);
+        assert_eq!(classify_work_kind("refactor the build script"), WorkKind::General);
     }
 }

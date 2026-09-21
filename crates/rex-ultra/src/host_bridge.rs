@@ -47,7 +47,7 @@ pub fn contract_from_plan(task: &str, plan: &[PlanStep]) -> AcceptanceContract {
             proof: Proof::BehaviorEvidence { description: step.instructions.clone() },
         })
         .collect();
-    AcceptanceContract { task: task.to_string(), obligations, forbidden_regressions: Vec::new() }
+    AcceptanceContract { task: task.to_string(), work_kind: crate::contract::classify_work_kind(task), obligations, forbidden_regressions: Vec::new() }
 }
 
 pub struct UltraHostBridge {
@@ -133,6 +133,18 @@ impl UltraHostBridge {
     ) -> Result<UltraHostView, BridgeError> {
         let mut adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
         adapter.record_verifier(evidence).map_err(BridgeError::Adapter)?;
+        adapter.finalize().map_err(BridgeError::Adapter)?;
+        self.view(task_id, &mut adapter)
+    }
+
+    pub fn record_visual(
+        &self,
+        task_id: &str,
+        contract: &AcceptanceContract,
+        evidence: crate::external_kernel::VisualEvidence,
+    ) -> Result<UltraHostView, BridgeError> {
+        let mut adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
+        adapter.record_visual(evidence).map_err(BridgeError::Adapter)?;
         adapter.finalize().map_err(BridgeError::Adapter)?;
         self.view(task_id, &mut adapter)
     }
@@ -226,6 +238,9 @@ mod tests {
                         content: content.into(),
                     }).unwrap();
                 }
+                crate::external_kernel::EvidenceKind::Visual => {
+                    unreachable!("general contracts issue no visual requests")
+                }
                 crate::external_kernel::EvidenceKind::Verifier => {
                     let content = "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"},{\"obligation_id\":\"step-2\",\"status\":\"proven\"}]}";
                     let after = bridge.record_verifier("task-abc", &contract, VerifierEvidence {
@@ -263,6 +278,9 @@ mod tests {
                         content: content.into(),
                     }).unwrap();
                 }
+                crate::external_kernel::EvidenceKind::Visual => {
+                    unreachable!("general contracts issue no visual requests")
+                }
                 crate::external_kernel::EvidenceKind::Verifier => {
                     let content = "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"failed\"},{\"obligation_id\":\"step-2\",\"status\":\"failed\"}]}";
                     bridge.record_verifier("task-def", &contract, VerifierEvidence {
@@ -292,5 +310,12 @@ mod tests {
             bridge.open_requests("", &contract, 2, 1).unwrap_err(),
             BridgeError::InvalidTaskId
         );
+    }
+    #[test]
+    fn contract_from_plan_classifies_visual_work() {
+        let visual = contract_from_plan("build a website landing page", &[]);
+        assert_eq!(visual.work_kind, crate::contract::WorkKind::Visual);
+        let general = contract_from_plan("tune the batch scheduler", &[]);
+        assert_eq!(general.work_kind, crate::contract::WorkKind::General);
     }
 }

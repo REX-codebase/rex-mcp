@@ -236,6 +236,59 @@ pub fn check_distinct_theses(theses: &[CandidateThesis]) -> Result<(), Vec<Strin
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
+/// Pixel-level evidence that a visual candidate actually exists and works:
+/// hash-bound screenshots at the mandatory viewports plus an interaction
+/// replay artifact. Text claims are not pixel evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenshotEvidence {
+    pub viewport: ViewportClass,
+    pub artifact_hash: String,
+}
+
+/// The host's visual evidence for one candidate thesis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TasteGateReport {
+    pub thesis_id: String,
+    pub screenshots: Vec<ScreenshotEvidence>,
+    pub interaction_replay_hash: String,
+    pub forbidden_patterns_hit: Vec<String>,
+    pub critic_clean: bool,
+}
+
+/// The mandatory floor for visual evidence: hash-bound screenshots at both
+/// desktop and phone, a hash-bound interaction replay, no forbidden pattern
+/// hits, and a clean critic pass. Brief-specific viewports and criteria stay
+/// with the spec compiler; the external kernel enforces this floor.
+pub fn validate_taste_gate(report: &TasteGateReport) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if report.thesis_id.trim().is_empty() {
+        errors.push("thesis id is empty".to_string());
+    }
+    for class in [ViewportClass::Desktop, ViewportClass::Phone] {
+        let covered = report
+            .screenshots
+            .iter()
+            .any(|shot| shot.viewport == class && is_artifact_hash(&shot.artifact_hash));
+        if !covered {
+            errors.push(format!("missing hash-bound screenshot evidence for the {class:?} viewport"));
+        }
+    }
+    if !is_artifact_hash(&report.interaction_replay_hash) {
+        errors.push("interaction replay is not hash-bound".to_string());
+    }
+    if !report.forbidden_patterns_hit.is_empty() {
+        errors.push(format!("forbidden patterns hit: {}", report.forbidden_patterns_hit.join(", ")));
+    }
+    if !report.critic_clean {
+        errors.push("critic pass is not clean".to_string());
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+fn is_artifact_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +428,41 @@ mod tests {
         b.motion_model = "   ".into();
         let theses = vec![thesis("a", "orbit the answer"), b, thesis("c", "grow a garden")];
         assert!(check_distinct_theses(&theses).unwrap_err().iter().any(|e| e.contains("all four semantic models")));
+    }
+    fn report() -> TasteGateReport {
+        TasteGateReport {
+            thesis_id: "thesis-a".into(),
+            screenshots: vec![
+                ScreenshotEvidence { viewport: ViewportClass::Desktop, artifact_hash: "a".repeat(64) },
+                ScreenshotEvidence { viewport: ViewportClass::Phone, artifact_hash: "b".repeat(64) },
+            ],
+            interaction_replay_hash: "c".repeat(64),
+            forbidden_patterns_hit: Vec::new(),
+            critic_clean: true,
+        }
+    }
+
+    #[test]
+    fn taste_gate_accepts_only_hash_bound_pixel_evidence() {
+        assert!(validate_taste_gate(&report()).is_ok());
+        let mut missing_phone = report();
+        missing_phone.screenshots.retain(|s| s.viewport == ViewportClass::Desktop);
+        assert!(validate_taste_gate(&missing_phone).unwrap_err().iter().any(|e| e.contains("Phone")));
+        let mut unbound = report();
+        unbound.screenshots[0].artifact_hash = "trust me".into();
+        assert!(validate_taste_gate(&unbound).is_err());
+        let mut no_replay = report();
+        no_replay.interaction_replay_hash = String::new();
+        assert!(validate_taste_gate(&no_replay).is_err());
+    }
+
+    #[test]
+    fn taste_gate_fails_closed_on_forbidden_patterns_and_dirty_critics() {
+        let mut hit = report();
+        hit.forbidden_patterns_hit = vec!["generic-hero-plus-cards".into()];
+        assert!(validate_taste_gate(&hit).is_err());
+        let mut dirty = report();
+        dirty.critic_clean = false;
+        assert!(validate_taste_gate(&dirty).is_err());
     }
 }

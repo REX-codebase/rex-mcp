@@ -312,6 +312,7 @@ fn scoring_allowlist_runs_denied_interpreters_without_widening_model_policy() {
     use crate::contract::{AcceptanceContract, Obligation, Proof};
     use crate::evidence::EvidenceStore;
     let mk = |argv: Vec<&str>| AcceptanceContract {
+            work_kind: Default::default(),
         task: "t".into(),
         obligations: vec![Obligation {
             id: "c1".into(),

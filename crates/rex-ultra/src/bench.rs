@@ -96,6 +96,7 @@ pub fn score_workspace_with_scoring(
 ) -> VerificationReport {
     let mut evidence = EvidenceStore::open(evidence_dir).expect("evidence store");
     let contract = AcceptanceContract {
+            work_kind: Default::default(),
         task: task.prompt.clone(),
         obligations: task
             .checks

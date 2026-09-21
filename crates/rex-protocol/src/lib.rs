@@ -498,6 +498,8 @@ pub enum UltraSubmissionKind {
     Candidate,
     Adversary,
     Verifier,
+    /// Pixel-level taste gate evidence for visual contracts.
+    Visual,
 }
 
 /// rex_ultra_open request: fetch the open Ultra requests for a live task.
