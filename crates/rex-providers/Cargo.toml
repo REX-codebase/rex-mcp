@@ -9,7 +9,6 @@ license = "Proprietary"
 serde = { workspace = true }
 serde_json = { workspace = true }
 rex-custody = { path = "../rex-custody" }
-rex-mcp = { path = "../rex-mcp" }
 rex-prompt = { path = "../rex-prompt" }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 rex-tools = { path = "../rex-tools" }
