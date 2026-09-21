@@ -21,6 +21,8 @@ pub mod phase4;
 pub mod phase5;
 pub mod verify;
 
+pub mod external_kernel;
+
 pub fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

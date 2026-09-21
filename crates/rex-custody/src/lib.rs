@@ -41,3 +41,4 @@ pub use offer::{CustodyAcceptance, CustodyOffer};
 pub use registry::{CustodyError, CustodyRegistry, Tombstone};
 pub use state::{BudgetKind, CustodyGrant, CustodyPhase, ReleaseReason, Violation};
 pub use tools::{CustodiedToolRuntime, CustodyToolError};
+pub mod authority;

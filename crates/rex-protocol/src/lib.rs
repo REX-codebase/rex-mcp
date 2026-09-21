@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Wire version. Major bumps break; minor bumps add optional fields only.
-pub const PROTOCOL_VERSION: &str = "1.0";
+pub const PROTOCOL_VERSION: &str = "1.1";
+
+pub mod schema;
 
 /// The complete v1 tool surface. MCP names are the snake_case strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -560,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_v1() {
-        assert_eq!(PROTOCOL_VERSION, "1.0");
+    fn protocol_version_is_v1_1() {
+        assert_eq!(PROTOCOL_VERSION, "1.1");
     }
 }

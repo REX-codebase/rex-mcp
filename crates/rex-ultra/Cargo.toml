@@ -6,6 +6,7 @@ description = "REX Ultra mode: contract-driven, adversarially verified agent run
 
 [dependencies]
 rex-prompt = { path = "../rex-prompt" }
+rex-protocol = { path = "../rex-protocol" }
 rex-providers = { path = "../rex-providers" }
 rex-tools = { path = "../rex-tools" }
 serde = { workspace = true }
