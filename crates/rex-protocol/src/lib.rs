@@ -616,7 +616,7 @@ mod tests {
             vec![
                 "rex_execute", "rex_next", "rex_read", "rex_edit", "rex_search", "rex_run",
                 "rex_test", "rex_submit", "rex_status", "rex_events", "rex_result", "rex_cancel",
-                "rex_ultra_open", "rex_ultra_submit",
+                "rex_ultra_open", "rex_ultra_submit", "rex_ultra_promote",
             ]
         );
         for t in ToolName::all() {

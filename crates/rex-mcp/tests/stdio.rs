@@ -48,7 +48,7 @@ fn full_caller_driven_lifecycle_over_stdio() {
     let list = s.call("tools/list", json!({}));
     let names: Vec<&str> = list["result"]["tools"].as_array().unwrap()
         .iter().filter_map(|t| t["name"].as_str()).collect();
-    assert_eq!(names.len(), 14);
+    assert_eq!(names.len(), 15);
     assert!(names.contains(&"rex_execute") && names.contains(&"rex_submit"));
 
     // Execute: durable task, frozen plan, first action issued.
