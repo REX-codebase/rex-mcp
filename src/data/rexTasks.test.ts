@@ -90,6 +90,19 @@ describe("rex task supervision bridge", () => {
     expect(JSON.parse(String(call?.[1]?.body)).task).toBe("supervise this");
   });
 
+  it("carries explicit Ultra mode on an agent task", async () => {
+    const fetchMock = sidecarFetch((url, init) =>
+      url === "http://127.0.0.1:8787/api/rex/tasks" && init?.method === "POST"
+        ? new Response(JSON.stringify({ task_id: "task-ultra", state: "active" }), { status: 200 })
+        : undefined
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { rexTaskBegin } = await import("./rexTasks");
+    await rexTaskBegin("verified task", true);
+    const call = fetchMock.mock.calls.find(([u]) => String(u) === "http://127.0.0.1:8787/api/rex/tasks");
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ task: "verified task", ultra: true });
+  });
+
   it("resumes the same durable task for a follow-up", async () => {
     const fetchMock = sidecarFetch((url, init) =>
       url === "http://127.0.0.1:8787/api/rex/tasks/task-9/follow-up" && init?.method === "POST"

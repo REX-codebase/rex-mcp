@@ -65,6 +65,8 @@ struct DurableTask {
     task: String,
     host: HostKind,
     operator_is_agent: bool,
+    #[serde(default)]
+    ultra: bool,
     plan_hash: String,
     plan: Vec<PlanStep>,
     cursor: usize,
@@ -275,6 +277,7 @@ impl HarnessDaemon {
             task: req.task,
             host: req.host,
             operator_is_agent: req.operator_is_agent,
+            ultra: req.ultra,
             plan_hash: hash_json(&plan)?,
             plan,
             cursor: 0,
@@ -313,7 +316,7 @@ impl HarnessDaemon {
             &mut task,
             "task_created",
             json!({"plan_hash":plan_hash,
-            "steps":step_count,"protocol":PROTOCOL_VERSION}),
+            "steps":step_count,"protocol":PROTOCOL_VERSION,"ultra":req.ultra}),
         )?;
         self.persist(&task)?;
         Ok(self.execute_view(&task, false, Some(host_resume_handle)))
@@ -706,6 +709,7 @@ impl HarnessDaemon {
     pub fn ultra_open(&self, req: UltraOpenRequest) -> Result<UltraViewResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch)?;
         require_agent(&t)?;
+        require_ultra(&t)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
         let contract = contract_from_plan(&t.task, &t.plan);
         let view = bridge
@@ -740,6 +744,7 @@ impl HarnessDaemon {
     ) -> Result<UltraViewResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch)?;
         require_agent(&t)?;
+        require_ultra(&t)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
         let contract = contract_from_plan(&t.task, &t.plan);
         let view = match req.kind {
@@ -803,6 +808,7 @@ impl HarnessDaemon {
     ) -> Result<rex_protocol::UltraPromoteResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch)?;
         require_agent(&t)?;
+        require_ultra(&t)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
         let contract = contract_from_plan(&t.task, &t.plan);
         let receipt = bridge
@@ -1287,6 +1293,16 @@ fn require_agent(t: &DurableTask) -> Result<(), ProtocolError> {
     }
     Ok(())
 }
+fn require_ultra(t: &DurableTask) -> Result<(), ProtocolError> {
+    if !t.ultra {
+        return Err(perr(
+            ErrorCode::ScopeDenied,
+            "Ultra operations require an Ultra-mode task",
+            &t.task_id,
+        ));
+    }
+    Ok(())
+}
 fn bridge_err(task_id: &str, e: BridgeError) -> ProtocolError {
     match e {
         BridgeError::InvalidTaskId => {
@@ -1489,6 +1505,7 @@ mod tests {
             follow_up: None,
             host: HostKind::ClaudeCode,
             operator_is_agent: true,
+            ultra: true,
             budgets: None,
             proof: None,
             plan: Some(vec![PlanStep {
@@ -1808,6 +1825,26 @@ mod tests {
         let e = daemon.ultra_submit(unknown).unwrap_err();
         assert_eq!(e.code, ErrorCode::GateFailed);
     }
+
+    #[test]
+    fn standard_agent_tasks_reject_ultra_operations() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut standard = req("r-standard");
+        standard.ultra = false;
+        let ex = daemon.execute(standard).unwrap();
+        let error = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id,
+                lease_epoch: ex.lease.epoch,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ScopeDenied);
+        assert!(error.message.contains("Ultra-mode task"));
+    }
+
     #[test]
     fn ultra_open_binds_a_compiled_skill_plan_once() {
         let d = tempdir().unwrap();

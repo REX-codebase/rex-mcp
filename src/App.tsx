@@ -47,6 +47,14 @@ import { OperatorModeChip, OperatorModeGate } from "./components/OperatorModeGat
 import { loadOperatorMode, saveOperatorMode, type OperatorMode } from "./data/operatorMode";
 import type { InstalledAgentId } from "./data/backend";
 
+export function shouldUseDirectUltra(
+  operatorMode: OperatorMode | null,
+  liveCapable: boolean,
+  ultra: boolean,
+): boolean {
+  return liveCapable && ultra && operatorMode === "human";
+}
+
 // The hero starter composer exists only while there is no session. The moment
 // the first run starts it settles - a brief blur + downward travel while its
 // wrapper collapses - and unmounts, leaving exactly one composer at the
@@ -253,7 +261,7 @@ export default function App() {
         .finally(() => setInstalledStarting(false));
       return;
     }
-    if (liveCapable && ultra) {
+    if (shouldUseDirectUltra(operatorMode, liveCapable, ultra)) {
       // Ultra path: contract -> build -> verify -> adversary -> judge.
       setUltraRun(null);
       setLiveRun(null);
@@ -304,7 +312,7 @@ export default function App() {
       setLiveStarting(true);
       beginSettle();
       if (operatorMode === "agent") {
-        rexTaskBegin(label)
+        rexTaskBegin(label, ultra)
           .then((res) => {
             const id = res?.task_id;
             if (id) {

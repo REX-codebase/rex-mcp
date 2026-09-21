@@ -168,7 +168,7 @@ pub fn tool_descriptors() -> Vec<Value> {
             ToolName::Execute => ("Start or resume a durable REX task; plan is frozen at creation.", json!({
                 "type":"object","required":["request_id","task","host","operator_is_agent"],
                 "properties":{"request_id":{"type":"string"},"task":{"type":"string"},"task_id":{"type":"string"},
-                "host":{"enum":["human","claude_code","antigravity","generic_agent"]},"operator_is_agent":{"type":"boolean"},
+                "host":{"enum":["human","claude_code","antigravity","generic_agent"]},"operator_is_agent":{"type":"boolean"},"ultra":{"type":"boolean"},
                 "budgets":{"type":"object"},"proof":{"type":"string"},"plan":{"type":"array","items":{"type":"object","required":["instructions"],"properties":{"instructions":{"type":"string"},"acceptance":{"type":"string"}}}}},"additionalProperties":false})),
             ToolName::Next => ("Heartbeat and get the currently open action.", task_epoch_schema()),
             ToolName::Read => ("Read a file inside the task workspace.", extend(task_epoch_schema(), json!({"path":{"type":"string"},"byte_range":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}}), &["path"])),

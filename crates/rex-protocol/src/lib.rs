@@ -239,6 +239,9 @@ pub struct ExecuteRequest {
     /// Operator identity declaration: human at the keyboard, or an agent
     /// operating under its own authority.
     pub operator_is_agent: bool,
+    /// Selects the durable Ultra proof route for this task.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ultra: bool,
     /// Requested budget ceilings; the daemon clamps to policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budgets: Option<BudgetRequest>,
@@ -250,6 +253,10 @@ pub struct ExecuteRequest {
     /// the audit chain). Absent means one action: the whole task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Vec<PlanStep>>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One host-proposed step, frozen at execute time.

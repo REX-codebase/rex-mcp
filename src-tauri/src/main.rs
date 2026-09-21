@@ -463,7 +463,7 @@ fn rex_shell_call(tool: &str, arguments: serde_json::Value) -> Result<serde_json
 /// records an agent operator from the start; the task waits active until a
 /// host session resumes it by id through rex-mcp.
 #[tauri::command]
-fn rex_task_begin(task: String) -> Result<serde_json::Value, String> {
+fn rex_task_begin(task: String, ultra: Option<bool>) -> Result<serde_json::Value, String> {
     let response = rex_shell_call(
         "rex_execute",
         serde_json::json!({
@@ -471,6 +471,7 @@ fn rex_task_begin(task: String) -> Result<serde_json::Value, String> {
             "task": task,
             "host": "generic_agent",
             "operator_is_agent": true,
+            "ultra": ultra.unwrap_or(false),
         }),
     )?;
     remember_rex_resume_handle(&response)?;
