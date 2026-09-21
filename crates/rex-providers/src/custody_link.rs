@@ -374,15 +374,15 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
                     Some(TerminalReason::BudgetToolCalls { .. }) => {
                         let _ = c.release_budget_exhausted(&grant_id, BudgetKind::ToolCalls, now);
                     }
-                    Some(other) => {
+                    Some(other)
                         if !matches!(
                             c.grant(&grant_id).map(|g| g.phase),
                             Some(CustodyPhase::Released) | Some(CustodyPhase::Quarantined)
-                        ) {
-                            let _ =
-                                c.declare_failure(&token, &format!("run ended: {other:?}"), now);
-                        }
+                        ) =>
+                    {
+                        let _ = c.declare_failure(&token, &format!("run ended: {other:?}"), now);
                     }
+                    Some(_) => {}
                     None => {}
                 }
                 return;

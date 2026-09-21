@@ -350,7 +350,7 @@ impl RunManager {
             error: None,
         };
 
-        let child = Command::new(&exe)
+        let child = Command::new(exe)
             .args(args)
             .current_dir(&staging)
             .env("REX_INSTALLED_AGENT", "1")

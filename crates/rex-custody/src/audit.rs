@@ -120,6 +120,10 @@ impl AuditLog {
     pub fn len(&self) -> u64 {
         self.seq
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.seq == 0
+    }
 }
 
 /// Read a whole chain for reporting. Verifies every link.

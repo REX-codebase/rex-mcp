@@ -914,6 +914,9 @@ struct DriveOut {
     fatal: Option<TerminalReason>,
 }
 
+// The provider key is resolved through catalog refresh with several
+// diverging failure finishes; a single let-expression would hide them.
+#[allow(clippy::needless_late_init)]
 fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
     let started = Instant::now();
     let mut ledger = Ledger::open(&ctx.state_dir);
@@ -1940,6 +1943,9 @@ fn call_signature(tool: &str, request: &Value) -> String {
     )
 }
 
+// One turn needs the full loop context plus per-turn inputs; the parts are
+// not a meaningful struct of their own.
+#[allow(clippy::too_many_arguments)]
 fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
     ctx: &LoopCtx<S, T>,
     tools: &ToolRuntime,

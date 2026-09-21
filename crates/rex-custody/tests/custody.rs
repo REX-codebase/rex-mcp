@@ -675,7 +675,7 @@ fn crash_recovery_preserves_state_and_detects_tampering() {
         .unwrap();
     }
     // Recover: consumption survives the crash.
-    let mut reg = CustodyRegistry::recover(c.root.clone(), T0 + 3000).unwrap();
+    let reg = CustodyRegistry::recover(c.root.clone(), T0 + 3000).unwrap();
     let grant = reg.grant(&grant_id).unwrap();
     assert_eq!(grant.consumed.steps, 2);
     assert_eq!(grant.consumed.tool_calls, 4);

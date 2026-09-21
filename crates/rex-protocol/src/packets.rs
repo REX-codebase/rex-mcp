@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum OperationStatus {
+    #[default]
     Queued,
     Prepared,
     Committed,
@@ -14,12 +16,6 @@ pub enum OperationStatus {
     Stale,
     Conflict,
     ExternalHostRequired,
-}
-
-impl Default for OperationStatus {
-    fn default() -> Self {
-        Self::Queued
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

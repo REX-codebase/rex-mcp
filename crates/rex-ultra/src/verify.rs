@@ -125,11 +125,11 @@ fn verify_one(
             timeout_ms,
             ..
         } => {
-            let timeout = Some(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS));
+            let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
             let request = ToolRequest::RunCommand {
                 argv: argv.clone(),
                 cwd: cwd.clone(),
-                timeout_ms: timeout,
+                timeout_ms: Some(timeout),
             };
             let prepared = match runtime.prepare(request) {
                 Ok(p) => p,
@@ -148,12 +148,7 @@ fn verify_one(
             let (result, via) = if prepared.risk == RiskClass::Denied {
                 match scoring {
                     Some(allowed) => (
-                        runtime.execute_trusted_scoring(
-                            argv,
-                            cwd.as_deref(),
-                            timeout.unwrap_or(DEFAULT_TIMEOUT_MS),
-                            allowed,
-                        ),
+                        runtime.execute_trusted_scoring(argv, cwd.as_deref(), timeout, allowed),
                         "trusted_scoring",
                     ),
                     None => {

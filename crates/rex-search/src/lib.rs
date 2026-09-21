@@ -480,6 +480,9 @@ impl SearchEngine {
         Ok(())
     }
 
+    // Redirect walking takes the crawl context as separate borrow scopes;
+    // the Evidence error type is the audit record, not a hot-path payload.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn request_following_redirects(
         &self,
         start: &Url,
@@ -592,6 +595,8 @@ impl SearchEngine {
         unreachable!()
     }
 
+    // Same crawl-context shape as request_following_redirects.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn fetch_discovery(
         &self,
         url: &Url,
@@ -645,6 +650,8 @@ impl SearchEngine {
         Ok((final_url, body, hops))
     }
 
+    // Same crawl-context shape as request_following_redirects.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn fetch_html(
         &self,
         url: &Url,

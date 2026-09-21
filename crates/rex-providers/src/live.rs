@@ -241,10 +241,9 @@ impl<S: SecretStore, T: Transport> LiveRunService<S, T> {
             run.error = result.error.as_ref().map(|e| e.detail.clone());
             return Ok(run.snapshot(run_id));
         }
-        start_preview(run).map_err(|e| {
+        start_preview(run).inspect_err(|e| {
             run.status = RunStatus::Failed;
             run.error = Some(e.clone());
-            e
         })?;
         run.status = RunStatus::Live;
         Ok(run.snapshot(run_id))

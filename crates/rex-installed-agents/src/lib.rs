@@ -189,14 +189,13 @@ fn detect(s: Spec) -> InstalledAgentSummary {
                 None
             }
         });
-    let state = if found.is_none() {
-        DetectionState::Missing
-    } else if version.is_none() {
-        DetectionState::UnsupportedVersion
-    } else if !codex_exec_interface_matches(found.as_ref().expect("checked above")) {
-        DetectionState::SupportNeedsReview
-    } else {
-        DetectionState::InstalledAuthUnknown
+    let state = match (&found, &version) {
+        (None, _) => DetectionState::Missing,
+        (Some(_), None) => DetectionState::UnsupportedVersion,
+        (Some(f), Some(_)) if !codex_exec_interface_matches(f) => {
+            DetectionState::SupportNeedsReview
+        }
+        _ => DetectionState::InstalledAuthUnknown,
     };
     InstalledAgentSummary{id:s.id,name:s.name,executable:s.executable,state,version,automation:s.automation,auth_boundary:s.auth_boundary,docs_url:s.docs_url,approval_boundary:"REX owns approval. The child never receives a skip-permissions flag and runs against an isolated staging copy.",compatibility:CompatibilityContract{verified_on:CODEX_CONTRACT_VERIFIED_ON,documented_interface:s.automation,entitlement_note:s.entitlement_note,fail_closed:true}}
 }

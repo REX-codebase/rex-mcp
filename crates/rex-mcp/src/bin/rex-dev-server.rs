@@ -251,7 +251,7 @@ fn handle(
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
-    let mut parts = request_line.trim().split_whitespace();
+    let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
 
@@ -290,6 +290,9 @@ fn handle(
     stream.flush()
 }
 
+// The router carries every service handle; grouping them behind a context
+// struct would only rename the dependencies.
+#[allow(clippy::too_many_arguments)]
 fn route(
     method: &str,
     path: &str,

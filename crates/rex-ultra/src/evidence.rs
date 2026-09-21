@@ -22,7 +22,6 @@ pub struct EvidenceEntry {
 }
 
 pub struct EvidenceStore {
-    dir: PathBuf,
     manifest: PathBuf,
     seq: u64,
 }
@@ -41,11 +40,7 @@ impl EvidenceStore {
         if let Ok(text) = fs::read_to_string(&manifest) {
             seq = text.lines().filter(|l| !l.trim().is_empty()).count() as u64;
         }
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            manifest,
-            seq,
-        })
+        Ok(Self { manifest, seq })
     }
 
     fn append(&mut self, kind: &str, path: Option<String>, bytes: &[u8]) -> EvidenceEntry {

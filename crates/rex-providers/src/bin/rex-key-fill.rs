@@ -120,7 +120,7 @@ fn main() {
         if reader.read_line(&mut request_line).is_err() {
             continue;
         }
-        let mut parts = request_line.trim().split_whitespace();
+        let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let path = parts.next().unwrap_or("").to_string();
         let mut content_length = 0usize;

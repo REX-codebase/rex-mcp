@@ -6,7 +6,9 @@ use std::io::Write;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 struct Session {
-    child: Child,
+    // Kept alive for the length of the session; process cleanup happens
+    // with the test process.
+    _child: Child,
     stdin: ChildStdin,
     stdout: std::io::BufReader<ChildStdout>,
     next_id: i64,
@@ -29,7 +31,7 @@ impl Session {
             stdin: child.stdin.take().unwrap(),
             stdout: std::io::BufReader::new(child.stdout.take().unwrap()),
             next_id: 0,
-            child,
+            _child: child,
         }
     }
     fn call(&mut self, method: &str, params: Value) -> Value {

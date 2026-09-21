@@ -161,7 +161,7 @@ impl CustodyRegistry {
         let log = self
             .audits
             .get_mut(grant_id)
-            .ok_or_else(|| CustodyError::UnknownGrant)?;
+            .ok_or(CustodyError::UnknownGrant)?;
         log.append(now_ms, kind, detail).map_err(ioe)?;
         Ok(())
     }
@@ -170,6 +170,9 @@ impl CustodyRegistry {
 
     /// Host-only: mint an offer for a task. Refused when the task is
     /// already custodied or tombstoned (duplicate execution block).
+    // Custody terms arrive as their recorded parts; collapsing them into a
+    // params struct would rename the public custody vocabulary for style.
+    #[allow(clippy::too_many_arguments)]
     pub fn offer(
         &mut self,
         task_id: &str,

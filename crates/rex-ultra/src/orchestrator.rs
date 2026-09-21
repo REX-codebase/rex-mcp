@@ -205,6 +205,9 @@ impl<S: SecretStore + 'static, T: Transport + 'static> UltraRunService<S, T> {
     /// Start one Ultra pipeline in a caller-owned isolated workspace. Phase 2
     /// uses this to give every candidate the same provider/model/options while
     /// keeping proof bundles and filesystem effects separate.
+    // Every candidate gets the same provider/model/options plus its own
+    // workspace and id; these are the pipeline's real inputs, not a config bag.
+    #[allow(clippy::too_many_arguments)]
     pub fn begin_in(
         &self,
         id: &str,

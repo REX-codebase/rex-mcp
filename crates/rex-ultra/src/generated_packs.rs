@@ -12,7 +12,6 @@
 use crate::skills::{
     CertificationStatus, GateTemplate, RepositoryFacts, RuleModule, Selector, SkillPackManifest,
 };
-use serde::{Deserialize, Serialize};
 
 /// Static description of a language REX can recognize from repository facts
 /// and probe on PATH. First-class certified languages (Rust) deliberately

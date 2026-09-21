@@ -1111,7 +1111,7 @@ impl HarnessDaemon {
         if version > STORE_SCHEMA_VERSION {
             return Err(perr(
                 ErrorCode::VersionMismatch,
-                &format!("stored task schema v{version} is newer than this server"),
+                format!("stored task schema v{version} is newer than this server"),
                 id,
             ));
         }
@@ -2037,6 +2037,7 @@ mod tests {
                     .unwrap(),
             };
         }
+        assert_eq!(view.kernel_state, "completed");
         let receipt = daemon
             .ultra_promote(rex_protocol::UltraPromoteRequest {
                 task_id: ex.task_id.clone(),

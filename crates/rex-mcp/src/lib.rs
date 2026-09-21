@@ -81,7 +81,7 @@ impl McpServer {
                     ProtocolError::new(ErrorCode::UnknownTool, format!("unknown tool: {name}"))
                 })?;
                 let args = p.get("arguments").cloned().unwrap_or(json!({}));
-                self.daemon.dispatch(tool, args).map(|v| tool_result(v))
+                self.daemon.dispatch(tool, args).map(tool_result)
             }),
             _ => {
                 return if notify {
