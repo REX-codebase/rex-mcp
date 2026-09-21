@@ -609,6 +609,8 @@ fn ultra_view(task_id: String, view: &UltraHostView, skill_plan: Option<SkillPla
         status: status.into(),
         kernel_state: kernel_state.into(),
         candidate_requests: view.candidate_requests.iter().map(|r| UltraCandidateRequestView {
+            work_kind: match r.work_kind { rex_ultra::contract::WorkKind::General => "general",
+                rex_ultra::contract::WorkKind::Visual => "visual" }.into(),
             candidate_id: r.candidate_id.clone(), contract_hash: r.contract_hash.clone(),
             task: r.task.clone(), obligation_ids: r.obligation_ids.clone(),
         }).collect(),

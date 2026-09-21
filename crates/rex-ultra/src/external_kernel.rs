@@ -59,6 +59,9 @@ pub enum HostKernelStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostCandidateRequest {
+    /// Visual contracts require pixel evidence at the taste gate; the host
+    /// must know before generating candidates.
+    pub work_kind: crate::contract::WorkKind,
     pub candidate_id: String,
     pub contract_hash: String,
     pub task: String,
@@ -232,7 +235,8 @@ impl ExternalHostAdapter {
         (0..self.state.minimum_candidates).map(|index| {
             let candidate_id = canonical_hash(&(contract_hash.as_str(), index))
                 .map_err(|e| AdapterError::Encoding(e.to_string()))?;
-            Ok(HostCandidateRequest { candidate_id, contract_hash: contract_hash.clone(),
+            Ok(HostCandidateRequest { work_kind: self.state.contract.work_kind,
+                candidate_id, contract_hash: contract_hash.clone(),
                 task: self.state.contract.task.clone(), obligation_ids: obligation_ids.clone() })
         }).collect()
     }
@@ -846,5 +850,12 @@ mod tests {
             request_id: "anything".into(), candidate_id: requests[0].candidate_id.clone(),
             response_hash: canonical_hash(&content).unwrap(), content,
         }), Err(AdapterError::InvalidEvidence(_))));
+    }
+    #[test]
+    fn candidate_requests_carry_the_work_kind() {
+        let general = ExternalHostAdapter::new(contract(), 1).unwrap();
+        assert_eq!(general.requests().unwrap()[0].work_kind, crate::contract::WorkKind::General);
+        let visual = ExternalHostAdapter::new(visual_contract(), 1).unwrap();
+        assert_eq!(visual.requests().unwrap()[0].work_kind, crate::contract::WorkKind::Visual);
     }
 }

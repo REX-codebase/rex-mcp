@@ -527,6 +527,8 @@ pub struct UltraSubmitRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UltraCandidateRequestView {
+    /// "general" or "visual"; visual contracts demand pixel evidence.
+    pub work_kind: String,
     pub candidate_id: String,
     pub contract_hash: String,
     pub task: String,
