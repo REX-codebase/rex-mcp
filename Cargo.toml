@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rex-custody", "crates/rex-protocol", "crates/rex-daemon", "crates/rex-mcp", "crates/rex-prompt", "crates/rex-providers", "crates/rex-search", "crates/rex-tools", "crates/rex-preview", "crates/rex-ultra", "crates/rex-installed-agents", "src-tauri"]
+members = ["crates/rex-custody", "crates/rex-protocol", "crates/rex-daemon", "crates/rex-mcp", "crates/rex-prompt", "crates/rex-providers", "crates/rex-search", "crates/rex-tools", "crates/rex-preview", "crates/rex-ultra", "crates/rex-installed-agents", "src-tauri", "examples/rex-ultra-scripted-host"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

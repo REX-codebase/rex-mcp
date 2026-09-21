@@ -1,0 +1,10 @@
+[package]
+name = "rex-ultra-scripted-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rex-protocol = { path = "../../crates/rex-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
