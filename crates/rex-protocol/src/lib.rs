@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 pub const PROTOCOL_VERSION: &str = "1.1";
 
 pub mod schema;
+pub mod packets;
 
 /// The complete v1 tool surface. MCP names are the snake_case strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,6 +418,10 @@ pub struct StatusResponse {
     pub open_action: Option<ActionSpec>,
     pub budgets: BudgetView,
     pub last_event_seq: u64,
+    #[serde(default)]
+    pub operation: packets::OperationStatus,
+    #[serde(default)]
+    pub packet: packets::PacketIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

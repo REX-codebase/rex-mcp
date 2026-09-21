@@ -15,6 +15,7 @@ use rex_custody::{
     WorkerMode,
 };
 use rex_protocol::*;
+use rex_protocol::packets::{OperationStatus, PacketIdentity};
 use rex_tools::{ToolRequest, ToolResult, ToolRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -77,6 +78,12 @@ struct DurableTask {
     registered_evidence: BTreeSet<String>,
     result: Option<String>,
     terminal_reason: Option<String>,
+    #[serde(default = "default_branch_id")]
+    branch_id: String,
+    #[serde(default)]
+    resume_nonce: u64,
+    #[serde(default)]
+    operation_status: OperationStatus,
 }
 
 pub struct HarnessDaemon {
@@ -155,7 +162,9 @@ impl HarnessDaemon {
             heartbeat_seq: grant.lease.next_seq, heartbeat_interval_ms: grant.lease.heartbeat_interval_ms,
             max_tool_calls: max_tools, used_tool_calls: 0, max_wall_ms: max_wall,
             created_ms: now, last_event_seq: 0, proof: req.proof, evidence: BTreeMap::new(),
-            registered_evidence: BTreeSet::new(), result: None, terminal_reason: None };
+            registered_evidence: BTreeSet::new(), result: None, terminal_reason: None,
+            branch_id: "main".into(), resume_nonce: grant.lease.next_seq,
+            operation_status: if req.operator_is_agent { OperationStatus::ExternalHostRequired } else { OperationStatus::Prepared } };
         let plan_hash = task.plan_hash.clone(); let step_count = task.plan.len();
         self.append_event(&mut task, "task_created", json!({"plan_hash":plan_hash,
             "steps":step_count,"protocol":PROTOCOL_VERSION}))?;
@@ -273,7 +282,7 @@ impl HarnessDaemon {
         let completion = self.custody.lock().map_err(|_| internal("custody registry poisoned"))?
             .claim_completion(&t.token, &claim, &evaluator, now_ms());
         match completion {
-            Ok(_) => { t.state = TaskState::Completed; t.result = Some(req.narrative);
+            Ok(_) => { t.operation_status = OperationStatus::Committed; t.state = TaskState::Completed; t.result = Some(req.narrative);
                 t.terminal_reason = Some("verified completion".into());
                 let ev = t.evidence.clone();
                 self.append_event(&mut t, "task_completed", json!({"evidence":ev}))?;
@@ -291,11 +300,14 @@ impl HarnessDaemon {
     pub fn status(&self, req: TaskRefRequest) -> Result<StatusResponse, ProtocolError> {
         let t = self.load(&req.task_id)?;
         let lease = lease_view(&t); let used_wall = elapsed(&t);
+        let operation = status_operation(&t);
+        let packet = PacketIdentity::new(&t.branch_id, t.lease_epoch, t.resume_nonce, &t.request_id);
         Ok(StatusResponse { task_id: t.task_id, state: t.state, task: t.task,
             operator_is_agent: t.operator_is_agent, host: t.host, lease,
             open_action: t.open_action, budgets: BudgetView { max_tool_calls: t.max_tool_calls,
                 used_tool_calls: t.used_tool_calls, max_wall_ms: t.max_wall_ms,
-                used_wall_ms: used_wall }, last_event_seq: t.last_event_seq })
+                used_wall_ms: used_wall }, last_event_seq: t.last_event_seq,
+            operation, packet })
     }
 
     pub fn events(&self, req: EventsRequest) -> Result<EventsResponse, ProtocolError> {
@@ -331,6 +343,7 @@ impl HarnessDaemon {
                 reg.human_stop(&t.grant_id, now_ms()).map_err(custody_err)?;
             }
         }
+        t.operation_status = OperationStatus::Aborted;
         t.state = TaskState::Cancelled;
         let why = req.reason.unwrap_or_else(|| "cancelled by operator".into());
         t.terminal_reason = Some(why.clone()); t.open_action = None;
@@ -501,6 +514,14 @@ fn elapsed(t:&DurableTask)->u64 { now_ms().saturating_sub(t.created_ms) as u64 }
 fn lease_view(t:&DurableTask)->LeaseView { LeaseView { epoch:t.lease_epoch,
     expires_ms_from_now:t.lease_expires_ms.saturating_sub(now_ms()) as u64,
     heartbeat_interval_ms:t.heartbeat_interval_ms } }
+fn default_branch_id() -> String { "main".into() }
+fn status_operation(t: &DurableTask) -> OperationStatus {
+    if now_ms() >= t.lease_expires_ms && !t.state.is_terminal() {
+        OperationStatus::Stale
+    } else {
+        t.operation_status.clone()
+    }
+}
 fn host_label(h:HostKind)->&'static str { match h { HostKind::Human=>"human-ui",HostKind::ClaudeCode=>"claude-code",
     HostKind::Antigravity=>"antigravity",HostKind::GenericAgent=>"generic-mcp" } }
 fn perr(code:ErrorCode,msg:impl Into<String>,id:&str)->ProtocolError { ProtocolError::new(code,msg).for_task(id) }
@@ -529,7 +550,11 @@ mod tests {
         let a=daemon.execute(req("r1")).unwrap(); let b=daemon.execute(req("r1")).unwrap();
         assert_eq!(a.task_id,b.task_id); assert!(b.resumed); drop(daemon);
         let reopened=HarnessDaemon::open(&root,DaemonPolicy::conservative(&w)).unwrap();
-        assert_eq!(reopened.status(TaskRefRequest{task_id:a.task_id.clone()}).unwrap().state,TaskState::Active);
+        let status = reopened.status(TaskRefRequest{task_id:a.task_id.clone()}).unwrap();
+        assert_eq!(status.state,TaskState::Active);
+        assert_eq!(status.operation, OperationStatus::ExternalHostRequired);
+        assert_eq!(status.packet.branch_id, "main");
+        assert_eq!(status.packet.idempotency_key, "r1");
     }
     #[test] fn read_confined_and_cancel_durable() {
         let d=tempdir().unwrap(); let w=d.path().join("ws"); fs::create_dir_all(&w).unwrap();
@@ -540,6 +565,7 @@ mod tests {
             path:"hello.txt".into(),byte_range:None}).unwrap(); assert_eq!(got.content,"hello");
         let c=daemon.cancel(CancelRequest{task_id:ex.task_id.clone(),reason:Some("stop".into())}).unwrap();
         assert_eq!(c.state,TaskState::Cancelled);
+        assert_eq!(daemon.status(TaskRefRequest{task_id:ex.task_id.clone()}).unwrap().operation, OperationStatus::Aborted);
         // A path escape quarantines the custody grant outright.
         let ex2=daemon.execute(req("r3b")).unwrap();
         let e=daemon.read(ReadRequest{task_id:ex2.task_id.clone(),lease_epoch:ex2.lease.epoch,

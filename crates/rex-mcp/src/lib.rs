@@ -164,6 +164,10 @@ mod tests {
         assert_eq!(rows.len(),3); assert_eq!(rows[0]["result"]["protocolVersion"],MCP_PROTOCOL_VERSION);
         assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(),12);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"],"active");
+        let task_id = rows[2]["result"]["structuredContent"]["task_id"].as_str().unwrap();
+        let status = s.handle(rpc(4,"tools/call",json!({"name":"rex_status","arguments":{"task_id":task_id}}))).unwrap();
+        assert_eq!(status["result"]["structuredContent"]["operation"],"external_host_required");
+        assert_eq!(status["result"]["structuredContent"]["packet"]["branch_id"],"main");
     }
     #[test] fn mismatch_and_unknown_tool_are_structured_errors() {
         let (_d,mut s)=server();
