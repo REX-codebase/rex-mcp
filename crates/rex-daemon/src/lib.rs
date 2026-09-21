@@ -443,7 +443,9 @@ impl HarnessDaemon {
 
     fn skill_plan(&self) -> Option<SkillPlanView> {
         let facts = rex_ultra::skills::collect_repository_facts(&self.policy.workspace);
-        let plan = rex_ultra::skills::compile_plan(&facts, &rex_ultra::skill_packs::first_class_registry()).ok()?;
+        let mut registry = rex_ultra::skill_packs::first_class_registry();
+        registry.extend(rex_ultra::generated_packs::broad_registry(&facts));
+        let plan = rex_ultra::skills::compile_plan(&facts, &registry).ok()?;
         Some(SkillPlanView {
             plan_hash: plan.plan_hash,
             compiler_version: plan.compiler_version,

@@ -309,7 +309,12 @@ pub fn compile_plan(
         }))
         .collect();
     gates.sort_by(|a, b| (&a.pack, &a.id).cmp(&(&b.pack, &b.id)));
-    let unsupported: Vec<String> = unsupported.into_iter().collect();
+    let mut unsupported: Vec<String> = unsupported.into_iter().collect();
+    // Broad-support honesty: recognizable languages with no certified pack
+    // or broad template are reported Unknown, never silently ignored.
+    unsupported.extend(crate::generated_packs::unknown_language_notes(facts));
+    unsupported.sort();
+    unsupported.dedup();
 
     let plan_hash = canonical_hash(&(
         COMPILER_VERSION,
@@ -339,7 +344,7 @@ struct ResolvedConflictKey(String, String);
 
 
 /// Well-known native tools probed on PATH, without executing anything.
-pub const PROBED_TOOLS: &[&str] = &["cargo", "rustc", "node", "npx", "python3"];
+pub const PROBED_TOOLS: &[&str] = &["cargo", "rustc", "node", "npx", "python3", "go", "javac", "ruby", "gcc", "g++"];
 
 /// Collect repository facts from a workspace directory without executing
 /// any tool: file extensions and root manifests from a bounded walk, and

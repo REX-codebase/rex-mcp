@@ -21,6 +21,7 @@ pub mod phase4;
 pub mod phase5;
 pub mod verify;
 
+pub mod generated_packs;
 pub mod external_kernel;
 pub mod host_bridge;
 pub mod skill_packs;
