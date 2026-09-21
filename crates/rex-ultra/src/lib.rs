@@ -23,6 +23,7 @@ pub mod verify;
 
 pub mod external_kernel;
 pub mod host_bridge;
+pub mod skill_packs;
 pub mod skills;
 pub mod taste;
 
