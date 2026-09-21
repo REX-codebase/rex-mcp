@@ -484,6 +484,58 @@ impl HarnessDaemon {
         })
     }
 
+    /// Assemble and persist the machine-readable proof bundle for one task:
+    /// frozen plan, kernel state, qualified candidate, bound skill plan,
+    /// promotion receipt, full event stream and a deterministic bundle hash.
+    /// This is the artifact the proof journey and release evidence build on.
+    pub fn proof_bundle(&self, req: TaskRefRequest) -> Result<TaskProofBundle, ProtocolError> {
+        let t = self.load(&req.task_id)?;
+        let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
+        let adapter = bridge.load_existing(&t.task_id).map_err(|e| bridge_err(&t.task_id, e))?;
+        let (kernel_state, qualified_candidate) = match &adapter {
+            Some(adapter) => {
+                let state = match adapter.kernel().state {
+                    KernelState::New => "new", KernelState::Leased => "leased",
+                    KernelState::Running => "running", KernelState::AwaitingEvidence => "awaiting_evidence",
+                    KernelState::Completed => "completed", KernelState::Failed => "failed",
+                    KernelState::Revoked => "revoked",
+                };
+                (Some(state.to_string()), adapter.qualified_candidate().map(str::to_string))
+            }
+            None => (None, None),
+        };
+        let skill_plan = self.skill_plan();
+        let store = rex_ultra::promotion::PromotionStore::open(self.root.join("ultra"))
+            .map_err(|e| internal(format!("promotion store: {e:?}")))?;
+        let promotion = store.receipt(&t.task_id)
+            .map_err(|e| internal(format!("promotion receipt: {e:?}")))?;
+        let promotion_state = promotion.as_ref().map(|r| match r.state {
+            rex_ultra::promotion::PromotionState::Prepared => "prepared",
+            rex_ultra::promotion::PromotionState::Committed => "committed",
+            rex_ultra::promotion::PromotionState::RolledBack => "rolled_back",
+            rex_ultra::promotion::PromotionState::CorruptState => "corrupt_state",
+        }.to_string());
+        let events = self.events(EventsRequest { task_id: t.task_id.clone(), after_seq: 0, limit: None })?.events;
+        let bundle_hash = hash_json(&(
+            &t.task_id, &t.request_hash, &t.task, &t.plan, t.state,
+            &kernel_state, &qualified_candidate, &skill_plan, &promotion_state,
+            &promotion, &events,
+        ))?;
+        let bundle = TaskProofBundle {
+            task_id: t.task_id.clone(), request_hash: t.request_hash.clone(),
+            task: t.task.clone(), plan: t.plan.clone(), state: t.state,
+            kernel_state, qualified_candidate, skill_plan, promotion_state, promotion, events,
+            bundle_hash,
+        };
+        let dir = self.root.join("proofs");
+        fs::create_dir_all(&dir).map_err(internal)?;
+        let path = dir.join(format!("{}.json", t.task_id));
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(&bundle).map_err(internal)?).map_err(internal)?;
+        fs::rename(&temporary, &path).map_err(internal)?;
+        Ok(bundle)
+    }
+
     fn skill_plan(&self) -> Option<SkillPlanView> {
         let facts = rex_ultra::skills::collect_repository_facts(&self.policy.workspace);
         let mut registry = rex_ultra::skill_packs::first_class_registry();
@@ -635,6 +687,23 @@ fn make_action(task_id: &str, idx: usize, step: &PlanStep, max_wall_ms: u64) -> 
         acceptance: step.acceptance.clone().unwrap_or_else(|| "submit evidence and a truthful outcome".into()),
         max_wall_ms }
 }
+/// The machine-readable proof bundle for one task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskProofBundle {
+    pub task_id: String,
+    pub request_hash: String,
+    pub task: String,
+    pub plan: Vec<PlanStep>,
+    pub state: TaskState,
+    pub kernel_state: Option<String>,
+    pub qualified_candidate: Option<String>,
+    pub skill_plan: Option<SkillPlanView>,
+    pub promotion_state: Option<String>,
+    pub promotion: Option<rex_ultra::promotion::PromotionReceipt>,
+    pub events: Vec<TaskEvent>,
+    pub bundle_hash: String,
+}
+
 fn require_agent(t: &DurableTask) -> Result<(), ProtocolError> {
     if !t.operator_is_agent { return Err(perr(ErrorCode::ScopeDenied,
         "ultra external-host loop requires an agent-operated task", &t.task_id)); }
@@ -929,5 +998,43 @@ mod tests {
         assert_eq!(daemon.execute(stale).unwrap_err().code,ErrorCode::ScopeDenied);
         let mut current=req("r-handle"); current.resume_handle=Some(rotated);
         assert!(daemon.execute(current).unwrap().resumed);
+    }    #[test] fn proof_bundle_records_the_full_verified_journey() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws"); fs::create_dir_all(&w).unwrap();
+        let root=d.path().join("state");
+        let daemon=HarnessDaemon::open(&root,DaemonPolicy::conservative(&w)).unwrap();
+        let ex=daemon.execute(req("r-proof")).unwrap();
+        let open=daemon.ultra_open(UltraOpenRequest{task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        let mut view=open.clone();
+        for (i,c) in open.candidate_requests.iter().enumerate() {
+            let content=format!("{{\"files\":[{{\"path\":\"out.txt\",\"content\":\"v{i}\"}}]}}");
+            view=daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,UltraSubmissionKind::Candidate,
+                &c.candidate_id,&c.candidate_id,&content)).unwrap();
+        }
+        let candidate=view.evidence_requests[0].candidate_id.clone();
+        for r in view.evidence_requests.iter().filter(|r| r.candidate_id==candidate).cloned().collect::<Vec<_>>() {
+            view = match r.kind.as_str() {
+                "adversary" => daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,
+                    UltraSubmissionKind::Adversary,&r.request_id,&r.candidate_id,"{\"defects\":[]}")).unwrap(),
+                _ => daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,
+                    UltraSubmissionKind::Verifier,&r.request_id,&r.candidate_id,
+                    "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"}]}")).unwrap(),
+            };
+        }
+        let receipt=daemon.ultra_promote(rex_protocol::UltraPromoteRequest{
+            task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        assert_eq!(receipt.state,"committed");
+        let bundle=daemon.proof_bundle(TaskRefRequest{task_id:ex.task_id.clone()}).unwrap();
+        assert_eq!(bundle.kernel_state.as_deref(),Some("completed"));
+        assert_eq!(bundle.qualified_candidate.as_deref(),Some(candidate.as_str()));
+        assert_eq!(bundle.promotion_state.as_deref(),Some("committed"));
+        assert!(bundle.skill_plan.is_some());
+        assert!(!bundle.events.is_empty());
+        assert!(!bundle.bundle_hash.is_empty());
+        let again=daemon.proof_bundle(TaskRefRequest{task_id:ex.task_id.clone()}).unwrap();
+        assert_eq!(bundle.bundle_hash,again.bundle_hash,"proof bundle hash is deterministic");
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("proofs").join(format!("{}.json",ex.task_id))).unwrap()).unwrap();
+        assert_eq!(persisted["bundle_hash"].as_str().unwrap(),bundle.bundle_hash);
+        assert_eq!(persisted["promotion_state"].as_str().unwrap(),"committed");
     }
 }

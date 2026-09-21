@@ -138,6 +138,16 @@ impl UltraHostBridge {
         self.view(task_id, &mut adapter)
     }
 
+    /// Read-only adapter access for proof assembly; never creates state.
+    pub fn load_existing(&self, task_id: &str) -> Result<Option<ExternalHostAdapter>, BridgeError> {
+        let path = self.path(task_id)?;
+        if path.exists() {
+            ExternalHostAdapter::open(&path).map(Some).map_err(BridgeError::Adapter)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Promote the qualified candidate's sealed bundle into the destination
     /// with the full section-J sequence and verified rollback.
     pub fn promote(
