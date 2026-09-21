@@ -677,6 +677,17 @@ fn route(
                 ),
             }
         }
+        ("GET", ["api", "rex", "tasks", id, "proof"]) => {
+            // Read-only load of the persisted proof bundle; no daemon lock
+            // taken, matching the task scan above.
+            match read_proof_bundle(&rex_shell.state_dir, id) {
+                Ok(bundle) => json_response(200, &bundle),
+                Err(detail) => json_response(
+                    404,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
         ("POST", ["api", "rex", "tasks", id, "stop"]) => {
             // The permanent human Stop: cancel fences the lease and is final
             // even against an agent operator.
@@ -696,5 +707,50 @@ fn route(
             404,
             "{\"error\":{\"kind\":\"invalid_response\",\"detail\":\"unknown route\"}}",
         ),
+    }
+}
+
+/// Load the persisted proof bundle for a task. Task ids are confined to a
+/// filename-safe alphabet so a request path can never escape the proofs
+/// directory.
+fn read_proof_bundle(state_dir: &std::path::Path, task_id: &str) -> Result<String, String> {
+    if task_id.is_empty()
+        || !task_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("invalid task id".to_string());
+    }
+    let path = state_dir.join("proofs").join(format!("{task_id}.json"));
+    std::fs::read_to_string(&path).map_err(|_| format!("no proof bundle for task {task_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_proof_bundle;
+
+    #[test]
+    fn proof_bundle_reads_persisted_bundle_and_refuses_traversal() {
+        let dir = std::env::temp_dir().join(format!(
+            "rex-dev-proof-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("proofs")).unwrap();
+        std::fs::write(
+            dir.join("proofs").join("task-1.json"),
+            "{\"bundle_hash\":\"abc\"}",
+        )
+        .unwrap();
+
+        let found = read_proof_bundle(&dir, "task-1").unwrap();
+        assert!(found.contains("abc"));
+        assert!(read_proof_bundle(&dir, "task-9").is_err());
+        assert!(read_proof_bundle(&dir, "../task-1").is_err());
+        assert!(read_proof_bundle(&dir, "task-1/../../proofs/task-1").is_err());
+        assert!(read_proof_bundle(&dir, "").is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
