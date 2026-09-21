@@ -23,6 +23,7 @@ pub mod verify;
 
 pub mod external_kernel;
 pub mod host_bridge;
+pub mod taste;
 
 pub fn now_ms() -> u128 {
     std::time::SystemTime::now()
