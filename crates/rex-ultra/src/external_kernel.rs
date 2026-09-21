@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::adversary::{parse_defects, AdversaryReport};
 use crate::contract::AcceptanceContract;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +72,70 @@ pub struct CandidateResponse {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Adversary,
+    Verifier,
+}
+
+impl EvidenceKind {
+    fn label(self) -> &'static str {
+        match self {
+            EvidenceKind::Adversary => "adversary",
+            EvidenceKind::Verifier => "verifier",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostEvidenceRequest {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub contract_hash: String,
+    pub kind: EvidenceKind,
+    pub obligation_ids: Vec<String>,
+    pub candidate_response_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdversaryEvidence {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub response_hash: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifierEvidence {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub response_hash: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdversaryEvidenceRecord {
+    pub request_id: String,
+    pub response_hash: String,
+    pub report: AdversaryReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifierEvidenceRecord {
+    pub request_id: String,
+    pub response_hash: String,
+    /// obligation id -> proven by fresh host execution
+    pub outcomes: BTreeMap<String, bool>,
+    pub all_proven: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateEvidence {
+    pub adversary: Option<AdversaryEvidenceRecord>,
+    pub verifier: Option<VerifierEvidenceRecord>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ExternalAdapterState {
     contract: AcceptanceContract,
@@ -78,6 +143,8 @@ struct ExternalAdapterState {
     minimum_candidates: usize,
     host_attached: bool,
     responses: BTreeMap<String, CandidateResponse>,
+    #[serde(default)]
+    evidence: BTreeMap<String, CandidateEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +155,10 @@ pub enum AdapterError {
     DuplicateCandidate,
     DuplicateResponse,
     UnknownCandidate,
+    EvidenceStageNotOpen,
+    UnknownEvidenceRequest,
+    DuplicateEvidence,
+    InvalidEvidence(String),
     Io(String),
     Encoding(String),
     Kernel(KernelError),
@@ -109,6 +180,7 @@ impl ExternalHostAdapter {
                 contract, kernel: KernelSnapshot { task_id, state: KernelState::New, step: 0,
                     lease_epoch: 0, transcript_hash: "genesis".into() },
                 minimum_candidates, host_attached: false, responses: BTreeMap::new(),
+                evidence: BTreeMap::new(),
             },
         })
     }
@@ -180,6 +252,127 @@ impl ExternalHostAdapter {
         }).map_err(AdapterError::Kernel)?;
         self.persist()?;
         Ok(HostKernelStatus::Ready)
+    }
+
+    /// Deterministic adversary and verifier requests for every collected
+    /// candidate. Only issued once the candidate stage has advanced; before
+    /// that the truthful answer is an empty list.
+    pub fn evidence_requests(&self) -> Result<Vec<HostEvidenceRequest>, AdapterError> {
+        if self.state.kernel.state != KernelState::AwaitingEvidence {
+            return Ok(Vec::new());
+        }
+        let contract_hash = canonical_hash(&self.state.contract).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        let obligation_ids: Vec<String> = self.state.contract.obligations.iter().map(|o| o.id.clone()).collect();
+        let mut requests = Vec::new();
+        for (candidate_id, response) in &self.state.responses {
+            for kind in [EvidenceKind::Adversary, EvidenceKind::Verifier] {
+                let request_id = canonical_hash(&(contract_hash.as_str(), candidate_id.as_str(), kind.label()))
+                    .map_err(|e| AdapterError::Encoding(e.to_string()))?;
+                requests.push(HostEvidenceRequest {
+                    request_id,
+                    candidate_id: candidate_id.clone(),
+                    contract_hash: contract_hash.clone(),
+                    kind,
+                    obligation_ids: obligation_ids.clone(),
+                    candidate_response_hash: response.response_hash.clone(),
+                });
+            }
+        }
+        Ok(requests)
+    }
+
+    fn expect_evidence_request(&self, kind: EvidenceKind, candidate_id: &str) -> Result<String, AdapterError> {
+        if !self.state.host_attached || self.state.kernel.state != KernelState::AwaitingEvidence {
+            return Err(AdapterError::EvidenceStageNotOpen);
+        }
+        if !self.state.responses.contains_key(candidate_id) { return Err(AdapterError::UnknownCandidate); }
+        let contract_hash = canonical_hash(&self.state.contract).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        canonical_hash(&(contract_hash.as_str(), candidate_id, kind.label()))
+            .map_err(|e| AdapterError::Encoding(e.to_string()))
+    }
+
+    pub fn record_adversary(&mut self, evidence: AdversaryEvidence) -> Result<(), AdapterError> {
+        let expected = self.expect_evidence_request(EvidenceKind::Adversary, &evidence.candidate_id)?;
+        if evidence.request_id != expected { return Err(AdapterError::UnknownEvidenceRequest); }
+        if self.state.evidence.get(&evidence.candidate_id).and_then(|e| e.adversary.as_ref()).is_some() {
+            return Err(AdapterError::DuplicateEvidence);
+        }
+        let expected_hash = canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        if expected_hash != evidence.response_hash { return Err(AdapterError::Encoding("response hash mismatch".into())); }
+        let report = parse_defects(&evidence.content, "external-host");
+        self.state.evidence.entry(evidence.candidate_id.clone()).or_default().adversary =
+            Some(AdversaryEvidenceRecord { request_id: evidence.request_id, response_hash: evidence.response_hash, report });
+        self.persist()
+    }
+
+    pub fn record_verifier(&mut self, evidence: VerifierEvidence) -> Result<(), AdapterError> {
+        let expected = self.expect_evidence_request(EvidenceKind::Verifier, &evidence.candidate_id)?;
+        if evidence.request_id != expected { return Err(AdapterError::UnknownEvidenceRequest); }
+        if self.state.evidence.get(&evidence.candidate_id).and_then(|e| e.verifier.as_ref()).is_some() {
+            return Err(AdapterError::DuplicateEvidence);
+        }
+        let expected_hash = canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        if expected_hash != evidence.response_hash { return Err(AdapterError::Encoding("response hash mismatch".into())); }
+        #[derive(Deserialize)]
+        struct RawOutcome { obligation_id: String, status: String }
+        #[derive(Deserialize)]
+        struct RawOutcomes { outcomes: Vec<RawOutcome> }
+        let raw: RawOutcomes = serde_json::from_str(&evidence.content)
+            .map_err(|e| AdapterError::InvalidEvidence(e.to_string()))?;
+        let mut outcomes = BTreeMap::new();
+        for outcome in raw.outcomes {
+            if outcomes.insert(outcome.obligation_id.clone(), outcome.status == "proven").is_some() {
+                return Err(AdapterError::InvalidEvidence("duplicate obligation outcome".into()));
+            }
+        }
+        let all_proven = !self.state.contract.obligations.is_empty()
+            && self.state.contract.obligations.iter().all(|o| outcomes.get(&o.id) == Some(&true));
+        self.state.evidence.entry(evidence.candidate_id.clone()).or_default().verifier =
+            Some(VerifierEvidenceRecord { request_id: evidence.request_id, response_hash: evidence.response_hash, outcomes, all_proven });
+        self.persist()
+    }
+
+    pub fn candidate_evidence(&self, candidate_id: &str) -> Option<&CandidateEvidence> {
+        self.state.evidence.get(candidate_id)
+    }
+
+    /// Evidence-gated transition. A candidate qualifies only when its
+    /// adversary report is conclusive and clean and its verifier outcomes
+    /// prove every contract obligation. Any qualified candidate completes
+    /// the kernel; when every candidate is fully evidenced and none
+    /// qualifies the kernel fails closed. Anything else stays truthfully
+    /// pending in AwaitingEvidence.
+    pub fn finalize(&mut self) -> Result<KernelState, AdapterError> {
+        if !self.state.host_attached { return Err(AdapterError::HostRequired); }
+        if self.state.kernel.state != KernelState::AwaitingEvidence { return Ok(self.state.kernel.state); }
+        let mut qualified = false;
+        let mut fully_evidenced = true;
+        for candidate_id in self.state.responses.keys() {
+            let evidence = self.state.evidence.get(candidate_id);
+            let adversary_clean = evidence
+                .and_then(|e| e.adversary.as_ref())
+                .map(|a| !a.report.inconclusive && a.report.defects.is_empty())
+                .unwrap_or(false);
+            let verifier_proven = evidence
+                .and_then(|e| e.verifier.as_ref())
+                .map(|v| v.all_proven)
+                .unwrap_or(false);
+            if adversary_clean && verifier_proven { qualified = true; }
+            let complete_record = evidence
+                .map(|e| e.adversary.is_some() && e.verifier.is_some())
+                .unwrap_or(false);
+            if !complete_record { fully_evidenced = false; }
+        }
+        if qualified {
+            self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Complete).map_err(AdapterError::Kernel)?;
+            self.persist()?;
+        } else if fully_evidenced && !self.state.responses.is_empty() {
+            self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Fail {
+                reason: "every candidate rejected by adversary or verifier evidence".into(),
+            }).map_err(AdapterError::Kernel)?;
+            self.persist()?;
+        }
+        Ok(self.state.kernel.state)
     }
 
     fn persist(&self) -> Result<(), AdapterError> {
@@ -289,5 +482,182 @@ mod tests {
         assert_eq!(recovered.status(), HostKernelStatus::Ready);
         assert_eq!(recovered.requests().unwrap(), requests);
         assert_eq!(recovered.responses().count(), 2);
+    }
+    fn ready_adapter() -> (ExternalHostAdapter, Vec<HostCandidateRequest>) {
+        let mut adapter = ExternalHostAdapter::new(contract(), 2).unwrap();
+        adapter.attach_host(1).unwrap();
+        let requests = adapter.requests().unwrap();
+        for (index, request) in requests.iter().enumerate() {
+            let content = format!("candidate-{index}");
+            adapter.record_response(CandidateResponse {
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content,
+            }).unwrap();
+        }
+        assert_eq!(adapter.advance().unwrap(), HostKernelStatus::Ready);
+        (adapter, requests)
+    }
+
+    fn evidence_for(request: &HostEvidenceRequest, content: &str) -> (String, String) {
+        (request.request_id.clone(), canonical_hash(&content).unwrap())
+    }
+
+    #[test]
+    fn evidence_requests_are_deterministic_per_candidate_and_kind() {
+        let (adapter, requests) = ready_adapter();
+        let evidence_requests = adapter.evidence_requests().unwrap();
+        assert_eq!(evidence_requests.len(), 4);
+        let again = adapter.evidence_requests().unwrap();
+        assert_eq!(evidence_requests, again);
+        let ids: std::collections::BTreeSet<&str> = evidence_requests.iter().map(|r| r.request_id.as_str()).collect();
+        assert_eq!(ids.len(), 4);
+        for request in &evidence_requests {
+            assert!(requests.iter().any(|c| c.candidate_id == request.candidate_id));
+            assert_eq!(request.obligation_ids, vec!["builds".to_string()]);
+        }
+        assert_eq!(evidence_requests.iter().filter(|r| r.kind == EvidenceKind::Adversary).count(), 2);
+        assert_eq!(evidence_requests.iter().filter(|r| r.kind == EvidenceKind::Verifier).count(), 2);
+    }
+
+    #[test]
+    fn evidence_stage_opens_only_after_candidates_advance() {
+        let mut adapter = ExternalHostAdapter::new(contract(), 1).unwrap();
+        adapter.attach_host(1).unwrap();
+        assert!(adapter.evidence_requests().unwrap().is_empty());
+        let request = adapter.requests().unwrap().remove(0);
+        let content = "only".to_string();
+        adapter.record_response(CandidateResponse {
+            candidate_id: request.candidate_id.clone(),
+            response_hash: canonical_hash(&content).unwrap(),
+            content,
+        }).unwrap();
+        let adversary = AdversaryEvidence {
+            request_id: "anything".into(),
+            candidate_id: request.candidate_id.clone(),
+            response_hash: canonical_hash(&"{}").unwrap(),
+            content: "{}".into(),
+        };
+        assert_eq!(adapter.record_adversary(adversary), Err(AdapterError::EvidenceStageNotOpen));
+    }
+
+    #[test]
+    fn adversary_and_verifier_evidence_gates_completion() {
+        let (mut adapter, _) = ready_adapter();
+        let requests = adapter.evidence_requests().unwrap();
+        let candidate = requests[0].candidate_id.clone();
+        let adversary_request = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary).unwrap();
+        let verifier_request = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier).unwrap();
+
+        let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
+        assert_eq!(adapter.record_adversary(AdversaryEvidence {
+            request_id: "forged".into(), candidate_id: candidate.clone(), response_hash: hash.clone(), content: "{\"defects\":[]}".into(),
+        }), Err(AdapterError::UnknownEvidenceRequest));
+        assert_eq!(adapter.record_adversary(AdversaryEvidence {
+            request_id: request_id.clone(), candidate_id: candidate.clone(), response_hash: canonical_hash(&"tampered").unwrap(), content: "{\"defects\":[]}".into(),
+        }), Err(AdapterError::Encoding("response hash mismatch".into())));
+        adapter.record_adversary(AdversaryEvidence {
+            request_id, candidate_id: candidate.clone(), response_hash: hash, content: "{\"defects\":[]}".into(),
+        }).unwrap();
+        assert!(matches!(adapter.finalize().unwrap(), KernelState::AwaitingEvidence));
+
+        let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
+        let (request_id, hash) = evidence_for(verifier_request, verifier_content);
+        adapter.record_verifier(VerifierEvidence {
+            request_id: request_id.clone(), candidate_id: candidate.clone(), response_hash: hash, content: verifier_content.into(),
+        }).unwrap();
+        assert_eq!(adapter.record_verifier(VerifierEvidence {
+            request_id, candidate_id: candidate.clone(), response_hash: canonical_hash(&verifier_content).unwrap(), content: verifier_content.into(),
+        }), Err(AdapterError::DuplicateEvidence));
+
+        assert_eq!(adapter.finalize().unwrap(), KernelState::Completed);
+        assert_eq!(adapter.kernel().state, KernelState::Completed);
+    }
+
+    #[test]
+    fn unproven_verifier_blocks_completion_until_every_candidate_fails() {
+        let (mut adapter, _) = ready_adapter();
+        let requests = adapter.evidence_requests().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for candidate in requests.iter().map(|r| r.candidate_id.clone()).filter(|c| seen.insert(c.clone())) {
+            let adversary_request = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary).unwrap();
+            let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
+            adapter.record_adversary(AdversaryEvidence {
+                request_id, candidate_id: candidate.clone(), response_hash: hash, content: "{\"defects\":[]}".into(),
+            }).unwrap();
+            let verifier_request = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier).unwrap();
+            let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"failed\"}]}";
+            let (request_id, hash) = evidence_for(verifier_request, verifier_content);
+            adapter.record_verifier(VerifierEvidence {
+                request_id, candidate_id: candidate.clone(), response_hash: hash, content: verifier_content.into(),
+            }).unwrap();
+        }
+        assert_eq!(adapter.finalize().unwrap(), KernelState::Failed);
+        assert_eq!(adapter.kernel().state, KernelState::Failed);
+    }
+
+    #[test]
+    fn standing_defects_fail_closed_and_inconclusive_never_cleans() {
+        let (mut adapter, _) = ready_adapter();
+        let requests = adapter.evidence_requests().unwrap();
+        let first = requests[0].candidate_id.clone();
+        let adversary_request = requests.iter().find(|r| r.candidate_id == first && r.kind == EvidenceKind::Adversary).unwrap();
+        let dirty = "{\"defects\":[{\"title\":\"fake proof\",\"detail\":\"cached result\"}]}";
+        let (request_id, hash) = evidence_for(adversary_request, dirty);
+        adapter.record_adversary(AdversaryEvidence {
+            request_id, candidate_id: first.clone(), response_hash: hash, content: dirty.into(),
+        }).unwrap();
+        let record = adapter.candidate_evidence(&first).unwrap().adversary.as_ref().unwrap();
+        assert!(!record.report.inconclusive);
+        assert_eq!(record.report.defects.len(), 1);
+
+        let second = requests.iter().map(|r| r.candidate_id.clone()).find(|c| *c != first).unwrap();
+        let adversary_request = requests.iter().find(|r| r.candidate_id == second && r.kind == EvidenceKind::Adversary).unwrap();
+        let (request_id, hash) = evidence_for(adversary_request, "could not inspect");
+        adapter.record_adversary(AdversaryEvidence {
+            request_id, candidate_id: second.clone(), response_hash: hash, content: "could not inspect".into(),
+        }).unwrap();
+        let verifier_request = requests.iter().find(|r| r.candidate_id == second && r.kind == EvidenceKind::Verifier).unwrap();
+        let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
+        let (request_id, hash) = evidence_for(verifier_request, verifier_content);
+        adapter.record_verifier(VerifierEvidence {
+            request_id, candidate_id: second.clone(), response_hash: hash, content: verifier_content.into(),
+        }).unwrap();
+        assert!(matches!(adapter.finalize().unwrap(), KernelState::AwaitingEvidence));
+    }
+
+    #[test]
+    fn evidence_stage_survives_restart_replay() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("external.json");
+        let mut adapter = ExternalHostAdapter::new(contract(), 1).unwrap();
+        adapter.save_as(&path).unwrap();
+        adapter.attach_host(1).unwrap();
+        let request = adapter.requests().unwrap().remove(0);
+        let content = "candidate-0".to_string();
+        adapter.record_response(CandidateResponse {
+            candidate_id: request.candidate_id.clone(),
+            response_hash: canonical_hash(&content).unwrap(),
+            content,
+        }).unwrap();
+        assert_eq!(adapter.advance().unwrap(), HostKernelStatus::Ready);
+        let requests = adapter.evidence_requests().unwrap();
+        let adversary_request = requests.iter().find(|r| r.kind == EvidenceKind::Adversary).unwrap();
+        let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
+        adapter.record_adversary(AdversaryEvidence {
+            request_id, candidate_id: request.candidate_id.clone(), response_hash: hash, content: "{\"defects\":[]}".into(),
+        }).unwrap();
+
+        let mut recovered = ExternalHostAdapter::open(&path).unwrap();
+        assert_eq!(recovered.evidence_requests().unwrap(), requests);
+        let verifier_request = requests.iter().find(|r| r.kind == EvidenceKind::Verifier).unwrap();
+        let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
+        let (request_id, hash) = evidence_for(verifier_request, verifier_content);
+        recovered.record_verifier(VerifierEvidence {
+            request_id, candidate_id: request.candidate_id.clone(), response_hash: hash, content: verifier_content.into(),
+        }).unwrap();
+        assert_eq!(recovered.finalize().unwrap(), KernelState::Completed);
+        let reloaded = ExternalHostAdapter::open(&path).unwrap();
+        assert_eq!(reloaded.kernel().state, KernelState::Completed);
     }
 }
