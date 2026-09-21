@@ -22,6 +22,7 @@ pub mod phase5;
 pub mod verify;
 
 pub mod external_kernel;
+pub mod host_bridge;
 
 pub fn now_ms() -> u128 {
     std::time::SystemTime::now()
