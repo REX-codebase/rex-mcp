@@ -337,6 +337,63 @@ fn matches_certified(pack: &SkillPackManifest) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolvedConflictKey(String, String);
 
+
+/// Well-known native tools probed on PATH, without executing anything.
+pub const PROBED_TOOLS: &[&str] = &["cargo", "rustc", "node", "npx", "python3"];
+
+/// Collect repository facts from a workspace directory without executing
+/// any tool: file extensions and root manifests from a bounded walk, and
+/// detected tools from a PATH directory listing. Detection is honest - a
+/// tool is reported only when its executable file is present, never assumed.
+pub fn collect_repository_facts(workspace: &std::path::Path) -> RepositoryFacts {
+    let mut facts = RepositoryFacts::default();
+    collect_dir(workspace, 0, &mut facts);
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for tool in PROBED_TOOLS {
+                if dir.join(tool).is_file() {
+                    facts.detected_tools.insert((*tool).to_string());
+                }
+            }
+        }
+    }
+    facts
+}
+
+const MANIFEST_NAMES: &[&str] = &[
+    "Cargo.toml", "package.json", "pyproject.toml", "go.mod", "pom.xml",
+    "build.gradle", "Gemfile", "composer.json", "Package.swift",
+];
+const MAX_WALK_DEPTH: u32 = 3;
+const MAX_WALK_ENTRIES: usize = 4_096;
+
+fn collect_dir(dir: &std::path::Path, depth: u32, facts: &mut RepositoryFacts) {
+    if depth > MAX_WALK_DEPTH { return; }
+    let Ok(entries) = std::fs::read_dir(dir) else { return; };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        count += 1;
+        if count > MAX_WALK_ENTRIES { return; }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') { continue; }
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_symlink() { continue; }
+        if kind.is_dir() {
+            collect_dir(&entry.path(), depth + 1, facts);
+        } else if kind.is_file() {
+            if depth == 0 && MANIFEST_NAMES.contains(&name.as_str()) {
+                facts.manifests.insert(name.clone());
+            }
+            if let Some((_, extension)) = name.rsplit_once('.') {
+                if !extension.is_empty() && extension.len() <= 12
+                    && extension.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    facts.file_extensions.insert(extension.to_string());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +547,39 @@ mod tests {
         let errors = compile_plan(&facts(), &[bad]).unwrap_err();
         assert!(errors.iter().any(|e| e.contains("pack id is required")));
         assert!(errors.iter().any(|e| e.contains("semver")));
+    }
+    #[test]
+    fn facts_come_from_the_workspace_and_path_without_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("src").join("notes.txt"), "hi").unwrap();
+        let facts = collect_repository_facts(root);
+        assert!(facts.manifests.contains("Cargo.toml"));
+        assert!(facts.file_extensions.contains("rs"));
+        assert!(facts.file_extensions.contains("txt"));
+        // PATH probing reports only what is actually present.
+        let path_has_cargo = std::env::var_os("PATH")
+            .map(|v| std::env::split_paths(&v).any(|d| d.join("cargo").is_file()))
+            .unwrap_or(false);
+        assert_eq!(facts.detected_tools.contains("cargo"), path_has_cargo);
+        assert!(!facts.detected_tools.contains("definitely-not-a-tool"));
+    }
+
+    #[test]
+    fn facts_feed_the_first_class_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(root.join("lib.rs"), "").unwrap();
+        let facts = collect_repository_facts(root);
+        let plan = compile_plan(&facts, &crate::skill_packs::first_class_registry()).unwrap();
+        let path_has_cargo = std::env::var_os("PATH")
+            .map(|v| std::env::split_paths(&v).any(|d| d.join("cargo").is_file()))
+            .unwrap_or(false);
+        assert_eq!(plan.selected.iter().any(|p| p.id == "rust"), path_has_cargo && facts.detected_tools.contains("rustc"));
+        assert!(plan.selected.iter().any(|p| p.id == "shared-laws"));
     }
 }

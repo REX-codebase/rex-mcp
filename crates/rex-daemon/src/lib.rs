@@ -91,6 +91,8 @@ struct DurableTask {
     resume_nonce: u64,
     #[serde(default)]
     operation_status: OperationStatus,
+    #[serde(default)]
+    ultra_skill_plan_hash: Option<String>,
 }
 
 pub struct HarnessDaemon {
@@ -171,7 +173,8 @@ impl HarnessDaemon {
             created_ms: now, last_event_seq: 0, proof: req.proof, evidence: BTreeMap::new(),
             registered_evidence: BTreeSet::new(), result: None, terminal_reason: None,
             branch_id: "main".into(), resume_nonce: grant.lease.next_seq,
-            operation_status: if req.operator_is_agent { OperationStatus::ExternalHostRequired } else { OperationStatus::Prepared } };
+            operation_status: if req.operator_is_agent { OperationStatus::ExternalHostRequired } else { OperationStatus::Prepared },
+            ultra_skill_plan_hash: None };
         let plan_hash = task.plan_hash.clone(); let step_count = task.plan.len();
         self.append_event(&mut task, "task_created", json!({"plan_hash":plan_hash,
             "steps":step_count,"protocol":PROTOCOL_VERSION}))?;
@@ -392,14 +395,23 @@ impl HarnessDaemon {
     /// The first open attaches the host at the task's lease epoch; later
     /// opens are pure views over the durable kernel.
     pub fn ultra_open(&self, req: UltraOpenRequest) -> Result<UltraViewResponse, ProtocolError> {
-        let t = self.live(&req.task_id, req.lease_epoch)?;
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
         require_agent(&t)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
         let contract = contract_from_plan(&t.task, &t.plan);
         let view = bridge
             .open_requests(&t.task_id, &contract, DEFAULT_MINIMUM_CANDIDATES, t.lease_epoch)
             .map_err(|e| bridge_err(&t.task_id, e))?;
-        Ok(ultra_view(t.task_id.clone(), &view))
+        let plan = self.skill_plan();
+        if let Some(plan) = &plan {
+            if t.ultra_skill_plan_hash.as_deref() != Some(plan.plan_hash.as_str()) {
+                t.ultra_skill_plan_hash = Some(plan.plan_hash.clone());
+                self.append_event(&mut t, "ultra_skill_plan", json!({"plan_hash":plan.plan_hash,
+                    "selected":plan.selected,"unsupported":plan.unsupported}))?;
+                self.persist(&t)?;
+            }
+        }
+        Ok(ultra_view(t.task_id.clone(), &view, plan))
     }
 
     /// Submit one candidate response or one adversary/verifier evidence item.
@@ -423,7 +435,22 @@ impl HarnessDaemon {
         self.append_event(&mut t, "ultra_submission", json!({"kind":format!("{:?}",req.kind),
             "kernel_state":format!("{:?}",view.kernel_state)}))?;
         self.persist(&t)?;
-        Ok(ultra_view(t.task_id.clone(), &view))
+        Ok(ultra_view(t.task_id.clone(), &view, self.skill_plan()))
+    }
+
+    fn skill_plan(&self) -> Option<SkillPlanView> {
+        let facts = rex_ultra::skills::collect_repository_facts(&self.policy.workspace);
+        let plan = rex_ultra::skills::compile_plan(&facts, &rex_ultra::skill_packs::first_class_registry()).ok()?;
+        Some(SkillPlanView {
+            plan_hash: plan.plan_hash,
+            compiler_version: plan.compiler_version,
+            selected: plan.selected.iter().map(|p| format!("{}@{}", p.id, p.version)).collect(),
+            gates: plan.gates.iter().map(|g| SkillGateView {
+                pack: g.pack.clone(), id: g.id.clone(),
+                command_hint: g.command_hint.clone(), required: g.required,
+            }).collect(),
+            unsupported: plan.unsupported,
+        })
     }
 
     fn call_tool(&self, t: &mut DurableTask, request: ToolRequest) -> Result<ToolResult, ProtocolError> {
@@ -559,7 +586,7 @@ fn bridge_err(task_id: &str, e: BridgeError) -> ProtocolError {
         BridgeError::Io(m) => perr(ErrorCode::Internal, format!("ultra store: {m}"), task_id),
     }
 }
-fn ultra_view(task_id: String, view: &UltraHostView) -> UltraViewResponse {
+fn ultra_view(task_id: String, view: &UltraHostView, skill_plan: Option<SkillPlanView>) -> UltraViewResponse {
     let status = match view.status {
         HostKernelStatus::HostRequired => "host_required",
         HostKernelStatus::Collecting => "collecting",
@@ -590,6 +617,7 @@ fn ultra_view(task_id: String, view: &UltraHostView) -> UltraViewResponse {
             obligation_ids: r.obligation_ids.clone(),
             candidate_response_hash: r.candidate_response_hash.clone(),
         }).collect(),
+        skill_plan,
     }
 }
 fn request_hash(r: &ExecuteRequest) -> Result<String, ProtocolError> { hash_json(r) }
@@ -747,5 +775,21 @@ mod tests {
             "not-a-candidate","not-a-candidate","anything");
         let e=daemon.ultra_submit(unknown).unwrap_err();
         assert_eq!(e.code,ErrorCode::GateFailed);
+    }    #[test] fn ultra_open_binds_a_compiled_skill_plan_once() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws"); fs::create_dir_all(&w).unwrap();
+        fs::write(w.join("Cargo.toml"),"[package]").unwrap();
+        let daemon=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let ex=daemon.execute(req("r-skills")).unwrap();
+        let open=daemon.ultra_open(UltraOpenRequest{task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        let plan=open.skill_plan.expect("skill plan bound");
+        assert!(plan.selected.iter().any(|s| s.starts_with("shared-laws@")));
+        assert!(plan.gates.iter().any(|g| g.id=="scope-diff" && g.required));
+        let hash=plan.plan_hash.clone();
+        assert!(!hash.is_empty());
+        let again=daemon.ultra_open(UltraOpenRequest{task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        assert_eq!(again.skill_plan.unwrap().plan_hash,hash);
+        let events=daemon.events(EventsRequest{task_id:ex.task_id.clone(),after_seq:0,limit:None}).unwrap();
+        let bindings=events.events.iter().filter(|e| e.kind=="ultra_skill_plan").count();
+        assert_eq!(bindings,1,"plan binding is recorded once per hash, not per open");
     }
 }

@@ -541,6 +541,25 @@ pub struct UltraEvidenceRequestView {
     pub candidate_response_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillGateView {
+    pub pack: String,
+    pub id: String,
+    pub command_hint: String,
+    pub required: bool,
+}
+
+/// The compiled, version-pinned skill plan bound to a task: what was
+/// selected, which executable gates apply, and what is honestly unsupported.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillPlanView {
+    pub plan_hash: String,
+    pub compiler_version: String,
+    pub selected: Vec<String>,
+    pub gates: Vec<SkillGateView>,
+    pub unsupported: Vec<String>,
+}
+
 /// Host-visible Ultra loop state: truthful kernel status plus open requests.
 /// Strings, not rex-ultra types, keep the protocol crate dependency-free of
 /// the Ultra subsystem.
@@ -551,6 +570,8 @@ pub struct UltraViewResponse {
     pub kernel_state: String,
     pub candidate_requests: Vec<UltraCandidateRequestView>,
     pub evidence_requests: Vec<UltraEvidenceRequestView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_plan: Option<SkillPlanView>,
 }
 
 #[cfg(test)]
