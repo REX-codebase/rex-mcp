@@ -185,6 +185,67 @@ fn full_caller_driven_lifecycle_over_stdio() {
 }
 
 #[test]
+fn agent_execute_advertises_and_accepts_host_resume_handle() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = d.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut s = Session::start(&d.path().join("state"), &ws, true);
+    let initialized = s.call("initialize", json!({"protocolVersion":"2025-11-25"}));
+    assert!(initialized.get("result").is_some());
+
+    let tools = s.call("tools/list", json!({}));
+    let execute_schema = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "rex_execute")
+        .unwrap();
+    assert_eq!(
+        execute_schema["inputSchema"]["properties"]["resume_handle"]["type"],
+        "string"
+    );
+    assert_eq!(
+        execute_schema["inputSchema"]["properties"]["follow_up"]["type"],
+        "string"
+    );
+
+    let initial = s.tool(
+        "rex_execute",
+        json!({
+            "request_id":"resume-contract",
+            "task":"resume the same task",
+            "host":"generic_agent",
+            "operator_is_agent":true,
+            "ultra":true
+        }),
+    );
+    let task_id = initial["task_id"].as_str().unwrap();
+    let handle = initial["host_resume_handle"].as_str().unwrap();
+
+    let resumed = s.tool(
+        "rex_execute",
+        json!({
+            "request_id":"resume-contract",
+            "task_id":task_id,
+            "task":"resume the same task",
+            "host":"generic_agent",
+            "operator_is_agent":true,
+            "ultra":true,
+            "resume_handle":handle,
+            "follow_up":"continue the same task"
+        }),
+    );
+    assert_eq!(resumed["task_id"], task_id);
+    assert_eq!(resumed["resumed"], true);
+    assert_ne!(resumed["host_resume_handle"], handle);
+
+    let events = s.tool("rex_events", json!({"task_id":task_id}));
+    assert!(events["events"].as_array().unwrap().iter().any(|event| {
+        event["kind"] == "host_follow_up" && event["detail"]["text"] == "continue the same task"
+    }));
+}
+
+#[test]
 fn mutations_require_trusted_launcher_approval_over_stdio() {
     let d = tempfile::tempdir().unwrap();
     let ws = d.path().join("ws");
