@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  proofJourneyPhases,
   rexTaskEvents,
   rexTaskList,
+  rexTaskProof,
   rexTaskStatus,
   rexTaskStop,
+  type ProofPhase,
   type RexEvent,
+  type RexProof,
   type RexStatus,
   type RexTaskSummary,
 } from "../data/rexTasks";
@@ -36,6 +40,7 @@ function eventLine(event: RexEvent): string {
 export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () => void }) {
   const [status, setStatus] = useState<RexStatus | null>(null);
   const [events, setEvents] = useState<RexEvent[]>([]);
+  const [proof, setProof] = useState<RexProof | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const cursor = useRef(0);
@@ -45,6 +50,7 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
     cursor.current = 0;
     setEvents([]);
     setStatus(null);
+    setProof(null);
     setError(null);
     const tick = () => {
       rexTaskStatus(taskId)
@@ -54,7 +60,15 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
         .then((r) => {
           if (!active || r.events.length === 0) return;
           cursor.current = r.last_seq;
-          setEvents((prev) => [...prev, ...r.events].slice(-50));
+          setEvents((prev) => {
+            const next = [...prev, ...r.events].slice(-50);
+            if (next.some((e) => e.kind.startsWith("ultra_"))) {
+              rexTaskProof(taskId)
+                .then((p) => { if (active) setProof(p); })
+                .catch(() => undefined);
+            }
+            return next;
+          });
         })
         .catch(() => undefined);
     };
@@ -64,6 +78,16 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
   }, [taskId]);
 
   const terminal = status != null && TERMINAL.has(status.state);
+  const phases: ProofPhase[] = proofJourneyPhases(events);
+  const terminalLine = !status
+    ? ""
+    : status.state === "completed"
+      ? "Completed - every gate passed and the winning candidate was promoted."
+      : status.state === "failed"
+        ? "Failed - the gates refused the work; the reason is in the evidence below."
+        : status.state === "cancelled"
+          ? "Stopped - the human Stop is final."
+          : "Work continues - the daemon waits for the host to call again.";
   const stop = () => {
     if (stopping || terminal) return;
     setStopping(true);
@@ -105,6 +129,53 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
           {status.open_action && !terminal && (
             <p className="rex-task-action">Open action: {status.open_action.instructions}</p>
           )}
+        </div>
+      )}
+      {phases.length > 0 && (
+        <div className="proof-journey" aria-label="Ultra proof journey">
+          <ol className="proof-spine">
+            {phases.map((phase) => (
+              <li key={phase.id} className={`proof-node is-${phase.state}`}>
+                <span className="proof-dot" aria-hidden="true" />
+                {phase.label}
+              </li>
+            ))}
+          </ol>
+          <div className="proof-hero">
+            <p className="proof-hero-line">{terminalLine}</p>
+            {proof && (
+              <dl className="proof-hero-grid">
+                {proof.kernel_state && (
+                  <div>
+                    <dt>Kernel</dt>
+                    <dd>{proof.kernel_state.replace(/_/g, " ")}</dd>
+                  </div>
+                )}
+                {proof.qualified_candidate && (
+                  <div>
+                    <dt>Qualified candidate</dt>
+                    <dd>{proof.qualified_candidate.slice(0, 12)}</dd>
+                  </div>
+                )}
+                {proof.promotion_state && (
+                  <div>
+                    <dt>Promotion</dt>
+                    <dd>{proof.promotion_state.replace(/_/g, " ")}</dd>
+                  </div>
+                )}
+                {proof.skill_plan?.selected && (
+                  <div>
+                    <dt>Skill packs</dt>
+                    <dd>{proof.skill_plan.selected.length} bound</dd>
+                  </div>
+                )}
+                <div>
+                  <dt>Proof hash</dt>
+                  <dd>{proof.bundle_hash.slice(0, 12)}</dd>
+                </div>
+              </dl>
+            )}
+          </div>
         </div>
       )}
       {events.length > 0 && (

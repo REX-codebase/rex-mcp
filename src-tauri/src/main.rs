@@ -517,6 +517,12 @@ fn rex_task_events(task_id: String, after_seq: Option<u64>) -> Result<serde_json
     )
 }
 
+/// The deterministic per-task proof bundle the proof journey renders.
+#[tauri::command]
+fn rex_task_proof(task_id: String) -> Result<serde_json::Value, String> {
+    rex_shell_call("rex_proof", serde_json::json!({ "task_id": task_id }))
+}
+
 /// The permanent human Stop for an agent-driven task: cancel fences the
 /// lease and is final even against an agent operator.
 #[tauri::command]
@@ -765,6 +771,7 @@ fn main() {
             rex_tasks,
             rex_task_status,
             rex_task_events,
+            rex_task_proof,
             rex_task_stop,
             agent_begin,
             agent_snapshot,
