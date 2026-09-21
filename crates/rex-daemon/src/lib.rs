@@ -16,6 +16,13 @@ use rex_custody::{
 };
 use rex_protocol::*;
 use rex_protocol::packets::{OperationStatus, PacketIdentity};
+use rex_ultra::external_kernel::{
+    AdversaryEvidence, CandidateResponse, EvidenceKind, HostKernelStatus, KernelState,
+    VerifierEvidence,
+};
+use rex_ultra::host_bridge::{
+    contract_from_plan, BridgeError, UltraHostBridge, UltraHostView, DEFAULT_MINIMUM_CANDIDATES,
+};
 use rex_tools::{ToolRequest, ToolResult, ToolRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -376,7 +383,47 @@ impl HarnessDaemon {
             ToolName::Events => go!(args, events),
             ToolName::Result => go!(args, result),
             ToolName::Cancel => go!(args, cancel),
+            ToolName::UltraOpen => go!(args, ultra_open),
+            ToolName::UltraSubmit => go!(args, ultra_submit),
         }
+    }
+
+    /// Open the Ultra external-host loop for a live agent-operated task.
+    /// The first open attaches the host at the task's lease epoch; later
+    /// opens are pure views over the durable kernel.
+    pub fn ultra_open(&self, req: UltraOpenRequest) -> Result<UltraViewResponse, ProtocolError> {
+        let t = self.live(&req.task_id, req.lease_epoch)?;
+        require_agent(&t)?;
+        let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
+        let contract = contract_from_plan(&t.task, &t.plan);
+        let view = bridge
+            .open_requests(&t.task_id, &contract, DEFAULT_MINIMUM_CANDIDATES, t.lease_epoch)
+            .map_err(|e| bridge_err(&t.task_id, e))?;
+        Ok(ultra_view(t.task_id.clone(), &view))
+    }
+
+    /// Submit one candidate response or one adversary/verifier evidence item.
+    /// The kernel alone decides whether the evidence gates a transition.
+    pub fn ultra_submit(&self, req: UltraSubmitRequest) -> Result<UltraViewResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        require_agent(&t)?;
+        let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
+        let contract = contract_from_plan(&t.task, &t.plan);
+        let view = match req.kind {
+            UltraSubmissionKind::Candidate => bridge.record_response(&t.task_id, &contract,
+                CandidateResponse { candidate_id: req.request_id.clone(),
+                    response_hash: req.response_hash, content: req.content }),
+            UltraSubmissionKind::Adversary => bridge.record_adversary(&t.task_id, &contract,
+                AdversaryEvidence { request_id: req.request_id.clone(), candidate_id: req.candidate_id,
+                    response_hash: req.response_hash, content: req.content }),
+            UltraSubmissionKind::Verifier => bridge.record_verifier(&t.task_id, &contract,
+                VerifierEvidence { request_id: req.request_id.clone(), candidate_id: req.candidate_id,
+                    response_hash: req.response_hash, content: req.content }),
+        }.map_err(|e| bridge_err(&t.task_id, e))?;
+        self.append_event(&mut t, "ultra_submission", json!({"kind":format!("{:?}",req.kind),
+            "kernel_state":format!("{:?}",view.kernel_state)}))?;
+        self.persist(&t)?;
+        Ok(ultra_view(t.task_id.clone(), &view))
     }
 
     fn call_tool(&self, t: &mut DurableTask, request: ToolRequest) -> Result<ToolResult, ProtocolError> {
@@ -499,6 +546,52 @@ fn make_action(task_id: &str, idx: usize, step: &PlanStep, max_wall_ms: u64) -> 
         acceptance: step.acceptance.clone().unwrap_or_else(|| "submit evidence and a truthful outcome".into()),
         max_wall_ms }
 }
+fn require_agent(t: &DurableTask) -> Result<(), ProtocolError> {
+    if !t.operator_is_agent { return Err(perr(ErrorCode::ScopeDenied,
+        "ultra external-host loop requires an agent-operated task", &t.task_id)); }
+    Ok(())
+}
+fn bridge_err(task_id: &str, e: BridgeError) -> ProtocolError {
+    match e {
+        BridgeError::InvalidTaskId => perr(ErrorCode::TaskNotFound, "invalid ultra task id", task_id),
+        BridgeError::Adapter(a) => perr(ErrorCode::GateFailed,
+            format!("ultra kernel rejected submission: {a:?}"), task_id),
+        BridgeError::Io(m) => perr(ErrorCode::Internal, format!("ultra store: {m}"), task_id),
+    }
+}
+fn ultra_view(task_id: String, view: &UltraHostView) -> UltraViewResponse {
+    let status = match view.status {
+        HostKernelStatus::HostRequired => "host_required",
+        HostKernelStatus::Collecting => "collecting",
+        HostKernelStatus::Ready => "ready",
+    };
+    let kernel_state = match view.kernel_state {
+        KernelState::New => "new",
+        KernelState::Leased => "leased",
+        KernelState::Running => "running",
+        KernelState::AwaitingEvidence => "awaiting_evidence",
+        KernelState::Completed => "completed",
+        KernelState::Failed => "failed",
+        KernelState::Revoked => "revoked",
+    };
+    UltraViewResponse {
+        task_id,
+        status: status.into(),
+        kernel_state: kernel_state.into(),
+        candidate_requests: view.candidate_requests.iter().map(|r| UltraCandidateRequestView {
+            candidate_id: r.candidate_id.clone(), contract_hash: r.contract_hash.clone(),
+            task: r.task.clone(), obligation_ids: r.obligation_ids.clone(),
+        }).collect(),
+        evidence_requests: view.evidence_requests.iter().map(|r| UltraEvidenceRequestView {
+            request_id: r.request_id.clone(), candidate_id: r.candidate_id.clone(),
+            contract_hash: r.contract_hash.clone(),
+            kind: match r.kind { EvidenceKind::Adversary => "adversary",
+                EvidenceKind::Verifier => "verifier" }.into(),
+            obligation_ids: r.obligation_ids.clone(),
+            candidate_response_hash: r.candidate_response_hash.clone(),
+        }).collect(),
+    }
+}
 fn request_hash(r: &ExecuteRequest) -> Result<String, ProtocolError> { hash_json(r) }
 fn hash_json<T: Serialize>(v: &T) -> Result<String, ProtocolError> {
     let b=serde_json::to_vec(v).map_err(internal)?; Ok(hex_sha256(&b))
@@ -594,5 +687,65 @@ mod tests {
         let e=daemon.edit(EditRequest{task_id:ex.task_id,lease_epoch:ex.lease.epoch,path:"x".into(),
             expected:None,replacement:"y".into(),create:true}).unwrap_err();
         assert_eq!(e.code,ErrorCode::ApprovalRequired);
+    }    fn ultra_req(task:&str,epoch:u64,kind:UltraSubmissionKind,request_id:&str,candidate_id:&str,content:&str)->UltraSubmitRequest {
+        UltraSubmitRequest{task_id:task.into(),lease_epoch:epoch,kind,request_id:request_id.into(),
+            candidate_id:candidate_id.into(),
+            response_hash:rex_protocol::schema::canonical_hash(&content).unwrap(),content:content.into()}
+    }
+    #[test] fn ultra_loop_runs_over_the_protocol_surface() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws");
+        let daemon=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let ex=daemon.execute(req("r-ultra")).unwrap();
+        let open=daemon.ultra_open(UltraOpenRequest{task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        assert_eq!(open.status,"collecting");
+        assert_eq!(open.candidate_requests.len(),2);
+        assert!(open.evidence_requests.is_empty());
+        assert_eq!(open.candidate_requests[0].obligation_ids,vec!["step-1".to_string()]);
+        let mut view=open.clone();
+        for c in &open.candidate_requests {
+            let content=format!("candidate answer {}",c.candidate_id);
+            view=daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,UltraSubmissionKind::Candidate,
+                &c.candidate_id,&c.candidate_id,&content)).unwrap();
+        }
+        assert_eq!(view.status,"ready");
+        assert_eq!(view.kernel_state,"awaiting_evidence");
+        assert_eq!(view.evidence_requests.len(),4);
+        let candidate=view.evidence_requests[0].candidate_id.clone();
+        let pending: Vec<UltraEvidenceRequestView> = view.evidence_requests.iter()
+            .filter(|r| r.candidate_id==candidate).cloned().collect();
+        for r in &pending {
+            view = match r.kind.as_str() {
+                "adversary" => daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,
+                    UltraSubmissionKind::Adversary,&r.request_id,&r.candidate_id,"{\"defects\":[]}")).unwrap(),
+                _ => daemon.ultra_submit(ultra_req(&ex.task_id,ex.lease.epoch,
+                    UltraSubmissionKind::Verifier,&r.request_id,&r.candidate_id,
+                    "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"}]}")).unwrap(),
+            };
+        }
+        assert_eq!(view.kernel_state,"completed");
+        let reopened=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let again=reopened.ultra_open(UltraOpenRequest{task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        assert_eq!(again.kernel_state,"completed");
+        assert!(again.evidence_requests.is_empty());
+    }
+    #[test] fn ultra_loop_rejects_human_tasks_and_forged_submissions() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws");
+        let daemon=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let mut r=req("r-human"); r.operator_is_agent=false; r.host=HostKind::Human;
+        let human=daemon.execute(r).unwrap();
+        let e=daemon.ultra_open(UltraOpenRequest{task_id:human.task_id.clone(),lease_epoch:human.lease.epoch}).unwrap_err();
+        assert_eq!(e.code,ErrorCode::ScopeDenied);
+        let ex=daemon.execute(req("r-forge")).unwrap();
+        let open=daemon.ultra_open(UltraOpenRequest{task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
+        let target=&open.candidate_requests[0];
+        let mut forged=ultra_req(&ex.task_id,ex.lease.epoch,UltraSubmissionKind::Candidate,
+            &target.candidate_id,&target.candidate_id,"honest answer");
+        forged.response_hash="deadbeef".into();
+        let e=daemon.ultra_submit(forged).unwrap_err();
+        assert_eq!(e.code,ErrorCode::GateFailed);
+        let unknown=ultra_req(&ex.task_id,ex.lease.epoch,UltraSubmissionKind::Candidate,
+            "not-a-candidate","not-a-candidate","anything");
+        let e=daemon.ultra_submit(unknown).unwrap_err();
+        assert_eq!(e.code,ErrorCode::GateFailed);
     }
 }

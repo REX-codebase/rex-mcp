@@ -40,6 +40,8 @@ pub enum ToolName {
     Events,
     Result,
     Cancel,
+    UltraOpen,
+    UltraSubmit,
 }
 
 impl ToolName {
@@ -57,6 +59,8 @@ impl ToolName {
             ToolName::Events => "rex_events",
             ToolName::Result => "rex_result",
             ToolName::Cancel => "rex_cancel",
+            ToolName::UltraOpen => "rex_ultra_open",
+            ToolName::UltraSubmit => "rex_ultra_submit",
         }
     }
 
@@ -74,6 +78,8 @@ impl ToolName {
             "rex_events" => ToolName::Events,
             "rex_result" => ToolName::Result,
             "rex_cancel" => ToolName::Cancel,
+            "rex_ultra_open" => ToolName::UltraOpen,
+            "rex_ultra_submit" => ToolName::UltraSubmit,
             _ => return None,
         })
     }
@@ -92,6 +98,8 @@ impl ToolName {
             ToolName::Events,
             ToolName::Result,
             ToolName::Cancel,
+            ToolName::UltraOpen,
+            ToolName::UltraSubmit,
         ]
     }
 }
@@ -483,6 +491,68 @@ pub struct CancelResponse {
     pub final_reason: String,
 }
 
+/// What the host is submitting into the Ultra external-host loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UltraSubmissionKind {
+    Candidate,
+    Adversary,
+    Verifier,
+}
+
+/// rex_ultra_open request: fetch the open Ultra requests for a live task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UltraOpenRequest {
+    pub task_id: String,
+    pub lease_epoch: u64,
+}
+
+/// rex_ultra_submit request: one candidate response or one evidence item.
+/// For candidates the answered candidate id goes in `request_id` (and
+/// `candidate_id` mirrors it); for adversary/verifier evidence `request_id`
+/// is the evidence request id being answered and `candidate_id` names the
+/// candidate under attack or verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UltraSubmitRequest {
+    pub task_id: String,
+    pub lease_epoch: u64,
+    pub kind: UltraSubmissionKind,
+    pub request_id: String,
+    pub candidate_id: String,
+    pub response_hash: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UltraCandidateRequestView {
+    pub candidate_id: String,
+    pub contract_hash: String,
+    pub task: String,
+    pub obligation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UltraEvidenceRequestView {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub contract_hash: String,
+    pub kind: String,
+    pub obligation_ids: Vec<String>,
+    pub candidate_response_hash: String,
+}
+
+/// Host-visible Ultra loop state: truthful kernel status plus open requests.
+/// Strings, not rex-ultra types, keep the protocol crate dependency-free of
+/// the Ultra subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UltraViewResponse {
+    pub task_id: String,
+    pub status: String,
+    pub kernel_state: String,
+    pub candidate_requests: Vec<UltraCandidateRequestView>,
+    pub evidence_requests: Vec<UltraEvidenceRequestView>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +565,7 @@ mod tests {
             vec![
                 "rex_execute", "rex_next", "rex_read", "rex_edit", "rex_search", "rex_run",
                 "rex_test", "rex_submit", "rex_status", "rex_events", "rex_result", "rex_cancel",
+                "rex_ultra_open", "rex_ultra_submit",
             ]
         );
         for t in ToolName::all() {
