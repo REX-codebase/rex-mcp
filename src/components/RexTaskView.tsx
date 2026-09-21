@@ -199,14 +199,16 @@ export function RexTaskList({ onPick }: { onPick: (taskId: string) => void }) {
 
   useEffect(() => {
     rexTaskList()
-      .then((r) => setTasks(r.tasks.filter((t) => !TERMINAL.has(t.state))))
+      // Terminal tasks stay listed: a promoted proof journey is exactly
+      // what supervision must be able to reopen.
+      .then((r) => setTasks(r.tasks))
       .catch(() => undefined);
   }, []);
 
   if (tasks.length === 0) return null;
   return (
-    <section className="rex-task-list" aria-label="Active REX tasks">
-      <span className="eyebrow">Active REX tasks</span>
+    <section className="rex-task-list" aria-label="REX tasks">
+      <span className="eyebrow">REX tasks</span>
       <ul>
         {tasks.map((t) => (
           <li key={t.task_id}>

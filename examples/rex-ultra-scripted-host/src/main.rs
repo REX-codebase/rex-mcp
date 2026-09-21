@@ -122,6 +122,13 @@ fn rex_mcp_bin() -> Result<PathBuf, String> {
 }
 
 fn temp_dir(tag: &str) -> Result<PathBuf, String> {
+    // UI verification and demos can aim the script at a chosen state dir.
+    let override_var = format!("REX_SCRIPTED_{}_DIR", tag.to_uppercase());
+    if let Ok(p) = std::env::var(&override_var) {
+        let dir = PathBuf::from(p);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        return Ok(dir);
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -141,7 +148,10 @@ fn main() {
     let result = match mode.as_str() {
         "smoke" => smoke(),
         "ultra" => ultra(),
-        other => Err(format!("unknown mode {other}; expected smoke|ultra")),
+        "seed-waiting" => seed_waiting(),
+        other => Err(format!(
+            "unknown mode {other}; expected smoke|ultra|seed-waiting"
+        )),
     };
     if let Err(e) = result {
         eprintln!("FAIL: {e}");
@@ -544,5 +554,51 @@ fn ultra() -> Result<(), String> {
     println!("PASS scripted-host ultra");
     println!("state dir kept for inspection: {}", state.display());
     println!("workspace kept for inspection: {}", ws.display());
+    Ok(())
+}
+
+/// Leave one active Ultra task waiting on its host: execute, open, and one
+/// collected candidate, then stop. Supervision UIs use this to render the
+/// truthful waiting state (the daemon waits; nothing advances).
+fn seed_waiting() -> Result<(), String> {
+    let bin = rex_mcp_bin()?;
+    let state = temp_dir("state")?;
+    let ws = temp_dir("ws")?;
+    let mut s = Session::start(&bin, &state, &ws)?;
+    s.handshake()?;
+    let ex = s.tool_ok(
+        "rex_execute",
+        json!({ "request_id": format!("seed-{:x}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)),
+            "task": "Design a visual settings panel with motion",
+            "host": "generic_agent", "operator_is_agent": true,
+            "plan": [
+                { "instructions": "panel layout", "acceptance": "panel renders at desktop and phone" },
+                { "instructions": "motion polish", "acceptance": "transitions replay cleanly" }
+            ] }),
+    )?;
+    let task_id = ex["task_id"].as_str().ok_or("no task id")?.to_string();
+    let epoch = ex["lease"]["epoch"].as_u64().ok_or("no lease epoch")?;
+    let open = s.tool_ok(
+        "rex_ultra_open",
+        json!({ "task_id": task_id, "lease_epoch": epoch }),
+    )?;
+    let first = open["candidate_requests"][0]["candidate_id"]
+        .as_str()
+        .ok_or("no candidate request")?
+        .to_string();
+    let content = json!({ "files": [{ "path": "panel-0.html",
+        "content": "<html><body><h1>panel candidate</h1></body></html>" }] })
+    .to_string();
+    s.tool_ok(
+        "rex_ultra_submit",
+        json!({ "task_id": task_id, "lease_epoch": epoch, "kind": "candidate",
+            "request_id": first, "candidate_id": first,
+            "response_hash": hash(&content)?, "content": content }),
+    )?;
+    s.shutdown();
+    println!("PASS seeded waiting Ultra task {task_id}");
+    println!("state dir: {}", state.display());
+    println!("workspace: {}", ws.display());
     Ok(())
 }
