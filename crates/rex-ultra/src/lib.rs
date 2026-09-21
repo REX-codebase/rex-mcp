@@ -19,6 +19,7 @@ pub mod orchestrator;
 pub mod phase3;
 pub mod phase4;
 pub mod phase5;
+pub mod promotion;
 pub mod verify;
 
 pub mod generated_packs;

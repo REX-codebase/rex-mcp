@@ -169,6 +169,9 @@ struct ExternalAdapterState {
     responses: BTreeMap<String, CandidateResponse>,
     #[serde(default)]
     evidence: BTreeMap<String, CandidateEvidence>,
+    /// The candidate whose evidence passed every gate, recorded at finalize.
+    #[serde(default)]
+    qualified_candidate: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +208,7 @@ impl ExternalHostAdapter {
                     lease_epoch: 0, transcript_hash: "genesis".into() },
                 minimum_candidates, host_attached: false, responses: BTreeMap::new(),
                 evidence: BTreeMap::new(),
+                qualified_candidate: None,
             },
         })
     }
@@ -396,6 +400,11 @@ impl ExternalHostAdapter {
         self.state.evidence.get(candidate_id)
     }
 
+    /// The candidate recorded as qualifying at finalize, if any.
+    pub fn qualified_candidate(&self) -> Option<&str> {
+        self.state.qualified_candidate.as_deref()
+    }
+
     /// Evidence-gated transition. A candidate qualifies only when its
     /// adversary report is conclusive and clean and its verifier outcomes
     /// prove every contract obligation. Any qualified candidate completes
@@ -405,7 +414,7 @@ impl ExternalHostAdapter {
     pub fn finalize(&mut self) -> Result<KernelState, AdapterError> {
         if !self.state.host_attached { return Err(AdapterError::HostRequired); }
         if self.state.kernel.state != KernelState::AwaitingEvidence { return Ok(self.state.kernel.state); }
-        let mut qualified = false;
+        let mut qualified: Option<String> = None;
         let mut fully_evidenced = true;
         for candidate_id in self.state.responses.keys() {
             let evidence = self.state.evidence.get(candidate_id);
@@ -419,14 +428,17 @@ impl ExternalHostAdapter {
                 .unwrap_or(false);
             let visual_ok = self.state.contract.work_kind != crate::contract::WorkKind::Visual
                 || evidence.and_then(|e| e.visual.as_ref()).is_some();
-            if adversary_clean && verifier_proven && visual_ok { qualified = true; }
+            if adversary_clean && verifier_proven && visual_ok && qualified.is_none() {
+                qualified = Some(candidate_id.clone());
+            }
             let complete_record = evidence
                 .map(|e| e.adversary.is_some() && e.verifier.is_some()
                     && (self.state.contract.work_kind != crate::contract::WorkKind::Visual || e.visual.is_some()))
                 .unwrap_or(false);
             if !complete_record { fully_evidenced = false; }
         }
-        if qualified {
+        if let Some(candidate_id) = qualified {
+            self.state.qualified_candidate = Some(candidate_id);
             self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Complete).map_err(AdapterError::Kernel)?;
             self.persist()?;
         } else if fully_evidenced && !self.state.responses.is_empty() {
@@ -857,5 +869,25 @@ mod tests {
         assert_eq!(general.requests().unwrap()[0].work_kind, crate::contract::WorkKind::General);
         let visual = ExternalHostAdapter::new(visual_contract(), 1).unwrap();
         assert_eq!(visual.requests().unwrap()[0].work_kind, crate::contract::WorkKind::Visual);
+    }
+    #[test]
+    fn finalize_records_the_qualified_candidate() {
+        let (mut adapter, _) = ready_adapter();
+        assert_eq!(adapter.qualified_candidate(), None);
+        let requests = adapter.evidence_requests().unwrap();
+        let candidate = requests[0].candidate_id.clone();
+        let adversary = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary).unwrap().clone();
+        adapter.record_adversary(AdversaryEvidence {
+            request_id: adversary.request_id, candidate_id: candidate.clone(),
+            response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(), content: "{\"defects\":[]}".into(),
+        }).unwrap();
+        let verifier = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier).unwrap().clone();
+        let content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
+        adapter.record_verifier(VerifierEvidence {
+            request_id: verifier.request_id, candidate_id: candidate.clone(),
+            response_hash: canonical_hash(&content).unwrap(), content: content.into(),
+        }).unwrap();
+        assert!(matches!(adapter.finalize().unwrap(), KernelState::Completed));
+        assert_eq!(adapter.qualified_candidate(), Some(candidate.as_str()));
     }
 }
