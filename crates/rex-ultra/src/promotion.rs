@@ -272,6 +272,32 @@ impl PromotionStore {
         let bundle = parse_bundle(&response.content)?;
         let bundle_hash = canonical_hash(&response.content).map_err(|e| PromotionError::Encoding(e.to_string()))?;
 
+        // Recover a dangling prepare from a crashed promotion before
+        // snapshotting again: a dirty destination is never a new base.
+        // Unverifiable recovery is CorruptState and refuses to promote.
+        if let Some(prior) = self.receipt(task_id)? {
+            if prior.state == PromotionState::Prepared {
+                let snapshot = self.dir.join(format!("snapshot-{task_id}"));
+                clear_tree(destination).and_then(|()| copy_tree(&snapshot, destination)).ok();
+                let mut recovered = prior;
+                match tree_hash(destination) {
+                    Ok(restored) if restored == recovered.destination_hash_before => {
+                        recovered.state = PromotionState::RolledBack;
+                        recovered.detail = "recovered a crashed promotion; restore verified".into();
+                    }
+                    _ => {
+                        recovered.state = PromotionState::CorruptState;
+                        recovered.detail = "crashed promotion recovery is unverifiable".into();
+                    }
+                }
+                let corrupt = recovered.state == PromotionState::CorruptState;
+                self.persist_receipt(&recovered)?;
+                if corrupt {
+                    return Ok(recovered);
+                }
+            }
+        }
+
         // Snapshot the destination before any mutation.
         let destination_hash_before = tree_hash(destination)?;
         let snapshot = self.dir.join(format!("snapshot-{task_id}"));
@@ -479,5 +505,65 @@ mod tests {
         assert_eq!(receipt.state, PromotionState::RolledBack);
         assert_eq!(tree_hash(&destination).unwrap(), before);
         assert!(destination.join("result.txt").is_dir());
+    }
+    fn simulate_crashed_promotion(
+        store: &PromotionStore,
+        task_id: &str,
+        destination: &Path,
+    ) -> String {
+        // A prepare receipt plus snapshot, then uncommitted destination
+        // dirt: exactly what a crash between prepare and commit leaves.
+        let before = tree_hash(destination).unwrap();
+        let snapshot = store.dir.join(format!("snapshot-{task_id}"));
+        if snapshot.exists() { fs::remove_dir_all(&snapshot).unwrap(); }
+        copy_tree(destination, &snapshot).unwrap();
+        store.persist_receipt(&PromotionReceipt {
+            task_id: task_id.into(),
+            candidate_id: "crashed".into(),
+            bundle_hash: "b".repeat(64),
+            destination_hash_before: before.clone(),
+            staging_hash: String::new(),
+            gates_rerun: vec![],
+            gates_not_rerun: vec![],
+            state: PromotionState::Prepared,
+            detail: "staged".into(),
+        }).unwrap();
+        fs::write(destination.join("junk.txt"), "half-applied").unwrap();
+        fs::write(destination.join("keep.txt"), "dirtied").unwrap();
+        before
+    }
+
+    #[test]
+    fn crashed_promotion_recovers_before_promoting_again() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        simulate_crashed_promotion(&store, "task-5", &destination);
+        let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
+        let receipt = store.promote("task-5", &adapter, &contract(), &destination).unwrap();
+        assert_eq!(receipt.state, PromotionState::Committed);
+        // The dirty state was rolled back first, then the bundle applied.
+        assert_eq!(fs::read_to_string(destination.join("keep.txt")).unwrap(), "original");
+        assert!(!destination.join("junk.txt").exists());
+        assert_eq!(fs::read_to_string(destination.join("result.txt")).unwrap(), "PASS\n");
+    }
+
+    #[test]
+    fn crashed_promotion_with_unverifiable_restore_is_corrupt_state() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        simulate_crashed_promotion(&store, "task-6", &destination);
+        fs::remove_dir_all(store.dir.join("snapshot-task-6")).unwrap();
+        let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
+        let receipt = store.promote("task-6", &adapter, &contract(), &destination).unwrap();
+        assert_eq!(receipt.state, PromotionState::CorruptState);
+        // Fail closed: nothing was promoted onto an unverifiable base.
+        assert!(!destination.join("result.txt").exists());
+        assert_eq!(store.receipt("task-6").unwrap().unwrap().state, PromotionState::CorruptState);
     }
 }
