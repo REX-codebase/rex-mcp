@@ -87,6 +87,26 @@ critic as the taste gate, and the kernel minimum is 2 candidates, not 3.
 - Private main commit + checksum-verified archive: private main PASS; Drive
   archive explicitly waived by the owner (GitHub checkpoints are the record)
 
-## Outstanding
-- Desktop (1440x900) and phone (390x844) pixel inspection of the Ultra
-  supervision surface under Xvfb, per the spec's UI completion rule.
+## Pixel inspection (spec section 9 UI completion) - DONE 2026-09-21
+Seeded a promoted Ultra task and a waiting-on-host Ultra task into a fresh
+rex store (scripted host `ultra` and `seed-waiting` modes), served the real
+supervision surface through rex-dev-server + vite, and captured it with
+headless Chrome at desktop and phone viewports (same React surface the
+Tauri shell renders; the shell adds only window framing). Inspected the
+actual pixels, committed as rex-phase7-waiting-desktop.png,
+rex-phase7-waiting-phone.png, rex-phase7-promoted-desktop.png and
+rex-phase7-promoted-phone.png.
+
+Findings: phase spine hierarchy reads correctly; the active node is the
+only purple element; done nodes are green; the terminal line is plain
+language; the proof hero names kernel, qualified candidate, promotion,
+skill packs and proof hash; Stop stays fixed in the status bar, visually
+separate from Close, and is absent on terminal tasks; the phone layout
+stacks spine above hero with no clipping; the evidence ledger uses
+plain-language event lines (one polish round shipped after inspection).
+Two noted minors, accepted: the phone status-bar meta wraps into a narrow
+column, and headless desktop captures render at 1356x847 rather than a
+literal 1440x900 frame.
+
+With this, every acceptance bullet in section 12 is PASS except the
+owner-waived Drive archive.

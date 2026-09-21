@@ -29,6 +29,28 @@ function eventLine(event: RexEvent): string {
       return "Failed";
     case "task_cancelled":
       return "Cancelled";
+    case "ultra_skill_plan":
+      return "Skill plan bound";
+    case "ultra_submission": {
+      const kind = String((event.detail as { kind?: string }).kind ?? "");
+      if (kind === "Candidate") return "Candidate thesis received";
+      if (kind === "Adversary") return "Adversary evidence recorded";
+      if (kind === "Verifier") return "Verifier evidence recorded";
+      if (kind === "Visual") return "Pixel evidence recorded";
+      return "Ultra evidence recorded";
+    }
+    case "ultra_promotion": {
+      const state = String((event.detail as { state?: string }).state ?? "");
+      return state === "committed"
+        ? "Winning candidate promoted into the workspace"
+        : `Promotion ${state.replace(/_/g, " ")}`;
+    }
+    case "tool_finished":
+      return "Tool run finished";
+    case "action_accepted":
+      return "Action accepted";
+    case "store_migrated":
+      return "Task store upgraded to the current schema";
     default:
       return event.kind.replace(/_/g, " ");
   }
