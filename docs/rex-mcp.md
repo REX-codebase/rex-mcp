@@ -6,6 +6,11 @@ and runs commands. REX freezes intent, confines every action to one
 workspace, enforces leases and budgets, and decides completion from
 evidence. REX holds no provider credentials and makes no model calls.
 
+This guide covers Standard custody: the host drives its own work inside
+one frozen plan. Full Ultra mode adds the orchestrated pipeline on top
+(taste contract, candidate branches, deterministic gates, verified
+promotion, proof bundles) - see docs/rex-mcp-ultra.md.
+
 ## Install
 
 ```sh
