@@ -93,6 +93,10 @@ struct DurableTask {
     operation_status: OperationStatus,
     #[serde(default)]
     ultra_skill_plan_hash: Option<String>,
+    /// SHA-256 of the current host resume handle. The handle itself is
+    /// never stored; it rotates on every accepted resume.
+    #[serde(default)]
+    host_resume_handle_hash: Option<String>,
 }
 
 pub struct HarnessDaemon {
@@ -119,18 +123,22 @@ impl HarnessDaemon {
     pub fn execute(&self, req: ExecuteRequest) -> Result<ExecuteResponse, ProtocolError> {
         validate_execute(&req)?;
         if let Some(id) = &req.task_id {
-            let task = self.load(id)?;
+            let mut task = self.load(id)?;
             if task.task != req.task { return Err(perr(ErrorCode::IdempotencyConflict,
                 "task_id exists with different task text", id)); }
-            return Ok(self.execute_view(&task, true));
+            let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
+            return Ok(self.execute_view(&task, true, Some(handle)));
         }
         if let Some(task) = self.find_by_request(&req.request_id)? {
             if task.request_hash != request_hash(&req)? { return Err(perr(
                 ErrorCode::IdempotencyConflict, "request_id was already used with another payload", &task.task_id)); }
-            return Ok(self.execute_view(&task, true));
+            let mut task = task;
+            let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
+            return Ok(self.execute_view(&task, true, Some(handle)));
         }
         let now = now_ms();
         let task_id = format!("task-{}", random_id());
+        let host_resume_handle = format!("hrh-{}", random_hex(24));
         let plan = req.plan.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| vec![PlanStep {
             instructions: req.task.clone(), acceptance: req.proof.clone() }]);
         if plan.len() > MAX_PLAN_STEPS { return Err(ProtocolError::new(
@@ -174,12 +182,13 @@ impl HarnessDaemon {
             registered_evidence: BTreeSet::new(), result: None, terminal_reason: None,
             branch_id: "main".into(), resume_nonce: grant.lease.next_seq,
             operation_status: if req.operator_is_agent { OperationStatus::ExternalHostRequired } else { OperationStatus::Prepared },
-            ultra_skill_plan_hash: None };
+            ultra_skill_plan_hash: None,
+            host_resume_handle_hash: Some(hex_sha256(host_resume_handle.as_bytes())) };
         let plan_hash = task.plan_hash.clone(); let step_count = task.plan.len();
         self.append_event(&mut task, "task_created", json!({"plan_hash":plan_hash,
             "steps":step_count,"protocol":PROTOCOL_VERSION}))?;
         self.persist(&task)?;
-        Ok(self.execute_view(&task, false))
+        Ok(self.execute_view(&task, false, Some(host_resume_handle)))
     }
 
     pub fn next(&self, req: NextRequest) -> Result<NextResponse, ProtocolError> {
@@ -534,8 +543,22 @@ impl HarnessDaemon {
         Ok(())
     }
 
-    fn execute_view(&self, t: &DurableTask, resumed: bool) -> ExecuteResponse {
-        ExecuteResponse { task_id: t.task_id.clone(), state: t.state, resumed,
+    fn verify_and_rotate_resume_handle(&self, t: &mut DurableTask, req: &ExecuteRequest) -> Result<String, ProtocolError> {
+        let expected = t.host_resume_handle_hash.clone().ok_or_else(|| perr(ErrorCode::ScopeDenied,
+            "task predates host resume handles; resume through the trusted human launcher path", &t.task_id))?;
+        let presented = req.resume_handle.as_deref().ok_or_else(|| perr(ErrorCode::ScopeDenied,
+            "resume requires the host resume handle issued at creation", &t.task_id))?;
+        if hex_sha256(presented.as_bytes()) != expected {
+            return Err(perr(ErrorCode::ScopeDenied, "host resume handle mismatch", &t.task_id));
+        }
+        let rotated = format!("hrh-{}", random_hex(24));
+        t.host_resume_handle_hash = Some(hex_sha256(rotated.as_bytes()));
+        self.persist(t)?;
+        Ok(rotated)
+    }
+
+    fn execute_view(&self, t: &DurableTask, resumed: bool, host_resume_handle: Option<String>) -> ExecuteResponse {
+        ExecuteResponse { task_id: t.task_id.clone(), state: t.state, resumed, host_resume_handle,
             next: t.open_action.clone(), lease: lease_view(t),
             discipline: Some(operator_discipline()) }
     }
@@ -664,7 +687,13 @@ fn ultra_view(task_id: String, view: &UltraHostView, skill_plan: Option<SkillPla
         skill_plan,
     }
 }
-fn request_hash(r: &ExecuteRequest) -> Result<String, ProtocolError> { hash_json(r) }
+fn request_hash(r: &ExecuteRequest) -> Result<String, ProtocolError> {
+    // The resume handle is a credential, not payload identity: it must not
+    // change the request hash or every resume would look like a conflict.
+    let mut normalized = r.clone();
+    normalized.resume_handle = None;
+    hash_json(&normalized)
+}
 fn hash_json<T: Serialize>(v: &T) -> Result<String, ProtocolError> {
     let b=serde_json::to_vec(v).map_err(internal)?; Ok(hex_sha256(&b))
 }
@@ -707,12 +736,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     fn req(id:&str)->ExecuteRequest { ExecuteRequest { request_id:id.into(), task:"make hello".into(),
-        task_id:None,host:HostKind::ClaudeCode,operator_is_agent:true,budgets:None,proof:None,
+        task_id:None,resume_handle:None,host:HostKind::ClaudeCode,operator_is_agent:true,budgets:None,proof:None,
         plan:Some(vec![PlanStep{instructions:"write hello".into(),acceptance:Some("file exists".into())}]) } }
     #[test] fn idempotency_and_recovery() {
         let d=tempdir().unwrap(); let w=d.path().join("ws"); let root=d.path().join("state");
         let daemon=HarnessDaemon::open(&root,DaemonPolicy::conservative(&w)).unwrap();
-        let a=daemon.execute(req("r1")).unwrap(); let b=daemon.execute(req("r1")).unwrap();
+        let a=daemon.execute(req("r1")).unwrap();
+        let mut replay=req("r1"); replay.resume_handle=a.host_resume_handle.clone();
+        let b=daemon.execute(replay).unwrap();
         assert_eq!(a.task_id,b.task_id); assert!(b.resumed); drop(daemon);
         let reopened=HarnessDaemon::open(&root,DaemonPolicy::conservative(&w)).unwrap();
         let status = reopened.status(TaskRefRequest{task_id:a.task_id.clone()}).unwrap();
@@ -875,5 +906,28 @@ mod tests {
             task_id:ex.task_id.clone(),lease_epoch:ex.lease.epoch}).unwrap();
         assert_eq!(again.state,"committed");
         assert_eq!(again.bundle_hash,receipt.bundle_hash);
+    }    #[test] fn host_resume_requires_and_rotates_the_handle() {
+        let d=tempdir().unwrap(); let w=d.path().join("ws");
+        let daemon=HarnessDaemon::open(d.path().join("state"),DaemonPolicy::conservative(&w)).unwrap();
+        let a=daemon.execute(req("r-handle")).unwrap();
+        let handle=a.host_resume_handle.clone().expect("handle issued at creation");
+        assert!(handle.starts_with("hrh-"));
+        // missing handle -> denied
+        assert_eq!(daemon.execute(req("r-handle")).unwrap_err().code,ErrorCode::ScopeDenied);
+        // wrong handle -> denied
+        let mut wrong=req("r-handle"); wrong.resume_handle=Some("hrh-forged".into());
+        assert_eq!(daemon.execute(wrong).unwrap_err().code,ErrorCode::ScopeDenied);
+        // correct handle -> resumed and rotated
+        let mut good=req("r-handle"); good.resume_handle=Some(handle.clone());
+        let b=daemon.execute(good).unwrap();
+        assert!(b.resumed);
+        assert_eq!(b.task_id,a.task_id);
+        let rotated=b.host_resume_handle.clone().expect("rotated handle issued");
+        assert_ne!(rotated,handle);
+        // the old handle is dead; the rotated handle works
+        let mut stale=req("r-handle"); stale.resume_handle=Some(handle);
+        assert_eq!(daemon.execute(stale).unwrap_err().code,ErrorCode::ScopeDenied);
+        let mut current=req("r-handle"); current.resume_handle=Some(rotated);
+        assert!(daemon.execute(current).unwrap().resumed);
     }
 }

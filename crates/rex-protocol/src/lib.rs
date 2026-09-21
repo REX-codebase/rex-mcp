@@ -222,6 +222,9 @@ pub struct ExecuteRequest {
     /// Optional explicit task id for resume-by-id from a fresh session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Host resume handle issued at creation; required on every resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_handle: Option<String>,
     pub host: HostKind,
     /// Operator identity declaration: human at the keyboard, or an agent
     /// operating under its own authority.
@@ -261,6 +264,11 @@ pub struct ExecuteResponse {
     pub state: TaskState,
     /// True when this call resumed an existing task instead of creating.
     pub resumed: bool,
+    /// Issued at creation and rotated on every accepted resume. The host
+    /// must persist the latest value; losing it leaves the task to the
+    /// trusted human launcher path. Never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_resume_handle: Option<String>,
     pub next: Option<ActionSpec>,
     pub lease: LeaseView,
     /// The Fable completion discipline every operator must honor. Host
