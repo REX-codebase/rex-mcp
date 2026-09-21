@@ -275,7 +275,16 @@ fn handle(
     reader.read_exact(&mut body)?;
     let body = String::from_utf8_lossy(&body).to_string();
 
-    let response = route(&method, &path, &body, &live, &agent, &custody_runs, &agent_runs_root, &rex_shell);
+    let response = route(
+        &method,
+        &path,
+        &body,
+        &live,
+        &agent,
+        &custody_runs,
+        &agent_runs_root,
+        &rex_shell,
+    );
     let mut stream = reader.into_inner();
     stream.write_all(response.as_bytes())?;
     stream.flush()
@@ -300,7 +309,11 @@ fn route(
     let query_param = |key: &str| -> Option<String> {
         query.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            if k == key { Some(v.to_string()) } else { None }
+            if k == key {
+                Some(v.to_string())
+            } else {
+                None
+            }
         })
     };
     match (method, segments.as_slice()) {
@@ -569,16 +582,14 @@ fn route(
                 }
             }
         }
-        ("GET", ["api", "agent", "custody", "grants", gid]) => {
-            match custody_runs.phase_of(gid) {
-                Some(phase) => json_response(
-                    200,
-                    &serde_json::to_string(&serde_json::json!({"grant_id": gid, "phase": phase}))
-                        .unwrap(),
-                ),
-                None => json_response(404, "{\"error\":\"unknown grant\"}"),
-            }
-        }
+        ("GET", ["api", "agent", "custody", "grants", gid]) => match custody_runs.phase_of(gid) {
+            Some(phase) => json_response(
+                200,
+                &serde_json::to_string(&serde_json::json!({"grant_id": gid, "phase": phase}))
+                    .unwrap(),
+            ),
+            None => json_response(404, "{\"error\":\"unknown grant\"}"),
+        },
         ("POST", ["api", "agent", "custody", "runs", id, "stop"]) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
@@ -625,7 +636,10 @@ fn route(
                 };
                 key(a).cmp(&key(b))
             });
-            json_response(200, &serde_json::to_string(&serde_json::json!({"tasks": tasks})).unwrap())
+            json_response(
+                200,
+                &serde_json::to_string(&serde_json::json!({"tasks": tasks})).unwrap(),
+            )
         }
         ("POST", ["api", "rex", "tasks"]) => {
             let parsed: serde_json::Value =
@@ -664,7 +678,9 @@ fn route(
             }
         }
         ("GET", ["api", "rex", "tasks", id, "events"]) => {
-            let after = query_param("since").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let after = query_param("since")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
             match rex_call(
                 rex_shell,
                 "rex_events",

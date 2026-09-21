@@ -173,8 +173,10 @@ fn walk_files(root: &Path, base: &Path, out: &mut Vec<PathBuf>) -> std::io::Resu
 pub fn diff_workspaces(source: &Path, staging: &Path) -> Result<DiffSummary, InstalledAgentError> {
     let mut source_files = Vec::new();
     let mut staging_files = Vec::new();
-    walk_files(source, source, &mut source_files).map_err(|e| InstalledAgentError::Io(e.to_string()))?;
-    walk_files(staging, staging, &mut staging_files).map_err(|e| InstalledAgentError::Io(e.to_string()))?;
+    walk_files(source, source, &mut source_files)
+        .map_err(|e| InstalledAgentError::Io(e.to_string()))?;
+    walk_files(staging, staging, &mut staging_files)
+        .map_err(|e| InstalledAgentError::Io(e.to_string()))?;
     let mut entries = Vec::new();
     for rel in &staging_files {
         let staged = staging.join(rel);
@@ -182,14 +184,22 @@ pub fn diff_workspaces(source: &Path, staging: &Path) -> Result<DiffSummary, Ins
         let bytes = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
         let rel_text = rel.to_string_lossy().into_owned();
         if !original.is_file() {
-            entries.push(DiffEntry { path: rel_text, kind: DiffKind::Added, bytes });
+            entries.push(DiffEntry {
+                path: rel_text,
+                kind: DiffKind::Added,
+                bytes,
+            });
         } else {
             let same = match (hash_file(&original), hash_file(&staged)) {
                 (Ok(a), Ok(b)) => a == b,
                 _ => false,
             };
             if !same {
-                entries.push(DiffEntry { path: rel_text, kind: DiffKind::Modified, bytes });
+                entries.push(DiffEntry {
+                    path: rel_text,
+                    kind: DiffKind::Modified,
+                    bytes,
+                });
             }
         }
     }
@@ -206,10 +216,17 @@ pub fn diff_workspaces(source: &Path, staging: &Path) -> Result<DiffSummary, Ins
     Ok(DiffSummary { entries })
 }
 
-fn apply_promotion(source: &Path, staging: &Path, diff: &DiffSummary) -> Result<(), InstalledAgentError> {
+fn apply_promotion(
+    source: &Path,
+    staging: &Path,
+    diff: &DiffSummary,
+) -> Result<(), InstalledAgentError> {
     for entry in &diff.entries {
         let rel = Path::new(&entry.path);
-        if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return Err(InstalledAgentError::Invalid(format!(
                 "refusing to promote path escape: {}",
                 entry.path
@@ -220,7 +237,8 @@ fn apply_promotion(source: &Path, staging: &Path, diff: &DiffSummary) -> Result<
         match entry.kind {
             DiffKind::Added | DiffKind::Modified => {
                 if let Some(parent) = to.parent() {
-                    fs::create_dir_all(parent).map_err(|e| InstalledAgentError::Io(e.to_string()))?;
+                    fs::create_dir_all(parent)
+                        .map_err(|e| InstalledAgentError::Io(e.to_string()))?;
                 }
                 fs::copy(&from, &to).map_err(|e| InstalledAgentError::Io(e.to_string()))?;
             }
@@ -239,7 +257,10 @@ const STDERR_TAIL_LIMIT: usize = 4000;
 impl RunManager {
     pub fn new(runs_dir: PathBuf) -> Result<Self, InstalledAgentError> {
         fs::create_dir_all(&runs_dir).map_err(|e| InstalledAgentError::Io(e.to_string()))?;
-        Ok(Self { runs: Mutex::new(HashMap::new()), runs_dir })
+        Ok(Self {
+            runs: Mutex::new(HashMap::new()),
+            runs_dir,
+        })
     }
 
     fn persist(&self, snapshot: &RunSnapshot) {
@@ -287,10 +308,10 @@ impl RunManager {
 
         let id = format!("run-{}", now_ms());
         let (source, staging, promotion) = if workspace.trim().is_empty() {
-            let fresh = self
-                .runs_dir
-                .join("workspaces")
-                .join(format!("{}-{}", slugify(prompt), now_ms()));
+            let fresh =
+                self.runs_dir
+                    .join("workspaces")
+                    .join(format!("{}-{}", slugify(prompt), now_ms()));
             fs::create_dir_all(&fresh).map_err(|e| InstalledAgentError::Io(e.to_string()))?;
             (None, fresh, PromotionState::NotRequired)
         } else {
@@ -333,7 +354,11 @@ impl RunManager {
             .args(args)
             .current_dir(&staging)
             .env("REX_INSTALLED_AGENT", "1")
-            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -385,7 +410,9 @@ impl RunManager {
         let finalize;
         {
             let mut runs = self.runs.lock().expect("runs lock");
-            let Some(record) = runs.get_mut(&run_id) else { return };
+            let Some(record) = runs.get_mut(&run_id) else {
+                return;
+            };
             if record.snapshot.status == RunStatus::Cancelled {
                 return; // cancel() already owns the terminal state and cleanup.
             }
@@ -441,7 +468,9 @@ impl RunManager {
     fn append_event(&self, run_id: &str, event: AgentEvent) {
         let snapshot = {
             let mut runs = self.runs.lock().expect("runs lock");
-            let Some(record) = runs.get_mut(run_id) else { return };
+            let Some(record) = runs.get_mut(run_id) else {
+                return;
+            };
             record.snapshot.events.push(event);
             record.snapshot.updated_at_ms = now_ms();
             record.snapshot.clone()
@@ -472,10 +501,9 @@ impl RunManager {
                 ));
             }
             if approved {
-                let source = record
-                    .source
-                    .clone()
-                    .ok_or_else(|| InstalledAgentError::Invalid("run has no source workspace".into()))?;
+                let source = record.source.clone().ok_or_else(|| {
+                    InstalledAgentError::Invalid("run has no source workspace".into())
+                })?;
                 let diff = record.snapshot.diff.clone().unwrap_or_default();
                 apply_promotion(&source, &record.staging, &diff)?;
                 record.snapshot.promotion = PromotionState::Promoted;
@@ -563,11 +591,7 @@ fn drive_child(
         let child = guard
             .as_mut()
             .ok_or_else(|| InstalledAgentError::Child("child already gone".into()))?;
-        (
-            child.stdin.take(),
-            child.stdout.take(),
-            child.stderr.take(),
-        )
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
     };
     if let (Some(mut pipe), Some(line)) = (stdin.take(), input) {
         match writeln!(pipe, "{line}") {
@@ -578,8 +602,10 @@ fn drive_child(
         // Closing stdin is the documented graceful end-of-session signal.
         drop(pipe);
     }
-    let stdout = stdout.ok_or_else(|| InstalledAgentError::Child("child stdout unavailable".into()))?;
-    let stderr = stderr.ok_or_else(|| InstalledAgentError::Child("child stderr unavailable".into()))?;
+    let stdout =
+        stdout.ok_or_else(|| InstalledAgentError::Child("child stdout unavailable".into()))?;
+    let stderr =
+        stderr.ok_or_else(|| InstalledAgentError::Child("child stderr unavailable".into()))?;
     let stderr_thread = thread::spawn(move || {
         let mut out = String::new();
         let mut reader = BufReader::new(stderr);
@@ -706,7 +732,10 @@ mod tests {
         let diff = diff_workspaces(&source, &staging).unwrap();
         apply_promotion(&source, &staging, &diff).unwrap();
         assert_eq!(fs::read_to_string(source.join("added.txt")).unwrap(), "new");
-        assert_eq!(fs::read_to_string(source.join("edit.txt")).unwrap(), "edited");
+        assert_eq!(
+            fs::read_to_string(source.join("edit.txt")).unwrap(),
+            "edited"
+        );
         assert_eq!(fs::read_to_string(source.join("keep.txt")).unwrap(), "keep");
         let _ = fs::remove_dir_all(root);
     }
@@ -770,15 +799,24 @@ mod tests {
         assert_eq!(reviewed.status, RunStatus::AwaitingReview);
         assert_eq!(reviewed.promotion, PromotionState::Pending);
         let diff = reviewed.diff.clone().unwrap();
-        assert!(diff.entries.iter().any(|e| e.path == "created.txt" && e.kind == DiffKind::Added));
+        assert!(diff
+            .entries
+            .iter()
+            .any(|e| e.path == "created.txt" && e.kind == DiffKind::Added));
         // Source is untouched until the operator approves.
         assert!(!source.join("created.txt").exists());
         // A second decision path is rejected while pending is required first.
         let promoted = m.decide(&snap.id, true).unwrap();
         assert_eq!(promoted.status, RunStatus::Completed);
         assert_eq!(promoted.promotion, PromotionState::Promoted);
-        assert_eq!(fs::read_to_string(source.join("created.txt")).unwrap(), "created\n");
-        assert_eq!(fs::read_to_string(source.join("existing.txt")).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(source.join("created.txt")).unwrap(),
+            "created\n"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("existing.txt")).unwrap(),
+            "original"
+        );
         assert_eq!(promoted.preview_dir, source.to_string_lossy());
         // Terminal runs cannot be decided or cancelled again.
         assert!(m.decide(&snap.id, true).is_err());
@@ -800,7 +838,13 @@ mod tests {
         );
         let (m, _dir) = manager();
         let snap = m
-            .begin_with(InstalledAgentId::Codex, "try", source.to_str().unwrap(), RunOptions::default(), &script)
+            .begin_with(
+                InstalledAgentId::Codex,
+                "try",
+                source.to_str().unwrap(),
+                RunOptions::default(),
+                &script,
+            )
             .unwrap();
         let reviewed = wait_terminal(&m, &snap.id, 10_000);
         assert_eq!(reviewed.status, RunStatus::AwaitingReview);
@@ -808,7 +852,10 @@ mod tests {
         let discarded = m.decide(&snap.id, false).unwrap();
         assert_eq!(discarded.promotion, PromotionState::Discarded);
         assert!(!source.join("rejected.txt").exists());
-        assert!(!Path::new(&staging).exists(), "staging is cleaned after discard");
+        assert!(
+            !Path::new(&staging).exists(),
+            "staging is cleaned after discard"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -817,14 +864,16 @@ mod tests {
     fn cancel_kills_the_child_and_marks_the_run() {
         let root = std::env::temp_dir().join(format!("rex-cancel-{}", now_ms()));
         let fixture = root.join("bin");
-        let script = fake_cli(
-            &fixture,
-            "codex",
-            "#!/bin/sh\nsleep 60\n",
-        );
+        let script = fake_cli(&fixture, "codex", "#!/bin/sh\nsleep 60\n");
         let (m, _dir) = manager();
         let snap = m
-            .begin_with(InstalledAgentId::Codex, "long task", "", RunOptions::default(), &script)
+            .begin_with(
+                InstalledAgentId::Codex,
+                "long task",
+                "",
+                RunOptions::default(),
+                &script,
+            )
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let cancelled = m.cancel(&snap.id).unwrap();

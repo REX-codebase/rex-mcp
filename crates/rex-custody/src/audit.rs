@@ -31,12 +31,22 @@ impl AuditEvent {
             "detail": detail,
             "prev_hash": prev_hash,
         });
-        hex_sha256(serde_json::to_string(&canon).expect("event serializes").as_bytes())
+        hex_sha256(
+            serde_json::to_string(&canon)
+                .expect("event serializes")
+                .as_bytes(),
+        )
     }
 
     pub fn verify(&self) -> bool {
         self.hash
-            == Self::compute_hash(self.seq, self.ts_ms, &self.kind, &self.detail, &self.prev_hash)
+            == Self::compute_hash(
+                self.seq,
+                self.ts_ms,
+                &self.kind,
+                &self.detail,
+                &self.prev_hash,
+            )
     }
 }
 
@@ -71,10 +81,19 @@ impl AuditLog {
                 last_hash = ev.hash;
             }
         }
-        Ok(Self { path, seq, last_hash })
+        Ok(Self {
+            path,
+            seq,
+            last_hash,
+        })
     }
 
-    pub fn append(&mut self, ts_ms: u128, kind: &str, detail: Value) -> std::io::Result<AuditEvent> {
+    pub fn append(
+        &mut self,
+        ts_ms: u128,
+        kind: &str,
+        detail: Value,
+    ) -> std::io::Result<AuditEvent> {
         let seq = self.seq + 1;
         let hash = AuditEvent::compute_hash(seq, ts_ms, kind, &detail, &self.last_hash);
         let ev = AuditEvent {
@@ -87,7 +106,10 @@ impl AuditLog {
         };
         let mut line = serde_json::to_string(&ev).expect("event serializes");
         line.push('\n');
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         f.write_all(line.as_bytes())?;
         f.sync_all()?;
         self.seq = seq;

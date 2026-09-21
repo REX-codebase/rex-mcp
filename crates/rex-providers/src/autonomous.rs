@@ -38,10 +38,10 @@ use crate::service::ProviderService;
 use rex_preview::{
     BrowserAction, BrowserEvidence, IterationReceipt, PreviewSupervisor, ProductionGate,
 };
-use rex_search::SearchRequest;
 use rex_prompt::roles::{Role, ToolPolicy};
 use rex_prompt::tools::ToolSpec;
 use rex_prompt::{Assembler, ModuleKind};
+use rex_search::SearchRequest;
 use rex_tools::{PreparedCall, ToolRequest, ToolResult, ToolRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -563,9 +563,14 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 let canon = if dir.exists() {
                     dir.canonicalize().map_err(|e| e.to_string())?
                 } else {
-                    let parent = dir.parent().ok_or_else(|| "invalid workspace path".to_string())?;
+                    let parent = dir
+                        .parent()
+                        .ok_or_else(|| "invalid workspace path".to_string())?;
                     let parent = parent.canonicalize().map_err(|e| e.to_string())?;
-                    parent.join(dir.file_name().ok_or_else(|| "invalid workspace path".to_string())?)
+                    parent.join(
+                        dir.file_name()
+                            .ok_or_else(|| "invalid workspace path".to_string())?,
+                    )
                 };
                 if !canon.starts_with(&root) {
                     return Err("workspace must live under the runs root".into());
@@ -714,7 +719,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             .and_then(Role::from_name)
             .unwrap_or(Role::Worker);
         let (scoped_tools, _) = scoped_tools_for(role);
-        let (system_prompt, current_version, current_hash) = assemble_run_prompt(role, &scoped_tools);
+        let (system_prompt, current_version, current_hash) =
+            assemble_run_prompt(role, &scoped_tools);
         // Prompt-identity gate. A checkpoint written under different prompt
         // semantics must never resume into them silently: fail closed. A
         // legacy checkpoint (no identity) migrates onto the current one and
@@ -1299,14 +1305,54 @@ fn build_state_message(
 /// or given tools it was never told about.
 fn offered_tool_specs() -> Vec<ToolSpec> {
     vec![
-        ToolSpec::new("update_plan", "Replace the visible todo plan.", false, false),
-        ToolSpec::new("read_file", "Read a file inside the selected workspace.", false, false),
-        ToolSpec::new("create_file", "Create a file inside the workspace.", true, true),
-        ToolSpec::new("edit_file", "Replace exact text in a workspace file.", true, true),
-        ToolSpec::new("search_files", "Search file contents inside the workspace.", false, false),
-        ToolSpec::new("run_command", "Run an allowed command inside the workspace.", true, true),
-        ToolSpec::new("web_search", "Search the public web for grounded facts.", false, false),
-        ToolSpec::new("complete_task", "Declare the task finished; harness gates verify the claim.", false, false),
+        ToolSpec::new(
+            "update_plan",
+            "Replace the visible todo plan.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "read_file",
+            "Read a file inside the selected workspace.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "create_file",
+            "Create a file inside the workspace.",
+            true,
+            true,
+        ),
+        ToolSpec::new(
+            "edit_file",
+            "Replace exact text in a workspace file.",
+            true,
+            true,
+        ),
+        ToolSpec::new(
+            "search_files",
+            "Search file contents inside the workspace.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "run_command",
+            "Run an allowed command inside the workspace.",
+            true,
+            true,
+        ),
+        ToolSpec::new(
+            "web_search",
+            "Search the public web for grounded facts.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "complete_task",
+            "Declare the task finished; harness gates verify the claim.",
+            false,
+            false,
+        ),
     ]
 }
 
@@ -1334,7 +1380,10 @@ fn assemble_run_prompt(role: Role, specs: &[ToolSpec]) -> (String, String, Strin
             rex_prompt::tools::render_contract(specs),
         )
         .expect("role allows its tool contract")
-        .module(ModuleKind::CompletionGate, rex_prompt::gate::COMPLETION_GATE)
+        .module(
+            ModuleKind::CompletionGate,
+            rex_prompt::gate::COMPLETION_GATE,
+        )
         .expect("role allows the completion gate")
         .assemble();
     (assembly.system, assembly.version, assembly.prompt_hash)
@@ -1414,12 +1463,11 @@ fn build_request(
             messages.push(json!({"role":"user","content":state_msg}));
             json!({"model":model,"max_tokens":8192,"temperature":0.2,
                 "system":system,
-                "messages":messages,"tools":anthropic_tool_definitions()}).to_string()
+                "messages":messages,"tools":anthropic_tool_definitions()})
+            .to_string()
         }
         ProviderProtocol::OpenAiCompatible => {
-            let mut messages = vec![
-                json!({"role":"system","content":system}),
-            ];
+            let mut messages = vec![json!({"role":"system","content":system})];
             if let Some(pair) = prev {
                 if !pair.model_parts.is_empty() {
                     messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":pair.model_parts}));
@@ -2140,9 +2188,8 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                             raw,
                             json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}),
                         );
-                        response_parts.push(function_response(
-                            protocol, tool_name, &id, false, &content,
-                        ));
+                        response_parts
+                            .push(function_response(protocol, tool_name, &id, false, &content));
                         continue;
                     }
                 }
@@ -2846,7 +2893,13 @@ mod tests {
 
     #[test]
     fn provider_specific_requests_keep_credentials_out_of_evidence() {
-        let anthropic = build_request(ProviderProtocol::Anthropic, "claude-test", "sys", "state", None);
+        let anthropic = build_request(
+            ProviderProtocol::Anthropic,
+            "claude-test",
+            "sys",
+            "state",
+            None,
+        );
         let openai = build_request(
             ProviderProtocol::OpenAiCompatible,
             "gpt-test",
@@ -3250,7 +3303,13 @@ mod tests {
     #[test]
     fn gemini_request_carries_the_assembled_system_instruction() {
         let (system, _, _) = assemble_run_prompt(Role::Worker, &offered_tool_specs());
-        let request = build_request(ProviderProtocol::Gemini, "gemini-test", &system, "state", None);
+        let request = build_request(
+            ProviderProtocol::Gemini,
+            "gemini-test",
+            &system,
+            "state",
+            None,
+        );
         let value: Value = serde_json::from_str(&request).unwrap();
         let text = value["systemInstruction"]["parts"][0]["text"]
             .as_str()
@@ -3262,7 +3321,13 @@ mod tests {
         // same semantics reach the other protocols' system fields
         let anthropic = build_request(ProviderProtocol::Anthropic, "m", &system, "state", None);
         assert!(anthropic.contains("REX CONSTITUTION"));
-        let openai = build_request(ProviderProtocol::OpenAiCompatible, "m", &system, "state", None);
+        let openai = build_request(
+            ProviderProtocol::OpenAiCompatible,
+            "m",
+            &system,
+            "state",
+            None,
+        );
         assert!(openai.contains("REX CONSTITUTION"));
     }
 
@@ -3288,7 +3353,10 @@ mod tests {
         let (scoped, allowlist) = scoped_tools_for(Role::Adversary);
         let allowed = allowlist.expect("adversary runs are scoped");
         for gone in ["create_file", "edit_file", "run_command"] {
-            assert!(!allowed.iter().any(|t| t == gone), "{gone} must not be allowed");
+            assert!(
+                !allowed.iter().any(|t| t == gone),
+                "{gone} must not be allowed"
+            );
         }
         for kept in ["read_file", "search_files", "web_search"] {
             assert!(allowed.iter().any(|t| t == kept), "{kept} stays");
@@ -3358,9 +3426,11 @@ mod tests {
             AgentEvent::Info { message } if message.contains("refused out-of-scope tool create_file")
         )));
         // nothing was written
-        assert!(std::fs::read_dir(tmp.path().join("runs").join(&snap.id).join("workspace"))
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(false));
+        assert!(
+            std::fs::read_dir(tmp.path().join("runs").join(&snap.id).join("workspace"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false)
+        );
     }
 
     #[test]

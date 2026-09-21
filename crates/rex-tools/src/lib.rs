@@ -1276,33 +1276,42 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-fn trusted_scoring_runs_allowlisted_bare_names_only() {
-    let dir = std::env::temp_dir().join(format!("rex-scoring-test-{}", std::process::id()));
-    let rt = ToolRuntime::new(&dir).expect("runtime");
-    // allowlisted executable runs
-    let ok = rt.execute_trusted_scoring(&["true".to_string()], None, 5_000, &["true"]);
-    assert!(ok.ok, "true should pass: {:?}", ok.error);
-    // allowlisted executable that exits nonzero is a failure, not a policy block
-    let bad = rt.execute_trusted_scoring(&["false".to_string()], None, 5_000, &["false"]);
-    assert!(!bad.ok);
-    assert!(matches!(bad.error.as_ref().map(|e| &e.kind), Some(ErrorKind::ProcessFailed)));
-    // non-allowlisted interpreter stays blocked even though it exists
-    let denied = rt.execute_trusted_scoring(
-        &["sh".to_string(), "-c".to_string(), "true".to_string()],
-        None,
-        5_000,
-        &["true"],
-    );
-    assert!(!denied.ok);
-    assert!(matches!(denied.error.as_ref().map(|e| &e.kind), Some(ErrorKind::PolicyDenied)));
-    // path traversal as executable name refused
-    let trav = rt.execute_trusted_scoring(&["/bin/true".to_string()], None, 5_000, &["true"]);
-    assert!(!trav.ok);
-    assert!(matches!(trav.error.as_ref().map(|e| &e.kind), Some(ErrorKind::PolicyDenied)));
-    let _ = std::fs::remove_dir_all(&dir);
-}
+    fn trusted_scoring_runs_allowlisted_bare_names_only() {
+        let dir = std::env::temp_dir().join(format!("rex-scoring-test-{}", std::process::id()));
+        let rt = ToolRuntime::new(&dir).expect("runtime");
+        // allowlisted executable runs
+        let ok = rt.execute_trusted_scoring(&["true".to_string()], None, 5_000, &["true"]);
+        assert!(ok.ok, "true should pass: {:?}", ok.error);
+        // allowlisted executable that exits nonzero is a failure, not a policy block
+        let bad = rt.execute_trusted_scoring(&["false".to_string()], None, 5_000, &["false"]);
+        assert!(!bad.ok);
+        assert!(matches!(
+            bad.error.as_ref().map(|e| &e.kind),
+            Some(ErrorKind::ProcessFailed)
+        ));
+        // non-allowlisted interpreter stays blocked even though it exists
+        let denied = rt.execute_trusted_scoring(
+            &["sh".to_string(), "-c".to_string(), "true".to_string()],
+            None,
+            5_000,
+            &["true"],
+        );
+        assert!(!denied.ok);
+        assert!(matches!(
+            denied.error.as_ref().map(|e| &e.kind),
+            Some(ErrorKind::PolicyDenied)
+        ));
+        // path traversal as executable name refused
+        let trav = rt.execute_trusted_scoring(&["/bin/true".to_string()], None, 5_000, &["true"]);
+        assert!(!trav.ok);
+        assert!(matches!(
+            trav.error.as_ref().map(|e| &e.kind),
+            Some(ErrorKind::PolicyDenied)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-#[test]
+    #[test]
     fn symlink_escape_refused() {
         use std::os::unix::fs::symlink;
         let root = temp();

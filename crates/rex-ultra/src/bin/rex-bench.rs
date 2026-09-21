@@ -10,10 +10,10 @@
 //! deterministic re-execution only.
 
 use rex_providers::autonomous::AutonomousRunService;
+use rex_providers::http::UreqTransport;
 use rex_providers::oneshot;
 use rex_providers::secrets::FileSecretStore;
 use rex_providers::service::ProviderService;
-use rex_providers::http::UreqTransport;
 use rex_ultra::bench::{self, BenchMode, BenchTask, TaskResult};
 use rex_ultra::evidence::sha256_hex;
 use rex_ultra::orchestrator::{ultra_prompt_identity, UltraOptions, UltraRunService};
@@ -358,7 +358,10 @@ fn main() {
         eprintln!("rex-bench: expected `run` or `report`");
         std::process::exit(2);
     }
-    let suite_path = args.suite.clone().unwrap_or_else(|| PathBuf::from("bench/suite.jsonl"));
+    let suite_path = args
+        .suite
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("bench/suite.jsonl"));
     let mut tasks = bench::load_suite(&suite_path).unwrap_or_else(|e| {
         eprintln!("rex-bench: {e}");
         std::process::exit(2);

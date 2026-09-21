@@ -38,12 +38,20 @@ impl McpStdioClient {
             .map_err(|e| format!("cannot spawn rex-mcp at {}: {e}", bin.display()))?;
         let stdin = child.stdin.take().ok_or("rex-mcp stdin unavailable")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("rex-mcp stdout unavailable")?);
-        let mut client = Self { child, stdin, stdout, next_id: 0 };
-        let hello = client.request(json!({
-            "protocolVersion": CLIENT_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "rex-shell", "version": env!("CARGO_PKG_VERSION") },
-        }), "initialize")?;
+        let mut client = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 0,
+        };
+        let hello = client.request(
+            json!({
+                "protocolVersion": CLIENT_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "rex-shell", "version": env!("CARGO_PKG_VERSION") },
+            }),
+            "initialize",
+        )?;
         if hello.get("result").is_none() {
             let _ = client.child.kill();
             return Err(format!("rex-mcp refused initialize: {hello}"));
@@ -63,7 +71,10 @@ impl McpStdioClient {
         if let Some(err) = response.get("error") {
             return Err(format!("rex-mcp error: {err}"));
         }
-        let result = response.get("result").cloned().ok_or("rex-mcp reply missing result")?;
+        let result = response
+            .get("result")
+            .cloned()
+            .ok_or("rex-mcp reply missing result")?;
         if result.get("isError").and_then(Value::as_bool) == Some(true) {
             return Err(format!("tool {name} failed: {result}"));
         }
@@ -84,14 +95,18 @@ impl McpStdioClient {
                 return Err(format!("rex-mcp reply timed out for {method}"));
             }
             let mut line = String::new();
-            let n = self.stdout.read_line(&mut line).map_err(|e| format!("rex-mcp read: {e}"))?;
+            let n = self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|e| format!("rex-mcp read: {e}"))?;
             if n == 0 {
                 return Err("rex-mcp closed stdout unexpectedly".into());
             }
             if line.trim().is_empty() {
                 continue;
             }
-            let msg: Value = serde_json::from_str(&line).map_err(|e| format!("rex-mcp bad json: {e}"))?;
+            let msg: Value =
+                serde_json::from_str(&line).map_err(|e| format!("rex-mcp bad json: {e}"))?;
             if msg.get("id").and_then(Value::as_u64) == Some(id) {
                 return Ok(msg);
             }
@@ -104,8 +119,12 @@ impl McpStdioClient {
 
     fn send(&mut self, msg: &Value) -> Result<(), String> {
         serde_json::to_writer(&mut self.stdin, msg).map_err(|e| format!("rex-mcp write: {e}"))?;
-        self.stdin.write_all(b"\n").map_err(|e| format!("rex-mcp write: {e}"))?;
-        self.stdin.flush().map_err(|e| format!("rex-mcp flush: {e}"))
+        self.stdin
+            .write_all(b"\n")
+            .map_err(|e| format!("rex-mcp write: {e}"))?;
+        self.stdin
+            .flush()
+            .map_err(|e| format!("rex-mcp flush: {e}"))
     }
 }
 
@@ -150,7 +169,11 @@ pub fn rex_mcp_bin() -> Result<PathBuf, String> {
     let sibling = exe
         .parent()
         .ok_or("current exe has no parent dir")?
-        .join(if cfg!(windows) { "rex-mcp.exe" } else { "rex-mcp" });
+        .join(if cfg!(windows) {
+            "rex-mcp.exe"
+        } else {
+            "rex-mcp"
+        });
     if sibling.exists() {
         Ok(sibling)
     } else {

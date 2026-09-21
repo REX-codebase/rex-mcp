@@ -89,7 +89,8 @@ fn installed_agent_snapshot(
     runs: State<'_, Arc<InstalledRuns>>,
     run_id: String,
 ) -> Result<InstalledRunSnapshot, String> {
-    runs.snapshot(&run_id).ok_or_else(|| "unknown run".to_string())
+    runs.snapshot(&run_id)
+        .ok_or_else(|| "unknown run".to_string())
 }
 
 /// Trusted operator decision on a staged diff. The model and the child can
@@ -489,7 +490,10 @@ fn rex_tasks() -> serde_json::Value {
     }
     tasks.sort_by(|a, b| {
         let key = |v: &serde_json::Value| {
-            v.get("task_id").and_then(|t| t.as_str()).unwrap_or("").to_string()
+            v.get("task_id")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string()
         };
         key(a).cmp(&key(b))
     });
@@ -607,7 +611,9 @@ fn ultra_begin(
 
 #[tauri::command]
 fn ultra_snapshot(ultra: State<'_, Arc<Ultra>>, run_id: String) -> Result<UltraSnapshot, String> {
-    ultra.snapshot(&run_id).ok_or_else(|| "unknown run".to_string())
+    ultra
+        .snapshot(&run_id)
+        .ok_or_else(|| "unknown run".to_string())
 }
 
 /// Trusted UI decision for the currently active builder/adversary sub-run.
@@ -687,7 +693,10 @@ fn main() {
     ));
     // Ultra shares the Simple run service: one provider core, one approval
     // channel, one runs root. Ultra adds its verification phases on top.
-    let ultra = Arc::new(UltraRunService::new(agent.clone(), config_dir().join("agent-runs")));
+    let ultra = Arc::new(UltraRunService::new(
+        agent.clone(),
+        config_dir().join("agent-runs"),
+    ));
     // Custody wraps the same run service: human-mode runs carry an operator
     // grant, grant-clamped budgets and gated completion.
     let custody_runs = Arc::new(CustodyRuns::new(

@@ -20,7 +20,9 @@
 //! `docs/subscription-policy.md` and `crates/rex-installed-agents/COMPATIBILITY.md`.
 
 pub mod run_service;
-pub use run_service::{DiffEntry, DiffKind, DiffSummary, PromotionState, RunManager, RunSnapshot, RunStatus};
+pub use run_service::{
+    DiffEntry, DiffKind, DiffSummary, PromotionState, RunManager, RunSnapshot, RunStatus,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -236,7 +238,11 @@ pub fn safe_args_with_options(
     Ok(safe_args_verified(id, prompt, options))
 }
 
-fn safe_args_verified(id: InstalledAgentId, prompt: &str, _options: &RunOptions) -> (Args, Option<String>) {
+fn safe_args_verified(
+    id: InstalledAgentId,
+    prompt: &str,
+    _options: &RunOptions,
+) -> (Args, Option<String>) {
     match id {
         InstalledAgentId::Codex => (
             vec![
@@ -333,7 +339,10 @@ pub mod collect_events {
     use super::{AgentEvent, InstalledAgentError, InstalledAgentId};
     use serde_json::Value;
 
-    pub fn parse_line(_id: InstalledAgentId, line: &str) -> Result<AgentEvent, InstalledAgentError> {
+    pub fn parse_line(
+        _id: InstalledAgentId,
+        line: &str,
+    ) -> Result<AgentEvent, InstalledAgentError> {
         let payload: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(_) => Value::String(line.to_string()),
@@ -647,8 +656,10 @@ mod tests {
     #[test]
     fn error_event_is_not_completion() {
         let mut events = valid_events();
-        *events.last_mut().unwrap() =
-            event("error", serde_json::json!({"type":"error","message":"boom"}));
+        *events.last_mut().unwrap() = event(
+            "error",
+            serde_json::json!({"type":"error","message":"boom"}),
+        );
         assert!(validate_codex_stream(&events, Some(0)).is_err());
     }
     #[test]
@@ -661,7 +672,10 @@ mod tests {
     #[test]
     fn event_after_terminal_and_duplicate_terminal_fail_closed() {
         let mut e = valid_events();
-        e.push(event("turn.started", serde_json::json!({"type":"turn.started"})));
+        e.push(event(
+            "turn.started",
+            serde_json::json!({"type":"turn.started"}),
+        ));
         assert!(validate_codex_stream(&e, Some(0)).is_err());
         let mut e = valid_events();
         e.push(e.last().unwrap().clone());

@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 /// Wire version. Major bumps break; minor bumps add optional fields only.
 pub const PROTOCOL_VERSION: &str = "1.1";
 
-pub mod schema;
 pub mod packets;
+pub mod schema;
 
 /// The complete v1 tool surface. MCP names are the snake_case strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +197,10 @@ pub enum TaskState {
 
 impl TaskState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, TaskState::Completed | TaskState::Failed | TaskState::Cancelled)
+        matches!(
+            self,
+            TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+        )
     }
 }
 
@@ -626,9 +629,22 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "rex_execute", "rex_next", "rex_read", "rex_edit", "rex_search", "rex_run",
-                "rex_test", "rex_submit", "rex_status", "rex_events", "rex_result", "rex_cancel",
-                "rex_ultra_open", "rex_ultra_submit", "rex_ultra_promote", "rex_proof",
+                "rex_execute",
+                "rex_next",
+                "rex_read",
+                "rex_edit",
+                "rex_search",
+                "rex_run",
+                "rex_test",
+                "rex_submit",
+                "rex_status",
+                "rex_events",
+                "rex_result",
+                "rex_cancel",
+                "rex_ultra_open",
+                "rex_ultra_submit",
+                "rex_ultra_promote",
+                "rex_proof",
             ]
         );
         for t in ToolName::all() {
@@ -650,29 +666,66 @@ mod tests {
 
     #[test]
     fn serde_stability_of_states_and_codes() {
-        assert_eq!(serde_json::to_string(&TaskState::Created).unwrap(), "\"created\"");
-        assert_eq!(serde_json::to_string(&TaskState::Verifying).unwrap(), "\"verifying\"");
-        assert_eq!(serde_json::to_string(&TaskState::Completed).unwrap(), "\"completed\"");
-        assert_eq!(serde_json::to_string(&ErrorCode::StaleLease).unwrap(), "\"stale_lease\"");
-        assert_eq!(serde_json::to_string(&ErrorCode::GateFailed).unwrap(), "\"gate_failed\"");
-        assert_eq!(serde_json::to_string(&HostKind::ClaudeCode).unwrap(), "\"claude_code\"");
-        assert_eq!(serde_json::to_string(&HostKind::GenericAgent).unwrap(), "\"generic_agent\"");
+        assert_eq!(
+            serde_json::to_string(&TaskState::Created).unwrap(),
+            "\"created\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskState::Verifying).unwrap(),
+            "\"verifying\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskState::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::StaleLease).unwrap(),
+            "\"stale_lease\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::GateFailed).unwrap(),
+            "\"gate_failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HostKind::ClaudeCode).unwrap(),
+            "\"claude_code\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HostKind::GenericAgent).unwrap(),
+            "\"generic_agent\""
+        );
         // Round trip every variant of each enum.
         for s in [
-            TaskState::Created, TaskState::Active, TaskState::Verifying, TaskState::Completed,
-            TaskState::Failed, TaskState::Cancelled,
+            TaskState::Created,
+            TaskState::Active,
+            TaskState::Verifying,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Cancelled,
         ] {
-            let back: TaskState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            let back: TaskState =
+                serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
             assert_eq!(back, s);
         }
         for c in [
-            ErrorCode::VersionMismatch, ErrorCode::UnknownTool, ErrorCode::MalformedRequest,
-            ErrorCode::Unauthorized, ErrorCode::TaskNotFound, ErrorCode::TaskTerminal,
-            ErrorCode::IdempotencyConflict, ErrorCode::StaleLease, ErrorCode::LeaseConflict,
-            ErrorCode::ScopeDenied, ErrorCode::ApprovalRequired, ErrorCode::BudgetExceeded,
-            ErrorCode::GateFailed, ErrorCode::NoResult, ErrorCode::Internal,
+            ErrorCode::VersionMismatch,
+            ErrorCode::UnknownTool,
+            ErrorCode::MalformedRequest,
+            ErrorCode::Unauthorized,
+            ErrorCode::TaskNotFound,
+            ErrorCode::TaskTerminal,
+            ErrorCode::IdempotencyConflict,
+            ErrorCode::StaleLease,
+            ErrorCode::LeaseConflict,
+            ErrorCode::ScopeDenied,
+            ErrorCode::ApprovalRequired,
+            ErrorCode::BudgetExceeded,
+            ErrorCode::GateFailed,
+            ErrorCode::NoResult,
+            ErrorCode::Internal,
         ] {
-            let back: ErrorCode = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+            let back: ErrorCode =
+                serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
             assert_eq!(back, c);
         }
     }
@@ -681,9 +734,15 @@ mod tests {
     fn optional_fields_omit_and_default() {
         // Optional fields omitted on the wire must deserialize as None
         // (forward compatibility for minor additions).
-        let json = r#"{"request_id":"r1","task":"do it","host":"claude_code","operator_is_agent":true}"#;
+        let json =
+            r#"{"request_id":"r1","task":"do it","host":"claude_code","operator_is_agent":true}"#;
         let req: ExecuteRequest = serde_json::from_str(json).unwrap();
-        assert!(req.task_id.is_none() && req.budgets.is_none() && req.proof.is_none() && req.plan.is_none());
+        assert!(
+            req.task_id.is_none()
+                && req.budgets.is_none()
+                && req.proof.is_none()
+                && req.plan.is_none()
+        );
         // ...and serializing a None-heavy request omits them.
         let out = serde_json::to_string(&req).unwrap();
         assert!(!out.contains("task_id"));
@@ -696,7 +755,8 @@ mod tests {
 
         let sub: SubmitRequest = serde_json::from_str(
             r#"{"task_id":"task-1","lease_epoch":1,"action_id":"a","narrative":"done"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(sub.evidence.is_empty());
     }
 

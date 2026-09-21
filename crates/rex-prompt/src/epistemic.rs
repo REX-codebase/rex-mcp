@@ -8,9 +8,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "class", rename_all = "snake_case")]
 pub enum EpistemicFact {
-    Observed { statement: String, evidence_id: String },
-    Inferred { statement: String, from: Vec<String> },
-    Guess { statement: String },
+    Observed {
+        statement: String,
+        evidence_id: String,
+    },
+    Inferred {
+        statement: String,
+        from: Vec<String>,
+    },
+    Guess {
+        statement: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,8 +153,12 @@ mod tests {
             guess("probably fine").unwrap(),
         ];
         let rendered = render_state(&facts);
-        assert!(rendered.contains("OBSERVED (harness-verified):\n- cargo check exit 0 [evidence ev-1]"));
-        assert!(rendered.contains("INFERRED (derived, not directly verified):\n- workspace compiles [from f-1]"));
+        assert!(
+            rendered.contains("OBSERVED (harness-verified):\n- cargo check exit 0 [evidence ev-1]")
+        );
+        assert!(rendered.contains(
+            "INFERRED (derived, not directly verified):\n- workspace compiles [from f-1]"
+        ));
         assert!(rendered.contains("GUESSES (unsupported; they unlock nothing):\n- probably fine"));
     }
 }

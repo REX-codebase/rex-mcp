@@ -63,7 +63,11 @@ impl EvidenceStore {
             .append(true)
             .open(&self.manifest)
         {
-            let _ = writeln!(file, "{}", serde_json::to_string(&entry).unwrap_or_default());
+            let _ = writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&entry).unwrap_or_default()
+            );
         }
         entry
     }
@@ -74,7 +78,12 @@ impl EvidenceStore {
     }
 
     /// Hash a workspace file into evidence without copying it.
-    pub fn put_file(&mut self, kind: &str, workspace: &Path, rel: &str) -> Result<EvidenceEntry, String> {
+    pub fn put_file(
+        &mut self,
+        kind: &str,
+        workspace: &Path,
+        rel: &str,
+    ) -> Result<EvidenceEntry, String> {
         let full = workspace.join(rel);
         let meta = fs::metadata(&full).map_err(|e| format!("{rel}: {e}"))?;
         if meta.len() > MAX_HASH_BYTES {
@@ -93,7 +102,9 @@ impl EvidenceStore {
             if entries.len() >= MAX_MANIFEST_ENTRIES {
                 break;
             }
-            let Ok(read) = fs::read_dir(&dir) else { continue };
+            let Ok(read) = fs::read_dir(&dir) else {
+                continue;
+            };
             for item in read.flatten() {
                 let path = item.path();
                 let name = item.file_name().to_string_lossy().to_string();

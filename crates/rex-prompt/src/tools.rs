@@ -62,11 +62,20 @@ observations; a call you did not make did not happen.\n",
     );
     for spec in specs {
         let mut tags = Vec::new();
-        tags.push(if spec.mutates { "mutating" } else { "read-only" });
+        tags.push(if spec.mutates {
+            "mutating"
+        } else {
+            "read-only"
+        });
         if spec.requires_approval {
             tags.push("requires trusted approval");
         }
-        out.push_str(&format!("- {} ({}) - {}\n", spec.name, tags.join(", "), spec.summary));
+        out.push_str(&format!(
+            "- {} ({}) - {}\n",
+            spec.name,
+            tags.join(", "),
+            spec.summary
+        ));
     }
     out.trim_end().to_string()
 }
@@ -94,7 +103,13 @@ mod tests {
         let names: Vec<&str> = scoped.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            ["update_plan", "read_file", "search_files", "web_search", "complete_task"]
+            [
+                "update_plan",
+                "read_file",
+                "search_files",
+                "web_search",
+                "complete_task"
+            ]
         );
         let contract = render_contract(&scoped);
         // tool overclaiming defence: mutating tools must not exist in the contract

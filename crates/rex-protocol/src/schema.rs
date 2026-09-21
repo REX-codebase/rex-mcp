@@ -18,7 +18,11 @@ pub struct SchemaVersions {
 
 impl Default for SchemaVersions {
     fn default() -> Self {
-        Self { protocol: PROTOCOL_SCHEMA_VERSION.into(), task: TASK_SCHEMA_VERSION, kernel: KERNEL_SCHEMA_VERSION }
+        Self {
+            protocol: PROTOCOL_SCHEMA_VERSION.into(),
+            task: TASK_SCHEMA_VERSION,
+            kernel: KERNEL_SCHEMA_VERSION,
+        }
     }
 }
 
@@ -66,11 +70,17 @@ pub fn canonical_hash<T: Serialize>(value: &T) -> Result<String, serde_json::Err
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-pub fn decode_record<T: DeserializeOwned>(bytes: &[u8], expected_task_version: u16) -> Result<T, MigrationError> {
+pub fn decode_record<T: DeserializeOwned>(
+    bytes: &[u8],
+    expected_task_version: u16,
+) -> Result<T, MigrationError> {
     let record: VersionedRecord<T> = serde_json::from_slice(bytes)
         .map_err(|error| MigrationError::InvalidEncoding(error.to_string()))?;
     if record.schema.task != expected_task_version {
-        return Err(MigrationError::TargetMismatch { expected: expected_task_version, found: record.schema.task });
+        return Err(MigrationError::TargetMismatch {
+            expected: expected_task_version,
+            found: record.schema.task,
+        });
     }
     Ok(record.value)
 }
@@ -80,26 +90,47 @@ pub fn decode_record<T: DeserializeOwned>(bytes: &[u8], expected_task_version: u
 pub fn migrate_v1_bytes(bytes: &[u8], kind: &str) -> Result<MigrationEnvelope, MigrationError> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| MigrationError::InvalidEncoding(error.to_string()))?;
-    let object = value.as_object().ok_or_else(|| MigrationError::InvalidEncoding("record is not an object".into()))?;
-    let version = object.get("schema_version").and_then(Value::as_u64)
-        .ok_or_else(|| MigrationError::InvalidEncoding("legacy schema_version is missing".into()))? as u16;
+    let object = value
+        .as_object()
+        .ok_or_else(|| MigrationError::InvalidEncoding("record is not an object".into()))?;
+    let version = object
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| MigrationError::InvalidEncoding("legacy schema_version is missing".into()))?
+        as u16;
     if version != 1 {
-        return Err(MigrationError::UnsupportedVersion { kind: kind.into(), version });
+        return Err(MigrationError::UnsupportedVersion {
+            kind: kind.into(),
+            version,
+        });
     }
     Ok(MigrationEnvelope {
-        kind: kind.into(), source_version: 1, target_version: 2,
-        payload: canonical_json(&value).map_err(|error| MigrationError::InvalidEncoding(error.to_string()))?,
+        kind: kind.into(),
+        source_version: 1,
+        target_version: 2,
+        payload: canonical_json(&value)
+            .map_err(|error| MigrationError::InvalidEncoding(error.to_string()))?,
     })
 }
 
-pub fn migrate_legacy_file(legacy: &std::path::Path, target: &std::path::Path, kind: &str) -> Result<(), MigrationError> {
-    if target.exists() { return Err(MigrationError::TargetExists); }
+pub fn migrate_legacy_file(
+    legacy: &std::path::Path,
+    target: &std::path::Path,
+    kind: &str,
+) -> Result<(), MigrationError> {
+    if target.exists() {
+        return Err(MigrationError::TargetExists);
+    }
     let envelope = migrate_v1_bytes(
-        &std::fs::read(legacy).map_err(|error| MigrationError::Io(error.to_string()))?, kind,
+        &std::fs::read(legacy).map_err(|error| MigrationError::Io(error.to_string()))?,
+        kind,
     )?;
     let temporary = target.with_extension("v2.tmp");
-    if temporary.exists() { return Err(MigrationError::TargetExists); }
-    let bytes = canonical_json(&envelope).map_err(|error| MigrationError::InvalidEncoding(error.to_string()))?;
+    if temporary.exists() {
+        return Err(MigrationError::TargetExists);
+    }
+    let bytes = canonical_json(&envelope)
+        .map_err(|error| MigrationError::InvalidEncoding(error.to_string()))?;
     std::fs::write(&temporary, bytes).map_err(|error| MigrationError::Io(error.to_string()))?;
     if let Err(error) = std::fs::rename(&temporary, target) {
         let _ = std::fs::remove_file(&temporary);
@@ -111,8 +142,10 @@ pub fn migrate_legacy_file(legacy: &std::path::Path, target: &std::path::Path, k
 fn canonical_value(value: Value) -> Value {
     match value {
         Value::Object(object) => {
-            let sorted: BTreeMap<String, Value> = object.into_iter()
-                .map(|(key, value)| (key, canonical_value(value))).collect();
+            let sorted: BTreeMap<String, Value> = object
+                .into_iter()
+                .map(|(key, value)| (key, canonical_value(value)))
+                .collect();
             Value::Object(sorted.into_iter().collect())
         }
         Value::Array(values) => Value::Array(values.into_iter().map(canonical_value).collect()),
@@ -134,13 +167,24 @@ mod tests {
     #[test]
     fn task_and_kernel_versions_are_separate() {
         assert_ne!(TASK_SCHEMA_VERSION, 0);
-        assert_eq!(VersionedRecord::<Value> { schema: SchemaVersions::default(), value: Value::Null }.schema.kernel, 2);
+        assert_eq!(
+            VersionedRecord::<Value> {
+                schema: SchemaVersions::default(),
+                value: Value::Null
+            }
+            .schema
+            .kernel,
+            2
+        );
     }
 
     #[test]
     fn unknown_legacy_version_fails_closed() {
         let error = migrate_v1_bytes(br#"{"schema_version":9}"#, "task").unwrap_err();
-        assert!(matches!(error, MigrationError::UnsupportedVersion { version: 9, .. }));
+        assert!(matches!(
+            error,
+            MigrationError::UnsupportedVersion { version: 9, .. }
+        ));
     }
 
     #[test]
@@ -152,6 +196,9 @@ mod tests {
         std::fs::write(&legacy, legacy_bytes).unwrap();
         migrate_legacy_file(&legacy, &target, "task").unwrap();
         assert_eq!(std::fs::read(&legacy).unwrap(), legacy_bytes);
-        assert_eq!(migrate_legacy_file(&legacy, &target, "task"), Err(MigrationError::TargetExists));
+        assert_eq!(
+            migrate_legacy_file(&legacy, &target, "task"),
+            Err(MigrationError::TargetExists)
+        );
     }
 }

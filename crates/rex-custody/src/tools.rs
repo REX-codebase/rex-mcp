@@ -49,10 +49,13 @@ impl CustodiedToolRuntime {
         request: ToolRequest,
         now_ms: u128,
     ) -> Result<PreparedCall, CustodyToolError> {
-        let mut reg = self.registry.lock().map_err(|_| {
-            CustodyToolError::Custody(CustodyError::Io("registry poisoned".into()))
-        })?;
-        let grant = reg.verify_token(token, now_ms).map_err(CustodyToolError::Custody)?;
+        let mut reg = self
+            .registry
+            .lock()
+            .map_err(|_| CustodyToolError::Custody(CustodyError::Io("registry poisoned".into())))?;
+        let grant = reg
+            .verify_token(token, now_ms)
+            .map_err(CustodyToolError::Custody)?;
         if let Err(denial) = grant.capabilities.permits(&request) {
             let v = Violation::CapabilityEscape {
                 detail: denial.to_string(),
@@ -70,7 +73,11 @@ impl CustodiedToolRuntime {
 
     /// Trusted UI decision passthrough. Custody adds no approval authority;
     /// the human boundary in rex-tools is untouched.
-    pub fn resolve_approval(&self, call_id: &str, approved: bool) -> Result<CallState, CustodyToolError> {
+    pub fn resolve_approval(
+        &self,
+        call_id: &str,
+        approved: bool,
+    ) -> Result<CallState, CustodyToolError> {
         self.inner
             .resolve_approval(call_id, approved)
             .map_err(CustodyToolError::Tool)
@@ -82,12 +89,7 @@ impl CustodiedToolRuntime {
 
     /// Execute a prepared call. Token is re-verified at execution: a grant
     /// released or quarantined between prepare and execute stops the call.
-    pub fn execute(
-        &self,
-        token: &CapabilityToken,
-        call_id: &str,
-        now_ms: u128,
-    ) -> ToolResult {
+    pub fn execute(&self, token: &CapabilityToken, call_id: &str, now_ms: u128) -> ToolResult {
         let checked = {
             let mut reg = match self.registry.lock() {
                 Ok(r) => r,

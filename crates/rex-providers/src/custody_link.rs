@@ -13,7 +13,9 @@
 //! truthfully until a protocol boundary lands; custody never pretends a
 //! route exists.
 
-use crate::autonomous::{AgentSnapshot, AgentStatus, AutonomousRunService, Budgets, TerminalReason};
+use crate::autonomous::{
+    AgentSnapshot, AgentStatus, AutonomousRunService, Budgets, TerminalReason,
+};
 use crate::http::Transport;
 use crate::secrets::SecretStore;
 use rex_custody::*;
@@ -77,10 +79,16 @@ pub fn ui_managed_request(
         tool_classes: [ToolClass::Read, ToolClass::Write, ToolClass::Execute]
             .into_iter()
             .collect(),
-        allowed_tools: ["read_file", "create_file", "edit_file", "search_files", "run_command"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        allowed_tools: [
+            "read_file",
+            "create_file",
+            "edit_file",
+            "search_files",
+            "run_command",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
         allow_search: true,
         allow_preview: true,
         can_delegate: false,
@@ -101,7 +109,10 @@ pub fn ui_managed_request(
         },
         lease_terms: LeaseTerms::default(),
         contract: CompletionContract {
-            gates: vec![EvidenceGate::NoPendingApprovals, EvidenceGate::WithinScopeChanges],
+            gates: vec![
+                EvidenceGate::NoPendingApprovals,
+                EvidenceGate::WithinScopeChanges,
+            ],
             max_claim_attempts: 1,
         },
     }
@@ -127,17 +138,16 @@ struct RunGateEvaluator<S: SecretStore + 'static, T: Transport + 'static> {
 impl<S: SecretStore + 'static, T: Transport + 'static> GateEvaluator for RunGateEvaluator<S, T> {
     fn evaluate(&self, gate: &EvidenceGate, _grant: &CustodyGrant) -> GateOutcome {
         match gate {
-            EvidenceGate::NoPendingApprovals => {
-                match self.runs.snapshot(&self.run_id) {
-                    Some(s) if s.pending_approval.is_none()
+            EvidenceGate::NoPendingApprovals => match self.runs.snapshot(&self.run_id) {
+                Some(s)
+                    if s.pending_approval.is_none()
                         && matches!(s.status, AgentStatus::Completed) =>
-                    {
-                        GateOutcome::Passed
-                    }
-                    Some(_) => GateOutcome::Failed("run not cleanly completed".into()),
-                    None => GateOutcome::Failed("run missing".into()),
+                {
+                    GateOutcome::Passed
                 }
-            }
+                Some(_) => GateOutcome::Failed("run not cleanly completed".into()),
+                None => GateOutcome::Failed("run missing".into()),
+            },
             // Every tool call already passed through the granted scope;
             // out-of-scope changes were structurally impossible.
             EvidenceGate::WithinScopeChanges => GateOutcome::Passed,
@@ -147,7 +157,10 @@ impl<S: SecretStore + 'static, T: Transport + 'static> GateEvaluator for RunGate
 }
 
 impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
-    pub fn new(runs: Arc<AutonomousRunService<S, T>>, custody: Arc<Mutex<CustodyRegistry>>) -> Self {
+    pub fn new(
+        runs: Arc<AutonomousRunService<S, T>>,
+        custody: Arc<Mutex<CustodyRegistry>>,
+    ) -> Self {
         Self { runs, custody }
     }
 
@@ -181,7 +194,10 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
             provider: req.provider.clone(),
             model: req.model.clone(),
         };
-        let mut custody = self.custody.lock().map_err(|_| "custody poisoned".to_string())?;
+        let mut custody = self
+            .custody
+            .lock()
+            .map_err(|_| "custody poisoned".to_string())?;
         let offer = custody
             .offer(
                 &req.task_id,
@@ -215,9 +231,9 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
             max_wall_ms: grant.budgets.max_wall_ms,
             max_tokens: grant.budgets.max_tokens,
         };
-        let workspace = req.workspace.unwrap_or_else(|| {
-            self.runs_workspace_hint(&grant.grant_id)
-        });
+        let workspace = req
+            .workspace
+            .unwrap_or_else(|| self.runs_workspace_hint(&grant.grant_id));
         let snapshot = self
             .runs
             .begin_in_workspace_with_role(
@@ -230,17 +246,19 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
             )
             .map_err(|e| {
                 // The run never started; release custody honestly.
-                let _ = self
-                    .custody
-                    .lock()
-                    .map(|mut c| {
-                        let _ = c.declare_failure(&token, &format!("run failed to start: {e}"), now_ms());
-                    });
+                let _ = self.custody.lock().map(|mut c| {
+                    let _ =
+                        c.declare_failure(&token, &format!("run failed to start: {e}"), now_ms());
+                });
                 format!("run refused: {e}")
             })?;
 
         self.spawn_monitor(grant.grant_id.clone(), token.clone(), snapshot.id.clone());
-        Ok(CustodiedRun { grant, token, snapshot })
+        Ok(CustodiedRun {
+            grant,
+            token,
+            snapshot,
+        })
     }
 
     fn runs_workspace_hint(&self, grant_id: &str) -> PathBuf {
@@ -337,7 +355,10 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
                         // Cancellation arrives either from the human stop
                         // path (custody already released; this is a no-op)
                         // or from an external cancel: treat as human stop.
-                        if !matches!(c.grant(&grant_id).map(|g| g.phase), Some(CustodyPhase::Released) | Some(CustodyPhase::Quarantined)) {
+                        if !matches!(
+                            c.grant(&grant_id).map(|g| g.phase),
+                            Some(CustodyPhase::Released) | Some(CustodyPhase::Quarantined)
+                        ) {
                             let _ = c.human_stop(&grant_id, now);
                         }
                     }
@@ -354,8 +375,12 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
                         let _ = c.release_budget_exhausted(&grant_id, BudgetKind::ToolCalls, now);
                     }
                     Some(other) => {
-                        if !matches!(c.grant(&grant_id).map(|g| g.phase), Some(CustodyPhase::Released) | Some(CustodyPhase::Quarantined)) {
-                            let _ = c.declare_failure(&token, &format!("run ended: {other:?}"), now);
+                        if !matches!(
+                            c.grant(&grant_id).map(|g| g.phase),
+                            Some(CustodyPhase::Released) | Some(CustodyPhase::Quarantined)
+                        ) {
+                            let _ =
+                                c.declare_failure(&token, &format!("run ended: {other:?}"), now);
                         }
                     }
                     None => {}
@@ -390,14 +415,25 @@ mod tests {
     }
     impl Script {
         fn new(turns: Vec<String>) -> Self {
-            Self { turns: Mutex::new(turns.into()) }
+            Self {
+                turns: Mutex::new(turns.into()),
+            }
         }
     }
     impl Transport for Script {
-        fn get(&self, _url: &str, _headers: &[(String, String)]) -> Result<(u16, String), ProviderError> {
+        fn get(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+        ) -> Result<(u16, String), ProviderError> {
             Ok((200, json!({"models":[{"name":"models/gemini-3.5-flash-lite","displayName":"Flash Lite","supportedGenerationMethods":["generateContent"]}]}).to_string()))
         }
-        fn post(&self, _url: &str, _headers: &[(String, String)], _body: &str) -> Result<(u16, String), ProviderError> {
+        fn post(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _body: &str,
+        ) -> Result<(u16, String), ProviderError> {
             self.turns
                 .lock()
                 .unwrap()
@@ -425,9 +461,19 @@ mod tests {
     fn caps(root: &Path) -> CapabilitySet {
         CapabilitySet {
             workspace_root: root.to_path_buf(),
-            tool_classes: [ToolClass::Read, ToolClass::Write, ToolClass::Execute].into_iter().collect(),
-            allowed_tools: ["read_file", "create_file", "edit_file", "search_files", "run_command"]
-                .iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+            tool_classes: [ToolClass::Read, ToolClass::Write, ToolClass::Execute]
+                .into_iter()
+                .collect(),
+            allowed_tools: [
+                "read_file",
+                "create_file",
+                "edit_file",
+                "search_files",
+                "run_command",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<_>>(),
             allow_search: false,
             allow_preview: false,
             can_delegate: false,
@@ -458,16 +504,32 @@ mod tests {
         let workspace = tmp.path().join("runs").join("custody-workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let service = CustodyRunService::new(runs.clone(), custody.clone());
-        (tmp, Rig { service, runs, custody, workspace })
+        (
+            tmp,
+            Rig {
+                service,
+                runs,
+                custody,
+                workspace,
+            },
+        )
     }
 
-    fn request(task_id: &str, workspace: PathBuf, budgets: CustodyBudgets, contract: CompletionContract) -> ManagedTaskRequest {
+    fn request(
+        task_id: &str,
+        workspace: PathBuf,
+        budgets: CustodyBudgets,
+        contract: CompletionContract,
+    ) -> ManagedTaskRequest {
         ManagedTaskRequest {
             task_id: task_id.into(),
             task: "build a tea house page".into(),
             operator: OperatorIdentity::Agent(CustodyRegistry::register_agent(
                 "t3-code",
-                AgentProtocol::Acp { client: "t3".into(), version: "1.0".into() },
+                AgentProtocol::Acp {
+                    client: "t3".into(),
+                    version: "1.0".into(),
+                },
             )),
             provider: "gemini".into(),
             model: Some("gemini-3.5-flash-lite".into()),
@@ -479,7 +541,11 @@ mod tests {
         }
     }
 
-    fn wait_custody_terminal(custody: &Arc<Mutex<CustodyRegistry>>, grant_id: &str, timeout_ms: u64) -> CustodyGrant {
+    fn wait_custody_terminal(
+        custody: &Arc<Mutex<CustodyRegistry>>,
+        grant_id: &str,
+        timeout_ms: u64,
+    ) -> CustodyGrant {
         let start = Instant::now();
         loop {
             {
@@ -492,7 +558,10 @@ mod tests {
             }
             if start.elapsed().as_millis() as u64 > timeout_ms {
                 let c = custody.lock().unwrap();
-                panic!("custody did not terminate in time: {:?}", c.grant(grant_id).map(|g| g.phase));
+                panic!(
+                    "custody did not terminate in time: {:?}",
+                    c.grant(grant_id).map(|g| g.phase)
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -532,14 +601,31 @@ mod tests {
         let (_t, rig) = rig(good_turns());
         let out = rig
             .service
-            .begin_managed_task(request("task-c", rig.workspace.clone(), CustodyBudgets::default(), CompletionContract::default()))
+            .begin_managed_task(request(
+                "task-c",
+                rig.workspace.clone(),
+                CustodyBudgets::default(),
+                CompletionContract::default(),
+            ))
             .unwrap();
         auto_approve(rig.runs.clone(), out.snapshot.id.clone());
         let grant = wait_custody_terminal(&rig.custody, &out.grant.grant_id, 60_000);
         assert_eq!(grant.phase, CustodyPhase::Released);
-        assert!(matches!(grant.release, Some(ReleaseReason::VerifiedCompletion { .. })), "got {:?}", grant.release);
+        assert!(
+            matches!(
+                grant.release,
+                Some(ReleaseReason::VerifiedCompletion { .. })
+            ),
+            "got {:?}",
+            grant.release
+        );
         assert!(grant.consumed.steps >= 1);
-        let chain = rig.custody.lock().unwrap().audit_chain(&grant.grant_id).unwrap();
+        let chain = rig
+            .custody
+            .lock()
+            .unwrap()
+            .audit_chain(&grant.grant_id)
+            .unwrap();
         let kinds: Vec<&str> = chain.iter().map(|e| e.kind.as_str()).collect();
         assert!(kinds.contains(&"custody_granted"));
         assert!(kinds.contains(&"heartbeat"));
@@ -548,9 +634,17 @@ mod tests {
         // Tombstone blocks a second custody of the same task.
         let err = rig
             .service
-            .begin_managed_task(request("task-c", rig.workspace.clone(), CustodyBudgets::default(), CompletionContract::default()))
+            .begin_managed_task(request(
+                "task-c",
+                rig.workspace.clone(),
+                CustodyBudgets::default(),
+                CompletionContract::default(),
+            ))
             .unwrap_err();
-        assert!(err.contains("tombstoned") || err.contains("refused"), "{err}");
+        assert!(
+            err.contains("tombstoned") || err.contains("refused"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -562,12 +656,23 @@ mod tests {
         };
         let out = rig
             .service
-            .begin_managed_task(request("task-g", rig.workspace.clone(), CustodyBudgets::default(), contract))
+            .begin_managed_task(request(
+                "task-g",
+                rig.workspace.clone(),
+                CustodyBudgets::default(),
+                contract,
+            ))
             .unwrap();
         auto_approve(rig.runs.clone(), out.snapshot.id.clone());
         let start = Instant::now();
         loop {
-            let phase = rig.custody.lock().unwrap().grant(&out.grant.grant_id).unwrap().phase;
+            let phase = rig
+                .custody
+                .lock()
+                .unwrap()
+                .grant(&out.grant.grant_id)
+                .unwrap()
+                .phase;
             if phase == CustodyPhase::Suspended {
                 break;
             }
@@ -587,17 +692,33 @@ mod tests {
             call_turn(vec![plan_call(vec![("1", "build page", "in_progress")])]),
             call_turn(vec![plan_call(vec![("1", "build page", "in_progress")])]),
         ]);
-        let budgets = CustodyBudgets { max_steps: 1, max_tool_calls: 10, max_wall_ms: 120_000, max_tokens: 100_000 };
+        let budgets = CustodyBudgets {
+            max_steps: 1,
+            max_tool_calls: 10,
+            max_wall_ms: 120_000,
+            max_tokens: 100_000,
+        };
         let out = rig
             .service
-            .begin_managed_task(request("task-b", rig.workspace.clone(), budgets, CompletionContract::default()))
+            .begin_managed_task(request(
+                "task-b",
+                rig.workspace.clone(),
+                budgets,
+                CompletionContract::default(),
+            ))
             .unwrap();
         let grant = wait_custody_terminal(&rig.custody, &out.grant.grant_id, 60_000);
         assert_eq!(grant.phase, CustodyPhase::Released);
-        assert!(matches!(
-            grant.release,
-            Some(ReleaseReason::BudgetExhausted { which: BudgetKind::Steps })
-        ), "got {:?}", grant.release);
+        assert!(
+            matches!(
+                grant.release,
+                Some(ReleaseReason::BudgetExhausted {
+                    which: BudgetKind::Steps
+                })
+            ),
+            "got {:?}",
+            grant.release
+        );
     }
 
     #[test]
@@ -611,7 +732,12 @@ mod tests {
         ]);
         let out = rig
             .service
-            .begin_managed_task(request("task-h", rig.workspace.clone(), CustodyBudgets::default(), CompletionContract::default()))
+            .begin_managed_task(request(
+                "task-h",
+                rig.workspace.clone(),
+                CustodyBudgets::default(),
+                CompletionContract::default(),
+            ))
             .unwrap();
         // Wait until the run is genuinely mid-flight (approval pending).
         let start = Instant::now();
@@ -653,7 +779,10 @@ mod tests {
         // carry the two this integration actually evaluates.
         assert_eq!(
             req.contract.gates,
-            vec![EvidenceGate::NoPendingApprovals, EvidenceGate::WithinScopeChanges]
+            vec![
+                EvidenceGate::NoPendingApprovals,
+                EvidenceGate::WithinScopeChanges
+            ]
         );
     }
 
@@ -708,14 +837,23 @@ mod tests {
             completion_summary: None,
             error: None,
         };
-        let run = CustodiedRun { grant, token, snapshot };
+        let run = CustodiedRun {
+            grant,
+            token,
+            snapshot,
+        };
         let view = rig.service.view_of(&run);
         assert_eq!(view.operator, "human");
         assert_eq!(view.phase, CustodyPhase::Active);
         assert_eq!(view.worker, "managed_model:gemini/gemini-3.5-flash-lite");
         let json = serde_json::to_value(&view).unwrap();
-        assert!(json.get("token").is_none(), "token must never leave the backend");
-        assert_eq!(rig.service.phase_of(&view.grant_id), Some(CustodyPhase::Active));
+        assert!(
+            json.get("token").is_none(),
+            "token must never leave the backend"
+        );
+        assert_eq!(
+            rig.service.phase_of(&view.grant_id),
+            Some(CustodyPhase::Active)
+        );
     }
 }
-

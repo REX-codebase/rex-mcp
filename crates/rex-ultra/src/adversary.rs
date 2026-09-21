@@ -47,7 +47,10 @@ pub fn adversary_brief(
     }
     let mut outcomes = String::new();
     for o in &verification.outcomes {
-        outcomes.push_str(&format!("- {}: {:?} - {}\n", o.obligation_id, o.status, o.detail));
+        outcomes.push_str(&format!(
+            "- {}: {:?} - {}\n",
+            o.obligation_id, o.status, o.detail
+        ));
     }
     format!(
         "You are the adversary in REX Ultra. Another agent claims this task is complete:\n\n\

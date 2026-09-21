@@ -17,7 +17,9 @@ pub enum OperationStatus {
 }
 
 impl Default for OperationStatus {
-    fn default() -> Self { Self::Queued }
+    fn default() -> Self {
+        Self::Queued
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,11 +34,18 @@ pub struct PacketIdentity {
 }
 
 impl Default for PacketIdentity {
-    fn default() -> Self { Self::new("main", 0, 0, "") }
+    fn default() -> Self {
+        Self::new("main", 0, 0, "")
+    }
 }
 
 impl PacketIdentity {
-    pub fn new(branch_id: impl Into<String>, lease_epoch: u64, resume_nonce: u64, idempotency_key: impl Into<String>) -> Self {
+    pub fn new(
+        branch_id: impl Into<String>,
+        lease_epoch: u64,
+        resume_nonce: u64,
+        idempotency_key: impl Into<String>,
+    ) -> Self {
         Self {
             protocol_version: crate::PROTOCOL_VERSION.into(),
             task_schema_version: TASK_SCHEMA_VERSION,

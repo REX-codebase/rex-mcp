@@ -153,9 +153,19 @@ fn main() {
             respond(&mut stream, "200 OK", "application/json", "{\"ok\":true}");
         } else if method == "GET" && path == "/fill" {
             if *used.lock().unwrap() {
-                respond(&mut stream, "410 Gone", "text/plain", "fill already completed");
+                respond(
+                    &mut stream,
+                    "410 Gone",
+                    "text/plain",
+                    "fill already completed",
+                );
             } else {
-                respond(&mut stream, "200 OK", "text/html", &form_page(&token, &provider));
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "text/html",
+                    &form_page(&token, &provider),
+                );
             }
         } else if method == "POST" && path == "/fill" {
             let mut got_token = String::new();
@@ -172,13 +182,23 @@ fn main() {
             let mut used_guard = used.lock().unwrap();
             if *used_guard || got_token != token || got_key.is_empty() {
                 drop(used_guard);
-                respond(&mut stream, "403 Forbidden", "application/json", "{\"ok\":false}");
+                respond(
+                    &mut stream,
+                    "403 Forbidden",
+                    "application/json",
+                    "{\"ok\":false}",
+                );
                 continue;
             }
             let store = match FileSecretStore::new(config_dir.clone()) {
                 Ok(s) => s,
                 Err(_) => {
-                    respond(&mut stream, "500 Internal Server Error", "application/json", "{\"ok\":false,\"stage\":\"store\"}");
+                    respond(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "application/json",
+                        "{\"ok\":false,\"stage\":\"store\"}",
+                    );
                     continue;
                 }
             };
@@ -202,7 +222,12 @@ fn main() {
                     std::process::exit(0);
                 }
                 Err(_) => {
-                    respond(&mut stream, "500 Internal Server Error", "application/json", "{\"ok\":false,\"stage\":\"write\"}");
+                    respond(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "application/json",
+                        "{\"ok\":false,\"stage\":\"write\"}",
+                    );
                 }
             }
         } else {

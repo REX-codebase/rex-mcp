@@ -68,18 +68,54 @@ pub enum WorkKind {
 /// Visual on purpose: a false positive demands more evidence, never less.
 pub fn classify_work_kind(task: &str) -> WorkKind {
     const TOKENS: &[&str] = &[
-        "ui","3d","svg","css","webgl","canvas","shader","shaders","animation",
-        "animations","animate","motion","video","render","rendering","website",
-        "webpage","frontend","layout","design","visual","graphic","graphics",
-        "component","components","styling","screenshot","pixel",
+        "ui",
+        "3d",
+        "svg",
+        "css",
+        "webgl",
+        "canvas",
+        "shader",
+        "shaders",
+        "animation",
+        "animations",
+        "animate",
+        "motion",
+        "video",
+        "render",
+        "rendering",
+        "website",
+        "webpage",
+        "frontend",
+        "layout",
+        "design",
+        "visual",
+        "graphic",
+        "graphics",
+        "component",
+        "components",
+        "styling",
+        "screenshot",
+        "pixel",
     ];
     let lower = task.to_lowercase();
     let token_hit = lower
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|token| TOKENS.contains(&token));
-    let phrase_hit = ["landing page","front-end","front end","three.js","web page","user interface"]
-        .iter().any(|phrase| lower.contains(phrase));
-    if token_hit || phrase_hit { WorkKind::Visual } else { WorkKind::General }
+    let phrase_hit = [
+        "landing page",
+        "front-end",
+        "front end",
+        "three.js",
+        "web page",
+        "user interface",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    if token_hit || phrase_hit {
+        WorkKind::Visual
+    } else {
+        WorkKind::General
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,10 +195,14 @@ pub fn parse_contract(text: &str, task: &str) -> Result<AcceptanceContract, Vec<
         errors.push("contract has no obligations".into());
     }
     if raw.obligations.len() > MAX_OBLIGATIONS {
-        errors.push(format!("contract has more than {MAX_OBLIGATIONS} obligations"));
+        errors.push(format!(
+            "contract has more than {MAX_OBLIGATIONS} obligations"
+        ));
     }
     if raw.forbidden_regressions.len() > MAX_REGRESSIONS {
-        errors.push(format!("contract has more than {MAX_REGRESSIONS} forbidden regressions"));
+        errors.push(format!(
+            "contract has more than {MAX_REGRESSIONS} forbidden regressions"
+        ));
     }
     for ob in &raw.obligations {
         if ob.id.trim().is_empty() {
@@ -192,7 +232,10 @@ pub fn parse_contract(text: &str, task: &str) -> Result<AcceptanceContract, Vec<
                 errors.push(format!("obligation {} has an empty path or needle", ob.id));
             }
             Proof::BehaviorEvidence { description } if description.trim().is_empty() => {
-                errors.push(format!("obligation {} has an empty behavior description", ob.id));
+                errors.push(format!(
+                    "obligation {} has an empty behavior description",
+                    ob.id
+                ));
             }
             _ => {}
         }
@@ -284,9 +327,21 @@ mod tests {
     }
     #[test]
     fn visual_classification_is_conservative_and_deterministic() {
-        assert_eq!(classify_work_kind("build a marketing website with animation"), WorkKind::Visual);
-        assert_eq!(classify_work_kind("render the dashboard component"), WorkKind::Visual);
-        assert_eq!(classify_work_kind("fix the CSV parser overflow"), WorkKind::General);
-        assert_eq!(classify_work_kind("refactor the build script"), WorkKind::General);
+        assert_eq!(
+            classify_work_kind("build a marketing website with animation"),
+            WorkKind::Visual
+        );
+        assert_eq!(
+            classify_work_kind("render the dashboard component"),
+            WorkKind::Visual
+        );
+        assert_eq!(
+            classify_work_kind("fix the CSV parser overflow"),
+            WorkKind::General
+        );
+        assert_eq!(
+            classify_work_kind("refactor the build script"),
+            WorkKind::General
+        );
     }
 }

@@ -197,16 +197,32 @@ pub struct ExternalHostAdapter {
 }
 
 impl ExternalHostAdapter {
-    pub fn new(contract: AcceptanceContract, minimum_candidates: usize) -> Result<Self, AdapterError> {
-        if contract.obligations.is_empty() { return Err(AdapterError::InvalidContract); }
-        if minimum_candidates == 0 { return Err(AdapterError::InvalidMinimum); }
-        let task_id = canonical_hash(&contract).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+    pub fn new(
+        contract: AcceptanceContract,
+        minimum_candidates: usize,
+    ) -> Result<Self, AdapterError> {
+        if contract.obligations.is_empty() {
+            return Err(AdapterError::InvalidContract);
+        }
+        if minimum_candidates == 0 {
+            return Err(AdapterError::InvalidMinimum);
+        }
+        let task_id =
+            canonical_hash(&contract).map_err(|e| AdapterError::Encoding(e.to_string()))?;
         Ok(Self {
             path: None,
             state: ExternalAdapterState {
-                contract, kernel: KernelSnapshot { task_id, state: KernelState::New, step: 0,
-                    lease_epoch: 0, transcript_hash: "genesis".into() },
-                minimum_candidates, host_attached: false, responses: BTreeMap::new(),
+                contract,
+                kernel: KernelSnapshot {
+                    task_id,
+                    state: KernelState::New,
+                    step: 0,
+                    lease_epoch: 0,
+                    transcript_hash: "genesis".into(),
+                },
+                minimum_candidates,
+                host_attached: false,
+                responses: BTreeMap::new(),
                 evidence: BTreeMap::new(),
                 qualified_candidate: None,
             },
@@ -217,7 +233,10 @@ impl ExternalHostAdapter {
         let path = path.into();
         let state = serde_json::from_slice(&fs::read(&path).map_err(io_error)?)
             .map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        Ok(Self { path: Some(path), state })
+        Ok(Self {
+            path: Some(path),
+            state,
+        })
     }
 
     pub fn save_as(&mut self, path: impl Into<PathBuf>) -> Result<(), AdapterError> {
@@ -226,59 +245,116 @@ impl ExternalHostAdapter {
     }
 
     pub fn status(&self) -> HostKernelStatus {
-        if !self.state.host_attached { HostKernelStatus::HostRequired }
-        else if self.state.responses.len() < self.state.minimum_candidates { HostKernelStatus::Collecting }
-        else { HostKernelStatus::Ready }
+        if !self.state.host_attached {
+            HostKernelStatus::HostRequired
+        } else if self.state.responses.len() < self.state.minimum_candidates {
+            HostKernelStatus::Collecting
+        } else {
+            HostKernelStatus::Ready
+        }
     }
 
-    pub fn kernel(&self) -> &KernelSnapshot { &self.state.kernel }
+    pub fn kernel(&self) -> &KernelSnapshot {
+        &self.state.kernel
+    }
 
     pub fn requests(&self) -> Result<Vec<HostCandidateRequest>, AdapterError> {
-        let contract_hash = canonical_hash(&self.state.contract).map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        let obligation_ids: Vec<String> = self.state.contract.obligations.iter().map(|o| o.id.clone()).collect();
-        (0..self.state.minimum_candidates).map(|index| {
-            let candidate_id = canonical_hash(&(contract_hash.as_str(), index))
-                .map_err(|e| AdapterError::Encoding(e.to_string()))?;
-            Ok(HostCandidateRequest { work_kind: self.state.contract.work_kind,
-                candidate_id, contract_hash: contract_hash.clone(),
-                task: self.state.contract.task.clone(), obligation_ids: obligation_ids.clone() })
-        }).collect()
+        let contract_hash = canonical_hash(&self.state.contract)
+            .map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        let obligation_ids: Vec<String> = self
+            .state
+            .contract
+            .obligations
+            .iter()
+            .map(|o| o.id.clone())
+            .collect();
+        (0..self.state.minimum_candidates)
+            .map(|index| {
+                let candidate_id = canonical_hash(&(contract_hash.as_str(), index))
+                    .map_err(|e| AdapterError::Encoding(e.to_string()))?;
+                Ok(HostCandidateRequest {
+                    work_kind: self.state.contract.work_kind,
+                    candidate_id,
+                    contract_hash: contract_hash.clone(),
+                    task: self.state.contract.task.clone(),
+                    obligation_ids: obligation_ids.clone(),
+                })
+            })
+            .collect()
     }
 
     pub fn attach_host(&mut self, lease_epoch: u64) -> Result<(), AdapterError> {
-        if self.state.host_attached { return Ok(()); }
-        self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Acquire { lease_epoch })
-            .map_err(AdapterError::Kernel)?;
-        self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Begin { action_id: "candidate-generation".into() })
-            .map_err(AdapterError::Kernel)?;
+        if self.state.host_attached {
+            return Ok(());
+        }
+        self.state.kernel = transition(
+            self.state.kernel.clone(),
+            KernelEvent::Acquire { lease_epoch },
+        )
+        .map_err(AdapterError::Kernel)?;
+        self.state.kernel = transition(
+            self.state.kernel.clone(),
+            KernelEvent::Begin {
+                action_id: "candidate-generation".into(),
+            },
+        )
+        .map_err(AdapterError::Kernel)?;
         self.state.host_attached = true;
         self.persist()
     }
 
     pub fn record_response(&mut self, response: CandidateResponse) -> Result<(), AdapterError> {
-        if !self.state.host_attached { return Err(AdapterError::HostRequired); }
+        if !self.state.host_attached {
+            return Err(AdapterError::HostRequired);
+        }
         let requests = self.requests()?;
-        if !requests.iter().any(|request| request.candidate_id == response.candidate_id) {
+        if !requests
+            .iter()
+            .any(|request| request.candidate_id == response.candidate_id)
+        {
             return Err(AdapterError::UnknownCandidate);
         }
-        if self.state.responses.contains_key(&response.candidate_id) { return Err(AdapterError::DuplicateCandidate); }
-        if self.state.responses.values().any(|existing| existing.response_hash == response.response_hash) {
+        if self.state.responses.contains_key(&response.candidate_id) {
+            return Err(AdapterError::DuplicateCandidate);
+        }
+        if self
+            .state
+            .responses
+            .values()
+            .any(|existing| existing.response_hash == response.response_hash)
+        {
             return Err(AdapterError::DuplicateResponse);
         }
-        let expected_hash = canonical_hash(&response.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        if expected_hash != response.response_hash { return Err(AdapterError::Encoding("response hash mismatch".into())); }
-        self.state.responses.insert(response.candidate_id.clone(), response);
+        let expected_hash =
+            canonical_hash(&response.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        if expected_hash != response.response_hash {
+            return Err(AdapterError::Encoding("response hash mismatch".into()));
+        }
+        self.state
+            .responses
+            .insert(response.candidate_id.clone(), response);
         self.persist()
     }
 
-    pub fn responses(&self) -> impl Iterator<Item = &CandidateResponse> { self.state.responses.values() }
+    pub fn responses(&self) -> impl Iterator<Item = &CandidateResponse> {
+        self.state.responses.values()
+    }
 
     pub fn advance(&mut self) -> Result<HostKernelStatus, AdapterError> {
-        if !self.state.host_attached { return Err(AdapterError::HostRequired); }
-        if self.state.responses.len() < self.state.minimum_candidates { return Ok(HostKernelStatus::Collecting); }
-        self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::SubmitEvidence {
-            digest: canonical_hash(&self.state.responses).map_err(|e| AdapterError::Encoding(e.to_string()))?,
-        }).map_err(AdapterError::Kernel)?;
+        if !self.state.host_attached {
+            return Err(AdapterError::HostRequired);
+        }
+        if self.state.responses.len() < self.state.minimum_candidates {
+            return Ok(HostKernelStatus::Collecting);
+        }
+        self.state.kernel = transition(
+            self.state.kernel.clone(),
+            KernelEvent::SubmitEvidence {
+                digest: canonical_hash(&self.state.responses)
+                    .map_err(|e| AdapterError::Encoding(e.to_string()))?,
+            },
+        )
+        .map_err(AdapterError::Kernel)?;
         self.persist()?;
         Ok(HostKernelStatus::Ready)
     }
@@ -290,8 +366,15 @@ impl ExternalHostAdapter {
         if self.state.kernel.state != KernelState::AwaitingEvidence {
             return Ok(Vec::new());
         }
-        let contract_hash = canonical_hash(&self.state.contract).map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        let obligation_ids: Vec<String> = self.state.contract.obligations.iter().map(|o| o.id.clone()).collect();
+        let contract_hash = canonical_hash(&self.state.contract)
+            .map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        let obligation_ids: Vec<String> = self
+            .state
+            .contract
+            .obligations
+            .iter()
+            .map(|o| o.id.clone())
+            .collect();
         let mut kinds = vec![EvidenceKind::Adversary, EvidenceKind::Verifier];
         if self.state.contract.work_kind == crate::contract::WorkKind::Visual {
             kinds.push(EvidenceKind::Visual);
@@ -299,8 +382,9 @@ impl ExternalHostAdapter {
         let mut requests = Vec::new();
         for (candidate_id, response) in &self.state.responses {
             for kind in kinds.iter().copied() {
-                let request_id = canonical_hash(&(contract_hash.as_str(), candidate_id.as_str(), kind.label()))
-                    .map_err(|e| AdapterError::Encoding(e.to_string()))?;
+                let request_id =
+                    canonical_hash(&(contract_hash.as_str(), candidate_id.as_str(), kind.label()))
+                        .map_err(|e| AdapterError::Encoding(e.to_string()))?;
                 requests.push(HostEvidenceRequest {
                     request_id,
                     candidate_id: candidate_id.clone(),
@@ -314,54 +398,115 @@ impl ExternalHostAdapter {
         Ok(requests)
     }
 
-    fn expect_evidence_request(&self, kind: EvidenceKind, candidate_id: &str) -> Result<String, AdapterError> {
+    fn expect_evidence_request(
+        &self,
+        kind: EvidenceKind,
+        candidate_id: &str,
+    ) -> Result<String, AdapterError> {
         if !self.state.host_attached || self.state.kernel.state != KernelState::AwaitingEvidence {
             return Err(AdapterError::EvidenceStageNotOpen);
         }
-        if !self.state.responses.contains_key(candidate_id) { return Err(AdapterError::UnknownCandidate); }
-        let contract_hash = canonical_hash(&self.state.contract).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        if !self.state.responses.contains_key(candidate_id) {
+            return Err(AdapterError::UnknownCandidate);
+        }
+        let contract_hash = canonical_hash(&self.state.contract)
+            .map_err(|e| AdapterError::Encoding(e.to_string()))?;
         canonical_hash(&(contract_hash.as_str(), candidate_id, kind.label()))
             .map_err(|e| AdapterError::Encoding(e.to_string()))
     }
 
     pub fn record_adversary(&mut self, evidence: AdversaryEvidence) -> Result<(), AdapterError> {
-        let expected = self.expect_evidence_request(EvidenceKind::Adversary, &evidence.candidate_id)?;
-        if evidence.request_id != expected { return Err(AdapterError::UnknownEvidenceRequest); }
-        if self.state.evidence.get(&evidence.candidate_id).and_then(|e| e.adversary.as_ref()).is_some() {
+        let expected =
+            self.expect_evidence_request(EvidenceKind::Adversary, &evidence.candidate_id)?;
+        if evidence.request_id != expected {
+            return Err(AdapterError::UnknownEvidenceRequest);
+        }
+        if self
+            .state
+            .evidence
+            .get(&evidence.candidate_id)
+            .and_then(|e| e.adversary.as_ref())
+            .is_some()
+        {
             return Err(AdapterError::DuplicateEvidence);
         }
-        let expected_hash = canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        if expected_hash != evidence.response_hash { return Err(AdapterError::Encoding("response hash mismatch".into())); }
+        let expected_hash =
+            canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        if expected_hash != evidence.response_hash {
+            return Err(AdapterError::Encoding("response hash mismatch".into()));
+        }
         let report = parse_defects(&evidence.content, "external-host");
-        self.state.evidence.entry(evidence.candidate_id.clone()).or_default().adversary =
-            Some(AdversaryEvidenceRecord { request_id: evidence.request_id, response_hash: evidence.response_hash, report });
+        self.state
+            .evidence
+            .entry(evidence.candidate_id.clone())
+            .or_default()
+            .adversary = Some(AdversaryEvidenceRecord {
+            request_id: evidence.request_id,
+            response_hash: evidence.response_hash,
+            report,
+        });
         self.persist()
     }
 
     pub fn record_verifier(&mut self, evidence: VerifierEvidence) -> Result<(), AdapterError> {
-        let expected = self.expect_evidence_request(EvidenceKind::Verifier, &evidence.candidate_id)?;
-        if evidence.request_id != expected { return Err(AdapterError::UnknownEvidenceRequest); }
-        if self.state.evidence.get(&evidence.candidate_id).and_then(|e| e.verifier.as_ref()).is_some() {
+        let expected =
+            self.expect_evidence_request(EvidenceKind::Verifier, &evidence.candidate_id)?;
+        if evidence.request_id != expected {
+            return Err(AdapterError::UnknownEvidenceRequest);
+        }
+        if self
+            .state
+            .evidence
+            .get(&evidence.candidate_id)
+            .and_then(|e| e.verifier.as_ref())
+            .is_some()
+        {
             return Err(AdapterError::DuplicateEvidence);
         }
-        let expected_hash = canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        if expected_hash != evidence.response_hash { return Err(AdapterError::Encoding("response hash mismatch".into())); }
+        let expected_hash =
+            canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        if expected_hash != evidence.response_hash {
+            return Err(AdapterError::Encoding("response hash mismatch".into()));
+        }
         #[derive(Deserialize)]
-        struct RawOutcome { obligation_id: String, status: String }
+        struct RawOutcome {
+            obligation_id: String,
+            status: String,
+        }
         #[derive(Deserialize)]
-        struct RawOutcomes { outcomes: Vec<RawOutcome> }
+        struct RawOutcomes {
+            outcomes: Vec<RawOutcome>,
+        }
         let raw: RawOutcomes = serde_json::from_str(&evidence.content)
             .map_err(|e| AdapterError::InvalidEvidence(e.to_string()))?;
         let mut outcomes = BTreeMap::new();
         for outcome in raw.outcomes {
-            if outcomes.insert(outcome.obligation_id.clone(), outcome.status == "proven").is_some() {
-                return Err(AdapterError::InvalidEvidence("duplicate obligation outcome".into()));
+            if outcomes
+                .insert(outcome.obligation_id.clone(), outcome.status == "proven")
+                .is_some()
+            {
+                return Err(AdapterError::InvalidEvidence(
+                    "duplicate obligation outcome".into(),
+                ));
             }
         }
         let all_proven = !self.state.contract.obligations.is_empty()
-            && self.state.contract.obligations.iter().all(|o| outcomes.get(&o.id) == Some(&true));
-        self.state.evidence.entry(evidence.candidate_id.clone()).or_default().verifier =
-            Some(VerifierEvidenceRecord { request_id: evidence.request_id, response_hash: evidence.response_hash, outcomes, all_proven });
+            && self
+                .state
+                .contract
+                .obligations
+                .iter()
+                .all(|o| outcomes.get(&o.id) == Some(&true));
+        self.state
+            .evidence
+            .entry(evidence.candidate_id.clone())
+            .or_default()
+            .verifier = Some(VerifierEvidenceRecord {
+            request_id: evidence.request_id,
+            response_hash: evidence.response_hash,
+            outcomes,
+            all_proven,
+        });
         self.persist()
     }
 
@@ -371,28 +516,53 @@ impl ExternalHostAdapter {
     pub fn record_visual(&mut self, evidence: VisualEvidence) -> Result<(), AdapterError> {
         if self.state.contract.work_kind != crate::contract::WorkKind::Visual {
             return Err(AdapterError::InvalidEvidence(
-                "visual evidence submitted for a non-visual contract".into()));
+                "visual evidence submitted for a non-visual contract".into(),
+            ));
         }
-        let expected = self.expect_evidence_request(EvidenceKind::Visual, &evidence.candidate_id)?;
-        if evidence.request_id != expected { return Err(AdapterError::UnknownEvidenceRequest); }
-        if self.state.evidence.get(&evidence.candidate_id).and_then(|e| e.visual.as_ref()).is_some() {
+        let expected =
+            self.expect_evidence_request(EvidenceKind::Visual, &evidence.candidate_id)?;
+        if evidence.request_id != expected {
+            return Err(AdapterError::UnknownEvidenceRequest);
+        }
+        if self
+            .state
+            .evidence
+            .get(&evidence.candidate_id)
+            .and_then(|e| e.visual.as_ref())
+            .is_some()
+        {
             return Err(AdapterError::DuplicateEvidence);
         }
-        let expected_hash = canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        if expected_hash != evidence.response_hash { return Err(AdapterError::Encoding("response hash mismatch".into())); }
+        let expected_hash =
+            canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        if expected_hash != evidence.response_hash {
+            return Err(AdapterError::Encoding("response hash mismatch".into()));
+        }
         let report: crate::taste::TasteGateReport = serde_json::from_str(&evidence.content)
             .map_err(|e| AdapterError::InvalidEvidence(e.to_string()))?;
         crate::taste::validate_taste_gate(&report)
             .map_err(|errors| AdapterError::InvalidEvidence(errors.join("; ")))?;
         let thesis_taken = self.state.evidence.values().any(|existing| {
-            existing.visual.as_ref().map(|v| v.report.thesis_id == report.thesis_id).unwrap_or(false)
+            existing
+                .visual
+                .as_ref()
+                .map(|v| v.report.thesis_id == report.thesis_id)
+                .unwrap_or(false)
         });
         if thesis_taken {
             return Err(AdapterError::InvalidEvidence(
-                "thesis already claimed by another candidate".into()));
+                "thesis already claimed by another candidate".into(),
+            ));
         }
-        self.state.evidence.entry(evidence.candidate_id.clone()).or_default().visual =
-            Some(VisualEvidenceRecord { request_id: evidence.request_id, response_hash: evidence.response_hash, report });
+        self.state
+            .evidence
+            .entry(evidence.candidate_id.clone())
+            .or_default()
+            .visual = Some(VisualEvidenceRecord {
+            request_id: evidence.request_id,
+            response_hash: evidence.response_hash,
+            report,
+        });
         self.persist()
     }
 
@@ -412,8 +582,12 @@ impl ExternalHostAdapter {
     /// qualifies the kernel fails closed. Anything else stays truthfully
     /// pending in AwaitingEvidence.
     pub fn finalize(&mut self) -> Result<KernelState, AdapterError> {
-        if !self.state.host_attached { return Err(AdapterError::HostRequired); }
-        if self.state.kernel.state != KernelState::AwaitingEvidence { return Ok(self.state.kernel.state); }
+        if !self.state.host_attached {
+            return Err(AdapterError::HostRequired);
+        }
+        if self.state.kernel.state != KernelState::AwaitingEvidence {
+            return Ok(self.state.kernel.state);
+        }
         let mut qualified: Option<String> = None;
         let mut fully_evidenced = true;
         for candidate_id in self.state.responses.keys() {
@@ -432,45 +606,86 @@ impl ExternalHostAdapter {
                 qualified = Some(candidate_id.clone());
             }
             let complete_record = evidence
-                .map(|e| e.adversary.is_some() && e.verifier.is_some()
-                    && (self.state.contract.work_kind != crate::contract::WorkKind::Visual || e.visual.is_some()))
+                .map(|e| {
+                    e.adversary.is_some()
+                        && e.verifier.is_some()
+                        && (self.state.contract.work_kind != crate::contract::WorkKind::Visual
+                            || e.visual.is_some())
+                })
                 .unwrap_or(false);
-            if !complete_record { fully_evidenced = false; }
+            if !complete_record {
+                fully_evidenced = false;
+            }
         }
         if let Some(candidate_id) = qualified {
             self.state.qualified_candidate = Some(candidate_id);
-            self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Complete).map_err(AdapterError::Kernel)?;
+            self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Complete)
+                .map_err(AdapterError::Kernel)?;
             self.persist()?;
         } else if fully_evidenced && !self.state.responses.is_empty() {
-            self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Fail {
-                reason: "every candidate rejected by adversary or verifier evidence".into(),
-            }).map_err(AdapterError::Kernel)?;
+            self.state.kernel = transition(
+                self.state.kernel.clone(),
+                KernelEvent::Fail {
+                    reason: "every candidate rejected by adversary or verifier evidence".into(),
+                },
+            )
+            .map_err(AdapterError::Kernel)?;
             self.persist()?;
         }
         Ok(self.state.kernel.state)
     }
 
     fn persist(&self) -> Result<(), AdapterError> {
-        let Some(path) = &self.path else { return Ok(()); };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         let temporary = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec(&self.state).map_err(|e| AdapterError::Encoding(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&self.state).map_err(|e| AdapterError::Encoding(e.to_string()))?;
         fs::write(&temporary, bytes).map_err(io_error)?;
         fs::rename(&temporary, path).map_err(io_error)
     }
 }
 
-fn io_error(error: std::io::Error) -> AdapterError { AdapterError::Io(error.to_string()) }
+fn io_error(error: std::io::Error) -> AdapterError {
+    AdapterError::Io(error.to_string())
+}
 
-pub fn transition(mut snapshot: KernelSnapshot, event: KernelEvent) -> Result<KernelSnapshot, KernelError> {
+pub fn transition(
+    mut snapshot: KernelSnapshot,
+    event: KernelEvent,
+) -> Result<KernelSnapshot, KernelError> {
     let next = match (&snapshot.state, &event) {
         (KernelState::New, KernelEvent::Acquire { lease_epoch: 1 }) => KernelState::Leased,
-        (KernelState::Leased, KernelEvent::Begin { action_id }) if !action_id.trim().is_empty() => KernelState::Running,
-        (KernelState::Running, KernelEvent::SubmitEvidence { digest }) if !digest.trim().is_empty() => KernelState::AwaitingEvidence,
+        (KernelState::Leased, KernelEvent::Begin { action_id }) if !action_id.trim().is_empty() => {
+            KernelState::Running
+        }
+        (KernelState::Running, KernelEvent::SubmitEvidence { digest })
+            if !digest.trim().is_empty() =>
+        {
+            KernelState::AwaitingEvidence
+        }
         (KernelState::AwaitingEvidence, KernelEvent::Complete) => KernelState::Completed,
-        (KernelState::Leased | KernelState::Running | KernelState::AwaitingEvidence, KernelEvent::Fail { reason }) if !reason.trim().is_empty() => KernelState::Failed,
-        (KernelState::New | KernelState::Leased | KernelState::Running | KernelState::AwaitingEvidence, KernelEvent::Revoke) => KernelState::Revoked,
-        (KernelState::New, KernelEvent::Acquire { .. }) => return Err(KernelError::NonMonotonicLease),
-        _ => return Err(KernelError::InvalidTransition { state: snapshot.state, event: format!("{event:?}") }),
+        (
+            KernelState::Leased | KernelState::Running | KernelState::AwaitingEvidence,
+            KernelEvent::Fail { reason },
+        ) if !reason.trim().is_empty() => KernelState::Failed,
+        (
+            KernelState::New
+            | KernelState::Leased
+            | KernelState::Running
+            | KernelState::AwaitingEvidence,
+            KernelEvent::Revoke,
+        ) => KernelState::Revoked,
+        (KernelState::New, KernelEvent::Acquire { .. }) => {
+            return Err(KernelError::NonMonotonicLease)
+        }
+        _ => {
+            return Err(KernelError::InvalidTransition {
+                state: snapshot.state,
+                event: format!("{event:?}"),
+            })
+        }
     };
     if let KernelEvent::Acquire { lease_epoch } = event {
         snapshot.lease_epoch = lease_epoch;
@@ -489,19 +704,37 @@ mod tests {
     use tempfile::tempdir;
 
     fn initial() -> KernelSnapshot {
-        KernelSnapshot { task_id: "task".into(), state: KernelState::New, step: 0, lease_epoch: 0, transcript_hash: "genesis".into() }
+        KernelSnapshot {
+            task_id: "task".into(),
+            state: KernelState::New,
+            step: 0,
+            lease_epoch: 0,
+            transcript_hash: "genesis".into(),
+        }
     }
 
     #[test]
     fn external_host_sequence_is_deterministic() {
         let events = [
             KernelEvent::Acquire { lease_epoch: 1 },
-            KernelEvent::Begin { action_id: "a".into() },
-            KernelEvent::SubmitEvidence { digest: "evidence".into() },
+            KernelEvent::Begin {
+                action_id: "a".into(),
+            },
+            KernelEvent::SubmitEvidence {
+                digest: "evidence".into(),
+            },
             KernelEvent::Complete,
         ];
-        let left = events.iter().cloned().try_fold(initial(), transition).unwrap();
-        let right = events.iter().cloned().try_fold(initial(), transition).unwrap();
+        let left = events
+            .iter()
+            .cloned()
+            .try_fold(initial(), transition)
+            .unwrap();
+        let right = events
+            .iter()
+            .cloned()
+            .try_fold(initial(), transition)
+            .unwrap();
         assert_eq!(left, right);
         assert_eq!(left.state, KernelState::Completed);
     }
@@ -513,9 +746,18 @@ mod tests {
     }
 
     fn contract() -> AcceptanceContract {
-        AcceptanceContract { task: "build it".into(), obligations: vec![Obligation {
-            id: "builds".into(), statement: "it builds".into(), proof: Proof::BehaviorEvidence { description: "host evidence".into() },
-        }], forbidden_regressions: vec![], work_kind: crate::contract::WorkKind::General }
+        AcceptanceContract {
+            task: "build it".into(),
+            obligations: vec![Obligation {
+                id: "builds".into(),
+                statement: "it builds".into(),
+                proof: Proof::BehaviorEvidence {
+                    description: "host evidence".into(),
+                },
+            }],
+            forbidden_regressions: vec![],
+            work_kind: crate::contract::WorkKind::General,
+        }
     }
 
     #[test]
@@ -531,11 +773,38 @@ mod tests {
         let mut adapter = ExternalHostAdapter::new(contract(), 2).unwrap();
         let requests = adapter.requests().unwrap();
         assert_ne!(requests[0].candidate_id, requests[1].candidate_id);
-        assert_eq!(adapter.record_response(CandidateResponse { candidate_id: requests[0].candidate_id.clone(), response_hash: canonical_hash(&"left").unwrap(), content: "left".into() }), Err(AdapterError::HostRequired));
+        assert_eq!(
+            adapter.record_response(CandidateResponse {
+                candidate_id: requests[0].candidate_id.clone(),
+                response_hash: canonical_hash(&"left").unwrap(),
+                content: "left".into()
+            }),
+            Err(AdapterError::HostRequired)
+        );
         adapter.attach_host(1).unwrap();
-        adapter.record_response(CandidateResponse { candidate_id: requests[0].candidate_id.clone(), response_hash: canonical_hash(&"left").unwrap(), content: "left".into() }).unwrap();
-        assert_eq!(adapter.record_response(CandidateResponse { candidate_id: requests[0].candidate_id.clone(), response_hash: canonical_hash(&"other").unwrap(), content: "other".into() }), Err(AdapterError::DuplicateCandidate));
-        assert_eq!(adapter.record_response(CandidateResponse { candidate_id: requests[1].candidate_id.clone(), response_hash: canonical_hash(&"left").unwrap(), content: "left".into() }), Err(AdapterError::DuplicateResponse));
+        adapter
+            .record_response(CandidateResponse {
+                candidate_id: requests[0].candidate_id.clone(),
+                response_hash: canonical_hash(&"left").unwrap(),
+                content: "left".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            adapter.record_response(CandidateResponse {
+                candidate_id: requests[0].candidate_id.clone(),
+                response_hash: canonical_hash(&"other").unwrap(),
+                content: "other".into()
+            }),
+            Err(AdapterError::DuplicateCandidate)
+        );
+        assert_eq!(
+            adapter.record_response(CandidateResponse {
+                candidate_id: requests[1].candidate_id.clone(),
+                response_hash: canonical_hash(&"left").unwrap(),
+                content: "left".into()
+            }),
+            Err(AdapterError::DuplicateResponse)
+        );
     }
 
     #[test]
@@ -548,7 +817,13 @@ mod tests {
         adapter.attach_host(1).unwrap();
         for (index, request) in requests.iter().enumerate() {
             let content = format!("candidate-{index}");
-            adapter.record_response(CandidateResponse { candidate_id: request.candidate_id.clone(), response_hash: canonical_hash(&content).unwrap(), content }).unwrap();
+            adapter
+                .record_response(CandidateResponse {
+                    candidate_id: request.candidate_id.clone(),
+                    response_hash: canonical_hash(&content).unwrap(),
+                    content,
+                })
+                .unwrap();
         }
         assert_eq!(adapter.advance().unwrap(), HostKernelStatus::Ready);
         let expected = adapter.kernel().clone();
@@ -564,18 +839,23 @@ mod tests {
         let requests = adapter.requests().unwrap();
         for (index, request) in requests.iter().enumerate() {
             let content = format!("candidate-{index}");
-            adapter.record_response(CandidateResponse {
-                candidate_id: request.candidate_id.clone(),
-                response_hash: canonical_hash(&content).unwrap(),
-                content,
-            }).unwrap();
+            adapter
+                .record_response(CandidateResponse {
+                    candidate_id: request.candidate_id.clone(),
+                    response_hash: canonical_hash(&content).unwrap(),
+                    content,
+                })
+                .unwrap();
         }
         assert_eq!(adapter.advance().unwrap(), HostKernelStatus::Ready);
         (adapter, requests)
     }
 
     fn evidence_for(request: &HostEvidenceRequest, content: &str) -> (String, String) {
-        (request.request_id.clone(), canonical_hash(&content).unwrap())
+        (
+            request.request_id.clone(),
+            canonical_hash(&content).unwrap(),
+        )
     }
 
     #[test]
@@ -585,14 +865,31 @@ mod tests {
         assert_eq!(evidence_requests.len(), 4);
         let again = adapter.evidence_requests().unwrap();
         assert_eq!(evidence_requests, again);
-        let ids: std::collections::BTreeSet<&str> = evidence_requests.iter().map(|r| r.request_id.as_str()).collect();
+        let ids: std::collections::BTreeSet<&str> = evidence_requests
+            .iter()
+            .map(|r| r.request_id.as_str())
+            .collect();
         assert_eq!(ids.len(), 4);
         for request in &evidence_requests {
-            assert!(requests.iter().any(|c| c.candidate_id == request.candidate_id));
+            assert!(requests
+                .iter()
+                .any(|c| c.candidate_id == request.candidate_id));
             assert_eq!(request.obligation_ids, vec!["builds".to_string()]);
         }
-        assert_eq!(evidence_requests.iter().filter(|r| r.kind == EvidenceKind::Adversary).count(), 2);
-        assert_eq!(evidence_requests.iter().filter(|r| r.kind == EvidenceKind::Verifier).count(), 2);
+        assert_eq!(
+            evidence_requests
+                .iter()
+                .filter(|r| r.kind == EvidenceKind::Adversary)
+                .count(),
+            2
+        );
+        assert_eq!(
+            evidence_requests
+                .iter()
+                .filter(|r| r.kind == EvidenceKind::Verifier)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -602,18 +899,23 @@ mod tests {
         assert!(adapter.evidence_requests().unwrap().is_empty());
         let request = adapter.requests().unwrap().remove(0);
         let content = "only".to_string();
-        adapter.record_response(CandidateResponse {
-            candidate_id: request.candidate_id.clone(),
-            response_hash: canonical_hash(&content).unwrap(),
-            content,
-        }).unwrap();
+        adapter
+            .record_response(CandidateResponse {
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content,
+            })
+            .unwrap();
         let adversary = AdversaryEvidence {
             request_id: "anything".into(),
             candidate_id: request.candidate_id.clone(),
             response_hash: canonical_hash(&"{}").unwrap(),
             content: "{}".into(),
         };
-        assert_eq!(adapter.record_adversary(adversary), Err(AdapterError::EvidenceStageNotOpen));
+        assert_eq!(
+            adapter.record_adversary(adversary),
+            Err(AdapterError::EvidenceStageNotOpen)
+        );
     }
 
     #[test]
@@ -621,29 +923,67 @@ mod tests {
         let (mut adapter, _) = ready_adapter();
         let requests = adapter.evidence_requests().unwrap();
         let candidate = requests[0].candidate_id.clone();
-        let adversary_request = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary).unwrap();
-        let verifier_request = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier).unwrap();
+        let adversary_request = requests
+            .iter()
+            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary)
+            .unwrap();
+        let verifier_request = requests
+            .iter()
+            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier)
+            .unwrap();
 
         let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
-        assert_eq!(adapter.record_adversary(AdversaryEvidence {
-            request_id: "forged".into(), candidate_id: candidate.clone(), response_hash: hash.clone(), content: "{\"defects\":[]}".into(),
-        }), Err(AdapterError::UnknownEvidenceRequest));
-        assert_eq!(adapter.record_adversary(AdversaryEvidence {
-            request_id: request_id.clone(), candidate_id: candidate.clone(), response_hash: canonical_hash(&"tampered").unwrap(), content: "{\"defects\":[]}".into(),
-        }), Err(AdapterError::Encoding("response hash mismatch".into())));
-        adapter.record_adversary(AdversaryEvidence {
-            request_id, candidate_id: candidate.clone(), response_hash: hash, content: "{\"defects\":[]}".into(),
-        }).unwrap();
-        assert!(matches!(adapter.finalize().unwrap(), KernelState::AwaitingEvidence));
+        assert_eq!(
+            adapter.record_adversary(AdversaryEvidence {
+                request_id: "forged".into(),
+                candidate_id: candidate.clone(),
+                response_hash: hash.clone(),
+                content: "{\"defects\":[]}".into(),
+            }),
+            Err(AdapterError::UnknownEvidenceRequest)
+        );
+        assert_eq!(
+            adapter.record_adversary(AdversaryEvidence {
+                request_id: request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&"tampered").unwrap(),
+                content: "{\"defects\":[]}".into(),
+            }),
+            Err(AdapterError::Encoding("response hash mismatch".into()))
+        );
+        adapter
+            .record_adversary(AdversaryEvidence {
+                request_id,
+                candidate_id: candidate.clone(),
+                response_hash: hash,
+                content: "{\"defects\":[]}".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::AwaitingEvidence
+        ));
 
-        let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
+        let verifier_content =
+            "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
         let (request_id, hash) = evidence_for(verifier_request, verifier_content);
-        adapter.record_verifier(VerifierEvidence {
-            request_id: request_id.clone(), candidate_id: candidate.clone(), response_hash: hash, content: verifier_content.into(),
-        }).unwrap();
-        assert_eq!(adapter.record_verifier(VerifierEvidence {
-            request_id, candidate_id: candidate.clone(), response_hash: canonical_hash(&verifier_content).unwrap(), content: verifier_content.into(),
-        }), Err(AdapterError::DuplicateEvidence));
+        adapter
+            .record_verifier(VerifierEvidence {
+                request_id: request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: hash,
+                content: verifier_content.into(),
+            })
+            .unwrap();
+        assert_eq!(
+            adapter.record_verifier(VerifierEvidence {
+                request_id,
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&verifier_content).unwrap(),
+                content: verifier_content.into(),
+            }),
+            Err(AdapterError::DuplicateEvidence)
+        );
 
         assert_eq!(adapter.finalize().unwrap(), KernelState::Completed);
         assert_eq!(adapter.kernel().state, KernelState::Completed);
@@ -654,18 +994,39 @@ mod tests {
         let (mut adapter, _) = ready_adapter();
         let requests = adapter.evidence_requests().unwrap();
         let mut seen = std::collections::BTreeSet::new();
-        for candidate in requests.iter().map(|r| r.candidate_id.clone()).filter(|c| seen.insert(c.clone())) {
-            let adversary_request = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary).unwrap();
+        for candidate in requests
+            .iter()
+            .map(|r| r.candidate_id.clone())
+            .filter(|c| seen.insert(c.clone()))
+        {
+            let adversary_request = requests
+                .iter()
+                .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary)
+                .unwrap();
             let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
-            adapter.record_adversary(AdversaryEvidence {
-                request_id, candidate_id: candidate.clone(), response_hash: hash, content: "{\"defects\":[]}".into(),
-            }).unwrap();
-            let verifier_request = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier).unwrap();
-            let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"failed\"}]}";
+            adapter
+                .record_adversary(AdversaryEvidence {
+                    request_id,
+                    candidate_id: candidate.clone(),
+                    response_hash: hash,
+                    content: "{\"defects\":[]}".into(),
+                })
+                .unwrap();
+            let verifier_request = requests
+                .iter()
+                .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier)
+                .unwrap();
+            let verifier_content =
+                "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"failed\"}]}";
             let (request_id, hash) = evidence_for(verifier_request, verifier_content);
-            adapter.record_verifier(VerifierEvidence {
-                request_id, candidate_id: candidate.clone(), response_hash: hash, content: verifier_content.into(),
-            }).unwrap();
+            adapter
+                .record_verifier(VerifierEvidence {
+                    request_id,
+                    candidate_id: candidate.clone(),
+                    response_hash: hash,
+                    content: verifier_content.into(),
+                })
+                .unwrap();
         }
         assert_eq!(adapter.finalize().unwrap(), KernelState::Failed);
         assert_eq!(adapter.kernel().state, KernelState::Failed);
@@ -676,29 +1037,66 @@ mod tests {
         let (mut adapter, _) = ready_adapter();
         let requests = adapter.evidence_requests().unwrap();
         let first = requests[0].candidate_id.clone();
-        let adversary_request = requests.iter().find(|r| r.candidate_id == first && r.kind == EvidenceKind::Adversary).unwrap();
+        let adversary_request = requests
+            .iter()
+            .find(|r| r.candidate_id == first && r.kind == EvidenceKind::Adversary)
+            .unwrap();
         let dirty = "{\"defects\":[{\"title\":\"fake proof\",\"detail\":\"cached result\"}]}";
         let (request_id, hash) = evidence_for(adversary_request, dirty);
-        adapter.record_adversary(AdversaryEvidence {
-            request_id, candidate_id: first.clone(), response_hash: hash, content: dirty.into(),
-        }).unwrap();
-        let record = adapter.candidate_evidence(&first).unwrap().adversary.as_ref().unwrap();
+        adapter
+            .record_adversary(AdversaryEvidence {
+                request_id,
+                candidate_id: first.clone(),
+                response_hash: hash,
+                content: dirty.into(),
+            })
+            .unwrap();
+        let record = adapter
+            .candidate_evidence(&first)
+            .unwrap()
+            .adversary
+            .as_ref()
+            .unwrap();
         assert!(!record.report.inconclusive);
         assert_eq!(record.report.defects.len(), 1);
 
-        let second = requests.iter().map(|r| r.candidate_id.clone()).find(|c| *c != first).unwrap();
-        let adversary_request = requests.iter().find(|r| r.candidate_id == second && r.kind == EvidenceKind::Adversary).unwrap();
+        let second = requests
+            .iter()
+            .map(|r| r.candidate_id.clone())
+            .find(|c| *c != first)
+            .unwrap();
+        let adversary_request = requests
+            .iter()
+            .find(|r| r.candidate_id == second && r.kind == EvidenceKind::Adversary)
+            .unwrap();
         let (request_id, hash) = evidence_for(adversary_request, "could not inspect");
-        adapter.record_adversary(AdversaryEvidence {
-            request_id, candidate_id: second.clone(), response_hash: hash, content: "could not inspect".into(),
-        }).unwrap();
-        let verifier_request = requests.iter().find(|r| r.candidate_id == second && r.kind == EvidenceKind::Verifier).unwrap();
-        let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
+        adapter
+            .record_adversary(AdversaryEvidence {
+                request_id,
+                candidate_id: second.clone(),
+                response_hash: hash,
+                content: "could not inspect".into(),
+            })
+            .unwrap();
+        let verifier_request = requests
+            .iter()
+            .find(|r| r.candidate_id == second && r.kind == EvidenceKind::Verifier)
+            .unwrap();
+        let verifier_content =
+            "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
         let (request_id, hash) = evidence_for(verifier_request, verifier_content);
-        adapter.record_verifier(VerifierEvidence {
-            request_id, candidate_id: second.clone(), response_hash: hash, content: verifier_content.into(),
-        }).unwrap();
-        assert!(matches!(adapter.finalize().unwrap(), KernelState::AwaitingEvidence));
+        adapter
+            .record_verifier(VerifierEvidence {
+                request_id,
+                candidate_id: second.clone(),
+                response_hash: hash,
+                content: verifier_content.into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::AwaitingEvidence
+        ));
     }
 
     #[test]
@@ -710,27 +1108,46 @@ mod tests {
         adapter.attach_host(1).unwrap();
         let request = adapter.requests().unwrap().remove(0);
         let content = "candidate-0".to_string();
-        adapter.record_response(CandidateResponse {
-            candidate_id: request.candidate_id.clone(),
-            response_hash: canonical_hash(&content).unwrap(),
-            content,
-        }).unwrap();
+        adapter
+            .record_response(CandidateResponse {
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content,
+            })
+            .unwrap();
         assert_eq!(adapter.advance().unwrap(), HostKernelStatus::Ready);
         let requests = adapter.evidence_requests().unwrap();
-        let adversary_request = requests.iter().find(|r| r.kind == EvidenceKind::Adversary).unwrap();
+        let adversary_request = requests
+            .iter()
+            .find(|r| r.kind == EvidenceKind::Adversary)
+            .unwrap();
         let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
-        adapter.record_adversary(AdversaryEvidence {
-            request_id, candidate_id: request.candidate_id.clone(), response_hash: hash, content: "{\"defects\":[]}".into(),
-        }).unwrap();
+        adapter
+            .record_adversary(AdversaryEvidence {
+                request_id,
+                candidate_id: request.candidate_id.clone(),
+                response_hash: hash,
+                content: "{\"defects\":[]}".into(),
+            })
+            .unwrap();
 
         let mut recovered = ExternalHostAdapter::open(&path).unwrap();
         assert_eq!(recovered.evidence_requests().unwrap(), requests);
-        let verifier_request = requests.iter().find(|r| r.kind == EvidenceKind::Verifier).unwrap();
-        let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
+        let verifier_request = requests
+            .iter()
+            .find(|r| r.kind == EvidenceKind::Verifier)
+            .unwrap();
+        let verifier_content =
+            "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
         let (request_id, hash) = evidence_for(verifier_request, verifier_content);
-        recovered.record_verifier(VerifierEvidence {
-            request_id, candidate_id: request.candidate_id.clone(), response_hash: hash, content: verifier_content.into(),
-        }).unwrap();
+        recovered
+            .record_verifier(VerifierEvidence {
+                request_id,
+                candidate_id: request.candidate_id.clone(),
+                response_hash: hash,
+                content: verifier_content.into(),
+            })
+            .unwrap();
         assert_eq!(recovered.finalize().unwrap(), KernelState::Completed);
         let reloaded = ExternalHostAdapter::open(&path).unwrap();
         assert_eq!(reloaded.kernel().state, KernelState::Completed);
@@ -747,11 +1164,13 @@ mod tests {
         let requests = adapter.requests().unwrap();
         for (index, request) in requests.iter().enumerate() {
             let content = format!("candidate-{index}");
-            adapter.record_response(CandidateResponse {
-                candidate_id: request.candidate_id.clone(),
-                response_hash: canonical_hash(&content).unwrap(),
-                content,
-            }).unwrap();
+            adapter
+                .record_response(CandidateResponse {
+                    candidate_id: request.candidate_id.clone(),
+                    response_hash: canonical_hash(&content).unwrap(),
+                    content,
+                })
+                .unwrap();
         }
         assert_eq!(adapter.advance().unwrap(), HostKernelStatus::Ready);
         (adapter, requests)
@@ -761,8 +1180,14 @@ mod tests {
         let report = crate::taste::TasteGateReport {
             thesis_id: thesis.into(),
             screenshots: vec![
-                crate::taste::ScreenshotEvidence { viewport: crate::taste::ViewportClass::Desktop, artifact_hash: "a".repeat(64) },
-                crate::taste::ScreenshotEvidence { viewport: crate::taste::ViewportClass::Phone, artifact_hash: "b".repeat(64) },
+                crate::taste::ScreenshotEvidence {
+                    viewport: crate::taste::ViewportClass::Desktop,
+                    artifact_hash: "a".repeat(64),
+                },
+                crate::taste::ScreenshotEvidence {
+                    viewport: crate::taste::ViewportClass::Phone,
+                    artifact_hash: "b".repeat(64),
+                },
             ],
             interaction_replay_hash: "c".repeat(64),
             forbidden_patterns_hit: Vec::new(),
@@ -776,8 +1201,15 @@ mod tests {
         let (adapter, _) = ready_visual_adapter();
         let requests = adapter.evidence_requests().unwrap();
         assert_eq!(requests.len(), 6);
-        assert_eq!(requests.iter().filter(|r| r.kind == EvidenceKind::Visual).count(), 2);
-        let ids: std::collections::BTreeSet<&str> = requests.iter().map(|r| r.request_id.as_str()).collect();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.kind == EvidenceKind::Visual)
+                .count(),
+            2
+        );
+        let ids: std::collections::BTreeSet<&str> =
+            requests.iter().map(|r| r.request_id.as_str()).collect();
         assert_eq!(ids.len(), 6);
     }
 
@@ -786,35 +1218,66 @@ mod tests {
         let (mut adapter, _) = ready_visual_adapter();
         let requests = adapter.evidence_requests().unwrap();
         let candidate = requests[0].candidate_id.clone();
-        let pick = |kind: EvidenceKind| requests.iter()
-            .find(|r| r.candidate_id == candidate && r.kind == kind).unwrap().clone();
+        let pick = |kind: EvidenceKind| {
+            requests
+                .iter()
+                .find(|r| r.candidate_id == candidate && r.kind == kind)
+                .unwrap()
+                .clone()
+        };
         let adversary = pick(EvidenceKind::Adversary);
         let verifier = pick(EvidenceKind::Verifier);
         let visual = pick(EvidenceKind::Visual);
-        adapter.record_adversary(AdversaryEvidence {
-            request_id: adversary.request_id.clone(), candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(), content: "{\"defects\":[]}".into(),
-        }).unwrap();
-        let verifier_content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
-        adapter.record_verifier(VerifierEvidence {
-            request_id: verifier.request_id.clone(), candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&verifier_content).unwrap(), content: verifier_content.into(),
-        }).unwrap();
+        adapter
+            .record_adversary(AdversaryEvidence {
+                request_id: adversary.request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(),
+                content: "{\"defects\":[]}".into(),
+            })
+            .unwrap();
+        let verifier_content =
+            "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
+        adapter
+            .record_verifier(VerifierEvidence {
+                request_id: verifier.request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&verifier_content).unwrap(),
+                content: verifier_content.into(),
+            })
+            .unwrap();
         // clean adversary + proven verifier is not enough for a visual task
-        assert!(matches!(adapter.finalize().unwrap(), KernelState::AwaitingEvidence));
-        let mut bad: crate::taste::TasteGateReport = serde_json::from_str(&visual_report("thesis-a")).unwrap();
-        bad.screenshots.retain(|s| s.viewport == crate::taste::ViewportClass::Desktop);
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::AwaitingEvidence
+        ));
+        let mut bad: crate::taste::TasteGateReport =
+            serde_json::from_str(&visual_report("thesis-a")).unwrap();
+        bad.screenshots
+            .retain(|s| s.viewport == crate::taste::ViewportClass::Desktop);
         let bad_content = serde_json::to_string(&bad).unwrap();
-        assert!(matches!(adapter.record_visual(VisualEvidence {
-            request_id: visual.request_id.clone(), candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&bad_content).unwrap(), content: bad_content,
-        }), Err(AdapterError::InvalidEvidence(_))));
+        assert!(matches!(
+            adapter.record_visual(VisualEvidence {
+                request_id: visual.request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&bad_content).unwrap(),
+                content: bad_content,
+            }),
+            Err(AdapterError::InvalidEvidence(_))
+        ));
         let good = visual_report("thesis-a");
-        adapter.record_visual(VisualEvidence {
-            request_id: visual.request_id.clone(), candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&good).unwrap(), content: good,
-        }).unwrap();
-        assert!(matches!(adapter.finalize().unwrap(), KernelState::Completed));
+        adapter
+            .record_visual(VisualEvidence {
+                request_id: visual.request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&good).unwrap(),
+                content: good,
+            })
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::Completed
+        ));
     }
 
     #[test]
@@ -822,34 +1285,61 @@ mod tests {
         let (mut adapter, _) = ready_visual_adapter();
         let requests = adapter.evidence_requests().unwrap();
         let candidate = requests[0].candidate_id.clone();
-        let visual = requests.iter()
-            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Visual).unwrap().clone();
-        let mut hit: crate::taste::TasteGateReport = serde_json::from_str(&visual_report("thesis-a")).unwrap();
+        let visual = requests
+            .iter()
+            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Visual)
+            .unwrap()
+            .clone();
+        let mut hit: crate::taste::TasteGateReport =
+            serde_json::from_str(&visual_report("thesis-a")).unwrap();
         hit.forbidden_patterns_hit = vec!["generic-hero-plus-cards".into()];
         let hit_content = serde_json::to_string(&hit).unwrap();
-        assert!(matches!(adapter.record_visual(VisualEvidence {
-            request_id: visual.request_id.clone(), candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&hit_content).unwrap(), content: hit_content,
-        }), Err(AdapterError::InvalidEvidence(_))));
-        let mut dirty: crate::taste::TasteGateReport = serde_json::from_str(&visual_report("thesis-a")).unwrap();
+        assert!(matches!(
+            adapter.record_visual(VisualEvidence {
+                request_id: visual.request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&hit_content).unwrap(),
+                content: hit_content,
+            }),
+            Err(AdapterError::InvalidEvidence(_))
+        ));
+        let mut dirty: crate::taste::TasteGateReport =
+            serde_json::from_str(&visual_report("thesis-a")).unwrap();
         dirty.critic_clean = false;
         let dirty_content = serde_json::to_string(&dirty).unwrap();
-        assert!(matches!(adapter.record_visual(VisualEvidence {
-            request_id: visual.request_id.clone(), candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&dirty_content).unwrap(), content: dirty_content,
-        }), Err(AdapterError::InvalidEvidence(_))));
+        assert!(matches!(
+            adapter.record_visual(VisualEvidence {
+                request_id: visual.request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&dirty_content).unwrap(),
+                content: dirty_content,
+            }),
+            Err(AdapterError::InvalidEvidence(_))
+        ));
         let good = visual_report("thesis-a");
-        adapter.record_visual(VisualEvidence {
-            request_id: visual.request_id.clone(), candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&good).unwrap(), content: good,
-        }).unwrap();
-        let other = requests.iter()
-            .find(|r| r.candidate_id != candidate && r.kind == EvidenceKind::Visual).unwrap().clone();
+        adapter
+            .record_visual(VisualEvidence {
+                request_id: visual.request_id.clone(),
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&good).unwrap(),
+                content: good,
+            })
+            .unwrap();
+        let other = requests
+            .iter()
+            .find(|r| r.candidate_id != candidate && r.kind == EvidenceKind::Visual)
+            .unwrap()
+            .clone();
         let shared = visual_report("thesis-a");
-        assert!(matches!(adapter.record_visual(VisualEvidence {
-            request_id: other.request_id, candidate_id: other.candidate_id,
-            response_hash: canonical_hash(&shared).unwrap(), content: shared,
-        }), Err(AdapterError::InvalidEvidence(_))));
+        assert!(matches!(
+            adapter.record_visual(VisualEvidence {
+                request_id: other.request_id,
+                candidate_id: other.candidate_id,
+                response_hash: canonical_hash(&shared).unwrap(),
+                content: shared,
+            }),
+            Err(AdapterError::InvalidEvidence(_))
+        ));
     }
 
     #[test]
@@ -858,17 +1348,28 @@ mod tests {
         let requests = adapter.evidence_requests().unwrap();
         assert!(requests.iter().all(|r| r.kind != EvidenceKind::Visual));
         let content = visual_report("thesis-a");
-        assert!(matches!(adapter.record_visual(VisualEvidence {
-            request_id: "anything".into(), candidate_id: requests[0].candidate_id.clone(),
-            response_hash: canonical_hash(&content).unwrap(), content,
-        }), Err(AdapterError::InvalidEvidence(_))));
+        assert!(matches!(
+            adapter.record_visual(VisualEvidence {
+                request_id: "anything".into(),
+                candidate_id: requests[0].candidate_id.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content,
+            }),
+            Err(AdapterError::InvalidEvidence(_))
+        ));
     }
     #[test]
     fn candidate_requests_carry_the_work_kind() {
         let general = ExternalHostAdapter::new(contract(), 1).unwrap();
-        assert_eq!(general.requests().unwrap()[0].work_kind, crate::contract::WorkKind::General);
+        assert_eq!(
+            general.requests().unwrap()[0].work_kind,
+            crate::contract::WorkKind::General
+        );
         let visual = ExternalHostAdapter::new(visual_contract(), 1).unwrap();
-        assert_eq!(visual.requests().unwrap()[0].work_kind, crate::contract::WorkKind::Visual);
+        assert_eq!(
+            visual.requests().unwrap()[0].work_kind,
+            crate::contract::WorkKind::Visual
+        );
     }
     #[test]
     fn finalize_records_the_qualified_candidate() {
@@ -876,18 +1377,37 @@ mod tests {
         assert_eq!(adapter.qualified_candidate(), None);
         let requests = adapter.evidence_requests().unwrap();
         let candidate = requests[0].candidate_id.clone();
-        let adversary = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary).unwrap().clone();
-        adapter.record_adversary(AdversaryEvidence {
-            request_id: adversary.request_id, candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(), content: "{\"defects\":[]}".into(),
-        }).unwrap();
-        let verifier = requests.iter().find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier).unwrap().clone();
+        let adversary = requests
+            .iter()
+            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary)
+            .unwrap()
+            .clone();
+        adapter
+            .record_adversary(AdversaryEvidence {
+                request_id: adversary.request_id,
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(),
+                content: "{\"defects\":[]}".into(),
+            })
+            .unwrap();
+        let verifier = requests
+            .iter()
+            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier)
+            .unwrap()
+            .clone();
         let content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
-        adapter.record_verifier(VerifierEvidence {
-            request_id: verifier.request_id, candidate_id: candidate.clone(),
-            response_hash: canonical_hash(&content).unwrap(), content: content.into(),
-        }).unwrap();
-        assert!(matches!(adapter.finalize().unwrap(), KernelState::Completed));
+        adapter
+            .record_verifier(VerifierEvidence {
+                request_id: verifier.request_id,
+                candidate_id: candidate.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content: content.into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::Completed
+        ));
         assert_eq!(adapter.qualified_candidate(), Some(candidate.as_str()));
     }
 }

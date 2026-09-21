@@ -79,11 +79,15 @@ impl BranchId {
         Ok(Self(value))
     }
 
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Default for BranchId {
-    fn default() -> Self { Self("main".into()) }
+    fn default() -> Self {
+        Self("main".into())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,7 +146,9 @@ impl TransactionJournal {
         };
         let main = BranchId::default();
         snapshot.branches.entry(main.clone()).or_insert(BranchSpec {
-            id: main.clone(), parent: None, base_revision: 0,
+            id: main.clone(),
+            parent: None,
+            base_revision: 0,
         });
         snapshot.branch_heads.entry(main).or_insert(0);
         Ok(Self { path, snapshot })
@@ -152,8 +158,14 @@ impl TransactionJournal {
         self.get_on_branch(&BranchId::default(), idempotency_key)
     }
 
-    pub fn get_on_branch(&self, branch_id: &BranchId, idempotency_key: &str) -> Option<&TransactionRecord> {
-        self.snapshot.records.get(&record_key(branch_id, idempotency_key))
+    pub fn get_on_branch(
+        &self,
+        branch_id: &BranchId,
+        idempotency_key: &str,
+    ) -> Option<&TransactionRecord> {
+        self.snapshot
+            .records
+            .get(&record_key(branch_id, idempotency_key))
     }
 
     pub fn create_branch(
@@ -162,14 +174,22 @@ impl TransactionJournal {
         parent: BranchId,
         base_revision: u64,
     ) -> Result<BranchSpec, JournalError> {
-        if self.snapshot.branches.contains_key(&id) || !self.snapshot.branches.contains_key(&parent) {
+        if self.snapshot.branches.contains_key(&id) || !self.snapshot.branches.contains_key(&parent)
+        {
             return Err(JournalError::InvalidBranch);
         }
         let actual = self.branch_head(&parent)?;
         if base_revision > actual {
-            return Err(JournalError::StaleBase { expected: base_revision, actual });
+            return Err(JournalError::StaleBase {
+                expected: base_revision,
+                actual,
+            });
         }
-        let spec = BranchSpec { id: id.clone(), parent: Some(parent), base_revision };
+        let spec = BranchSpec {
+            id: id.clone(),
+            parent: Some(parent),
+            base_revision,
+        };
         self.snapshot.branches.insert(id.clone(), spec.clone());
         self.snapshot.branch_heads.insert(id, base_revision);
         self.persist()?;
@@ -177,7 +197,11 @@ impl TransactionJournal {
     }
 
     pub fn branch_head(&self, branch_id: &BranchId) -> Result<u64, JournalError> {
-        self.snapshot.branch_heads.get(branch_id).copied().ok_or(JournalError::UnknownBranch)
+        self.snapshot
+            .branch_heads
+            .get(branch_id)
+            .copied()
+            .ok_or(JournalError::UnknownBranch)
     }
 
     pub fn prepare(
@@ -187,7 +211,13 @@ impl TransactionJournal {
         payload: &[u8],
         nonce: u64,
     ) -> Result<TransactionRecord, JournalError> {
-        self.prepare_on_branch(&BranchId::default(), grant_id, idempotency_key, payload, nonce)
+        self.prepare_on_branch(
+            &BranchId::default(),
+            grant_id,
+            idempotency_key,
+            payload,
+            nonce,
+        )
     }
 
     pub fn prepare_on_branch(
@@ -208,29 +238,58 @@ impl TransactionJournal {
             return Ok(record.clone());
         }
         let nonce_key = nonce_key(branch_id, grant_id);
-        if nonce <= self.snapshot.latest_nonce.get(&nonce_key).copied().unwrap_or(0) {
+        if nonce
+            <= self
+                .snapshot
+                .latest_nonce
+                .get(&nonce_key)
+                .copied()
+                .unwrap_or(0)
+        {
             return Err(JournalError::NonceReplay);
         }
         let parent_revision = self.branch_head(branch_id)?;
         let revision = parent_revision + 1;
         let record = TransactionRecord {
-            branch_id: branch_id.clone(), grant_id: grant_id.into(), idempotency_key: idempotency_key.into(),
-            request_hash, nonce, parent_revision, revision, state: TransactionState::Prepared, outcome: None,
+            branch_id: branch_id.clone(),
+            grant_id: grant_id.into(),
+            idempotency_key: idempotency_key.into(),
+            request_hash,
+            nonce,
+            parent_revision,
+            revision,
+            state: TransactionState::Prepared,
+            outcome: None,
         };
         self.snapshot.latest_nonce.insert(nonce_key, nonce);
-        self.snapshot.branch_heads.insert(branch_id.clone(), revision);
+        self.snapshot
+            .branch_heads
+            .insert(branch_id.clone(), revision);
         self.snapshot.records.insert(key, record.clone());
         self.persist()?;
         Ok(record)
     }
 
-    pub fn commit(&mut self, idempotency_key: &str, outcome: &str) -> Result<TransactionRecord, JournalError> {
+    pub fn commit(
+        &mut self,
+        idempotency_key: &str,
+        outcome: &str,
+    ) -> Result<TransactionRecord, JournalError> {
         self.commit_on_branch(&BranchId::default(), idempotency_key, outcome)
     }
 
-    pub fn commit_on_branch(&mut self, branch_id: &BranchId, idempotency_key: &str, outcome: &str) -> Result<TransactionRecord, JournalError> {
+    pub fn commit_on_branch(
+        &mut self,
+        branch_id: &BranchId,
+        idempotency_key: &str,
+        outcome: &str,
+    ) -> Result<TransactionRecord, JournalError> {
         let key = record_key(branch_id, idempotency_key);
-        let record = self.snapshot.records.get_mut(&key).ok_or(JournalError::NotPrepared)?;
+        let record = self
+            .snapshot
+            .records
+            .get_mut(&key)
+            .ok_or(JournalError::NotPrepared)?;
         if record.state == TransactionState::Committed {
             return Ok(record.clone());
         }
@@ -244,13 +303,26 @@ impl TransactionJournal {
         Ok(result)
     }
 
-    pub fn abort(&mut self, idempotency_key: &str, reason: &str) -> Result<TransactionRecord, JournalError> {
+    pub fn abort(
+        &mut self,
+        idempotency_key: &str,
+        reason: &str,
+    ) -> Result<TransactionRecord, JournalError> {
         self.abort_on_branch(&BranchId::default(), idempotency_key, reason)
     }
 
-    pub fn abort_on_branch(&mut self, branch_id: &BranchId, idempotency_key: &str, reason: &str) -> Result<TransactionRecord, JournalError> {
+    pub fn abort_on_branch(
+        &mut self,
+        branch_id: &BranchId,
+        idempotency_key: &str,
+        reason: &str,
+    ) -> Result<TransactionRecord, JournalError> {
         let key = record_key(branch_id, idempotency_key);
-        let record = self.snapshot.records.get_mut(&key).ok_or(JournalError::NotPrepared)?;
+        let record = self
+            .snapshot
+            .records
+            .get_mut(&key)
+            .ok_or(JournalError::NotPrepared)?;
         if record.state == TransactionState::Aborted {
             return Ok(record.clone());
         }
@@ -264,20 +336,38 @@ impl TransactionJournal {
         Ok(result)
     }
 
-    pub fn merge(&mut self, target: &BranchId, source: &BranchId) -> Result<MergeResult, JournalError> {
-        let source_spec = self.snapshot.branches.get(source).ok_or(JournalError::UnknownBranch)?.clone();
+    pub fn merge(
+        &mut self,
+        target: &BranchId,
+        source: &BranchId,
+    ) -> Result<MergeResult, JournalError> {
+        let source_spec = self
+            .snapshot
+            .branches
+            .get(source)
+            .ok_or(JournalError::UnknownBranch)?
+            .clone();
         let target_head = self.branch_head(target)?;
         if source_spec.parent.as_ref() != Some(target) {
             return Err(JournalError::MergeConflict);
         }
         if target_head != source_spec.base_revision {
-            return Err(JournalError::StaleBase { expected: source_spec.base_revision, actual: target_head });
+            return Err(JournalError::StaleBase {
+                expected: source_spec.base_revision,
+                actual: target_head,
+            });
         }
-        let source_records: Vec<TransactionRecord> = self.snapshot.records.values()
+        let source_records: Vec<TransactionRecord> = self
+            .snapshot
+            .records
+            .values()
             .filter(|record| &record.branch_id == source)
             .cloned()
             .collect();
-        if source_records.iter().any(|record| record.state != TransactionState::Committed) {
+        if source_records
+            .iter()
+            .any(|record| record.state != TransactionState::Committed)
+        {
             return Err(JournalError::UncommittedSource);
         }
         let mut planned_head = target_head;
@@ -305,14 +395,29 @@ impl TransactionJournal {
             imports.push((target_key, imported_record));
         }
         for (target_key, imported_record) in imports {
-            self.snapshot.latest_nonce.insert(nonce_key(target, &imported_record.grant_id), imported_record.nonce);
+            self.snapshot.latest_nonce.insert(
+                nonce_key(target, &imported_record.grant_id),
+                imported_record.nonce,
+            );
             self.snapshot.records.insert(target_key, imported_record);
         }
-        let imported = self.snapshot.records.values().filter(|record| &record.branch_id == target && record.revision > target_head).count();
-        self.snapshot.branch_heads.insert(target.clone(), planned_head);
+        let imported = self
+            .snapshot
+            .records
+            .values()
+            .filter(|record| &record.branch_id == target && record.revision > target_head)
+            .count();
+        self.snapshot
+            .branch_heads
+            .insert(target.clone(), planned_head);
         let revision = planned_head;
         self.persist()?;
-        Ok(MergeResult { source: source.clone(), target: target.clone(), imported, revision })
+        Ok(MergeResult {
+            source: source.clone(),
+            target: target.clone(),
+            imported,
+            revision,
+        })
     }
 
     fn persist(&self) -> Result<(), JournalError> {
@@ -343,17 +448,32 @@ pub struct LeaseAuthority {
 
 impl LeaseAuthority {
     pub fn new(secret: impl Into<String>) -> Self {
-        Self { secret: secret.into(), snapshot: AuthoritySnapshot::default() }
+        Self {
+            secret: secret.into(),
+            snapshot: AuthoritySnapshot::default(),
+        }
     }
 
     pub fn from_snapshot(secret: impl Into<String>, snapshot: AuthoritySnapshot) -> Self {
-        Self { secret: secret.into(), snapshot }
+        Self {
+            secret: secret.into(),
+            snapshot,
+        }
     }
 
-    pub fn snapshot(&self) -> AuthoritySnapshot { self.snapshot.clone() }
+    pub fn snapshot(&self) -> AuthoritySnapshot {
+        self.snapshot.clone()
+    }
 
-    pub fn acquire(&mut self, grant_id: &str, now_ms: u128, ttl_ms: u128) -> Result<LeaseGrant, AuthorityError> {
-        if self.snapshot.revoked.contains(grant_id) { return Err(AuthorityError::Revoked); }
+    pub fn acquire(
+        &mut self,
+        grant_id: &str,
+        now_ms: u128,
+        ttl_ms: u128,
+    ) -> Result<LeaseGrant, AuthorityError> {
+        if self.snapshot.revoked.contains(grant_id) {
+            return Err(AuthorityError::Revoked);
+        }
         let grant = LeaseGrant {
             token: self.token(grant_id, 1, 1),
             expires_at_ms: now_ms.saturating_add(ttl_ms),
@@ -362,14 +482,23 @@ impl LeaseAuthority {
         Ok(grant)
     }
 
-    pub fn renew(&mut self, token: &ResumeToken, now_ms: u128, ttl_ms: u128) -> Result<LeaseGrant, AuthorityError> {
+    pub fn renew(
+        &mut self,
+        token: &ResumeToken,
+        now_ms: u128,
+        ttl_ms: u128,
+    ) -> Result<LeaseGrant, AuthorityError> {
         let current = self.authenticate(token, now_ms)?;
-        if token.nonce < current.token.nonce { return Err(AuthorityError::NonceReplay); }
+        if token.nonce < current.token.nonce {
+            return Err(AuthorityError::NonceReplay);
+        }
         let grant = LeaseGrant {
             token: self.token(&token.grant_id, current.token.epoch + 1, token.nonce + 1),
             expires_at_ms: now_ms.saturating_add(ttl_ms),
         };
-        self.snapshot.leases.insert(token.grant_id.clone(), grant.clone());
+        self.snapshot
+            .leases
+            .insert(token.grant_id.clone(), grant.clone());
         Ok(grant)
     }
 
@@ -380,11 +509,25 @@ impl LeaseAuthority {
         Ok(())
     }
 
-    pub fn authenticate(&self, token: &ResumeToken, now_ms: u128) -> Result<&LeaseGrant, AuthorityError> {
-        if self.snapshot.revoked.contains(&token.grant_id) { return Err(AuthorityError::Revoked); }
-        let grant = self.snapshot.leases.get(&token.grant_id).ok_or(AuthorityError::UnknownGrant)?;
-        if grant.expires_at_ms <= now_ms { return Err(AuthorityError::Expired); }
-        if token != &grant.token || token.authenticator != self.authenticator(&token.grant_id, token.epoch, token.nonce) {
+    pub fn authenticate(
+        &self,
+        token: &ResumeToken,
+        now_ms: u128,
+    ) -> Result<&LeaseGrant, AuthorityError> {
+        if self.snapshot.revoked.contains(&token.grant_id) {
+            return Err(AuthorityError::Revoked);
+        }
+        let grant = self
+            .snapshot
+            .leases
+            .get(&token.grant_id)
+            .ok_or(AuthorityError::UnknownGrant)?;
+        if grant.expires_at_ms <= now_ms {
+            return Err(AuthorityError::Expired);
+        }
+        if token != &grant.token
+            || token.authenticator != self.authenticator(&token.grant_id, token.epoch, token.nonce)
+        {
             return Err(AuthorityError::InvalidToken);
         }
         Ok(grant)
@@ -392,19 +535,34 @@ impl LeaseAuthority {
 
     /// Returns the existing result for an exact replay and rejects a reused
     /// key with different input before any side effect can run.
-    pub fn exactly_once(&mut self, key: &str, payload: &[u8], result: &str) -> Result<String, AuthorityError> {
+    pub fn exactly_once(
+        &mut self,
+        key: &str,
+        payload: &[u8],
+        result: &str,
+    ) -> Result<String, AuthorityError> {
         let request_hash = hash(payload);
         if let Some(record) = self.snapshot.idempotency.get(key) {
-            if record.request_hash != request_hash { return Err(AuthorityError::IdempotencyConflict); }
+            if record.request_hash != request_hash {
+                return Err(AuthorityError::IdempotencyConflict);
+            }
             return Ok(record.result.clone());
         }
-        let record = IdempotencyRecord { request_hash, result: result.into() };
+        let record = IdempotencyRecord {
+            request_hash,
+            result: result.into(),
+        };
         self.snapshot.idempotency.insert(key.into(), record.clone());
         Ok(record.result)
     }
 
     fn token(&self, grant_id: &str, epoch: u64, nonce: u64) -> ResumeToken {
-        ResumeToken { grant_id: grant_id.into(), epoch, nonce, authenticator: self.authenticator(grant_id, epoch, nonce) }
+        ResumeToken {
+            grant_id: grant_id.into(),
+            epoch,
+            nonce,
+            authenticator: self.authenticator(grant_id, epoch, nonce),
+        }
     }
 
     fn authenticator(&self, grant_id: &str, epoch: u64, nonce: u64) -> String {
@@ -413,7 +571,10 @@ impl LeaseAuthority {
 }
 
 fn hash(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -427,9 +588,15 @@ mod tests {
         let grant = authority.acquire("task", 10, 100).unwrap();
         let mut forged = grant.token.clone();
         forged.authenticator.replace_range(..2, "00");
-        assert_eq!(authority.authenticate(&forged, 11), Err(AuthorityError::InvalidToken));
+        assert_eq!(
+            authority.authenticate(&forged, 11),
+            Err(AuthorityError::InvalidToken)
+        );
         let renewed = authority.renew(&grant.token, 11, 100).unwrap();
-        assert_eq!(authority.renew(&grant.token, 12, 100), Err(AuthorityError::InvalidToken));
+        assert_eq!(
+            authority.renew(&grant.token, 12, 100),
+            Err(AuthorityError::InvalidToken)
+        );
         assert!(renewed.token.nonce > grant.token.nonce);
     }
 
@@ -437,13 +604,25 @@ mod tests {
     fn restart_preserves_revocation_and_idempotency() {
         let mut authority = LeaseAuthority::new("secret");
         let grant = authority.acquire("task", 10, 100).unwrap();
-        assert_eq!(authority.exactly_once("k", b"input", "done").unwrap(), "done");
+        assert_eq!(
+            authority.exactly_once("k", b"input", "done").unwrap(),
+            "done"
+        );
         let snapshot = authority.snapshot();
         let mut recovered = LeaseAuthority::from_snapshot("secret", snapshot);
-        assert_eq!(recovered.exactly_once("k", b"input", "other").unwrap(), "done");
-        assert_eq!(recovered.exactly_once("k", b"changed", "other"), Err(AuthorityError::IdempotencyConflict));
+        assert_eq!(
+            recovered.exactly_once("k", b"input", "other").unwrap(),
+            "done"
+        );
+        assert_eq!(
+            recovered.exactly_once("k", b"changed", "other"),
+            Err(AuthorityError::IdempotencyConflict)
+        );
         recovered.revoke(&grant.token, 11).unwrap();
-        assert_eq!(recovered.authenticate(&grant.token, 12), Err(AuthorityError::Revoked));
+        assert_eq!(
+            recovered.authenticate(&grant.token, 12),
+            Err(AuthorityError::Revoked)
+        );
     }
 
     #[test]
@@ -454,7 +633,10 @@ mod tests {
         journal.prepare("grant", "request", b"payload", 1).unwrap();
         let committed = journal.commit("request", "accepted").unwrap();
         assert_eq!(journal.commit("request", "ignored").unwrap(), committed);
-        assert_eq!(journal.prepare("grant", "request", b"changed", 1), Err(JournalError::Conflict));
+        assert_eq!(
+            journal.prepare("grant", "request", b"changed", 1),
+            Err(JournalError::Conflict)
+        );
     }
 
     #[test]
@@ -467,7 +649,10 @@ mod tests {
             assert_eq!(prepared.state, TransactionState::Prepared);
         }
         let mut recovered = TransactionJournal::open(&path).unwrap();
-        assert_eq!(recovered.get("prepare").unwrap().state, TransactionState::Prepared);
+        assert_eq!(
+            recovered.get("prepare").unwrap().state,
+            TransactionState::Prepared
+        );
         let committed = recovered.commit("prepare", "once").unwrap();
         let restarted = TransactionJournal::open(&path).unwrap();
         assert_eq!(restarted.get("prepare").unwrap(), &committed);
@@ -484,11 +669,30 @@ mod tests {
         journal.abort("abort", "cancelled").unwrap();
 
         let mut recovered = TransactionJournal::open(&path).unwrap();
-        assert_eq!(recovered.get("commit").unwrap().state, TransactionState::Committed);
-        assert_eq!(recovered.get("abort").unwrap().state, TransactionState::Aborted);
-        assert_eq!(recovered.commit("commit", "different").unwrap().outcome.as_deref(), Some("done"));
-        assert_eq!(recovered.commit("abort", "wrong"), Err(JournalError::NotPrepared));
-        assert_eq!(recovered.prepare("grant", "new", b"c", 2), Err(JournalError::NonceReplay));
+        assert_eq!(
+            recovered.get("commit").unwrap().state,
+            TransactionState::Committed
+        );
+        assert_eq!(
+            recovered.get("abort").unwrap().state,
+            TransactionState::Aborted
+        );
+        assert_eq!(
+            recovered
+                .commit("commit", "different")
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some("done")
+        );
+        assert_eq!(
+            recovered.commit("abort", "wrong"),
+            Err(JournalError::NotPrepared)
+        );
+        assert_eq!(
+            recovered.prepare("grant", "new", b"c", 2),
+            Err(JournalError::NonceReplay)
+        );
     }
 
     fn branch(name: &str) -> BranchId {
@@ -502,16 +706,48 @@ mod tests {
         let mut journal = TransactionJournal::open(&path).unwrap();
         let left = branch("left");
         let right = branch("right");
-        journal.create_branch(left.clone(), BranchId::default(), 0).unwrap();
-        journal.create_branch(right.clone(), BranchId::default(), 0).unwrap();
-        journal.prepare_on_branch(&left, "grant", "same-key", b"left", 1).unwrap();
-        journal.prepare_on_branch(&right, "grant", "same-key", b"right", 1).unwrap();
-        journal.commit_on_branch(&left, "same-key", "left-done").unwrap();
-        journal.commit_on_branch(&right, "same-key", "right-done").unwrap();
-        assert_eq!(journal.get_on_branch(&left, "same-key").unwrap().outcome.as_deref(), Some("left-done"));
-        assert_eq!(journal.get_on_branch(&right, "same-key").unwrap().outcome.as_deref(), Some("right-done"));
+        journal
+            .create_branch(left.clone(), BranchId::default(), 0)
+            .unwrap();
+        journal
+            .create_branch(right.clone(), BranchId::default(), 0)
+            .unwrap();
+        journal
+            .prepare_on_branch(&left, "grant", "same-key", b"left", 1)
+            .unwrap();
+        journal
+            .prepare_on_branch(&right, "grant", "same-key", b"right", 1)
+            .unwrap();
+        journal
+            .commit_on_branch(&left, "same-key", "left-done")
+            .unwrap();
+        journal
+            .commit_on_branch(&right, "same-key", "right-done")
+            .unwrap();
+        assert_eq!(
+            journal
+                .get_on_branch(&left, "same-key")
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some("left-done")
+        );
+        assert_eq!(
+            journal
+                .get_on_branch(&right, "same-key")
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some("right-done")
+        );
         journal.merge(&BranchId::default(), &left).unwrap();
-        assert_eq!(journal.merge(&BranchId::default(), &right), Err(JournalError::StaleBase { expected: 0, actual: 1 }));
+        assert_eq!(
+            journal.merge(&BranchId::default(), &right),
+            Err(JournalError::StaleBase {
+                expected: 0,
+                actual: 1
+            })
+        );
     }
 
     #[test]
@@ -520,12 +756,24 @@ mod tests {
         let path = directory.path().join("transactions.json");
         let mut journal = TransactionJournal::open(&path).unwrap();
         let feature = branch("feature");
-        journal.create_branch(feature.clone(), BranchId::default(), 0).unwrap();
+        journal
+            .create_branch(feature.clone(), BranchId::default(), 0)
+            .unwrap();
         journal.prepare("grant", "main-op", b"main", 1).unwrap();
         journal.commit("main-op", "done").unwrap();
-        journal.prepare_on_branch(&feature, "grant", "feature-op", b"feature", 1).unwrap();
-        journal.commit_on_branch(&feature, "feature-op", "done").unwrap();
-        assert_eq!(journal.merge(&BranchId::default(), &feature), Err(JournalError::StaleBase { expected: 0, actual: 1 }));
+        journal
+            .prepare_on_branch(&feature, "grant", "feature-op", b"feature", 1)
+            .unwrap();
+        journal
+            .commit_on_branch(&feature, "feature-op", "done")
+            .unwrap();
+        assert_eq!(
+            journal.merge(&BranchId::default(), &feature),
+            Err(JournalError::StaleBase {
+                expected: 0,
+                actual: 1
+            })
+        );
     }
 
     #[test]
@@ -537,10 +785,19 @@ mod tests {
         journal.commit("shared", "target-done").unwrap();
         let feature = branch("conflict");
         let base = journal.branch_head(&BranchId::default()).unwrap();
-        journal.create_branch(feature.clone(), BranchId::default(), base).unwrap();
-        journal.prepare_on_branch(&feature, "grant", "shared", b"source", 1).unwrap();
-        journal.commit_on_branch(&feature, "shared", "source-done").unwrap();
-        assert_eq!(journal.merge(&BranchId::default(), &feature), Err(JournalError::MergeConflict));
+        journal
+            .create_branch(feature.clone(), BranchId::default(), base)
+            .unwrap();
+        journal
+            .prepare_on_branch(&feature, "grant", "shared", b"source", 1)
+            .unwrap();
+        journal
+            .commit_on_branch(&feature, "shared", "source-done")
+            .unwrap();
+        assert_eq!(
+            journal.merge(&BranchId::default(), &feature),
+            Err(JournalError::MergeConflict)
+        );
     }
 
     #[test]
@@ -551,14 +808,34 @@ mod tests {
         let right = branch("restart-right");
         {
             let mut journal = TransactionJournal::open(&path).unwrap();
-            journal.create_branch(left.clone(), BranchId::default(), 0).unwrap();
-            journal.create_branch(right.clone(), BranchId::default(), 0).unwrap();
-            journal.prepare_on_branch(&left, "grant", "same", b"left", 1).unwrap();
-            journal.prepare_on_branch(&right, "grant", "same", b"right", 1).unwrap();
+            journal
+                .create_branch(left.clone(), BranchId::default(), 0)
+                .unwrap();
+            journal
+                .create_branch(right.clone(), BranchId::default(), 0)
+                .unwrap();
+            journal
+                .prepare_on_branch(&left, "grant", "same", b"left", 1)
+                .unwrap();
+            journal
+                .prepare_on_branch(&right, "grant", "same", b"right", 1)
+                .unwrap();
         }
         let recovered = TransactionJournal::open(&path).unwrap();
-        assert_eq!(recovered.get_on_branch(&left, "same").unwrap().request_hash, hash(b"left"));
-        assert_eq!(recovered.get_on_branch(&right, "same").unwrap().request_hash, hash(b"right"));
-        assert_eq!(recovered.get_on_branch(&left, "same").unwrap().nonce, recovered.get_on_branch(&right, "same").unwrap().nonce);
+        assert_eq!(
+            recovered.get_on_branch(&left, "same").unwrap().request_hash,
+            hash(b"left")
+        );
+        assert_eq!(
+            recovered
+                .get_on_branch(&right, "same")
+                .unwrap()
+                .request_hash,
+            hash(b"right")
+        );
+        assert_eq!(
+            recovered.get_on_branch(&left, "same").unwrap().nonce,
+            recovered.get_on_branch(&right, "same").unwrap().nonce
+        );
     }
 }

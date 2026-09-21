@@ -51,7 +51,9 @@ mod tests {
     use super::*;
 
     fn registered() -> BTreeSet<String> {
-        ["ev-1".to_string(), "ev-2".to_string()].into_iter().collect()
+        ["ev-1".to_string(), "ev-2".to_string()]
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -60,8 +62,8 @@ mod tests {
         let err = validate_completion_claim("done", &[], &registered()).unwrap_err();
         assert!(err.iter().any(|e| e.contains("cites no evidence")));
         // invented evidence ids
-        let err = validate_completion_claim("done", &["ev-999".to_string()], &registered())
-            .unwrap_err();
+        let err =
+            validate_completion_claim("done", &["ev-999".to_string()], &registered()).unwrap_err();
         assert!(err.iter().any(|e| e.contains("never registered")));
         // empty summary
         assert!(validate_completion_claim("", &["ev-1".to_string()], &registered()).is_err());
@@ -69,14 +71,18 @@ mod tests {
 
     #[test]
     fn evidenced_completion_passes() {
-        assert!(
-            validate_completion_claim("all obligations verified", &["ev-1".to_string()], &registered())
-                .is_ok()
-        );
+        assert!(validate_completion_claim(
+            "all obligations verified",
+            &["ev-1".to_string()],
+            &registered()
+        )
+        .is_ok());
     }
 
     #[test]
     fn gate_fits_its_budget() {
-        assert!(COMPLETION_GATE.chars().count() <= crate::ModuleKind::CompletionGate.budget_chars());
+        assert!(
+            COMPLETION_GATE.chars().count() <= crate::ModuleKind::CompletionGate.budget_chars()
+        );
     }
 }

@@ -18,11 +18,11 @@ use crate::phase4::{
     WorkspaceSnapshot,
 };
 use crate::verify::{self, ObligationStatus, VerificationReport};
+use rex_prompt::roles::Role;
+use rex_prompt::{sha256_hex as prompt_sha256_hex, Assembler};
 use rex_providers::autonomous::{AgentSnapshot, AutonomousRunService, Budgets};
 use rex_providers::http::Transport;
 use rex_providers::oneshot;
-use rex_prompt::roles::Role;
-use rex_prompt::{sha256_hex as prompt_sha256_hex, Assembler};
 use rex_providers::secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,7 +61,10 @@ pub fn ultra_prompt_identity() -> (String, String) {
     material.push_str(&format!("builder:{}:{}\n", builder.0, builder.1));
     material.push_str(&format!("adversary:{}:{}\n", adversary.0, adversary.1));
     material.push_str(&ultra_oneshot_system(Role::CleanRoomJudge));
-    (rex_prompt::PROMPT_VERSION.to_string(), prompt_sha256_hex(material.as_bytes()))
+    (
+        rex_prompt::PROMPT_VERSION.to_string(),
+        prompt_sha256_hex(material.as_bytes()),
+    )
 }
 
 pub fn ultra_budgets() -> Budgets {
@@ -1121,8 +1124,13 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                 };
                 let prompt =
                     phase5::reconstruction_prompt(&ctx.task, &twin, &acceptance, &manifest);
-                let answer = oneshot::complete_text(inner.service(), recon_provider, recon_model,
-                    &ultra_oneshot_system(Role::CleanRoomJudge), &prompt)?;
+                let answer = oneshot::complete_text(
+                    inner.service(),
+                    recon_provider,
+                    recon_model,
+                    &ultra_oneshot_system(Role::CleanRoomJudge),
+                    &prompt,
+                )?;
                 let answer_ev = evidence.put_bytes("reconstruction_answer", answer.text.as_bytes());
                 let mut reconstruction_evidence = known_evidence.clone();
                 reconstruction_evidence.insert(answer_ev.id);

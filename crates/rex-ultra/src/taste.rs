@@ -50,10 +50,15 @@ pub struct VisualReference {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReferenceProvenance {
-    Url { url: String },
+    Url {
+        url: String,
+    },
     /// A registered local artifact; the hash binds the exact bytes, so a
     /// name alone is never evidence.
-    LocalArtifact { artifact_id: String, content_hash: String },
+    LocalArtifact {
+        artifact_id: String,
+        content_hash: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,16 +112,40 @@ pub struct CandidateThesis {
 /// explicit decision, not a silent one.
 pub fn default_forbidden_patterns() -> Vec<ForbiddenPattern> {
     [
-        ("generic-sci-fi-hud", "generic sci-fi HUD styling instead of a product-specific direction"),
-        ("dashboard-as-landing", "dashboard presented as the landing experience"),
-        ("dense-parameter-cards", "dense parameter cards as the primary composition"),
-        ("gratuitous-gradients-glow", "gratuitous gradients or glow substituting for design"),
-        ("control-overload", "control overload beyond the task's actual needs"),
-        ("generic-hero-plus-cards", "generic hero-plus-cards layout with no central behavior"),
-        ("polish-without-invention", "visual polish without a new central behavior"),
+        (
+            "generic-sci-fi-hud",
+            "generic sci-fi HUD styling instead of a product-specific direction",
+        ),
+        (
+            "dashboard-as-landing",
+            "dashboard presented as the landing experience",
+        ),
+        (
+            "dense-parameter-cards",
+            "dense parameter cards as the primary composition",
+        ),
+        (
+            "gratuitous-gradients-glow",
+            "gratuitous gradients or glow substituting for design",
+        ),
+        (
+            "control-overload",
+            "control overload beyond the task's actual needs",
+        ),
+        (
+            "generic-hero-plus-cards",
+            "generic hero-plus-cards layout with no central behavior",
+        ),
+        (
+            "polish-without-invention",
+            "visual polish without a new central behavior",
+        ),
     ]
     .iter()
-    .map(|(id, description)| ForbiddenPattern { id: id.to_string(), description: description.to_string() })
+    .map(|(id, description)| ForbiddenPattern {
+        id: id.to_string(),
+        description: description.to_string(),
+    })
     .collect()
 }
 
@@ -155,10 +184,15 @@ pub fn validate_brief(brief: &CreativeBrief) -> Result<(), Vec<String>> {
             }
         }
     }
-    for (label, references) in [("reference", &brief.references), ("anti-reference", &brief.anti_references)] {
+    for (label, references) in [
+        ("reference", &brief.references),
+        ("anti-reference", &brief.anti_references),
+    ] {
         for reference in references {
             if reference.property.trim().is_empty() {
-                errors.push(format!("{label} needs the property being learned or avoided"));
+                errors.push(format!(
+                    "{label} needs the property being learned or avoided"
+                ));
             }
             match &reference.provenance {
                 ReferenceProvenance::Url { url } => {
@@ -166,18 +200,31 @@ pub fn validate_brief(brief: &CreativeBrief) -> Result<(), Vec<String>> {
                         errors.push(format!("{label} url is empty"));
                     }
                 }
-                ReferenceProvenance::LocalArtifact { artifact_id, content_hash } => {
+                ReferenceProvenance::LocalArtifact {
+                    artifact_id,
+                    content_hash,
+                } => {
                     if artifact_id.trim().is_empty() || content_hash.trim().is_empty() {
-                        errors.push(format!("{label} local artifact needs an id and a content hash"));
+                        errors.push(format!(
+                            "{label} local artifact needs an id and a content hash"
+                        ));
                     }
                 }
             }
         }
     }
-    if !brief.required_viewports.iter().any(|v| v.class == ViewportClass::Desktop) {
+    if !brief
+        .required_viewports
+        .iter()
+        .any(|v| v.class == ViewportClass::Desktop)
+    {
         errors.push("a desktop viewport is required".to_string());
     }
-    if !brief.required_viewports.iter().any(|v| v.class == ViewportClass::Phone) {
+    if !brief
+        .required_viewports
+        .iter()
+        .any(|v| v.class == ViewportClass::Phone)
+    {
         errors.push("a phone viewport is required".to_string());
     }
     for viewport in &brief.required_viewports {
@@ -185,11 +232,18 @@ pub fn validate_brief(brief: &CreativeBrief) -> Result<(), Vec<String>> {
             errors.push("viewport needs a name and non-zero dimensions".to_string());
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn normalize(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn thesis_signature(thesis: &CandidateThesis) -> (String, String, String, String) {
@@ -219,8 +273,15 @@ pub fn check_distinct_theses(theses: &[CandidateThesis]) -> Result<(), Vec<Strin
             errors.push("thesis ids must be non-empty and unique".to_string());
         }
         let signature = thesis_signature(thesis);
-        if signature.0.is_empty() || signature.1.is_empty() || signature.2.is_empty() || signature.3.is_empty() {
-            errors.push(format!("thesis {:?} must declare all four semantic models", thesis.id));
+        if signature.0.is_empty()
+            || signature.1.is_empty()
+            || signature.2.is_empty()
+            || signature.3.is_empty()
+        {
+            errors.push(format!(
+                "thesis {:?} must declare all four semantic models",
+                thesis.id
+            ));
         }
     }
     for (index, left) in theses.iter().enumerate() {
@@ -233,7 +294,11 @@ pub fn check_distinct_theses(theses: &[CandidateThesis]) -> Result<(), Vec<Strin
             }
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Pixel-level evidence that a visual candidate actually exists and works:
@@ -270,19 +335,28 @@ pub fn validate_taste_gate(report: &TasteGateReport) -> Result<(), Vec<String>> 
             .iter()
             .any(|shot| shot.viewport == class && is_artifact_hash(&shot.artifact_hash));
         if !covered {
-            errors.push(format!("missing hash-bound screenshot evidence for the {class:?} viewport"));
+            errors.push(format!(
+                "missing hash-bound screenshot evidence for the {class:?} viewport"
+            ));
         }
     }
     if !is_artifact_hash(&report.interaction_replay_hash) {
         errors.push("interaction replay is not hash-bound".to_string());
     }
     if !report.forbidden_patterns_hit.is_empty() {
-        errors.push(format!("forbidden patterns hit: {}", report.forbidden_patterns_hit.join(", ")));
+        errors.push(format!(
+            "forbidden patterns hit: {}",
+            report.forbidden_patterns_hit.join(", ")
+        ));
     }
     if !report.critic_clean {
         errors.push("critic pass is not clean".to_string());
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn is_artifact_hash(value: &str) -> bool {
@@ -294,7 +368,10 @@ mod tests {
     use super::*;
 
     fn criterion(id: &str) -> Criterion {
-        Criterion { id: id.into(), statement: format!("{id} holds") }
+        Criterion {
+            id: id.into(),
+            statement: format!("{id} holds"),
+        }
     }
 
     fn brief() -> CreativeBrief {
@@ -307,7 +384,9 @@ mod tests {
             },
             references: vec![VisualReference {
                 property: "spatial depth".into(),
-                provenance: ReferenceProvenance::Url { url: "https://example.com/ref".into() },
+                provenance: ReferenceProvenance::Url {
+                    url: "https://example.com/ref".into(),
+                },
             }],
             anti_references: vec![VisualReference {
                 property: "flat card grid".into(),
@@ -316,14 +395,32 @@ mod tests {
                     content_hash: "abc123".into(),
                 },
             }],
-            composition: CriterionSet { criteria: vec![criterion("focal-path")] },
-            typography: CriterionSet { criteria: vec![criterion("measure")] },
-            motion: CriterionSet { criteria: vec![criterion("easing")] },
-            responsive: CriterionSet { criteria: vec![criterion("reflow")] },
+            composition: CriterionSet {
+                criteria: vec![criterion("focal-path")],
+            },
+            typography: CriterionSet {
+                criteria: vec![criterion("measure")],
+            },
+            motion: CriterionSet {
+                criteria: vec![criterion("easing")],
+            },
+            responsive: CriterionSet {
+                criteria: vec![criterion("reflow")],
+            },
             forbidden_patterns: default_forbidden_patterns(),
             required_viewports: vec![
-                ViewportSpec { name: "desktop".into(), class: ViewportClass::Desktop, width: 1440, height: 900 },
-                ViewportSpec { name: "phone".into(), class: ViewportClass::Phone, width: 390, height: 844 },
+                ViewportSpec {
+                    name: "desktop".into(),
+                    class: ViewportClass::Desktop,
+                    width: 1440,
+                    height: 900,
+                },
+                ViewportSpec {
+                    name: "phone".into(),
+                    class: ViewportClass::Phone,
+                    width: 390,
+                    height: 844,
+                },
             ],
         }
     }
@@ -348,7 +445,10 @@ mod tests {
     fn comprehension_window_must_intersect_the_truthful_range() {
         let mut b = brief();
         b.central_invention.comprehension_window_seconds = 12..=30;
-        assert!(validate_brief(&b).unwrap_err().iter().any(|e| e.contains("comprehension window")));
+        assert!(validate_brief(&b)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("comprehension window")));
         let mut b = brief();
         b.central_invention.comprehension_window_seconds = 1..=2;
         assert!(validate_brief(&b).is_err());
@@ -361,19 +461,30 @@ mod tests {
     fn references_need_provenance_and_a_property() {
         let mut b = brief();
         b.references[0].property = "  ".into();
-        assert!(validate_brief(&b).unwrap_err().iter().any(|e| e.contains("property")));
+        assert!(validate_brief(&b)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("property")));
         let mut b = brief();
         b.anti_references[0].provenance = ReferenceProvenance::LocalArtifact {
-            artifact_id: "old-cut".into(), content_hash: String::new(),
+            artifact_id: "old-cut".into(),
+            content_hash: String::new(),
         };
-        assert!(validate_brief(&b).unwrap_err().iter().any(|e| e.contains("content hash")));
+        assert!(validate_brief(&b)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("content hash")));
     }
 
     #[test]
     fn both_viewport_classes_are_required() {
         let mut b = brief();
-        b.required_viewports.retain(|v| v.class == ViewportClass::Desktop);
-        assert!(validate_brief(&b).unwrap_err().iter().any(|e| e.contains("phone viewport")));
+        b.required_viewports
+            .retain(|v| v.class == ViewportClass::Desktop);
+        assert!(validate_brief(&b)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("phone viewport")));
         let mut b = brief();
         b.required_viewports.clear();
         let errors = validate_brief(&b).unwrap_err();
@@ -385,7 +496,10 @@ mod tests {
     fn every_criterion_set_must_be_declared() {
         let mut b = brief();
         b.motion.criteria.clear();
-        assert!(validate_brief(&b).unwrap_err().iter().any(|e| e.contains("motion criterion set is empty")));
+        assert!(validate_brief(&b)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("motion criterion set is empty")));
     }
 
     #[test]
@@ -400,7 +514,10 @@ mod tests {
     #[test]
     fn fewer_than_three_theses_is_rejected() {
         let theses = vec![thesis("a", "orbit"), thesis("b", "slice")];
-        assert!(check_distinct_theses(&theses).unwrap_err().iter().any(|e| e.contains("at least 3")));
+        assert!(check_distinct_theses(&theses)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("at least 3")));
     }
 
     #[test]
@@ -413,12 +530,19 @@ mod tests {
         a.color_tokens = vec!["#fff".into()];
         b.color_tokens = vec!["#000".into(), "#123456".into()];
         let theses = vec![a, b, thesis("c", "slice time")];
-        assert!(check_distinct_theses(&theses).unwrap_err().iter().any(|e| e.contains("near-duplicates")));
+        assert!(check_distinct_theses(&theses)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("near-duplicates")));
     }
 
     #[test]
     fn genuinely_distinct_theses_pass() {
-        let theses = vec![thesis("a", "orbit the answer"), thesis("b", "slice time"), thesis("c", "grow a garden")];
+        let theses = vec![
+            thesis("a", "orbit the answer"),
+            thesis("b", "slice time"),
+            thesis("c", "grow a garden"),
+        ];
         assert_eq!(check_distinct_theses(&theses), Ok(()));
     }
 
@@ -426,15 +550,28 @@ mod tests {
     fn blank_semantic_models_cannot_hide_duplication() {
         let mut b = thesis("b", "slice time");
         b.motion_model = "   ".into();
-        let theses = vec![thesis("a", "orbit the answer"), b, thesis("c", "grow a garden")];
-        assert!(check_distinct_theses(&theses).unwrap_err().iter().any(|e| e.contains("all four semantic models")));
+        let theses = vec![
+            thesis("a", "orbit the answer"),
+            b,
+            thesis("c", "grow a garden"),
+        ];
+        assert!(check_distinct_theses(&theses)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("all four semantic models")));
     }
     fn report() -> TasteGateReport {
         TasteGateReport {
             thesis_id: "thesis-a".into(),
             screenshots: vec![
-                ScreenshotEvidence { viewport: ViewportClass::Desktop, artifact_hash: "a".repeat(64) },
-                ScreenshotEvidence { viewport: ViewportClass::Phone, artifact_hash: "b".repeat(64) },
+                ScreenshotEvidence {
+                    viewport: ViewportClass::Desktop,
+                    artifact_hash: "a".repeat(64),
+                },
+                ScreenshotEvidence {
+                    viewport: ViewportClass::Phone,
+                    artifact_hash: "b".repeat(64),
+                },
             ],
             interaction_replay_hash: "c".repeat(64),
             forbidden_patterns_hit: Vec::new(),
@@ -446,8 +583,13 @@ mod tests {
     fn taste_gate_accepts_only_hash_bound_pixel_evidence() {
         assert!(validate_taste_gate(&report()).is_ok());
         let mut missing_phone = report();
-        missing_phone.screenshots.retain(|s| s.viewport == ViewportClass::Desktop);
-        assert!(validate_taste_gate(&missing_phone).unwrap_err().iter().any(|e| e.contains("Phone")));
+        missing_phone
+            .screenshots
+            .retain(|s| s.viewport == ViewportClass::Desktop);
+        assert!(validate_taste_gate(&missing_phone)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("Phone")));
         let mut unbound = report();
         unbound.screenshots[0].artifact_hash = "trust me".into();
         assert!(validate_taste_gate(&unbound).is_err());

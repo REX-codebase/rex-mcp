@@ -129,7 +129,10 @@ pub struct CompiledSkillPlan {
 
 fn valid_semver(version: &str) -> bool {
     let parts: Vec<&str> = version.split('.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub fn validate_manifest(manifest: &SkillPackManifest) -> Result<(), Vec<String>> {
@@ -138,7 +141,10 @@ pub fn validate_manifest(manifest: &SkillPackManifest) -> Result<(), Vec<String>
         errors.push("pack id is required".to_string());
     }
     if !valid_semver(&manifest.version) {
-        errors.push(format!("pack {:?} version {:?} is not semver x.y.z", manifest.id, manifest.version));
+        errors.push(format!(
+            "pack {:?} version {:?} is not semver x.y.z",
+            manifest.id, manifest.version
+        ));
     }
     if manifest.schema == 0 {
         errors.push(format!("pack {:?} needs a schema version", manifest.id));
@@ -148,15 +154,25 @@ pub fn validate_manifest(manifest: &SkillPackManifest) -> Result<(), Vec<String>
     }
     for gate in &manifest.gates {
         if gate.id.trim().is_empty() || gate.command_hint.trim().is_empty() {
-            errors.push(format!("pack {:?} has a gate without id or command hint", manifest.id));
+            errors.push(format!(
+                "pack {:?} has a gate without id or command hint",
+                manifest.id
+            ));
         }
     }
     for rule in &manifest.rules {
         if rule.id.trim().is_empty() || rule.statement.trim().is_empty() {
-            errors.push(format!("pack {:?} has a rule without id or statement", manifest.id));
+            errors.push(format!(
+                "pack {:?} has a rule without id or statement",
+                manifest.id
+            ));
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn matches(pack: &SkillPackManifest, facts: &RepositoryFacts) -> usize {
@@ -166,7 +182,9 @@ fn matches(pack: &SkillPackManifest, facts: &RepositoryFacts) -> usize {
             Selector::FileExtension { extension } => facts.file_extensions.contains(extension),
             Selector::Manifest { filename } => facts.manifests.contains(filename),
             Selector::Shebang { program } => facts.shebangs.contains(program),
-            Selector::Medium { medium } => facts.requested_medium.as_deref() == Some(medium.as_str()),
+            Selector::Medium { medium } => {
+                facts.requested_medium.as_deref() == Some(medium.as_str())
+            }
         })
         .count()
 }
@@ -218,7 +236,11 @@ pub fn compile_plan(
                     unsupported.insert(format!(
                         "{}: required tools not detected ({})",
                         pack.id,
-                        missing.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+                        missing
+                            .iter()
+                            .map(|t| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ));
                 }
             }
@@ -229,10 +251,18 @@ pub fn compile_plan(
     // unselectable dependency fails compilation rather than half-applying.
     let mut queue: Vec<&str> = selected.keys().cloned().collect();
     while let Some(id) = queue.pop() {
-        let Some(pack) = selected.get(id).copied() else { continue };
+        let Some(pack) = selected.get(id).copied() else {
+            continue;
+        };
         for dependency in &pack.dependencies {
             match by_id.get(dependency.as_str()) {
-                Some(dep) if matches_certified(dep) && dep.required_tools.iter().all(|t| facts.detected_tools.contains(t)) => {
+                Some(dep)
+                    if matches_certified(dep)
+                        && dep
+                            .required_tools
+                            .iter()
+                            .all(|t| facts.detected_tools.contains(t)) =>
+                {
                     if selected.insert(dep.id.as_str(), dep).is_none() {
                         queue.push(dep.id.as_str());
                     }
@@ -254,10 +284,16 @@ pub fn compile_plan(
     for id in &ids {
         let pack = selected[id];
         for conflict in &pack.conflicts {
-            let Some(other) = selected.get(conflict.other_pack.as_str()).copied() else { continue };
-            let key = ResolvedConflictKey(std::cmp::min(id, &other.id.as_str()).to_string()
-                , std::cmp::max(id, &other.id.as_str()).to_string());
-            if !resolved.insert(key) { continue; }
+            let Some(other) = selected.get(conflict.other_pack.as_str()).copied() else {
+                continue;
+            };
+            let key = ResolvedConflictKey(
+                std::cmp::min(id, &other.id.as_str()).to_string(),
+                std::cmp::max(id, &other.id.as_str()).to_string(),
+            );
+            if !resolved.insert(key) {
+                continue;
+            }
             match (conflict.kind, &conflict.resolution) {
                 (ConflictKind::Cosmetic, _) => {
                     let (kept, dropped) = if matches(pack, facts) >= matches(other, facts) {
@@ -298,15 +334,23 @@ pub fn compile_plan(
 
     let mut selected_packs: Vec<PinnedSkillPack> = selected
         .values()
-        .map(|p| PinnedSkillPack { id: p.id.clone(), version: p.version.clone() })
+        .map(|p| PinnedSkillPack {
+            id: p.id.clone(),
+            version: p.version.clone(),
+        })
         .collect();
     selected_packs.sort_by(|a, b| a.id.cmp(&b.id));
     resolved_conflicts.sort_by(|a, b| (&a.pack, &a.other).cmp(&(&b.pack, &b.other)));
     let mut gates: Vec<CompiledGate> = selected
         .values()
-        .flat_map(|p| p.gates.iter().map(move |g| CompiledGate {
-            pack: p.id.clone(), id: g.id.clone(), command_hint: g.command_hint.clone(), required: g.required,
-        }))
+        .flat_map(|p| {
+            p.gates.iter().map(move |g| CompiledGate {
+                pack: p.id.clone(),
+                id: g.id.clone(),
+                command_hint: g.command_hint.clone(),
+                required: g.required,
+            })
+        })
         .collect();
     gates.sort_by(|a, b| (&a.pack, &a.id).cmp(&(&b.pack, &b.id)));
     let mut unsupported: Vec<String> = unsupported.into_iter().collect();
@@ -336,15 +380,19 @@ pub fn compile_plan(
 }
 
 fn matches_certified(pack: &SkillPackManifest) -> bool {
-    matches!(pack.certification, CertificationStatus::Certified | CertificationStatus::Partial)
+    matches!(
+        pack.certification,
+        CertificationStatus::Certified | CertificationStatus::Partial
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolvedConflictKey(String, String);
 
-
 /// Well-known native tools probed on PATH, without executing anything.
-pub const PROBED_TOOLS: &[&str] = &["cargo", "rustc", "node", "npx", "python3", "go", "javac", "ruby", "gcc", "g++"];
+pub const PROBED_TOOLS: &[&str] = &[
+    "cargo", "rustc", "node", "npx", "python3", "go", "javac", "ruby", "gcc", "g++",
+];
 
 /// Collect repository facts from a workspace directory without executing
 /// any tool: file extensions and root manifests from a bounded walk, and
@@ -366,23 +414,42 @@ pub fn collect_repository_facts(workspace: &std::path::Path) -> RepositoryFacts 
 }
 
 const MANIFEST_NAMES: &[&str] = &[
-    "Cargo.toml", "package.json", "pyproject.toml", "go.mod", "pom.xml",
-    "build.gradle", "Gemfile", "composer.json", "Package.swift",
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "Gemfile",
+    "composer.json",
+    "Package.swift",
 ];
 const MAX_WALK_DEPTH: u32 = 3;
 const MAX_WALK_ENTRIES: usize = 4_096;
 
 fn collect_dir(dir: &std::path::Path, depth: u32, facts: &mut RepositoryFacts) {
-    if depth > MAX_WALK_DEPTH { return; }
-    let Ok(entries) = std::fs::read_dir(dir) else { return; };
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut count = 0;
     for entry in entries.flatten() {
         count += 1;
-        if count > MAX_WALK_ENTRIES { return; }
+        if count > MAX_WALK_ENTRIES {
+            return;
+        }
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') { continue; }
-        let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_symlink() { continue; }
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
         if kind.is_dir() {
             collect_dir(&entry.path(), depth + 1, facts);
         } else if kind.is_file() {
@@ -390,8 +457,10 @@ fn collect_dir(dir: &std::path::Path, depth: u32, facts: &mut RepositoryFacts) {
                 facts.manifests.insert(name.clone());
             }
             if let Some((_, extension)) = name.rsplit_once('.') {
-                if !extension.is_empty() && extension.len() <= 12
-                    && extension.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                if !extension.is_empty()
+                    && extension.len() <= 12
+                    && extension.bytes().all(|b| b.is_ascii_alphanumeric())
+                {
                     facts.file_extensions.insert(extension.to_string());
                 }
             }
@@ -412,8 +481,15 @@ mod tests {
             selectors,
             dependencies: vec![],
             conflicts: vec![],
-            rules: vec![RuleModule { id: "r1".into(), statement: "evidence required".into() }],
-            gates: vec![GateTemplate { id: "g1".into(), command_hint: "run tests".into(), required: true }],
+            rules: vec![RuleModule {
+                id: "r1".into(),
+                statement: "evidence required".into(),
+            }],
+            gates: vec![GateTemplate {
+                id: "g1".into(),
+                command_hint: "run tests".into(),
+                required: true,
+            }],
             required_tools: vec![],
             provenance: "test registry".into(),
             certification: CertificationStatus::Certified,
@@ -433,11 +509,25 @@ mod tests {
     fn registry() -> Vec<SkillPackManifest> {
         vec![
             pack("shared-laws", &[SHARED_LAWS_DOMAIN], vec![]),
-            pack("rust", &["language"], vec![
-                Selector::Manifest { filename: "Cargo.toml".into() },
-                Selector::FileExtension { extension: "rs".into() },
-            ]),
-            pack("three-d", &["medium"], vec![Selector::Medium { medium: "three-d".into() }]),
+            pack(
+                "rust",
+                &["language"],
+                vec![
+                    Selector::Manifest {
+                        filename: "Cargo.toml".into(),
+                    },
+                    Selector::FileExtension {
+                        extension: "rs".into(),
+                    },
+                ],
+            ),
+            pack(
+                "three-d",
+                &["medium"],
+                vec![Selector::Medium {
+                    medium: "three-d".into(),
+                }],
+            ),
         ]
     }
 
@@ -461,11 +551,29 @@ mod tests {
 
     #[test]
     fn support_is_never_claimed_without_certification_and_tools() {
-        let mut unprobed = pack("mystery", &["language"], vec![Selector::FileExtension { extension: "rs".into() }]);
+        let mut unprobed = pack(
+            "mystery",
+            &["language"],
+            vec![Selector::FileExtension {
+                extension: "rs".into(),
+            }],
+        );
         unprobed.certification = CertificationStatus::Unknown;
-        let mut probed_out = pack("legacy", &["language"], vec![Selector::Manifest { filename: "Cargo.toml".into() }]);
+        let mut probed_out = pack(
+            "legacy",
+            &["language"],
+            vec![Selector::Manifest {
+                filename: "Cargo.toml".into(),
+            }],
+        );
         probed_out.certification = CertificationStatus::DetectedUnsupported;
-        let mut needs_tool = pack("wasm-pack", &["ecosystem"], vec![Selector::FileExtension { extension: "rs".into() }]);
+        let mut needs_tool = pack(
+            "wasm-pack",
+            &["ecosystem"],
+            vec![Selector::FileExtension {
+                extension: "rs".into(),
+            }],
+        );
         needs_tool.required_tools = vec!["wasm32-toolchain".into()];
         let mut reg = registry();
         reg.extend([unprobed, probed_out, needs_tool]);
@@ -474,13 +582,25 @@ mod tests {
         assert_eq!(ids, vec!["rust", "shared-laws"]);
         assert_eq!(plan.unsupported.len(), 3);
         assert!(plan.unsupported.iter().any(|u| u.contains("never probed")));
-        assert!(plan.unsupported.iter().any(|u| u.contains("probed unsupported")));
-        assert!(plan.unsupported.iter().any(|u| u.contains("required tools not detected")));
+        assert!(plan
+            .unsupported
+            .iter()
+            .any(|u| u.contains("probed unsupported")));
+        assert!(plan
+            .unsupported
+            .iter()
+            .any(|u| u.contains("required tools not detected")));
     }
 
     #[test]
     fn dependencies_pull_in_certified_packs_and_fail_on_missing_ones() {
-        let mut app = pack("app", &["ecosystem"], vec![Selector::Manifest { filename: "Cargo.toml".into() }]);
+        let mut app = pack(
+            "app",
+            &["ecosystem"],
+            vec![Selector::Manifest {
+                filename: "Cargo.toml".into(),
+            }],
+        );
         app.dependencies = vec!["rust".into()];
         let mut reg = registry();
         reg.push(app.clone());
@@ -489,24 +609,62 @@ mod tests {
         app.dependencies = vec!["nonexistent".into()];
         let mut reg = registry();
         reg.push(app);
-        assert!(compile_plan(&facts(), &reg).unwrap_err().iter().any(|e| e.contains("nonexistent")));
+        assert!(compile_plan(&facts(), &reg)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("nonexistent")));
     }
 
     #[test]
     fn safety_conflicts_without_a_declared_rule_fail_compilation() {
-        let mut a = pack("alpha", &["language"], vec![Selector::FileExtension { extension: "rs".into() }]);
-        let mut b = pack("beta", &["language"], vec![Selector::FileExtension { extension: "rs".into() }]);
-        a.conflicts = vec![SkillConflict { other_pack: "beta".into(), kind: ConflictKind::Safety, resolution: None }];
-        b.conflicts = vec![SkillConflict { other_pack: "alpha".into(), kind: ConflictKind::Safety, resolution: None }];
+        let mut a = pack(
+            "alpha",
+            &["language"],
+            vec![Selector::FileExtension {
+                extension: "rs".into(),
+            }],
+        );
+        let mut b = pack(
+            "beta",
+            &["language"],
+            vec![Selector::FileExtension {
+                extension: "rs".into(),
+            }],
+        );
+        a.conflicts = vec![SkillConflict {
+            other_pack: "beta".into(),
+            kind: ConflictKind::Safety,
+            resolution: None,
+        }];
+        b.conflicts = vec![SkillConflict {
+            other_pack: "alpha".into(),
+            kind: ConflictKind::Safety,
+            resolution: None,
+        }];
         let mut reg = registry();
         reg.extend([a, b]);
-        assert!(compile_plan(&facts(), &reg).unwrap_err().iter().any(|e| e.contains("no declared resolution")));
+        assert!(compile_plan(&facts(), &reg)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("no declared resolution")));
     }
 
     #[test]
     fn declared_rules_resolve_hard_conflicts_once() {
-        let mut a = pack("alpha", &["language"], vec![Selector::FileExtension { extension: "rs".into() }]);
-        let b = pack("beta", &["language"], vec![Selector::FileExtension { extension: "rs".into() }]);
+        let mut a = pack(
+            "alpha",
+            &["language"],
+            vec![Selector::FileExtension {
+                extension: "rs".into(),
+            }],
+        );
+        let b = pack(
+            "beta",
+            &["language"],
+            vec![Selector::FileExtension {
+                extension: "rs".into(),
+            }],
+        );
         a.conflicts = vec![SkillConflict {
             other_pack: "beta".into(),
             kind: ConflictKind::Toolchain,
@@ -521,12 +679,30 @@ mod tests {
 
     #[test]
     fn cosmetic_conflicts_pick_the_more_repository_specific_pack() {
-        let mut general = pack("general-rust", &["language"], vec![Selector::FileExtension { extension: "rs".into() }]);
-        let specific = pack("workspace-rust", &["repo-local"], vec![
-            Selector::FileExtension { extension: "rs".into() },
-            Selector::Manifest { filename: "Cargo.toml".into() },
-        ]);
-        general.conflicts = vec![SkillConflict { other_pack: "workspace-rust".into(), kind: ConflictKind::Cosmetic, resolution: None }];
+        let mut general = pack(
+            "general-rust",
+            &["language"],
+            vec![Selector::FileExtension {
+                extension: "rs".into(),
+            }],
+        );
+        let specific = pack(
+            "workspace-rust",
+            &["repo-local"],
+            vec![
+                Selector::FileExtension {
+                    extension: "rs".into(),
+                },
+                Selector::Manifest {
+                    filename: "Cargo.toml".into(),
+                },
+            ],
+        );
+        general.conflicts = vec![SkillConflict {
+            other_pack: "workspace-rust".into(),
+            kind: ConflictKind::Cosmetic,
+            resolution: None,
+        }];
         let mut reg = registry();
         reg.extend([general, specific]);
         let plan = compile_plan(&facts(), &reg).unwrap();
@@ -538,7 +714,10 @@ mod tests {
     #[test]
     fn plan_hash_is_stable_and_changes_with_selection() {
         let one = compile_plan(&facts(), &registry()).unwrap();
-        assert_eq!(one.plan_hash, compile_plan(&facts(), &registry()).unwrap().plan_hash);
+        assert_eq!(
+            one.plan_hash,
+            compile_plan(&facts(), &registry()).unwrap().plan_hash
+        );
         let mut f = facts();
         f.requested_medium = Some("three-d".into());
         let two = compile_plan(&f, &registry()).unwrap();
@@ -584,7 +763,10 @@ mod tests {
         let path_has_cargo = std::env::var_os("PATH")
             .map(|v| std::env::split_paths(&v).any(|d| d.join("cargo").is_file()))
             .unwrap_or(false);
-        assert_eq!(plan.selected.iter().any(|p| p.id == "rust"), path_has_cargo && facts.detected_tools.contains("rustc"));
+        assert_eq!(
+            plan.selected.iter().any(|p| p.id == "rust"),
+            path_has_cargo && facts.detected_tools.contains("rustc")
+        );
         assert!(plan.selected.iter().any(|p| p.id == "shared-laws"));
     }
 }

@@ -148,12 +148,20 @@ impl<S: SecretStore, T: Transport> LiveRunService<S, T> {
             return Err("task is too long".into());
         }
         if provider != "gemini" {
-            return Err(format!("live runs are implemented for gemini, not {provider}"));
+            return Err(format!(
+                "live runs are implemented for gemini, not {provider}"
+            ));
         }
         let spec = crate::providers::find_spec(provider).ok_or("unknown provider")?;
         let catalog = self.service.refresh(provider).map_err(|e| e.to_string())?;
-        let model = pick_flash_lite(&catalog.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>())
-            .ok_or("no live Flash Lite model in the current catalog")?;
+        let model = pick_flash_lite(
+            &catalog
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .ok_or("no live Flash Lite model in the current catalog")?;
         let key = self
             .service
             .get_key(provider)
@@ -243,7 +251,11 @@ impl<S: SecretStore, T: Transport> LiveRunService<S, T> {
     }
 
     pub fn snapshot(&self, run_id: &str) -> Option<RunSnapshot> {
-        self.runs.lock().ok()?.get(run_id).map(|r| r.snapshot(run_id))
+        self.runs
+            .lock()
+            .ok()?
+            .get(run_id)
+            .map(|r| r.snapshot(run_id))
     }
 
     pub fn preview_action(&self, run_id: &str, action: &BrowserAction) -> Result<(), String> {
@@ -301,7 +313,9 @@ fn start_preview(run: &mut LiveRun) -> Result<(), String> {
 
     // Iteration 1: desktop capture only. It is preserved as rejected because
     // the mobile gate has no evidence yet.
-    let it1 = supervisor.begin_iteration(&sid).map_err(|e| e.to_string())?;
+    let it1 = supervisor
+        .begin_iteration(&sid)
+        .map_err(|e| e.to_string())?;
     supervisor
         .action(
             &sid,
@@ -330,7 +344,9 @@ fn start_preview(run: &mut LiveRun) -> Result<(), String> {
 
     // Iteration 2: mobile capture then restore desktop. Accepted only after
     // both viewports exist with no console or network failure evidence.
-    let it2 = supervisor.begin_iteration(&sid).map_err(|e| e.to_string())?;
+    let it2 = supervisor
+        .begin_iteration(&sid)
+        .map_err(|e| e.to_string())?;
     supervisor
         .action(
             &sid,
@@ -386,11 +402,15 @@ fn start_preview(run: &mut LiveRun) -> Result<(), String> {
 
 fn measured_failures(ev: &BrowserEvidence) -> Vec<ProductionGate> {
     let mut out = Vec::new();
-    if ev
-        .items
-        .iter()
-        .any(|i| matches!(i, rex_preview::Evidence::Console { level: rex_preview::ConsoleLevel::Error, .. }))
-    {
+    if ev.items.iter().any(|i| {
+        matches!(
+            i,
+            rex_preview::Evidence::Console {
+                level: rex_preview::ConsoleLevel::Error,
+                ..
+            }
+        )
+    }) {
         out.push(ProductionGate::NoConsoleErrors);
     }
     if ev
@@ -412,7 +432,11 @@ pub fn pick_flash_lite(ids: &[&str]) -> Option<String> {
                 .find(|id| id.contains("flash-lite") && !id.contains("preview"))
                 .map(|s| s.to_string())
         })
-        .or_else(|| ids.iter().find(|id| id.contains("flash-lite")).map(|s| s.to_string()))
+        .or_else(|| {
+            ids.iter()
+                .find(|id| id.contains("flash-lite"))
+                .map(|s| s.to_string())
+        })
 }
 
 fn tool_definitions() -> Value {
@@ -470,20 +494,38 @@ mod tests {
 
     struct Script;
     impl Transport for Script {
-        fn get(&self, _url: &str, _headers: &[(String, String)]) -> Result<(u16, String), ProviderError> {
+        fn get(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+        ) -> Result<(u16, String), ProviderError> {
             Ok((200, r#"{"models":[{"name":"models/gemini-3.5-flash-lite","displayName":"Gemini 3.5 Flash Lite","supportedGenerationMethods":["generateContent"]}]}"#.into()))
         }
-        fn post(&self, _url: &str, _headers: &[(String, String)], _body: &str) -> Result<(u16, String), ProviderError> {
+        fn post(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _body: &str,
+        ) -> Result<(u16, String), ProviderError> {
             Ok((200, r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"create_file","args":{"path":"index.html","content":"<!doctype html><html><body><button id=\"switch\">Switch to weekly</button><script>document.getElementById(\"switch\").onclick=()=>{document.body.dataset.mode=\"weekly\"}</script></body></html>","overwrite":true}}}]},"finishReason":"STOP"}]}"#.into()))
         }
     }
 
     struct ScriptNoCall;
     impl Transport for ScriptNoCall {
-        fn get(&self, _url: &str, _headers: &[(String, String)]) -> Result<(u16, String), ProviderError> {
+        fn get(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+        ) -> Result<(u16, String), ProviderError> {
             Ok((200, r#"{"models":[{"name":"models/gemini-3.5-flash-lite","displayName":"Gemini 3.5 Flash Lite","supportedGenerationMethods":["generateContent"]}]}"#.into()))
         }
-        fn post(&self, _url: &str, _headers: &[(String, String)], _body: &str) -> Result<(u16, String), ProviderError> {
+        fn post(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _body: &str,
+        ) -> Result<(u16, String), ProviderError> {
             Ok((200, r#"{"candidates":[{"content":{"parts":[{"text":"no tool needed"}]},"finishReason":"STOP"}]}"#.into()))
         }
     }
@@ -508,7 +550,12 @@ mod tests {
         assert!(snap.result.is_none());
         assert!(snap.preview.is_none());
         // nothing executes before the trusted decision
-        assert!(!tmp.path().join("runs").join(&snap.id).join("index.html").exists());
+        assert!(!tmp
+            .path()
+            .join("runs")
+            .join(&snap.id)
+            .join("index.html")
+            .exists());
         svc.teardown(&snap.id).unwrap();
     }
 
@@ -519,7 +566,12 @@ mod tests {
         let snap = svc.begin("build the aeris climate ui", "gemini").unwrap();
         let after = svc.decide(&snap.id, false).unwrap();
         assert_eq!(after.status, RunStatus::Denied);
-        assert!(!tmp.path().join("runs").join(&snap.id).join("index.html").exists());
+        assert!(!tmp
+            .path()
+            .join("runs")
+            .join(&snap.id)
+            .join("index.html")
+            .exists());
         assert!(after.preview.is_none());
         svc.teardown(&snap.id).unwrap();
     }
@@ -539,8 +591,14 @@ mod tests {
         let preview = after.preview.expect("preview");
         assert!(preview.url.starts_with("http://127.0.0.1:"));
         assert_eq!(preview.receipts.len(), 2);
-        assert!(!preview.receipts[0].accepted, "first iteration stays rejected");
-        assert_eq!(preview.receipts[0].failed_gates, vec![ProductionGate::MobileViewport]);
+        assert!(
+            !preview.receipts[0].accepted,
+            "first iteration stays rejected"
+        );
+        assert_eq!(
+            preview.receipts[0].failed_gates,
+            vec![ProductionGate::MobileViewport]
+        );
         assert!(preview.receipts[1].accepted);
         assert!(preview.desktop_shot.is_some(), "desktop capture present");
         assert!(preview.mobile_shot.is_some(), "mobile capture present");
@@ -552,8 +610,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = MemorySecretStore::new();
         store.set_key("gemini", "test-key").unwrap();
-        let svc: LiveRunService<MemorySecretStore, ScriptNoCall> =
-            LiveRunService::new(ProviderService::new(store, ScriptNoCall), tmp.path().join("runs"));
+        let svc: LiveRunService<MemorySecretStore, ScriptNoCall> = LiveRunService::new(
+            ProviderService::new(store, ScriptNoCall),
+            tmp.path().join("runs"),
+        );
         let snap = svc.begin("say hello", "gemini").unwrap();
         assert_eq!(snap.status, RunStatus::Failed);
         assert!(snap.error.is_some());

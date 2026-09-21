@@ -28,36 +28,102 @@ pub struct LanguageTemplate {
 }
 
 pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
-    LanguageTemplate { language: "python", extensions: &["py"], manifests: &["pyproject.toml"],
-        tool: "python3", test_gate: "python3 -m pytest", lint_gate: Some("python3 -m py_compile on changed files") },
-    LanguageTemplate { language: "javascript", extensions: &["js", "jsx", "mjs", "cjs"], manifests: &["package.json"],
-        tool: "node", test_gate: "npm test", lint_gate: Some("node --check on changed files") },
-    LanguageTemplate { language: "typescript", extensions: &["ts", "tsx"], manifests: &["tsconfig.json"],
-        tool: "npx", test_gate: "npm test", lint_gate: Some("npx tsc --noEmit") },
-    LanguageTemplate { language: "go", extensions: &["go"], manifests: &["go.mod"],
-        tool: "go", test_gate: "go test ./...", lint_gate: Some("go vet ./...") },
-    LanguageTemplate { language: "ruby", extensions: &["rb"], manifests: &["Gemfile"],
-        tool: "ruby", test_gate: "bundle exec rake test", lint_gate: Some("ruby -c on changed files") },
-    LanguageTemplate { language: "java", extensions: &["java"], manifests: &["pom.xml", "build.gradle"],
-        tool: "javac", test_gate: "mvn test or gradle test per build file", lint_gate: Some("javac on changed files") },
-    LanguageTemplate { language: "c", extensions: &["c", "h"], manifests: &["Makefile"],
-        tool: "gcc", test_gate: "make test", lint_gate: Some("gcc -fsyntax-only on changed files") },
-    LanguageTemplate { language: "cpp", extensions: &["cpp", "cc", "cxx", "hpp"], manifests: &["CMakeLists.txt"],
-        tool: "g++", test_gate: "ctest", lint_gate: Some("g++ -fsyntax-only on changed files") },
+    LanguageTemplate {
+        language: "python",
+        extensions: &["py"],
+        manifests: &["pyproject.toml"],
+        tool: "python3",
+        test_gate: "python3 -m pytest",
+        lint_gate: Some("python3 -m py_compile on changed files"),
+    },
+    LanguageTemplate {
+        language: "javascript",
+        extensions: &["js", "jsx", "mjs", "cjs"],
+        manifests: &["package.json"],
+        tool: "node",
+        test_gate: "npm test",
+        lint_gate: Some("node --check on changed files"),
+    },
+    LanguageTemplate {
+        language: "typescript",
+        extensions: &["ts", "tsx"],
+        manifests: &["tsconfig.json"],
+        tool: "npx",
+        test_gate: "npm test",
+        lint_gate: Some("npx tsc --noEmit"),
+    },
+    LanguageTemplate {
+        language: "go",
+        extensions: &["go"],
+        manifests: &["go.mod"],
+        tool: "go",
+        test_gate: "go test ./...",
+        lint_gate: Some("go vet ./..."),
+    },
+    LanguageTemplate {
+        language: "ruby",
+        extensions: &["rb"],
+        manifests: &["Gemfile"],
+        tool: "ruby",
+        test_gate: "bundle exec rake test",
+        lint_gate: Some("ruby -c on changed files"),
+    },
+    LanguageTemplate {
+        language: "java",
+        extensions: &["java"],
+        manifests: &["pom.xml", "build.gradle"],
+        tool: "javac",
+        test_gate: "mvn test or gradle test per build file",
+        lint_gate: Some("javac on changed files"),
+    },
+    LanguageTemplate {
+        language: "c",
+        extensions: &["c", "h"],
+        manifests: &["Makefile"],
+        tool: "gcc",
+        test_gate: "make test",
+        lint_gate: Some("gcc -fsyntax-only on changed files"),
+    },
+    LanguageTemplate {
+        language: "cpp",
+        extensions: &["cpp", "cc", "cxx", "hpp"],
+        manifests: &["CMakeLists.txt"],
+        tool: "g++",
+        test_gate: "ctest",
+        lint_gate: Some("g++ -fsyntax-only on changed files"),
+    },
 ];
 
 /// Recognizable programming languages REX has neither a certified pack nor a
 /// broad template for. Detecting one produces an honest Unknown note.
 const UNTEMPLATED_LANGUAGES: &[(&str, &str)] = &[
-    ("kt", "kotlin"), ("swift", "swift"), ("cs", "csharp"), ("php", "php"),
-    ("scala", "scala"), ("hs", "haskell"), ("lua", "lua"), ("pl", "perl"),
-    ("r", "r"), ("dart", "dart"), ("ex", "elixir"), ("exs", "elixir"),
-    ("clj", "clojure"), ("zig", "zig"), ("fs", "fsharp"), ("ml", "ocaml"),
+    ("kt", "kotlin"),
+    ("swift", "swift"),
+    ("cs", "csharp"),
+    ("php", "php"),
+    ("scala", "scala"),
+    ("hs", "haskell"),
+    ("lua", "lua"),
+    ("pl", "perl"),
+    ("r", "r"),
+    ("dart", "dart"),
+    ("ex", "elixir"),
+    ("exs", "elixir"),
+    ("clj", "clojure"),
+    ("zig", "zig"),
+    ("fs", "fsharp"),
+    ("ml", "ocaml"),
 ];
 
 fn template_matched(template: &LanguageTemplate, facts: &RepositoryFacts) -> bool {
-    template.extensions.iter().any(|extension| facts.file_extensions.contains(*extension))
-        || template.manifests.iter().any(|manifest| facts.manifests.contains(*manifest))
+    template
+        .extensions
+        .iter()
+        .any(|extension| facts.file_extensions.contains(*extension))
+        || template
+            .manifests
+            .iter()
+            .any(|manifest| facts.manifests.contains(*manifest))
 }
 
 /// Generate broad pack manifests for every language detected in the
@@ -71,7 +137,9 @@ pub fn broad_registry(facts: &RepositoryFacts) -> Vec<SkillPackManifest> {
         .filter(|template| template_matched(template, facts))
         .collect();
     let typescript = matched.iter().any(|t| t.language == "typescript");
-    let has_js_files = ["js", "jsx", "mjs", "cjs"].iter().any(|e| facts.file_extensions.contains(*e));
+    let has_js_files = ["js", "jsx", "mjs", "cjs"]
+        .iter()
+        .any(|e| facts.file_extensions.contains(*e));
     matched
         .into_iter()
         .filter(|template| {
@@ -152,8 +220,14 @@ mod tests {
 
     fn facts(extensions: &[&str], manifests: &[&str], tools: &[&str]) -> RepositoryFacts {
         RepositoryFacts {
-            file_extensions: extensions.iter().map(|e| e.to_string()).collect::<BTreeSet<_>>(),
-            manifests: manifests.iter().map(|m| m.to_string()).collect::<BTreeSet<_>>(),
+            file_extensions: extensions
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<BTreeSet<_>>(),
+            manifests: manifests
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<BTreeSet<_>>(),
             shebangs: BTreeSet::new(),
             requested_medium: None,
             detected_tools: tools.iter().map(|t| t.to_string()).collect::<BTreeSet<_>>(),
@@ -163,17 +237,29 @@ mod tests {
     #[test]
     fn broad_pack_is_partial_when_its_tool_is_detected() {
         let registry = broad_registry(&facts(&["py"], &["pyproject.toml"], &["python3"]));
-        let pack = registry.iter().find(|p| p.id == "generated-python").unwrap();
+        let pack = registry
+            .iter()
+            .find(|p| p.id == "generated-python")
+            .unwrap();
         assert_eq!(pack.certification, CertificationStatus::Partial);
         assert_eq!(pack.required_tools, vec!["python3".to_string()]);
-        assert!(pack.gates.iter().any(|g| g.id == "generated-python-test" && g.required));
-        assert!(pack.gates.iter().any(|g| g.id == "generated-python-lint" && !g.required));
+        assert!(pack
+            .gates
+            .iter()
+            .any(|g| g.id == "generated-python-test" && g.required));
+        assert!(pack
+            .gates
+            .iter()
+            .any(|g| g.id == "generated-python-lint" && !g.required));
     }
 
     #[test]
     fn broad_pack_is_detected_unsupported_without_its_tool() {
         let registry = broad_registry(&facts(&["py"], &[], &[]));
-        let pack = registry.iter().find(|p| p.id == "generated-python").unwrap();
+        let pack = registry
+            .iter()
+            .find(|p| p.id == "generated-python")
+            .unwrap();
         assert_eq!(pack.certification, CertificationStatus::DetectedUnsupported);
     }
 
@@ -190,11 +276,23 @@ mod tests {
     fn generated_packs_never_claim_certification() {
         for with_tool in [true, false] {
             for template in LANGUAGE_TEMPLATES {
-                let tools = if with_tool { vec![template.tool] } else { vec![] };
-                let registry = broad_registry(&facts(template.extensions, template.manifests, &tools));
-                let pack = registry.iter().find(|p| p.id == format!("generated-{}", template.language)).unwrap();
-                assert_ne!(pack.certification, CertificationStatus::Certified,
-                    "{} must never be certified by generation", template.language);
+                let tools = if with_tool {
+                    vec![template.tool]
+                } else {
+                    vec![]
+                };
+                let registry =
+                    broad_registry(&facts(template.extensions, template.manifests, &tools));
+                let pack = registry
+                    .iter()
+                    .find(|p| p.id == format!("generated-{}", template.language))
+                    .unwrap();
+                assert_ne!(
+                    pack.certification,
+                    CertificationStatus::Certified,
+                    "{} must never be certified by generation",
+                    template.language
+                );
             }
         }
     }
@@ -202,10 +300,15 @@ mod tests {
     #[test]
     fn templates_do_not_shadow_first_class_packs() {
         let first_class: BTreeSet<String> = crate::skill_packs::first_class_registry()
-            .iter().map(|p| p.id.clone()).collect();
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
         for template in LANGUAGE_TEMPLATES {
-            assert!(!first_class.contains(template.language),
-                "template {} shadows a certified pack", template.language);
+            assert!(
+                !first_class.contains(template.language),
+                "template {} shadows a certified pack",
+                template.language
+            );
         }
     }
 
@@ -213,8 +316,12 @@ mod tests {
     fn untemplated_languages_are_reported_unknown_never_supported() {
         let notes = unknown_language_notes(&facts(&["kt", "swift"], &[], &[]));
         assert_eq!(notes.len(), 2);
-        assert!(notes.iter().any(|n| n.contains("kotlin") && n.contains("Unknown")));
-        assert!(notes.iter().any(|n| n.contains("swift") && n.contains("Unknown")));
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("kotlin") && n.contains("Unknown")));
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("swift") && n.contains("Unknown")));
         assert!(unknown_language_notes(&facts(&["py", "rs"], &[], &[])).is_empty());
     }
 
@@ -224,8 +331,13 @@ mod tests {
         let mut registry = crate::skill_packs::first_class_registry();
         registry.extend(broad_registry(&python));
         let plan = compile_plan(&python, &registry).unwrap();
-        assert!(plan.selected.iter().any(|p| p.id == "generated-python" && p.version == "0.1.0"));
-        assert!(plan.gates.iter().any(|g| g.pack == "generated-python" && g.id == "generated-python-test" && g.required));
+        assert!(plan
+            .selected
+            .iter()
+            .any(|p| p.id == "generated-python" && p.version == "0.1.0"));
+        assert!(plan.gates.iter().any(|g| g.pack == "generated-python"
+            && g.id == "generated-python-test"
+            && g.required));
         let again = compile_plan(&python, &registry).unwrap();
         assert_eq!(plan.plan_hash, again.plan_hash);
 
@@ -234,10 +346,16 @@ mod tests {
         registry.extend(broad_registry(&toolless));
         let plan = compile_plan(&toolless, &registry).unwrap();
         assert!(!plan.selected.iter().any(|p| p.id == "generated-python"));
-        assert!(plan.unsupported.iter().any(|u| u.contains("generated-python")));
+        assert!(plan
+            .unsupported
+            .iter()
+            .any(|u| u.contains("generated-python")));
 
         let kotlin = facts(&["kt"], &[], &[]);
         let plan = compile_plan(&kotlin, &crate::skill_packs::first_class_registry()).unwrap();
-        assert!(plan.unsupported.iter().any(|u| u.contains("kotlin") && u.contains("Unknown")));
+        assert!(plan
+            .unsupported
+            .iter()
+            .any(|u| u.contains("kotlin") && u.contains("Unknown")));
     }
 }

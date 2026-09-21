@@ -10,8 +10,8 @@ use crate::conversation::decode_turn;
 use crate::http::Transport;
 use crate::provider_failure::structured_http_failure;
 use crate::providers::{find_spec, ProviderProtocol};
-use crate::service::ProviderService;
 use crate::secrets::SecretStore;
+use crate::service::ProviderService;
 use serde_json::json;
 
 const RETRIES: u32 = 3;
@@ -228,7 +228,9 @@ mod tests {
     fn empty_text_is_an_error_not_a_silent_pass() {
         let script = Script {
             bodies: Mutex::new(Vec::new()),
-            response: json!({"candidates":[{"content":{"parts":[{"text":"  "}]},"finishReason":"STOP"}]}).to_string(),
+            response:
+                json!({"candidates":[{"content":{"parts":[{"text":"  "}]},"finishReason":"STOP"}]})
+                    .to_string(),
             status: 200,
         };
         let svc = service_with(script);

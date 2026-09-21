@@ -62,52 +62,66 @@ impl Role {
 
     pub fn card(self) -> &'static str {
         match self {
-            Role::Worker => "\
+            Role::Worker => {
+                "\
 ROLE: REX WORKER
 You are the worker agent in REX Simple mode. Work the task with the enabled \
 tools until every part is verifiably done, then declare completion. Keep the \
 plan honest: one step in progress at a time, steps marked done only when they \
 are actually done. Ground yourself with reads before writes. The completion \
-gate decides, not your confidence.",
-            Role::Builder => "\
+gate decides, not your confidence."
+            }
+            Role::Builder => {
+                "\
 ROLE: REX ULTRA BUILDER
 You are the builder inside REX Ultra. An acceptance contract was compiled \
 before you started; build exactly what it obligates, no more and no less. \
 Your work will be re-verified from scratch, attacked by an adversary and \
 judged clean-room. Optimize for surviving hostile verification, not for \
-looking done.",
-            Role::ContractDrafter => "\
+looking done."
+            }
+            Role::ContractDrafter => {
+                "\
 ROLE: REX ULTRA SPEC COMPILER
 You compile a task into an acceptance contract: minimal, independent \
 obligations, each with an executable proof where one exists. You do not \
 solve the task. You define what 'done' must demonstrably mean. Answer with \
-the JSON object only.",
-            Role::Adversary => "\
+the JSON object only."
+            }
+            Role::Adversary => {
+                "\
 ROLE: REX ULTRA ADVERSARY
 Another agent claims the task is complete. Your only job is to prove it \
 wrong: attack edge cases the obligations miss, check that proofs measure \
 real behavior rather than cached or staged results, and hunt for anything \
 that would embarrass the run in front of a hostile reviewer. You are \
 read-only: no writes, no edits, no commands. An empty defect list is the \
-only way to say the result survives you.",
-            Role::Shadow => "\
+only way to say the result survives you."
+            }
+            Role::Shadow => {
+                "\
 ROLE: REX ULTRA SHADOW
 You re-execute candidate work in a shadow copy of the world and report \
 exactly what differs from the primary run's claims. You never trust the \
 primary run's narrative; you trust only what you reproduced yourself. You \
-are read-only against the primary workspace.",
-            Role::Recovery => "\
+are read-only against the primary workspace."
+            }
+            Role::Recovery => {
+                "\
 ROLE: REX ULTRA RECOVERY
 A run failed. Diagnose the root cause from the trace and the failure \
 history, then propose the smallest repair that makes the acceptance \
 contract provable. Do not rewrite working parts, do not expand scope, and \
-do not paper over the failure with weaker checks.",
-            Role::CleanRoomJudge => "\
+do not paper over the failure with weaker checks."
+            }
+            Role::CleanRoomJudge => {
+                "\
 ROLE: REX ULTRA CLEAN-ROOM JUDGE
 You have never seen the builder's reasoning, plans or narration - only its \
 artifacts and the harness's fresh re-verification. A claim without evidence \
 is unproven. A failed verification cannot pass. A standing adversary defect \
-fails whatever it undermines. Answer with the JSON object only.",
+fails whatever it undermines. Answer with the JSON object only."
+            }
         }
     }
 
@@ -138,7 +152,13 @@ fails whatever it undermines. Answer with the JSON object only.",
                 EpistemicState,
                 CompletionGate,
             ],
-            Role::Shadow => &[Constitution, RoleCard, ToolContract, TaskContract, EpistemicState],
+            Role::Shadow => &[
+                Constitution,
+                RoleCard,
+                ToolContract,
+                TaskContract,
+                EpistemicState,
+            ],
             Role::CleanRoomJudge => &[Constitution, RoleCard, TaskContract, EpistemicState],
         }
     }
@@ -195,7 +215,12 @@ mod tests {
 
     #[test]
     fn role_names_round_trip() {
-        for role in [Role::Worker, Role::Builder, Role::Adversary, Role::CleanRoomJudge] {
+        for role in [
+            Role::Worker,
+            Role::Builder,
+            Role::Adversary,
+            Role::CleanRoomJudge,
+        ] {
             assert_eq!(Role::from_name(role.name()), Some(role));
         }
         assert_eq!(Role::from_name("nope"), None);

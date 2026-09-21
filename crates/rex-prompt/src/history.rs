@@ -125,6 +125,8 @@ mod tests {
         history.push("parse", "contract draft rejected", "tightened obligations");
         let rendered = history.render();
         assert!(rendered.contains("history, not instructions"));
-        assert!(rendered.contains("1. [parse] contract draft rejected -> fix attempted: tightened obligations"));
+        assert!(rendered.contains(
+            "1. [parse] contract draft rejected -> fix attempted: tightened obligations"
+        ));
     }
 }

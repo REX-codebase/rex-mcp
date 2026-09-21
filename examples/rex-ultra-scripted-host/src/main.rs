@@ -36,7 +36,12 @@ impl Session {
             .map_err(|e| format!("cannot spawn {}: {e}", bin.display()))?;
         let stdin = child.stdin.take().ok_or("rex-mcp stdin unavailable")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("rex-mcp stdout unavailable")?);
-        Ok(Self { child, stdin, stdout, next_id: 0 })
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 0,
+        })
     }
 
     fn handshake(&mut self) -> Result<(), String> {
@@ -53,12 +58,15 @@ impl Session {
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.next_id += 1;
-        let msg = json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params });
+        let msg =
+            json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params });
         serde_json::to_writer(&mut self.stdin, &msg).map_err(|e| e.to_string())?;
         self.stdin.write_all(b"\n").map_err(|e| e.to_string())?;
         self.stdin.flush().map_err(|e| e.to_string())?;
         let mut line = String::new();
-        self.stdout.read_line(&mut line).map_err(|e| e.to_string())?;
+        self.stdout
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
         serde_json::from_str(&line).map_err(|e| format!("invalid JSON-RPC response ({e}): {line}"))
     }
 
@@ -151,12 +159,20 @@ fn smoke() -> Result<(), String> {
     println!("ok handshake: protocol 2025-11-25");
 
     let list = s.request("tools/list", json!({}))?;
-    let tools = list["result"]["tools"].as_array().ok_or("tools/list missing tools")?;
+    let tools = list["result"]["tools"]
+        .as_array()
+        .ok_or("tools/list missing tools")?;
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     if names.len() != 16 {
         return Err(format!("expected 16 tools, got {}: {names:?}", names.len()));
     }
-    for t in ["rex_execute", "rex_ultra_open", "rex_ultra_submit", "rex_ultra_promote", "rex_proof"] {
+    for t in [
+        "rex_execute",
+        "rex_ultra_open",
+        "rex_ultra_submit",
+        "rex_ultra_promote",
+        "rex_proof",
+    ] {
         if !names.contains(&t) {
             return Err(format!("missing tool {t}"));
         }
@@ -169,14 +185,20 @@ fn smoke() -> Result<(), String> {
             "host": "generic_agent", "operator_is_agent": true,
             "plan": [{ "instructions": "open", "acceptance": "task opens" }] }),
     )?;
-    let task_id = ex["task_id"].as_str().ok_or("rex_execute returned no task id")?.to_string();
+    let task_id = ex["task_id"]
+        .as_str()
+        .ok_or("rex_execute returned no task id")?
+        .to_string();
     let status = s.tool_ok("rex_status", json!({ "task_id": task_id }))?;
     if status["state"] != "active" {
         return Err(format!("unexpected task state: {status}"));
     }
     println!("ok execute+status: task {task_id} active");
 
-    let done = s.tool_ok("rex_cancel", json!({ "task_id": task_id, "reason": "smoke complete" }))?;
+    let done = s.tool_ok(
+        "rex_cancel",
+        json!({ "task_id": task_id, "reason": "smoke complete" }),
+    )?;
     if done["state"] != "cancelled" {
         return Err(format!("unexpected cancel state: {done}"));
     }
@@ -219,10 +241,16 @@ fn ultra() -> Result<(), String> {
         .as_str()
         .ok_or("no host resume handle")?
         .to_string();
-    let action1 = ex["next"]["action_id"].as_str().ok_or("no first action")?.to_string();
+    let action1 = ex["next"]["action_id"]
+        .as_str()
+        .ok_or("no first action")?
+        .to_string();
     println!("ok execute: task {task_id}, resume handle issued");
 
-    let open = s.tool_ok("rex_ultra_open", json!({ "task_id": task_id, "lease_epoch": epoch }))?;
+    let open = s.tool_ok(
+        "rex_ultra_open",
+        json!({ "task_id": task_id, "lease_epoch": epoch }),
+    )?;
     if open["status"] != "collecting" {
         return Err(format!("unexpected ultra_open status: {open}"));
     }
@@ -241,9 +269,14 @@ fn ultra() -> Result<(), String> {
         })
         .collect::<Result<_, _>>()?;
     if candidates.len() < 2 {
-        return Err(format!("expected at least 2 candidates, got {candidates:?}"));
+        return Err(format!(
+            "expected at least 2 candidates, got {candidates:?}"
+        ));
     }
-    println!("ok ultra_open: {} candidate theses requested (visual contract)", candidates.len());
+    println!(
+        "ok ultra_open: {} candidate theses requested (visual contract)",
+        candidates.len()
+    );
 
     // Candidate theses: each answers with an isolated file bundle.
     let mut view = Value::Null;
@@ -266,7 +299,9 @@ fn ultra() -> Result<(), String> {
         .ok_or("no evidence requests")?
         .clone();
     if evidence.len() != candidates.len() * 3 {
-        return Err(format!("expected adversary+verifier+visual per candidate, got {evidence:?}"));
+        return Err(format!(
+            "expected adversary+verifier+visual per candidate, got {evidence:?}"
+        ));
     }
     println!("ok candidates: {} evidence requests issued", evidence.len());
 
@@ -356,7 +391,10 @@ fn ultra() -> Result<(), String> {
     if replay["resumed"] != true || replay["task_id"] != task_id {
         return Err(format!("replay did not resume the same task: {replay}"));
     }
-    handle = replay["host_resume_handle"].as_str().ok_or("no rotated handle")?.to_string();
+    handle = replay["host_resume_handle"]
+        .as_str()
+        .ok_or("no rotated handle")?
+        .to_string();
     println!("ok restart 1: replayed call resumed {task_id}, handle rotated");
 
     // The host repairs the winner: a clean critic pass with hash-bound
@@ -394,14 +432,27 @@ fn ultra() -> Result<(), String> {
     if replay2["resumed"] != true {
         return Err(format!("second replay failed: {replay2}"));
     }
-    let open2 = s.tool_ok("rex_ultra_open", json!({ "task_id": task_id, "lease_epoch": epoch }))?;
-    if open2["kernel_state"] != "completed" || !open2["evidence_requests"].as_array().map(|e| e.is_empty()).unwrap_or(false) {
-        return Err(format!("completed kernel not durable across restart: {open2}"));
+    let open2 = s.tool_ok(
+        "rex_ultra_open",
+        json!({ "task_id": task_id, "lease_epoch": epoch }),
+    )?;
+    if open2["kernel_state"] != "completed"
+        || !open2["evidence_requests"]
+            .as_array()
+            .map(|e| e.is_empty())
+            .unwrap_or(false)
+    {
+        return Err(format!(
+            "completed kernel not durable across restart: {open2}"
+        ));
     }
     println!("ok restart 2: completed kernel durable, no open requests");
 
     // Atomic promotion: exactly the winning bundle lands in the workspace.
-    let receipt = s.tool_ok("rex_ultra_promote", json!({ "task_id": task_id, "lease_epoch": epoch }))?;
+    let receipt = s.tool_ok(
+        "rex_ultra_promote",
+        json!({ "task_id": task_id, "lease_epoch": epoch }),
+    )?;
     if receipt["state"] != "committed" || receipt["candidate_id"] != winner {
         return Err(format!("unexpected promotion receipt: {receipt}"));
     }
@@ -414,21 +465,42 @@ fn ultra() -> Result<(), String> {
 
     // Terminal result: the host closes the frozen plan citing the receipts
     // the harness registered, never its own narration.
-    let run1 = s.tool_ok("rex_run", json!({ "task_id": task_id, "lease_epoch": epoch,
-        "argv": ["ls"] }))?;
-    let receipt1 = run1["receipt"].as_str().ok_or("no run receipt")?.to_string();
-    let sub1 = s.tool_ok("rex_submit", json!({ "task_id": task_id, "lease_epoch": epoch,
-        "action_id": action1, "narrative": "winner promoted into the workspace" }))?;
+    let run1 = s.tool_ok(
+        "rex_run",
+        json!({ "task_id": task_id, "lease_epoch": epoch,
+        "argv": ["ls"] }),
+    )?;
+    let receipt1 = run1["receipt"]
+        .as_str()
+        .ok_or("no run receipt")?
+        .to_string();
+    let sub1 = s.tool_ok(
+        "rex_submit",
+        json!({ "task_id": task_id, "lease_epoch": epoch,
+        "action_id": action1, "narrative": "winner promoted into the workspace" }),
+    )?;
     if sub1["accepted"] != true {
         return Err(format!("first plan submit refused: {sub1}"));
     }
-    let action2 = sub1["next"]["action_id"].as_str().ok_or("no second action")?.to_string();
-    let run2 = s.tool_ok("rex_run", json!({ "task_id": task_id, "lease_epoch": epoch,
-        "argv": ["cat", "hero-1.html"] }))?;
-    let receipt2 = run2["receipt"].as_str().ok_or("no second receipt")?.to_string();
-    let sub2 = s.tool_ok("rex_submit", json!({ "task_id": task_id, "lease_epoch": epoch,
+    let action2 = sub1["next"]["action_id"]
+        .as_str()
+        .ok_or("no second action")?
+        .to_string();
+    let run2 = s.tool_ok(
+        "rex_run",
+        json!({ "task_id": task_id, "lease_epoch": epoch,
+        "argv": ["cat", "hero-1.html"] }),
+    )?;
+    let receipt2 = run2["receipt"]
+        .as_str()
+        .ok_or("no second receipt")?
+        .to_string();
+    let sub2 = s.tool_ok(
+        "rex_submit",
+        json!({ "task_id": task_id, "lease_epoch": epoch,
         "action_id": action2, "narrative": "promotion verified against the workspace",
-        "evidence": { "ls": receipt1, "cat": receipt2 } }))?;
+        "evidence": { "ls": receipt1, "cat": receipt2 } }),
+    )?;
     if sub2["state"] != "completed" {
         return Err(format!("final submit did not complete: {sub2}"));
     }
@@ -445,16 +517,28 @@ fn ultra() -> Result<(), String> {
         return Err("proof bundle hash is not deterministic".into());
     }
     if p1["kernel_state"] != "completed" || p1["promotion_state"] != "committed" {
-        return Err(format!("proof bundle misses the verified journey: {}", p1["bundle_hash"]));
+        return Err(format!(
+            "proof bundle misses the verified journey: {}",
+            p1["bundle_hash"]
+        ));
     }
     if p1["qualified_candidate"] != winner {
-        return Err(format!("proof bundle names the wrong winner: {}", p1["qualified_candidate"]));
+        return Err(format!(
+            "proof bundle names the wrong winner: {}",
+            p1["qualified_candidate"]
+        ));
     }
     let persisted = state.join("proofs").join(format!("{task_id}.json"));
     if !persisted.exists() {
-        return Err(format!("proof bundle not persisted at {}", persisted.display()));
+        return Err(format!(
+            "proof bundle not persisted at {}",
+            persisted.display()
+        ));
     }
-    println!("ok proof: deterministic bundle {} persisted", p1["bundle_hash"]);
+    println!(
+        "ok proof: deterministic bundle {} persisted",
+        p1["bundle_hash"]
+    );
 
     s.shutdown();
     println!("PASS scripted-host ultra");

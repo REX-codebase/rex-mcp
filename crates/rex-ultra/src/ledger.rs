@@ -64,7 +64,11 @@ impl EpistemicLedger {
             class,
             recorded_ms: crate::now_ms(),
         };
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             let _ = writeln!(file, "{}", serde_json::to_string(&fact).unwrap_or_default());
         }
         let id = fact.id.clone();
@@ -98,7 +102,12 @@ mod tests {
                 evidence_id: "ev-1".into(),
             },
         );
-        let inferred = ledger.record("therefore correct", FactClass::Inferred { from: vec![observed.clone()] });
+        let inferred = ledger.record(
+            "therefore correct",
+            FactClass::Inferred {
+                from: vec![observed.clone()],
+            },
+        );
         let guess = ledger.record("probably fine", FactClass::Guess);
         assert!(ledger.is_observed(&observed));
         assert!(!ledger.is_observed(&inferred));

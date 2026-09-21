@@ -7,12 +7,12 @@
 //! provider, no managed inference, no silent fallback - a missing host stays
 //! `HostRequired`.
 
-use rex_protocol::PlanStep;
 use crate::contract::{AcceptanceContract, Obligation, Proof};
 use crate::external_kernel::{
     AdapterError, AdversaryEvidence, CandidateResponse, ExternalHostAdapter, HostCandidateRequest,
     HostEvidenceRequest, HostKernelStatus, KernelState, VerifierEvidence,
 };
+use rex_protocol::PlanStep;
 use std::fs;
 use std::path::PathBuf;
 
@@ -44,11 +44,21 @@ pub fn contract_from_plan(task: &str, plan: &[PlanStep]) -> AcceptanceContract {
         .enumerate()
         .map(|(index, step)| Obligation {
             id: format!("step-{}", index + 1),
-            statement: step.acceptance.clone().unwrap_or_else(|| step.instructions.clone()),
-            proof: Proof::BehaviorEvidence { description: step.instructions.clone() },
+            statement: step
+                .acceptance
+                .clone()
+                .unwrap_or_else(|| step.instructions.clone()),
+            proof: Proof::BehaviorEvidence {
+                description: step.instructions.clone(),
+            },
         })
         .collect();
-    AcceptanceContract { task: task.to_string(), work_kind: crate::contract::classify_work_kind(task), obligations, forbidden_regressions: Vec::new() }
+    AcceptanceContract {
+        task: task.to_string(),
+        work_kind: crate::contract::classify_work_kind(task),
+        obligations,
+        forbidden_regressions: Vec::new(),
+    }
 }
 
 pub struct UltraHostBridge {
@@ -64,7 +74,9 @@ impl UltraHostBridge {
 
     fn path(&self, task_id: &str) -> Result<PathBuf, BridgeError> {
         if task_id.is_empty()
-            || !task_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            || !task_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
         {
             return Err(BridgeError::InvalidTaskId);
         }
@@ -98,7 +110,9 @@ impl UltraHostBridge {
         lease_epoch: u64,
     ) -> Result<UltraHostView, BridgeError> {
         let mut adapter = self.load_or_create(task_id, contract, minimum_candidates)?;
-        adapter.attach_host(lease_epoch).map_err(BridgeError::Adapter)?;
+        adapter
+            .attach_host(lease_epoch)
+            .map_err(BridgeError::Adapter)?;
         self.view(task_id, &mut adapter)
     }
 
@@ -109,7 +123,9 @@ impl UltraHostBridge {
         response: CandidateResponse,
     ) -> Result<UltraHostView, BridgeError> {
         let mut adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
-        adapter.record_response(response).map_err(BridgeError::Adapter)?;
+        adapter
+            .record_response(response)
+            .map_err(BridgeError::Adapter)?;
         adapter.advance().map_err(BridgeError::Adapter)?;
         self.view(task_id, &mut adapter)
     }
@@ -121,7 +137,9 @@ impl UltraHostBridge {
         evidence: AdversaryEvidence,
     ) -> Result<UltraHostView, BridgeError> {
         let mut adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
-        adapter.record_adversary(evidence).map_err(BridgeError::Adapter)?;
+        adapter
+            .record_adversary(evidence)
+            .map_err(BridgeError::Adapter)?;
         adapter.finalize().map_err(BridgeError::Adapter)?;
         self.view(task_id, &mut adapter)
     }
@@ -133,7 +151,9 @@ impl UltraHostBridge {
         evidence: VerifierEvidence,
     ) -> Result<UltraHostView, BridgeError> {
         let mut adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
-        adapter.record_verifier(evidence).map_err(BridgeError::Adapter)?;
+        adapter
+            .record_verifier(evidence)
+            .map_err(BridgeError::Adapter)?;
         adapter.finalize().map_err(BridgeError::Adapter)?;
         self.view(task_id, &mut adapter)
     }
@@ -142,7 +162,9 @@ impl UltraHostBridge {
     pub fn load_existing(&self, task_id: &str) -> Result<Option<ExternalHostAdapter>, BridgeError> {
         let path = self.path(task_id)?;
         if path.exists() {
-            ExternalHostAdapter::open(&path).map(Some).map_err(BridgeError::Adapter)
+            ExternalHostAdapter::open(&path)
+                .map(Some)
+                .map_err(BridgeError::Adapter)
         } else {
             Ok(None)
         }
@@ -157,8 +179,11 @@ impl UltraHostBridge {
         destination: &std::path::Path,
     ) -> Result<crate::promotion::PromotionReceipt, BridgeError> {
         let adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
-        let store = crate::promotion::PromotionStore::open(&self.dir).map_err(BridgeError::Promotion)?;
-        store.promote(task_id, &adapter, contract, destination).map_err(BridgeError::Promotion)
+        let store =
+            crate::promotion::PromotionStore::open(&self.dir).map_err(BridgeError::Promotion)?;
+        store
+            .promote(task_id, &adapter, contract, destination)
+            .map_err(BridgeError::Promotion)
     }
 
     pub fn record_visual(
@@ -168,12 +193,18 @@ impl UltraHostBridge {
         evidence: crate::external_kernel::VisualEvidence,
     ) -> Result<UltraHostView, BridgeError> {
         let mut adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
-        adapter.record_visual(evidence).map_err(BridgeError::Adapter)?;
+        adapter
+            .record_visual(evidence)
+            .map_err(BridgeError::Adapter)?;
         adapter.finalize().map_err(BridgeError::Adapter)?;
         self.view(task_id, &mut adapter)
     }
 
-    fn view(&self, task_id: &str, adapter: &mut ExternalHostAdapter) -> Result<UltraHostView, BridgeError> {
+    fn view(
+        &self,
+        task_id: &str,
+        adapter: &mut ExternalHostAdapter,
+    ) -> Result<UltraHostView, BridgeError> {
         Ok(UltraHostView {
             task_id: task_id.to_string(),
             status: adapter.status(),
@@ -192,8 +223,14 @@ mod tests {
 
     fn plan() -> Vec<PlanStep> {
         vec![
-            PlanStep { instructions: "build the thing".into(), acceptance: Some("it builds".into()) },
-            PlanStep { instructions: "prove the thing".into(), acceptance: None },
+            PlanStep {
+                instructions: "build the thing".into(),
+                acceptance: Some("it builds".into()),
+            },
+            PlanStep {
+                instructions: "prove the thing".into(),
+                acceptance: None,
+            },
         ]
     }
 
@@ -207,11 +244,15 @@ mod tests {
         for request in &view.candidate_requests {
             let content = format!("candidate for {}", request.candidate_id);
             current = bridge
-                .record_response(task_id, contract, CandidateResponse {
-                    candidate_id: request.candidate_id.clone(),
-                    response_hash: canonical_hash(&content).unwrap(),
-                    content,
-                })
+                .record_response(
+                    task_id,
+                    contract,
+                    CandidateResponse {
+                        candidate_id: request.candidate_id.clone(),
+                        response_hash: canonical_hash(&content).unwrap(),
+                        content,
+                    },
+                )
                 .unwrap();
         }
         current
@@ -251,28 +292,44 @@ mod tests {
         // One fully qualified candidate completes the kernel; evidence for
         // the remaining candidate is no longer requested afterwards.
         let candidate = view.evidence_requests[0].candidate_id.clone();
-        for request in view.evidence_requests.iter().filter(|r| r.candidate_id == candidate) {
+        for request in view
+            .evidence_requests
+            .iter()
+            .filter(|r| r.candidate_id == candidate)
+        {
             match request.kind {
                 crate::external_kernel::EvidenceKind::Adversary => {
                     let content = "{\"defects\":[]}";
-                    bridge.record_adversary("task-abc", &contract, AdversaryEvidence {
-                        request_id: request.request_id.clone(),
-                        candidate_id: request.candidate_id.clone(),
-                        response_hash: canonical_hash(&content).unwrap(),
-                        content: content.into(),
-                    }).unwrap();
+                    bridge
+                        .record_adversary(
+                            "task-abc",
+                            &contract,
+                            AdversaryEvidence {
+                                request_id: request.request_id.clone(),
+                                candidate_id: request.candidate_id.clone(),
+                                response_hash: canonical_hash(&content).unwrap(),
+                                content: content.into(),
+                            },
+                        )
+                        .unwrap();
                 }
                 crate::external_kernel::EvidenceKind::Visual => {
                     unreachable!("general contracts issue no visual requests")
                 }
                 crate::external_kernel::EvidenceKind::Verifier => {
                     let content = "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"},{\"obligation_id\":\"step-2\",\"status\":\"proven\"}]}";
-                    let after = bridge.record_verifier("task-abc", &contract, VerifierEvidence {
-                        request_id: request.request_id.clone(),
-                        candidate_id: request.candidate_id.clone(),
-                        response_hash: canonical_hash(&content).unwrap(),
-                        content: content.into(),
-                    }).unwrap();
+                    let after = bridge
+                        .record_verifier(
+                            "task-abc",
+                            &contract,
+                            VerifierEvidence {
+                                request_id: request.request_id.clone(),
+                                candidate_id: request.candidate_id.clone(),
+                                response_hash: canonical_hash(&content).unwrap(),
+                                content: content.into(),
+                            },
+                        )
+                        .unwrap();
                     assert_eq!(after.kernel_state, KernelState::Completed);
                 }
             }
@@ -295,24 +352,36 @@ mod tests {
             match request.kind {
                 crate::external_kernel::EvidenceKind::Adversary => {
                     let content = "{\"defects\":[{\"title\":\"wrong\",\"detail\":\"confirmed\"}]}";
-                    bridge.record_adversary("task-def", &contract, AdversaryEvidence {
-                        request_id: request.request_id.clone(),
-                        candidate_id: request.candidate_id.clone(),
-                        response_hash: canonical_hash(&content).unwrap(),
-                        content: content.into(),
-                    }).unwrap();
+                    bridge
+                        .record_adversary(
+                            "task-def",
+                            &contract,
+                            AdversaryEvidence {
+                                request_id: request.request_id.clone(),
+                                candidate_id: request.candidate_id.clone(),
+                                response_hash: canonical_hash(&content).unwrap(),
+                                content: content.into(),
+                            },
+                        )
+                        .unwrap();
                 }
                 crate::external_kernel::EvidenceKind::Visual => {
                     unreachable!("general contracts issue no visual requests")
                 }
                 crate::external_kernel::EvidenceKind::Verifier => {
                     let content = "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"failed\"},{\"obligation_id\":\"step-2\",\"status\":\"failed\"}]}";
-                    bridge.record_verifier("task-def", &contract, VerifierEvidence {
-                        request_id: request.request_id.clone(),
-                        candidate_id: request.candidate_id.clone(),
-                        response_hash: canonical_hash(&content).unwrap(),
-                        content: content.into(),
-                    }).unwrap();
+                    bridge
+                        .record_verifier(
+                            "task-def",
+                            &contract,
+                            VerifierEvidence {
+                                request_id: request.request_id.clone(),
+                                candidate_id: request.candidate_id.clone(),
+                                response_hash: canonical_hash(&content).unwrap(),
+                                content: content.into(),
+                            },
+                        )
+                        .unwrap();
                 }
             }
         }
@@ -327,7 +396,9 @@ mod tests {
         let bridge = UltraHostBridge::open(directory.path()).unwrap();
         let contract = contract_from_plan("do it", &plan());
         assert_eq!(
-            bridge.open_requests("../escape", &contract, 2, 1).unwrap_err(),
+            bridge
+                .open_requests("../escape", &contract, 2, 1)
+                .unwrap_err(),
             BridgeError::InvalidTaskId
         );
         assert_eq!(

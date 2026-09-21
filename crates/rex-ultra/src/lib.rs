@@ -22,8 +22,8 @@ pub mod phase5;
 pub mod promotion;
 pub mod verify;
 
-pub mod generated_packs;
 pub mod external_kernel;
+pub mod generated_packs;
 pub mod host_bridge;
 pub mod skill_packs;
 pub mod skills;

@@ -52,7 +52,10 @@ pub fn judge_prompt(
     let mut obligations = String::new();
     for ob in &contract.obligations {
         let proof = serde_json::to_string(&ob.proof).unwrap_or_default();
-        obligations.push_str(&format!("- {}: {} (proof: {})\n", ob.id, ob.statement, proof));
+        obligations.push_str(&format!(
+            "- {}: {} (proof: {})\n",
+            ob.id, ob.statement, proof
+        ));
     }
     let mut outcomes = String::new();
     for o in &verification.outcomes {
@@ -113,10 +116,16 @@ pub fn parse_verdicts(
     let mut seen = HashSet::new();
     for v in &raw.verdicts {
         if !contract.obligations.iter().any(|o| o.id == v.obligation_id) {
-            return Err(format!("judge returned a verdict for unknown obligation {}", v.obligation_id));
+            return Err(format!(
+                "judge returned a verdict for unknown obligation {}",
+                v.obligation_id
+            ));
         }
         if !seen.insert(v.obligation_id.clone()) {
-            return Err(format!("judge returned duplicate verdicts for {}", v.obligation_id));
+            return Err(format!(
+                "judge returned duplicate verdicts for {}",
+                v.obligation_id
+            ));
         }
     }
     for ob in &contract.obligations {
@@ -163,8 +172,20 @@ mod tests {
         ).unwrap();
         let v = VerificationReport {
             outcomes: vec![
-                ObligationOutcome { obligation_id: "a".into(), status: ObligationStatus::Proven, detail: "ok".into(), evidence_ids: vec!["ev-1".into()], duration_ms: 1 },
-                ObligationOutcome { obligation_id: "b".into(), status: ObligationStatus::AwaitingJudge, detail: "judge".into(), evidence_ids: vec![], duration_ms: 0 },
+                ObligationOutcome {
+                    obligation_id: "a".into(),
+                    status: ObligationStatus::Proven,
+                    detail: "ok".into(),
+                    evidence_ids: vec!["ev-1".into()],
+                    duration_ms: 1,
+                },
+                ObligationOutcome {
+                    obligation_id: "b".into(),
+                    status: ObligationStatus::AwaitingJudge,
+                    detail: "judge".into(),
+                    evidence_ids: vec![],
+                    duration_ms: 0,
+                },
             ],
             executable_all_proven: true,
             verified_ms: 0,
@@ -188,8 +209,12 @@ mod tests {
         let (c, v) = fixture();
         let err = parse_verdicts(
             r#"{"verdicts":[{"obligation_id":"a","verdict":"pass","reason":"ok"}]}"#,
-            &c, &v, "m", true,
-        ).unwrap_err();
+            &c,
+            &v,
+            "m",
+            true,
+        )
+        .unwrap_err();
         assert!(err.contains("no verdict"), "{err}");
     }
 
@@ -201,7 +226,10 @@ mod tests {
             r#"{"verdicts":[{"obligation_id":"a","verdict":"pass","reason":"i believe it"},{"obligation_id":"b","verdict":"fail","reason":"no evidence"}]}"#,
             &c, &v, "m", true,
         ).unwrap_err();
-        assert!(err.contains("overrule") || err.contains("failed deterministic"), "{err}");
+        assert!(
+            err.contains("overrule") || err.contains("failed deterministic"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -209,8 +237,12 @@ mod tests {
         let (c, v) = fixture();
         assert!(parse_verdicts(
             r#"{"verdicts":[{"obligation_id":"zzz","verdict":"pass","reason":"?"}]}"#,
-            &c, &v, "m", true,
-        ).is_err());
+            &c,
+            &v,
+            "m",
+            true,
+        )
+        .is_err());
     }
 
     #[test]

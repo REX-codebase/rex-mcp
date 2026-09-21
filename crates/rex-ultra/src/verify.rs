@@ -78,9 +78,15 @@ fn verify_one(
                         Ok(entry) => evidence_ids.push(entry.id),
                         Err(e) => return outcome!(ObligationStatus::Failed, e),
                     }
-                    outcome!(ObligationStatus::Proven, format!("{path} exists and is non-empty"))
+                    outcome!(
+                        ObligationStatus::Proven,
+                        format!("{path} exists and is non-empty")
+                    )
                 }
-                Ok(_) => outcome!(ObligationStatus::Failed, format!("{path} is empty or not a file")),
+                Ok(_) => outcome!(
+                    ObligationStatus::Failed,
+                    format!("{path} is empty or not a file")
+                ),
                 Err(e) => outcome!(ObligationStatus::Failed, format!("{path}: {e}")),
             }
         }
@@ -94,7 +100,10 @@ fn verify_one(
                         Err(e) => return outcome!(ObligationStatus::Failed, e),
                     }
                     if text.contains(needle.as_str()) {
-                        outcome!(ObligationStatus::Proven, format!("{path} contains the needle"))
+                        outcome!(
+                            ObligationStatus::Proven,
+                            format!("{path} contains the needle")
+                        )
                     } else {
                         outcome!(
                             ObligationStatus::Failed,
@@ -105,7 +114,11 @@ fn verify_one(
                 Err(e) => outcome!(ObligationStatus::Failed, format!("{path}: {e}")),
             }
         }
-        Proof::CommandSucceeds { argv, cwd, timeout_ms }
+        Proof::CommandSucceeds {
+            argv,
+            cwd,
+            timeout_ms,
+        }
         | Proof::CommandOutputContains {
             argv,
             cwd,
@@ -120,7 +133,12 @@ fn verify_one(
             };
             let prepared = match runtime.prepare(request) {
                 Ok(p) => p,
-                Err(e) => return outcome!(ObligationStatus::Failed, format!("prepare failed: {}", e.detail)),
+                Err(e) => {
+                    return outcome!(
+                        ObligationStatus::Failed,
+                        format!("prepare failed: {}", e.detail)
+                    )
+                }
             };
             // Two execution paths, one audit trail. Model-facing policy
             // denials stand UNLESS the caller pinned a scoring allowlist:
@@ -141,7 +159,10 @@ fn verify_one(
                     None => {
                         return outcome!(
                             ObligationStatus::Failed,
-                            format!("verification command blocked by hard policy: {}", prepared.policy_reason),
+                            format!(
+                                "verification command blocked by hard policy: {}",
+                                prepared.policy_reason
+                            ),
                         )
                     }
                 }
@@ -150,7 +171,10 @@ fn verify_one(
                 // recorded in evidence so the user can audit every command.
                 if prepared.approval_required {
                     if let Err(e) = runtime.resolve_approval(&prepared.call_id, true) {
-                        return outcome!(ObligationStatus::Failed, format!("approval failed: {}", e.detail));
+                        return outcome!(
+                            ObligationStatus::Failed,
+                            format!("approval failed: {}", e.detail)
+                        );
                     }
                 }
                 (runtime.execute(&prepared.call_id), "runtime")
@@ -255,9 +279,7 @@ mod tests {
     use crate::contract::parse_contract;
 
     fn contract_with(proof: &str) -> AcceptanceContract {
-        let draft = format!(
-            r#"{{"obligations":[{{"id":"o1","statement":"s","proof":{proof}}}]}}"#
-        );
+        let draft = format!(r#"{{"obligations":[{{"id":"o1","statement":"s","proof":{proof}}}]}}"#);
         parse_contract(&draft, "t").unwrap()
     }
 
@@ -308,49 +330,54 @@ mod tests {
     }
 
     #[test]
-fn scoring_allowlist_runs_denied_interpreters_without_widening_model_policy() {
-    use crate::contract::{AcceptanceContract, Obligation, Proof};
-    use crate::evidence::EvidenceStore;
-    let mk = |argv: Vec<&str>| AcceptanceContract {
+    fn scoring_allowlist_runs_denied_interpreters_without_widening_model_policy() {
+        use crate::contract::{AcceptanceContract, Obligation, Proof};
+        use crate::evidence::EvidenceStore;
+        let mk = |argv: Vec<&str>| AcceptanceContract {
             work_kind: Default::default(),
-        task: "t".into(),
-        obligations: vec![Obligation {
-            id: "c1".into(),
-            statement: "runs".into(),
-            proof: Proof::CommandSucceeds {
-                argv: argv.iter().map(|s| s.to_string()).collect(),
-                cwd: None,
-                timeout_ms: Some(5_000),
-            },
-        }],
-        forbidden_regressions: Vec::new(),
-    };
-    let dir = std::env::temp_dir().join(format!("rex-verify-scoring-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut ev = EvidenceStore::open(&dir.join("ev")).unwrap();
+            task: "t".into(),
+            obligations: vec![Obligation {
+                id: "c1".into(),
+                statement: "runs".into(),
+                proof: Proof::CommandSucceeds {
+                    argv: argv.iter().map(|s| s.to_string()).collect(),
+                    cwd: None,
+                    timeout_ms: Some(5_000),
+                },
+            }],
+            forbidden_regressions: Vec::new(),
+        };
+        let dir = std::env::temp_dir().join(format!("rex-verify-scoring-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ev = EvidenceStore::open(&dir.join("ev")).unwrap();
 
-    // no allowlist: model-facing denial stands (old behavior preserved)
-    let r = verify_contract(&mk(vec!["sh", "-c", "true"]), &dir, &mut ev);
-    assert!(!r.executable_all_proven);
-    assert!(r.outcomes[0].detail.contains("blocked by hard policy"));
+        // no allowlist: model-facing denial stands (old behavior preserved)
+        let r = verify_contract(&mk(vec!["sh", "-c", "true"]), &dir, &mut ev);
+        assert!(!r.executable_all_proven);
+        assert!(r.outcomes[0].detail.contains("blocked by hard policy"));
 
-    // allowlist with an exiting-zero command proves the obligation
-    let r = verify_contract_with_scoring(&mk(vec!["true"]), &dir, &mut ev, Some(&["true"]));
-    assert!(r.executable_all_proven, "{:?}", r.outcomes[0].detail);
+        // allowlist with an exiting-zero command proves the obligation
+        let r = verify_contract_with_scoring(&mk(vec!["true"]), &dir, &mut ev, Some(&["true"]));
+        assert!(r.executable_all_proven, "{:?}", r.outcomes[0].detail);
 
-    // allowlist with a nonzero exit fails the obligation but EXECUTED
-    let r = verify_contract_with_scoring(&mk(vec!["false"]), &dir, &mut ev, Some(&["true"]));
-    assert!(!r.executable_all_proven);
-    assert!(!r.outcomes[0].detail.contains("blocked by hard policy"));
+        // allowlist with a nonzero exit fails the obligation but EXECUTED
+        let r = verify_contract_with_scoring(&mk(vec!["false"]), &dir, &mut ev, Some(&["true"]));
+        assert!(!r.executable_all_proven);
+        assert!(!r.outcomes[0].detail.contains("blocked by hard policy"));
 
-    // allowlist never admits shells even when named
-    let r = verify_contract_with_scoring(&mk(vec!["sh", "-c", "true"]), &dir, &mut ev, Some(&["true"]));
-    assert!(!r.executable_all_proven);
+        // allowlist never admits shells even when named
+        let r = verify_contract_with_scoring(
+            &mk(vec!["sh", "-c", "true"]),
+            &dir,
+            &mut ev,
+            Some(&["true"]),
+        );
+        assert!(!r.executable_all_proven);
 
-    let _ = std::fs::remove_dir_all(&dir);
-}
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-#[test]
+    #[test]
     fn behavior_claims_wait_for_the_judge() {
         let dir = tempfile::tempdir().unwrap();
         let mut ev = EvidenceStore::open(&dir.path().join("ev")).unwrap();

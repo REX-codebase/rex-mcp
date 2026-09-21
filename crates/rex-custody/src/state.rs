@@ -70,7 +70,10 @@ pub enum Violation {
     CapabilityEscape { detail: String },
     /// A token or heartbeat from a superseded lease epoch was presented
     /// (stale lease resurrection, e.g. an old process waking up).
-    StaleLeaseUse { presented_epoch: u64, current_epoch: u64 },
+    StaleLeaseUse {
+        presented_epoch: u64,
+        current_epoch: u64,
+    },
     /// A second custody or acceptance was attempted for a task that
     /// already has one.
     DoubleExecution { task_id: String },

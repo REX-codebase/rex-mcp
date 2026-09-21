@@ -7,16 +7,21 @@
 //! it is claimed only when detection, native tooling, diagnosis and
 //! executable gates exist, per the certification states in `skills`.
 
-use crate::skills::{
-    CertificationStatus, GateTemplate, RuleModule, Selector, SkillPackManifest,
-};
+use crate::skills::{CertificationStatus, GateTemplate, RuleModule, Selector, SkillPackManifest};
 
 fn gate(id: &str, command_hint: &str, required: bool) -> GateTemplate {
-    GateTemplate { id: id.into(), command_hint: command_hint.into(), required }
+    GateTemplate {
+        id: id.into(),
+        command_hint: command_hint.into(),
+        required,
+    }
 }
 
 fn rule(id: &str, statement: &str) -> RuleModule {
-    RuleModule { id: id.into(), statement: statement.into() }
+    RuleModule {
+        id: id.into(),
+        statement: statement.into(),
+    }
 }
 
 fn manifest(
@@ -50,23 +55,57 @@ pub fn three_d() -> SkillPackManifest {
         "three-d",
         &["medium"],
         vec![
-            Selector::Medium { medium: "three-d".into() },
-            Selector::Medium { medium: "webgl".into() },
-            Selector::Medium { medium: "three-js".into() },
+            Selector::Medium {
+                medium: "three-d".into(),
+            },
+            Selector::Medium {
+                medium: "webgl".into(),
+            },
+            Selector::Medium {
+                medium: "three-js".into(),
+            },
         ],
         &["node", "npx"],
         vec![
-            rule("scene-graph", "a real scene graph with named camera, lights and materials - not a textured div"),
-            rule("spatial-composition", "depth, parallax and occlusion carry the composition"),
-            rule("interaction", "the central behavior responds to pointer or device input"),
-            rule("performance", "steady frame budget on the target device; no unbounded geometry or texture loads"),
+            rule(
+                "scene-graph",
+                "a real scene graph with named camera, lights and materials - not a textured div",
+            ),
+            rule(
+                "spatial-composition",
+                "depth, parallax and occlusion carry the composition",
+            ),
+            rule(
+                "interaction",
+                "the central behavior responds to pointer or device input",
+            ),
+            rule(
+                "performance",
+                "steady frame budget on the target device; no unbounded geometry or texture loads",
+            ),
         ],
         vec![
             gate("build", "bundle the scene with the pinned toolchain", true),
-            gate("pixel-evidence-desktop", "headless screenshot at the declared desktop viewport, hash recorded", true),
-            gate("pixel-evidence-phone", "headless screenshot at the declared phone viewport, hash recorded", true),
-            gate("interaction-replay", "recorded replay of the central behavior input", true),
-            gate("frame-budget", "measured frame times against the declared budget", false),
+            gate(
+                "pixel-evidence-desktop",
+                "headless screenshot at the declared desktop viewport, hash recorded",
+                true,
+            ),
+            gate(
+                "pixel-evidence-phone",
+                "headless screenshot at the declared phone viewport, hash recorded",
+                true,
+            ),
+            gate(
+                "interaction-replay",
+                "recorded replay of the central behavior input",
+                true,
+            ),
+            gate(
+                "frame-budget",
+                "measured frame times against the declared budget",
+                false,
+            ),
         ],
     )
 }
@@ -106,20 +145,41 @@ pub fn svg() -> SkillPackManifest {
         "svg",
         &["medium"],
         vec![
-            Selector::Medium { medium: "svg".into() },
-            Selector::FileExtension { extension: "svg".into() },
+            Selector::Medium {
+                medium: "svg".into(),
+            },
+            Selector::FileExtension {
+                extension: "svg".into(),
+            },
         ],
         &["node", "npx"],
         vec![
-            rule("topology", "paths and groups are structured for the drawing, not exported noise"),
-            rule("viewbox", "a declared viewBox scales the artwork without distortion"),
-            rule("accessible", "role, title and description make the graphic readable to assistive tech"),
+            rule(
+                "topology",
+                "paths and groups are structured for the drawing, not exported noise",
+            ),
+            rule(
+                "viewbox",
+                "a declared viewBox scales the artwork without distortion",
+            ),
+            rule(
+                "accessible",
+                "role, title and description make the graphic readable to assistive tech",
+            ),
         ],
         vec![
             gate("xml-parse", "the artwork parses as valid XML/SVG", true),
-            gate("viewbox-check", "viewBox present and consistent with the declared aspect", true),
+            gate(
+                "viewbox-check",
+                "viewBox present and consistent with the declared aspect",
+                true,
+            ),
             gate("a11y-check", "role/img, title and desc present", true),
-            gate("raster-export", "rasterized export at the declared sizes matches within tolerance", false),
+            gate(
+                "raster-export",
+                "rasterized export at the declared sizes matches within tolerance",
+                false,
+            ),
         ],
     )
 }
@@ -131,14 +191,27 @@ pub fn rust() -> SkillPackManifest {
         "rust",
         &["language", "ecosystem"],
         vec![
-            Selector::Manifest { filename: "Cargo.toml".into() },
-            Selector::FileExtension { extension: "rs".into() },
+            Selector::Manifest {
+                filename: "Cargo.toml".into(),
+            },
+            Selector::FileExtension {
+                extension: "rs".into(),
+            },
         ],
         &["cargo", "rustc"],
         vec![
-            rule("ownership", "ownership and borrowing are the design, not an afterthought"),
-            rule("unsafe-boundary", "unsafe is contained, justified and documented at the boundary"),
-            rule("error-model", "fallible operations return typed errors; no silent unwrap in library paths"),
+            rule(
+                "ownership",
+                "ownership and borrowing are the design, not an afterthought",
+            ),
+            rule(
+                "unsafe-boundary",
+                "unsafe is contained, justified and documented at the boundary",
+            ),
+            rule(
+                "error-model",
+                "fallible operations return typed errors; no silent unwrap in library paths",
+            ),
         ],
         vec![
             gate("cargo-test", "cargo test passes for the workspace", true),
@@ -160,12 +233,28 @@ pub fn shared_laws() -> SkillPackManifest {
         dependencies: vec![],
         conflicts: vec![],
         rules: vec![
-            rule("evidence", "claims are backed by executable evidence, never prose"),
-            rule("accessibility", "output is usable with assistive technology and keyboard alone"),
-            rule("security", "no secrets in artifacts; untrusted input is validated at the boundary"),
-            rule("scope", "only the task's declared scope changes; incidental edits are defects"),
+            rule(
+                "evidence",
+                "claims are backed by executable evidence, never prose",
+            ),
+            rule(
+                "accessibility",
+                "output is usable with assistive technology and keyboard alone",
+            ),
+            rule(
+                "security",
+                "no secrets in artifacts; untrusted input is validated at the boundary",
+            ),
+            rule(
+                "scope",
+                "only the task's declared scope changes; incidental edits are defects",
+            ),
         ],
-        gates: vec![gate("scope-diff", "the changed surface matches the declared scope", true)],
+        gates: vec![gate(
+            "scope-diff",
+            "the changed surface matches the declared scope",
+            true,
+        )],
         required_tools: vec![],
         provenance: "shared engineering laws, frozen architecture 2026-09-20".into(),
         certification: CertificationStatus::Certified,
@@ -250,6 +339,9 @@ mod tests {
         };
         let plan = compile_plan(&facts, &first_class_registry()).unwrap();
         assert!(!plan.selected.iter().any(|p| p.id == "three-d"));
-        assert!(plan.unsupported.iter().any(|u| u.contains("three-d") && u.contains("required tools not detected")));
+        assert!(plan
+            .unsupported
+            .iter()
+            .any(|u| u.contains("three-d") && u.contains("required tools not detected")));
     }
 }

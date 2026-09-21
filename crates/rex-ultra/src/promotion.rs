@@ -73,10 +73,19 @@ const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn validate_bundle_path(path: &str) -> Result<(), PromotionError> {
     let invalid = |reason: &str| PromotionError::InvalidBundle(format!("path {path:?}: {reason}"));
-    if path.is_empty() { return Err(invalid("empty")); }
-    if path.starts_with('/') || path.starts_with('\\') { return Err(invalid("absolute")); }
-    if path.contains('\\') { return Err(invalid("backslash separator")); }
-    if path.split('/').any(|part| part == ".." || part == "." || part.is_empty()) {
+    if path.is_empty() {
+        return Err(invalid("empty"));
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err(invalid("absolute"));
+    }
+    if path.contains('\\') {
+        return Err(invalid("backslash separator"));
+    }
+    if path
+        .split('/')
+        .any(|part| part == ".." || part == "." || part.is_empty())
+    {
         return Err(invalid("traversal or empty segment"));
     }
     Ok(())
@@ -91,16 +100,25 @@ pub fn parse_bundle(content: &str) -> Result<SealedCandidateBundle, PromotionErr
         return Err(PromotionError::InvalidBundle("bundle has no files".into()));
     }
     if bundle.files.len() > MAX_BUNDLE_FILES {
-        return Err(PromotionError::InvalidBundle(format!("{} files exceeds {MAX_BUNDLE_FILES}", bundle.files.len())));
+        return Err(PromotionError::InvalidBundle(format!(
+            "{} files exceeds {MAX_BUNDLE_FILES}",
+            bundle.files.len()
+        )));
     }
     let mut seen = std::collections::BTreeSet::new();
     for file in &bundle.files {
         validate_bundle_path(&file.path)?;
         if !seen.insert(file.path.clone()) {
-            return Err(PromotionError::InvalidBundle(format!("duplicate path {:?}", file.path)));
+            return Err(PromotionError::InvalidBundle(format!(
+                "duplicate path {:?}",
+                file.path
+            )));
         }
         if file.content.len() > MAX_FILE_BYTES {
-            return Err(PromotionError::InvalidBundle(format!("path {:?} exceeds {MAX_FILE_BYTES} bytes", file.path)));
+            return Err(PromotionError::InvalidBundle(format!(
+                "path {:?} exceeds {MAX_FILE_BYTES} bytes",
+                file.path
+            )));
         }
     }
     Ok(bundle)
@@ -122,23 +140,38 @@ fn collect_tree(
     total_bytes: &mut u64,
 ) -> Result<(), PromotionError> {
     if entries.len() >= MAX_TREE_ENTRIES {
-        return Err(PromotionError::Io(format!("tree exceeds {MAX_TREE_ENTRIES} entries")));
+        return Err(PromotionError::Io(format!(
+            "tree exceeds {MAX_TREE_ENTRIES} entries"
+        )));
     }
     let read = fs::read_dir(dir).map_err(|e| PromotionError::Io(e.to_string()))?;
     for entry in read.flatten() {
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_symlink() { continue; }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
         if kind.is_dir() {
             collect_tree(root, &path, entries, total_bytes)?;
         } else if kind.is_file() {
             let bytes = fs::read(&path).map_err(|e| PromotionError::Io(e.to_string()))?;
             *total_bytes += bytes.len() as u64;
             if *total_bytes > MAX_SNAPSHOT_BYTES {
-                return Err(PromotionError::Io(format!("tree exceeds {MAX_SNAPSHOT_BYTES} bytes")));
+                return Err(PromotionError::Io(format!(
+                    "tree exceeds {MAX_SNAPSHOT_BYTES} bytes"
+                )));
             }
-            let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-            entries.insert(relative, canonical_hash(&bytes).map_err(|e| PromotionError::Encoding(e.to_string()))?);
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            entries.insert(
+                relative,
+                canonical_hash(&bytes).map_err(|e| PromotionError::Encoding(e.to_string()))?,
+            );
         }
     }
     Ok(())
@@ -150,8 +183,12 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), PromotionError> {
     for entry in read.flatten() {
         let from = entry.path();
         let to = destination.join(entry.file_name());
-        let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_symlink() { continue; }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
         if kind.is_dir() {
             copy_tree(&from, &to)?;
         } else if kind.is_file() {
@@ -162,11 +199,15 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), PromotionError> {
 }
 
 fn clear_tree(dir: &Path) -> Result<(), PromotionError> {
-    if !dir.exists() { return Ok(()); }
+    if !dir.exists() {
+        return Ok(());
+    }
     let read = fs::read_dir(dir).map_err(|e| PromotionError::Io(e.to_string()))?;
     for entry in read.flatten() {
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         if kind.is_dir() && !kind.is_symlink() {
             fs::remove_dir_all(&path).map_err(|e| PromotionError::Io(e.to_string()))?;
         } else {
@@ -200,12 +241,24 @@ fn rerun_gates(
     for obligation in &contract.obligations {
         match &obligation.proof {
             Proof::FileExists { path } => {
-                let ok = fs::metadata(stage.join(path)).map(|m| m.is_file() && m.len() > 0).unwrap_or(false);
-                if ok { rerun.push(obligation.id.clone()) } else { failed.push(obligation.id.clone()) }
+                let ok = fs::metadata(stage.join(path))
+                    .map(|m| m.is_file() && m.len() > 0)
+                    .unwrap_or(false);
+                if ok {
+                    rerun.push(obligation.id.clone())
+                } else {
+                    failed.push(obligation.id.clone())
+                }
             }
             Proof::FileContains { path, needle } => {
-                let ok = fs::read_to_string(stage.join(path)).map(|c| c.contains(needle)).unwrap_or(false);
-                if ok { rerun.push(obligation.id.clone()) } else { failed.push(obligation.id.clone()) }
+                let ok = fs::read_to_string(stage.join(path))
+                    .map(|c| c.contains(needle))
+                    .unwrap_or(false);
+                if ok {
+                    rerun.push(obligation.id.clone())
+                } else {
+                    failed.push(obligation.id.clone())
+                }
             }
             _ => not_rerun.push(obligation.id.clone()),
         }
@@ -226,7 +279,9 @@ impl PromotionStore {
 
     pub fn receipt(&self, task_id: &str) -> Result<Option<PromotionReceipt>, PromotionError> {
         let path = self.receipt_path(task_id)?;
-        if !path.exists() { return Ok(None); }
+        if !path.exists() {
+            return Ok(None);
+        }
         let bytes = fs::read(&path).map_err(|e| PromotionError::Io(e.to_string()))?;
         serde_json::from_slice(&bytes)
             .map(Some)
@@ -234,8 +289,14 @@ impl PromotionStore {
     }
 
     fn receipt_path(&self, task_id: &str) -> Result<PathBuf, PromotionError> {
-        if task_id.is_empty() || !task_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(PromotionError::InvalidBundle("invalid task id for promotion store".into()));
+        if task_id.is_empty()
+            || !task_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(PromotionError::InvalidBundle(
+                "invalid task id for promotion store".into(),
+            ));
         }
         Ok(self.dir.join(format!("receipt-{task_id}.json")))
     }
@@ -243,7 +304,8 @@ impl PromotionStore {
     fn persist_receipt(&self, receipt: &PromotionReceipt) -> Result<(), PromotionError> {
         let path = self.receipt_path(&receipt.task_id)?;
         let temporary = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec(receipt).map_err(|e| PromotionError::Encoding(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(receipt).map_err(|e| PromotionError::Encoding(e.to_string()))?;
         fs::write(&temporary, bytes).map_err(|e| PromotionError::Io(e.to_string()))?;
         fs::rename(&temporary, &path).map_err(|e| PromotionError::Io(e.to_string()))
     }
@@ -270,7 +332,8 @@ impl PromotionStore {
             .find(|r| r.candidate_id == candidate_id)
             .ok_or(PromotionError::NoQualifiedCandidate)?;
         let bundle = parse_bundle(&response.content)?;
-        let bundle_hash = canonical_hash(&response.content).map_err(|e| PromotionError::Encoding(e.to_string()))?;
+        let bundle_hash = canonical_hash(&response.content)
+            .map_err(|e| PromotionError::Encoding(e.to_string()))?;
 
         // Recover a dangling prepare from a crashed promotion before
         // snapshotting again: a dirty destination is never a new base.
@@ -278,7 +341,9 @@ impl PromotionStore {
         if let Some(prior) = self.receipt(task_id)? {
             if prior.state == PromotionState::Prepared {
                 let snapshot = self.dir.join(format!("snapshot-{task_id}"));
-                clear_tree(destination).and_then(|()| copy_tree(&snapshot, destination)).ok();
+                clear_tree(destination)
+                    .and_then(|()| copy_tree(&snapshot, destination))
+                    .ok();
                 let mut recovered = prior;
                 match tree_hash(destination) {
                     Ok(restored) if restored == recovered.destination_hash_before => {
@@ -347,7 +412,9 @@ impl PromotionStore {
             }
             apply_bundle(&bundle, destination)?;
             if tree_hash(destination)? != receipt.staging_hash {
-                return Err(PromotionError::Io("destination hash mismatch after apply".into()));
+                return Err(PromotionError::Io(
+                    "destination hash mismatch after apply".into(),
+                ));
             }
             receipt.state = PromotionState::Committed;
             receipt.detail = "promoted and destination hash verified".into();
@@ -358,7 +425,9 @@ impl PromotionStore {
             Ok(()) => finish(receipt),
             Err(error) => {
                 // Roll back: restore the snapshot and verify the restore.
-                clear_tree(destination).and_then(|()| copy_tree(&snapshot, destination)).ok();
+                clear_tree(destination)
+                    .and_then(|()| copy_tree(&snapshot, destination))
+                    .ok();
                 match tree_hash(destination) {
                     Ok(restored) if restored == destination_hash_before => {
                         receipt.state = PromotionState::RolledBack;
@@ -392,7 +461,10 @@ mod tests {
             obligations: vec![Obligation {
                 id: "o1".into(),
                 statement: "result exists and passes".into(),
-                proof: Proof::FileContains { path: "result.txt".into(), needle: "PASS".into() },
+                proof: Proof::FileContains {
+                    path: "result.txt".into(),
+                    needle: "PASS".into(),
+                },
             }],
             forbidden_regressions: vec![],
         }
@@ -409,25 +481,46 @@ mod tests {
         let mut adapter = ExternalHostAdapter::new(contract.clone(), 1).unwrap();
         adapter.attach_host(1).unwrap();
         let request = adapter.requests().unwrap().remove(0);
-        adapter.record_response(CandidateResponse {
-            candidate_id: request.candidate_id.clone(),
-            response_hash: canonical_hash(&content).unwrap(),
-            content: content.to_string(),
-        }).unwrap();
+        adapter
+            .record_response(CandidateResponse {
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content: content.to_string(),
+            })
+            .unwrap();
         adapter.advance().unwrap();
         let requests = adapter.evidence_requests().unwrap();
-        let adversary = requests.iter().find(|r| r.kind == EvidenceKind::Adversary).unwrap().clone();
-        adapter.record_adversary(AdversaryEvidence {
-            request_id: adversary.request_id, candidate_id: request.candidate_id.clone(),
-            response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(), content: "{\"defects\":[]}".into(),
-        }).unwrap();
-        let verifier = requests.iter().find(|r| r.kind == EvidenceKind::Verifier).unwrap().clone();
+        let adversary = requests
+            .iter()
+            .find(|r| r.kind == EvidenceKind::Adversary)
+            .unwrap()
+            .clone();
+        adapter
+            .record_adversary(AdversaryEvidence {
+                request_id: adversary.request_id,
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(),
+                content: "{\"defects\":[]}".into(),
+            })
+            .unwrap();
+        let verifier = requests
+            .iter()
+            .find(|r| r.kind == EvidenceKind::Verifier)
+            .unwrap()
+            .clone();
         let verdict = "{\"outcomes\":[{\"obligation_id\":\"o1\",\"status\":\"proven\"}]}";
-        adapter.record_verifier(VerifierEvidence {
-            request_id: verifier.request_id, candidate_id: request.candidate_id.clone(),
-            response_hash: canonical_hash(&verdict).unwrap(), content: verdict.into(),
-        }).unwrap();
-        assert!(matches!(adapter.finalize().unwrap(), KernelState::Completed));
+        adapter
+            .record_verifier(VerifierEvidence {
+                request_id: verifier.request_id,
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&verdict).unwrap(),
+                content: verdict.into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::Completed
+        ));
         adapter
     }
 
@@ -440,12 +533,20 @@ mod tests {
         let before = tree_hash(&destination).unwrap();
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
-        let receipt = store.promote("task-1", &adapter, &contract(), &destination).unwrap();
+        let receipt = store
+            .promote("task-1", &adapter, &contract(), &destination)
+            .unwrap();
         assert_eq!(receipt.state, PromotionState::Committed);
         assert_eq!(receipt.destination_hash_before, before);
         assert_eq!(receipt.gates_rerun, vec!["o1".to_string()]);
-        assert_eq!(fs::read_to_string(destination.join("result.txt")).unwrap(), "PASS\n");
-        assert_eq!(fs::read_to_string(destination.join("keep.txt")).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(destination.join("result.txt")).unwrap(),
+            "PASS\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("keep.txt")).unwrap(),
+            "original"
+        );
         assert_eq!(tree_hash(&destination).unwrap(), receipt.staging_hash);
         assert_eq!(store.receipt("task-1").unwrap(), Some(receipt));
     }
@@ -484,11 +585,16 @@ mod tests {
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
         // The bundle builds the wrong content; the staged gate must catch it.
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "FAIL\n")]));
-        let receipt = store.promote("task-3", &adapter, &contract(), &destination).unwrap();
+        let receipt = store
+            .promote("task-3", &adapter, &contract(), &destination)
+            .unwrap();
         assert_eq!(receipt.state, PromotionState::RolledBack);
         assert_eq!(tree_hash(&destination).unwrap(), before);
         assert!(!destination.join("result.txt").exists());
-        assert_eq!(fs::read_to_string(destination.join("keep.txt")).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(destination.join("keep.txt")).unwrap(),
+            "original"
+        );
     }
 
     #[test]
@@ -501,7 +607,9 @@ mod tests {
         let before = tree_hash(&destination).unwrap();
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
-        let receipt = store.promote("task-4", &adapter, &contract(), &destination).unwrap();
+        let receipt = store
+            .promote("task-4", &adapter, &contract(), &destination)
+            .unwrap();
         assert_eq!(receipt.state, PromotionState::RolledBack);
         assert_eq!(tree_hash(&destination).unwrap(), before);
         assert!(destination.join("result.txt").is_dir());
@@ -515,19 +623,23 @@ mod tests {
         // dirt: exactly what a crash between prepare and commit leaves.
         let before = tree_hash(destination).unwrap();
         let snapshot = store.dir.join(format!("snapshot-{task_id}"));
-        if snapshot.exists() { fs::remove_dir_all(&snapshot).unwrap(); }
+        if snapshot.exists() {
+            fs::remove_dir_all(&snapshot).unwrap();
+        }
         copy_tree(destination, &snapshot).unwrap();
-        store.persist_receipt(&PromotionReceipt {
-            task_id: task_id.into(),
-            candidate_id: "crashed".into(),
-            bundle_hash: "b".repeat(64),
-            destination_hash_before: before.clone(),
-            staging_hash: String::new(),
-            gates_rerun: vec![],
-            gates_not_rerun: vec![],
-            state: PromotionState::Prepared,
-            detail: "staged".into(),
-        }).unwrap();
+        store
+            .persist_receipt(&PromotionReceipt {
+                task_id: task_id.into(),
+                candidate_id: "crashed".into(),
+                bundle_hash: "b".repeat(64),
+                destination_hash_before: before.clone(),
+                staging_hash: String::new(),
+                gates_rerun: vec![],
+                gates_not_rerun: vec![],
+                state: PromotionState::Prepared,
+                detail: "staged".into(),
+            })
+            .unwrap();
         fs::write(destination.join("junk.txt"), "half-applied").unwrap();
         fs::write(destination.join("keep.txt"), "dirtied").unwrap();
         before
@@ -542,12 +654,20 @@ mod tests {
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
         simulate_crashed_promotion(&store, "task-5", &destination);
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
-        let receipt = store.promote("task-5", &adapter, &contract(), &destination).unwrap();
+        let receipt = store
+            .promote("task-5", &adapter, &contract(), &destination)
+            .unwrap();
         assert_eq!(receipt.state, PromotionState::Committed);
         // The dirty state was rolled back first, then the bundle applied.
-        assert_eq!(fs::read_to_string(destination.join("keep.txt")).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(destination.join("keep.txt")).unwrap(),
+            "original"
+        );
         assert!(!destination.join("junk.txt").exists());
-        assert_eq!(fs::read_to_string(destination.join("result.txt")).unwrap(), "PASS\n");
+        assert_eq!(
+            fs::read_to_string(destination.join("result.txt")).unwrap(),
+            "PASS\n"
+        );
     }
 
     #[test]
@@ -560,10 +680,15 @@ mod tests {
         simulate_crashed_promotion(&store, "task-6", &destination);
         fs::remove_dir_all(store.dir.join("snapshot-task-6")).unwrap();
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
-        let receipt = store.promote("task-6", &adapter, &contract(), &destination).unwrap();
+        let receipt = store
+            .promote("task-6", &adapter, &contract(), &destination)
+            .unwrap();
         assert_eq!(receipt.state, PromotionState::CorruptState);
         // Fail closed: nothing was promoted onto an unverifiable base.
         assert!(!destination.join("result.txt").exists());
-        assert_eq!(store.receipt("task-6").unwrap().unwrap().state, PromotionState::CorruptState);
+        assert_eq!(
+            store.receipt("task-6").unwrap().unwrap().state,
+            PromotionState::CorruptState
+        );
     }
 }

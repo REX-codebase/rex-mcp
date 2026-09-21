@@ -42,7 +42,10 @@ fn shell_client_runs_a_full_task_lifecycle_over_stdio() {
     let status = client
         .call_tool("rex_status", json!({ "task_id": task_id }))
         .unwrap();
-    assert_eq!(status.get("task_id").and_then(|v| v.as_str()), Some(task_id.as_str()));
+    assert_eq!(
+        status.get("task_id").and_then(|v| v.as_str()),
+        Some(task_id.as_str())
+    );
     assert_eq!(
         status.get("operator_is_agent").and_then(|v| v.as_bool()),
         Some(true),
@@ -52,11 +55,18 @@ fn shell_client_runs_a_full_task_lifecycle_over_stdio() {
     let events = client
         .call_tool("rex_events", json!({ "task_id": task_id }))
         .unwrap();
-    assert!(events.get("events").and_then(|v| v.as_array()).map(|e| !e.is_empty()).unwrap_or(false));
+    assert!(events
+        .get("events")
+        .and_then(|v| v.as_array())
+        .map(|e| !e.is_empty())
+        .unwrap_or(false));
 
     // Human stop is final even for an agent-operator task.
     let cancel = client
-        .call_tool("rex_cancel", json!({ "task_id": task_id, "reason": "human stop from shell" }))
+        .call_tool(
+            "rex_cancel",
+            json!({ "task_id": task_id, "reason": "human stop from shell" }),
+        )
         .unwrap();
     assert_eq!(
         cancel.get("state").and_then(|v| v.as_str()).unwrap_or(""),
@@ -65,7 +75,10 @@ fn shell_client_runs_a_full_task_lifecycle_over_stdio() {
     let after = client
         .call_tool("rex_status", json!({ "task_id": task_id }))
         .unwrap();
-    assert_eq!(after.get("state").and_then(|v| v.as_str()).unwrap_or(""), "cancelled");
+    assert_eq!(
+        after.get("state").and_then(|v| v.as_str()).unwrap_or(""),
+        "cancelled"
+    );
 }
 
 #[test]
@@ -87,5 +100,8 @@ fn one_shot_call_matches_persistent_session() {
         }),
     )
     .unwrap();
-    assert_eq!(exec.get("state").and_then(|v| v.as_str()).unwrap_or(""), "active");
+    assert_eq!(
+        exec.get("state").and_then(|v| v.as_str()).unwrap_or(""),
+        "active"
+    );
 }

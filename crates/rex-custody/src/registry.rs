@@ -17,15 +17,15 @@
 
 use crate::audit::{read_chain, AuditEvent, AuditLog};
 use crate::budget::Consumption;
+use crate::budget::CustodyBudgets;
+use crate::capability::CapabilitySet;
 use crate::capability::{random_hex, CapabilityToken};
+use crate::contract::CompletionContract;
 use crate::contract::{CompletionClaim, GateEvaluator, GateOutcome};
 use crate::identity::{AgentIdentity, OperatorIdentity, WorkerMode};
 use crate::lease::{Lease, LeaseTerms};
 use crate::offer::{CustodyAcceptance, CustodyOffer};
 use crate::state::{CustodyGrant, CustodyPhase, ReleaseReason, Violation};
-use crate::budget::CustodyBudgets;
-use crate::capability::CapabilitySet;
-use crate::contract::CompletionContract;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -93,7 +93,9 @@ impl CustodyRegistry {
         fs::create_dir_all(root.join("grants")).map_err(ioe)?;
         fs::create_dir_all(root.join("audit")).map_err(ioe)?;
         let index: Index = match fs::read(root.join("index.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| CustodyError::Io(e.to_string()))?,
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).map_err(|e| CustodyError::Io(e.to_string()))?
+            }
             Err(_) => Index::default(),
         };
         let mut grants = HashMap::new();
@@ -103,8 +105,8 @@ impl CustodyRegistry {
         grant_ids.sort();
         grant_ids.dedup();
         for grant_id in grant_ids {
-            let bytes = fs::read(root.join("grants").join(format!("{grant_id}.json")))
-                .map_err(ioe)?;
+            let bytes =
+                fs::read(root.join("grants").join(format!("{grant_id}.json"))).map_err(ioe)?;
             let grant: CustodyGrant =
                 serde_json::from_slice(&bytes).map_err(|e| CustodyError::Io(e.to_string()))?;
             let log = AuditLog::open(root.join("audit").join(format!("{grant_id}.jsonl")))
@@ -130,16 +132,22 @@ impl CustodyRegistry {
             .root
             .join("grants")
             .join(format!("{}.json", grant.grant_id));
-        fs::write(&tmp, serde_json::to_vec_pretty(grant).expect("grant serializes"))
-            .map_err(ioe)?;
+        fs::write(
+            &tmp,
+            serde_json::to_vec_pretty(grant).expect("grant serializes"),
+        )
+        .map_err(ioe)?;
         fs::rename(&tmp, &fin).map_err(ioe)
     }
 
     fn persist_index(&self) -> Result<(), CustodyError> {
         let tmp = self.root.join("index.json.tmp");
         let fin = self.root.join("index.json");
-        fs::write(&tmp, serde_json::to_vec_pretty(&self.index).expect("index serializes"))
-            .map_err(ioe)?;
+        fs::write(
+            &tmp,
+            serde_json::to_vec_pretty(&self.index).expect("index serializes"),
+        )
+        .map_err(ioe)?;
         fs::rename(&tmp, &fin).map_err(ioe)
     }
 
@@ -318,7 +326,11 @@ impl CustodyRegistry {
 
     // ----- token verification ------------------------------------------
 
-    fn grant_for_token(&mut self, token: &CapabilityToken, now_ms: u128) -> Result<(), CustodyError> {
+    fn grant_for_token(
+        &mut self,
+        token: &CapabilityToken,
+        now_ms: u128,
+    ) -> Result<(), CustodyError> {
         let grant = self
             .grants
             .get(&token.grant_id)
@@ -392,7 +404,12 @@ impl CustodyRegistry {
         let lease = grant.lease.clone();
         let grant_id = grant.grant_id.clone();
         self.persist_grant(self.grants.get(&grant_id).expect("checked"))?;
-        self.audit(&grant_id, now_ms, "heartbeat", json!({ "seq": seq, "epoch": lease.epoch }))?;
+        self.audit(
+            &grant_id,
+            now_ms,
+            "heartbeat",
+            json!({ "seq": seq, "epoch": lease.epoch }),
+        )?;
         Ok(lease)
     }
 
@@ -415,13 +432,14 @@ impl CustodyRegistry {
         let grant_id = grant.grant_id.clone();
         let consumed = grant.consumed;
         self.persist_grant(self.grants.get(&grant_id).expect("checked"))?;
-        self.audit(&grant_id, now_ms, "consumed", json!({ "delta": delta, "total": consumed }))?;
+        self.audit(
+            &grant_id,
+            now_ms,
+            "consumed",
+            json!({ "delta": delta, "total": consumed }),
+        )?;
         if let Some(which) = exceeded {
-            self.release(
-                &grant_id,
-                ReleaseReason::BudgetExhausted { which },
-                now_ms,
-            )?;
+            self.release(&grant_id, ReleaseReason::BudgetExhausted { which }, now_ms)?;
             return Err(CustodyError::BudgetExhausted);
         }
         Ok(())
@@ -430,8 +448,16 @@ impl CustodyRegistry {
     // ----- suspend / resume --------------------------------------------
 
     /// Interruption: crash detected, operator paused, or lease lapsed.
-    pub fn suspend(&mut self, grant_id: &str, reason: &str, now_ms: u128) -> Result<(), CustodyError> {
-        let grant = self.grants.get_mut(grant_id).ok_or(CustodyError::UnknownGrant)?;
+    pub fn suspend(
+        &mut self,
+        grant_id: &str,
+        reason: &str,
+        now_ms: u128,
+    ) -> Result<(), CustodyError> {
+        let grant = self
+            .grants
+            .get_mut(grant_id)
+            .ok_or(CustodyError::UnknownGrant)?;
         if grant.phase != CustodyPhase::Active {
             return Err(CustodyError::WrongPhase(grant.phase));
         }
@@ -439,7 +465,12 @@ impl CustodyRegistry {
         grant.suspended_at_ms = Some(now_ms);
         grant.updated_ms = now_ms;
         self.persist_grant(self.grants.get(grant_id).expect("checked"))?;
-        self.audit(grant_id, now_ms, "suspended", json!({ "reason": reason, "epoch": self.grants[grant_id].lease.epoch }))?;
+        self.audit(
+            grant_id,
+            now_ms,
+            "suspended",
+            json!({ "reason": reason, "epoch": self.grants[grant_id].lease.epoch }),
+        )?;
         Ok(())
     }
 
@@ -453,7 +484,11 @@ impl CustodyRegistry {
         resume_secret: &str,
         now_ms: u128,
     ) -> Result<CapabilityToken, CustodyError> {
-        let grant = self.grants.get(grant_id).cloned().ok_or(CustodyError::UnknownGrant)?;
+        let grant = self
+            .grants
+            .get(grant_id)
+            .cloned()
+            .ok_or(CustodyError::UnknownGrant)?;
         if grant.phase != CustodyPhase::Suspended {
             return Err(CustodyError::WrongPhase(grant.phase));
         }
@@ -510,7 +545,12 @@ impl CustodyRegistry {
             grant.updated_ms = now_ms;
         }
         self.persist_grant(self.grants.get(&token.grant_id).expect("checked"))?;
-        self.audit(&token.grant_id, now_ms, "completion_claimed", json!({ "summary": claim.summary }))?;
+        self.audit(
+            &token.grant_id,
+            now_ms,
+            "completion_claimed",
+            json!({ "summary": claim.summary }),
+        )?;
 
         let grant = self.grants.get(&token.grant_id).expect("checked").clone();
         let mut failures = Vec::new();
@@ -531,7 +571,12 @@ impl CustodyRegistry {
             let attempts = grant.claim_attempts;
             let max = grant.contract.max_claim_attempts;
             let grant_id = grant.grant_id.clone();
-            self.audit(&grant_id, now_ms, "completion_rejected", json!({ "failures": failures, "attempt": attempts }))?;
+            self.audit(
+                &grant_id,
+                now_ms,
+                "completion_rejected",
+                json!({ "failures": failures, "attempt": attempts }),
+            )?;
             if attempts > max {
                 let v = Violation::FalseCompletion { attempts };
                 self.violate(&grant_id, v.clone(), now_ms)?;
@@ -571,8 +616,15 @@ impl CustodyRegistry {
 
     /// The human stop button. Works in every non-terminal phase, including
     /// Verifying and Suspended. Never gated on operator state.
-    pub fn human_stop(&mut self, grant_id: &str, now_ms: u128) -> Result<ReleaseReason, CustodyError> {
-        let grant = self.grants.get(grant_id).ok_or(CustodyError::UnknownGrant)?;
+    pub fn human_stop(
+        &mut self,
+        grant_id: &str,
+        now_ms: u128,
+    ) -> Result<ReleaseReason, CustodyError> {
+        let grant = self
+            .grants
+            .get(grant_id)
+            .ok_or(CustodyError::UnknownGrant)?;
         if grant.phase.is_terminal() {
             return Err(CustodyError::WrongPhase(grant.phase));
         }
@@ -589,7 +641,10 @@ impl CustodyRegistry {
         reason: ReleaseReason,
         now_ms: u128,
     ) -> Result<(), CustodyError> {
-        let grant = self.grants.get_mut(grant_id).ok_or(CustodyError::UnknownGrant)?;
+        let grant = self
+            .grants
+            .get_mut(grant_id)
+            .ok_or(CustodyError::UnknownGrant)?;
         if grant.phase.is_terminal() {
             return Err(CustodyError::WrongPhase(grant.phase));
         }
@@ -637,7 +692,12 @@ impl CustodyRegistry {
             violation: Some(violation.clone()),
         };
         self.persist_grant(self.grants.get(grant_id).expect("checked"))?;
-        self.audit(grant_id, now_ms, "quarantined", json!({ "violation": violation }))?;
+        self.audit(
+            grant_id,
+            now_ms,
+            "quarantined",
+            json!({ "violation": violation }),
+        )?;
         self.index.active.remove(&task_id);
         self.index.tombstones.insert(task_id, tombstone);
         self.persist_index()?;
@@ -667,7 +727,12 @@ impl CustodyRegistry {
             .remove(task_id)
             .ok_or(CustodyError::UnknownGrant)?;
         self.persist_index()?;
-        self.audit(&tomb.grant_id, now_ms, "task_reopened", json!({ "task_id": task_id }))?;
+        self.audit(
+            &tomb.grant_id,
+            now_ms,
+            "task_reopened",
+            json!({ "task_id": task_id }),
+        )?;
         Ok(())
     }
 
@@ -743,10 +808,7 @@ impl CustodyRegistry {
 
     /// Register a named external agent instance (id minting lives here so
     /// name collisions never share identity).
-    pub fn register_agent(
-        name: &str,
-        protocol: crate::identity::AgentProtocol,
-    ) -> AgentIdentity {
+    pub fn register_agent(name: &str, protocol: crate::identity::AgentProtocol) -> AgentIdentity {
         AgentIdentity {
             name: name.chars().take(120).collect(),
             protocol,
