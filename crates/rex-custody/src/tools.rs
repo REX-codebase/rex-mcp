@@ -129,6 +129,7 @@ fn custody_blocked_result(call_id: &str, detail: &str) -> ToolResult {
             output_truncated: false,
             diff: None,
             redactions: 0,
+            sandbox: None,
         },
     }
 }

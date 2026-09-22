@@ -4,6 +4,8 @@
 //! request is prepared against a canonical workspace, classified, and bound to
 //! an unguessable pending call. Risky calls require a separate user decision.
 
+pub mod sandbox;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -104,6 +106,10 @@ pub struct AuditReceipt {
     pub output_truncated: bool,
     pub diff: Option<String>,
     pub redactions: usize,
+    /// OS sandbox outcome for spawned commands: "applied: ..." or
+    /// "unavailable: <reason>". Never absent for run commands.
+    #[serde(default)]
+    pub sandbox: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -650,67 +656,23 @@ impl ToolRuntime {
                 "command cwd is not a directory",
             ));
         }
-        let mut command = Command::new(&argv[0]);
-        command
-            .args(&argv[1..])
-            .current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear();
-        if let Ok(path) = std::env::var("PATH") {
-            command.env("PATH", path);
-        }
-        // Suite checks run with HOME pointed at the disposable workspace, so
-        // Python user-site installs (pip --user, the default under
-        // --break-system-packages) are invisible unless the bench host
-        // exports PYTHONPATH to the real user site-packages. Pass it through
-        // like PATH; it only affects Python subprocesses of suite checks.
-        if let Ok(pythonpath) = std::env::var("PYTHONPATH") {
-            command.env("PYTHONPATH", pythonpath);
-        }
-        command
-            .env("HOME", &*self.root)
-            .env("REX_WORKSPACE", &*self.root);
-        #[cfg(unix)]
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let cpu = libc::rlimit {
-                    rlim_cur: 120,
-                    rlim_max: 120,
-                };
-                let mem = libc::rlimit {
-                    rlim_cur: 1024 * 1024 * 1024,
-                    rlim_max: 1024 * 1024 * 1024,
-                };
-                let files = libc::rlimit {
-                    rlim_cur: 256,
-                    rlim_max: 256,
-                };
-                if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0
-                    || libc::setrlimit(libc::RLIMIT_AS, &mem) != 0
-                    || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().map_err(|e| {
-            let hint = if e.kind() == std::io::ErrorKind::NotFound {
-                "; suite checks must use an interpreter-prefixed argv such as [\"python3\", \"-m\", \"pytest\", ...]"
-            } else {
-                ""
-            };
-            err(
-                ErrorKind::Io,
-                &format!("failed to spawn scoring command '{}' ({e}){hint}", argv[0]),
-            )
-        })?;
+        // The real boundary is the OS sandbox: every child enters fresh
+        // user/network/IPC/UTS namespaces. If the kernel refuses, degrade
+        // honestly - the command still runs under rlimits and process-group
+        // isolation, and the receipt says exactly why confinement is off.
+        let (mut child, sandbox_status) = match self.spawn_command(argv, &cwd, true) {
+            Ok(child) => (child, sandbox::SandboxStatus::Applied),
+            Err(setup) => {
+                let reason = setup
+                    .strip_prefix(sandbox::SANDBOX_ERROR_PREFIX)
+                    .unwrap_or(&setup)
+                    .to_string();
+                let child = self
+                    .spawn_command(argv, &cwd, false)
+                    .map_err(|e| err(ErrorKind::Io, &e))?;
+                (child, sandbox::SandboxStatus::Unavailable(reason))
+            }
+        };
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let out_handle = thread::spawn(move || read_capped(stdout, MAX_OUTPUT_BYTES));
@@ -755,6 +717,7 @@ impl ToolRuntime {
         r.command = Some(argv.to_vec());
         r.exit_code = status.code();
         r.output_truncated = out_truncated || err_truncated;
+        r.sandbox = Some(sandbox_status.label());
         if !status.success() {
             return Err(err(
                 ErrorKind::ProcessFailed,
@@ -762,6 +725,89 @@ impl ToolRuntime {
             ));
         }
         Ok(exec(Some(combined), r))
+    }
+
+    /// Spawn one bounded command. With `with_sandbox` the child first
+    /// enters the namespace sandbox; a setup failure surfaces as an
+    /// error carrying sandbox::SANDBOX_ERROR_PREFIX so the caller can
+    /// retry without confinement and report the degradation.
+    fn spawn_command(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        with_sandbox: bool,
+    ) -> Result<std::process::Child, String> {
+        let mut command = Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear();
+        if let Ok(path) = std::env::var("PATH") {
+            command.env("PATH", path);
+        }
+        // Suite checks run with HOME pointed at the disposable workspace, so
+        // Python user-site installs (pip --user, the default under
+        // --break-system-packages) are invisible unless the bench host
+        // exports PYTHONPATH to the real user site-packages. Pass it through
+        // like PATH; it only affects Python subprocesses of suite checks.
+        if let Ok(pythonpath) = std::env::var("PYTHONPATH") {
+            command.env("PYTHONPATH", pythonpath);
+        }
+        command
+            .env("HOME", &*self.root)
+            .env("REX_WORKSPACE", &*self.root);
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if with_sandbox {
+                    if let Err(reason) = sandbox::apply_in_child() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("{}{reason}", sandbox::SANDBOX_ERROR_PREFIX),
+                        ));
+                    }
+                }
+                let cpu = libc::rlimit {
+                    rlim_cur: 120,
+                    rlim_max: 120,
+                };
+                let mem = libc::rlimit {
+                    rlim_cur: 1024 * 1024 * 1024,
+                    rlim_max: 1024 * 1024 * 1024,
+                };
+                let files = libc::rlimit {
+                    rlim_cur: 256,
+                    rlim_max: 256,
+                };
+                if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0
+                    || libc::setrlimit(libc::RLIMIT_AS, &mem) != 0
+                    || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().map_err(|e| {
+            let hint = if e.kind() == std::io::ErrorKind::NotFound {
+                "; suite checks must use an interpreter-prefixed argv such as [\"python3\", \"-m\", \"pytest\", ...]"
+            } else {
+                ""
+            };
+            let message = format!("{e}");
+            if message.starts_with(sandbox::SANDBOX_ERROR_PREFIX) {
+                message
+            } else {
+                format!("failed to spawn scoring command '{}' ({e}){hint}", argv[0])
+            }
+        })
     }
 
     fn resolve_existing(&self, raw: &str, allow_dir: bool) -> Result<PathBuf, ToolError> {
@@ -849,6 +895,7 @@ fn receipt(
         bytes_read,
         bytes_written,
         output_truncated: false,
+        sandbox: None,
         diff: None,
         redactions: 0,
     }
@@ -882,6 +929,7 @@ fn failure(
             output_truncated: false,
             diff: None,
             redactions,
+            sandbox: None,
         },
     }
 }
@@ -1070,6 +1118,26 @@ fn command_policy(argv: &[String]) -> Result<(), ToolError> {
         "node",
         "ruby",
         "perl",
+        // Launcher indirection: these exist to run something else, so a
+        // basename list can never cover what they invoke.
+        "env",
+        "busybox",
+        "xargs",
+        "find",
+        "nohup",
+        "stdbuf",
+        "timeout",
+        "nice",
+        "ionice",
+        "setsid",
+        "taskset",
+        "unshare",
+        "nsenter",
+        "chroot",
+        "bwrap",
+        "firejail",
+        "script",
+        "watch",
     ];
     if denied.contains(&exe.as_str()) {
         return Err(err(ErrorKind::PolicyDenied,"shells, interpreters, network clients, privilege tools, destructive commands, and process-control commands are blocked"));
@@ -1309,6 +1377,102 @@ mod tests {
             Some(ErrorKind::PolicyDenied)
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_launcher_is_hard_denied() {
+        // Audit finding 5 exploit: absolute-path launcher indirection used
+        // to walk past the argv[0] basename denylist.
+        let rt = ToolRuntime::new(temp()).unwrap();
+        for argv0 in ["/usr/bin/env", "/bin/busybox", "xargs", "timeout"] {
+            let p = rt
+                .prepare(ToolRequest::RunCommand {
+                    argv: vec![argv0.into(), "bash".into(), "-c".into(), "id".into()],
+                    cwd: None,
+                    timeout_ms: None,
+                })
+                .unwrap();
+            assert_eq!(p.risk, RiskClass::Denied, "{argv0} must be denied");
+            assert_eq!(
+                rt.execute(&p.call_id).error.unwrap().kind,
+                ErrorKind::PolicyDenied
+            );
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn run_approved(rt: &ToolRuntime, argv: &[&str]) -> ToolResult {
+        let p = rt
+            .prepare(ToolRequest::RunCommand {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                cwd: None,
+                timeout_ms: Some(10_000),
+            })
+            .unwrap();
+        assert_eq!(p.risk, RiskClass::Execute);
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        rt.execute(&p.call_id)
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_gives_child_a_fresh_network_namespace() {
+        let rt = ToolRuntime::new(temp()).unwrap();
+        let r = run_approved(&rt, &["readlink", "/proc/self/ns/net"]);
+        assert!(r.ok, "readlink failed: {:?}", r.error);
+        let status = r
+            .receipt
+            .sandbox
+            .clone()
+            .expect("receipt must carry the sandbox status");
+        let child_ns = r.output.unwrap().replace("stdout:\n", "").trim().to_string();
+        let parent_ns = std::fs::read_link("/proc/self/ns/net")
+            .unwrap()
+            .display()
+            .to_string();
+        if status.starts_with("applied") {
+            assert_ne!(
+                child_ns, parent_ns,
+                "sandboxed child must not share the host network namespace"
+            );
+        } else {
+            assert!(
+                status.starts_with("unavailable: "),
+                "degradation must be explicit, got: {status}"
+            );
+            assert_eq!(child_ns, parent_ns);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandboxed_child_has_no_default_route() {
+        let rt = ToolRuntime::new(temp()).unwrap();
+        let r = run_approved(&rt, &["cat", "/proc/net/route"]);
+        assert!(r.ok, "cat failed: {:?}", r.error);
+        let status = r.receipt.sandbox.clone().unwrap_or_default();
+        let table = r.output.unwrap();
+        if status.starts_with("applied") {
+            // Fresh netns: loopback is down and no route was ever added,
+            // so there is no default route (destination 00000000).
+            assert!(
+                !table.contains("00000000"),
+                "sandboxed child must have no network route: {table}"
+            );
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandboxed_child_maps_root_and_keeps_workspace_writes() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let id = run_approved(&rt, &["id", "-u"]);
+        assert!(id.ok, "id failed: {:?}", id.error);
+        let status = id.receipt.sandbox.clone().unwrap_or_default();
+        if status.starts_with("applied") {
+            let uid = id.output.unwrap().replace("stdout:\n", "").trim().to_string();
+            assert_eq!(uid, "0", "userns root maps back to the real uid");
+        }
+        let t = run_approved(&rt, &["touch", "probe.txt"]);
+        assert!(t.ok, "touch failed: {:?}", t.error);
+        assert!(root.join("probe.txt").exists());
     }
 
     #[test]
