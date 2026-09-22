@@ -144,14 +144,18 @@ impl HarnessDaemon {
         let tools = CustodiedToolRuntime::new(runtime, custody.clone());
         let human_token_hash = load_or_create_human_token(&root)?;
         let artifacts = ArtifactStore::open(&root).map_err(|e| internal(e.to_string()))?;
-        Ok(Self {
+        let daemon = Self {
             root,
             policy,
             custody,
             tools,
             human_token_hash,
             artifacts,
-        })
+        };
+        // Heal any crash window between a promotion commit and the task's
+        // terminal persist before serving new calls.
+        daemon.reconcile_ultra_tasks();
+        Ok(daemon)
     }
 
     /// The final human Stop: terminal fence for any task, gated on the
@@ -1055,6 +1059,13 @@ impl HarnessDaemon {
             "kernel_state":format!("{:?}",view.kernel_state)}),
         )?;
         self.persist(&t)?;
+        // The joined state machine: a kernel failure is a task failure,
+        // and a committed promotion is task completion - replayed from the
+        // durable records on every transition.
+        self.join_ultra_terminal(&mut t)?;
+        let view = bridge
+            .current_view(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?;
         Ok(ultra_view(t.task_id.clone(), &view, self.skill_plan()))
     }
 
@@ -1310,6 +1321,134 @@ impl HarnessDaemon {
         bridge
             .record_daemon_visual(task_id, candidate_id, record)
             .map_err(|e| bridge_err(task_id, e))
+    }
+
+    /// The joined terminal transition (audit finding 2): an Ultra task's
+    /// durable state, its kernel state and its promotion receipt are one
+    /// state machine. The kernel failing fails the task; a committed
+    /// promotion completes it. Both directions are replayed here from the
+    /// durable records, so a crash between the promotion commit and the
+    /// task persist is healed by simply running the join again - at the
+    /// next submission, at promotion, or at daemon open.
+    fn join_ultra_terminal(&self, t: &mut DurableTask) -> Result<(), ProtocolError> {
+        if !t.ultra || t.state.is_terminal() {
+            return Ok(());
+        }
+        let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
+        let Some(adapter) = bridge
+            .load_existing(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?
+        else {
+            return Ok(());
+        };
+        match adapter.kernel().state {
+            KernelState::Failed => {
+                t.state = TaskState::Failed;
+                t.terminal_reason = Some(
+                    "ultra kernel failed: no candidate passed the daemon-executed gates".into(),
+                );
+                self.append_event(
+                    t,
+                    "ultra_task_failed",
+                    json!({"kernel_state":"failed","join":"kernel failure is task failure"}),
+                )?;
+                self.persist(t)?;
+            }
+            KernelState::Completed => {
+                let store = rex_ultra::promotion::PromotionStore::open(self.root.join("ultra"))
+                    .map_err(|e| internal(format!("promotion store: {e:?}")))?;
+                let committed = store
+                    .receipt(&t.task_id)
+                    .map_err(|e| internal(format!("promotion receipt: {e:?}")))?
+                    .filter(|r| r.state == rex_ultra::promotion::PromotionState::Committed);
+                let Some(receipt) = committed else {
+                    // Kernel qualified a candidate but promotion has not
+                    // committed: the task waits, honestly non-terminal.
+                    return Ok(());
+                };
+                let receipt_hash = hash_json(&receipt)?;
+                let qualified = adapter.qualified_candidate().unwrap_or("unknown").to_string();
+                t.evidence.insert(
+                    "ultra_qualified_candidate".into(),
+                    qualified.clone(),
+                );
+                t.evidence
+                    .insert("ultra_promotion_receipt".into(), receipt_hash.clone());
+                t.state = TaskState::Completed;
+                t.terminal_reason = Some(format!(
+                    "ultra promotion committed: candidate {qualified}, receipt {receipt_hash}"
+                ));
+                self.append_event(
+                    t,
+                    "ultra_task_completed",
+                    json!({"kernel_state":"completed","qualified_candidate":qualified,"receipt":receipt_hash}),
+                )?;
+                self.persist(t)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Promotion and the terminal task transition as one crash-safe step.
+    /// The MCP surface keeps this frozen until the rebuilt promotion path
+    /// (phase F) lands; the join itself is exercised directly.
+    #[allow(dead_code)]
+    pub(crate) fn promote_and_join(
+        &self,
+        req: &rex_protocol::UltraPromoteRequest,
+    ) -> Result<rex_ultra::promotion::PromotionReceipt, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
+        require_agent(&t)?;
+        require_ultra(&t)?;
+        let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
+        let contract = bridge
+            .frozen_contract(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?;
+        let adapter = bridge
+            .load_existing(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?
+            .ok_or_else(|| perr(ErrorCode::GateFailed, "ultra kernel is not open", &t.task_id))?;
+        if !matches!(adapter.kernel().state, KernelState::Completed) {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "ultra kernel has not qualified a candidate",
+                &t.task_id,
+            ));
+        }
+        // The promotion store commits with its own crash-safe receipt
+        // sequence; the join below turns a committed receipt into the
+        // task's terminal state. A crash between the two is healed by the
+        // next join (daemon open sweep or any later call).
+        let receipt = bridge
+            .promote(&t.task_id, &contract, &self.policy.workspace)
+            .map_err(|e| bridge_err(&t.task_id, e))?;
+        self.append_event(
+            &mut t,
+            "ultra_promotion",
+            json!({"state":format!("{:?}",receipt.state),"bundle_hash":receipt.bundle_hash}),
+        )?;
+        self.persist(&t)?;
+        self.join_ultra_terminal(&mut t)?;
+        Ok(receipt)
+    }
+
+    /// Crash-recovery sweep at daemon open: replay the join for every
+    /// non-terminal Ultra task. Best-effort per task; a task that cannot
+    /// be loaded fails closed on its next direct access instead of
+    /// blocking the daemon.
+    fn reconcile_ultra_tasks(&self) {
+        let tasks_dir = self.root.join("tasks");
+        let Ok(read) = fs::read_dir(&tasks_dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let Ok(mut t) = self.load(&id) else {
+                continue;
+            };
+            let _ = self.join_ultra_terminal(&mut t);
+        }
     }
 
     pub fn proof_bundle(&self, req: TaskRefRequest) -> Result<TaskProofBundle, ProtocolError> {
@@ -2572,6 +2711,161 @@ mod tests {
         );
         let e = daemon.ultra_submit(unknown).unwrap_err();
         assert_eq!(e.code, ErrorCode::GateFailed);
+    }
+
+    /// Drive an ultra task through candidates until the daemon gates
+    /// settle the kernel; returns the final view.
+    fn drive_ultra_candidates(
+        daemon: &HarnessDaemon,
+        ex: &ExecuteResponse,
+        open: &rex_protocol::UltraViewResponse,
+        contents: &[String],
+    ) -> rex_protocol::UltraViewResponse {
+        let mut view = open.clone();
+        for (c, content) in open.candidate_requests.iter().zip(contents.iter()) {
+            view = daemon
+                .ultra_submit(ultra_req(
+                    &ex.task_id,
+                    &cap_of(ex),
+                    ex.lease.epoch,
+                    UltraSubmissionKind::Candidate,
+                    &c.candidate_id,
+                    &c.candidate_id,
+                    content,
+                ))
+                .unwrap();
+        }
+        view
+    }
+
+    #[test]
+    fn ultra_kernel_failure_fails_the_task_joined() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("r-join-fail")).unwrap();
+        let open = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
+            })
+            .unwrap();
+        // Every candidate carries placeholder content: the daemon's own
+        // adversary scan finds defects in all of them.
+        let contents: Vec<String> = (0..open.candidate_requests.len())
+            .map(|i| {
+                format!(
+                    "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i} TODO: finish\"}}]}}"
+                )
+            })
+            .collect();
+        let view = drive_ultra_candidates(&daemon, &ex, &open, &contents);
+        assert_eq!(view.kernel_state, "failed");
+        // The joined state machine: kernel failure IS task failure.
+        let t = daemon.load(&ex.task_id).unwrap();
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(t
+            .terminal_reason
+            .unwrap_or_default()
+            .contains("ultra kernel failed"));
+    }
+
+    #[test]
+    fn promotion_and_task_completion_are_one_joined_transition() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("r-join-ok")).unwrap();
+        let open = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
+            })
+            .unwrap();
+        let contents: Vec<String> = (0..open.candidate_requests.len())
+            .map(|i| {
+                format!(
+                    "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
+                )
+            })
+            .collect();
+        let view = drive_ultra_candidates(&daemon, &ex, &open, &contents);
+        assert_eq!(view.kernel_state, "completed");
+        // Kernel completion alone leaves the task honestly non-terminal:
+        // only a committed promotion completes it.
+        let t = daemon.load(&ex.task_id).unwrap();
+        assert!(!t.state.is_terminal());
+        let receipt = daemon
+            .promote_and_join(&rex_protocol::UltraPromoteRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+            })
+            .unwrap();
+        assert_eq!(
+            receipt.state,
+            rex_ultra::promotion::PromotionState::Committed
+        );
+        let t = daemon.load(&ex.task_id).unwrap();
+        assert_eq!(t.state, TaskState::Completed);
+        assert!(t.evidence.contains_key("ultra_promotion_receipt"));
+        assert!(t.evidence.contains_key("ultra_qualified_candidate"));
+        assert!(t
+            .terminal_reason
+            .unwrap_or_default()
+            .contains("promotion committed"));
+        // The promoted bundle really landed in the workspace.
+        assert!(w.join("hello.txt").exists());
+    }
+
+    #[test]
+    fn crash_between_promotion_and_task_persist_is_healed_on_open() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let daemon =
+            HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("r-join-crash")).unwrap();
+        let open = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
+            })
+            .unwrap();
+        let contents: Vec<String> = (0..open.candidate_requests.len())
+            .map(|i| {
+                format!(
+                    "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
+                )
+            })
+            .collect();
+        let view = drive_ultra_candidates(&daemon, &ex, &open, &contents);
+        assert_eq!(view.kernel_state, "completed");
+        // Simulate the crash window: the promotion commits (its receipt is
+        // durable) but the daemon dies before the task transition persists.
+        let bridge = UltraHostBridge::open(&root).unwrap();
+        let contract = bridge.frozen_contract(&ex.task_id).unwrap();
+        let receipt = bridge
+            .promote(&ex.task_id, &contract, &w)
+            .unwrap();
+        assert_eq!(
+            receipt.state,
+            rex_ultra::promotion::PromotionState::Committed
+        );
+        drop(daemon);
+        // Reopening replays the join from the durable records.
+        let healed = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let t = healed.load(&ex.task_id).unwrap();
+        assert_eq!(t.state, TaskState::Completed);
+        assert!(t.evidence.contains_key("ultra_promotion_receipt"));
     }
 
     #[test]
