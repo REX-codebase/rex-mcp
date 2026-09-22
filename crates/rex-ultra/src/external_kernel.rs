@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::adversary::{parse_defects, AdversaryReport};
 use crate::contract::AcceptanceContract;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,18 +103,15 @@ pub struct HostEvidenceRequest {
     pub candidate_response_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdversaryEvidence {
-    pub request_id: String,
-    pub candidate_id: String,
-    pub response_hash: String,
-    pub content: String,
-}
-
 /// Request id carried by daemon-executed verifier records: proves the
 /// outcomes were produced by the daemon running the contract, never by a
 /// host claiming "proven".
 pub const DAEMON_VERIFIER_REQUEST: &str = "daemon-verifier";
+
+/// Request id carried by daemon-executed adversary records: proves the
+/// scan was produced by the daemon walking the candidate tree, never by a
+/// host claiming "clean".
+pub const DAEMON_ADVERSARY_REQUEST: &str = "daemon-adversary";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerifierEvidence {
@@ -135,10 +131,10 @@ pub struct VisualEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdversaryEvidenceRecord {
+pub struct DaemonAdversaryRecord {
     pub request_id: String,
     pub response_hash: String,
-    pub report: AdversaryReport,
+    pub report: crate::daemon_adversary::DaemonAdversaryReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,7 +155,8 @@ pub struct VisualEvidenceRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CandidateEvidence {
-    pub adversary: Option<AdversaryEvidenceRecord>,
+    #[serde(default)]
+    pub daemon_adversary: Option<DaemonAdversaryRecord>,
     pub verifier: Option<VerifierEvidenceRecord>,
     #[serde(default)]
     pub visual: Option<VisualEvidenceRecord>,
@@ -385,10 +382,10 @@ impl ExternalHostAdapter {
             .iter()
             .map(|o| o.id.clone())
             .collect();
-        // The verifier is executed by the daemon inside each candidate
-        // workspace; hosts are only ever asked for adversary and (visual)
+        // The verifier and the adversary are executed by the daemon inside
+        // each candidate workspace; hosts are only ever asked for (visual)
         // pixel inputs, never for verdicts on their own work.
-        let mut kinds = vec![EvidenceKind::Adversary];
+        let mut kinds = Vec::new();
         if self.state.contract.work_kind == crate::contract::WorkKind::Visual {
             kinds.push(EvidenceKind::Visual);
         }
@@ -428,34 +425,37 @@ impl ExternalHostAdapter {
             .map_err(|e| AdapterError::Encoding(e.to_string()))
     }
 
-    pub fn record_adversary(&mut self, evidence: AdversaryEvidence) -> Result<(), AdapterError> {
-        let expected =
-            self.expect_evidence_request(EvidenceKind::Adversary, &evidence.candidate_id)?;
-        if evidence.request_id != expected {
-            return Err(AdapterError::UnknownEvidenceRequest);
+    /// Record the daemon's own adversary scan for one candidate. The
+    /// daemon walks the sealed candidate tree itself; host-submitted
+    /// adversary verdicts do not exist on this path.
+    pub fn record_daemon_adversary(
+        &mut self,
+        candidate_id: &str,
+        report: crate::daemon_adversary::DaemonAdversaryReport,
+        receipts_hash: String,
+    ) -> Result<(), AdapterError> {
+        if !self.state.host_attached || self.state.kernel.state != KernelState::AwaitingEvidence {
+            return Err(AdapterError::EvidenceStageNotOpen);
+        }
+        if !self.state.responses.contains_key(candidate_id) {
+            return Err(AdapterError::UnknownCandidate);
         }
         if self
             .state
             .evidence
-            .get(&evidence.candidate_id)
-            .and_then(|e| e.adversary.as_ref())
+            .get(candidate_id)
+            .and_then(|e| e.daemon_adversary.as_ref())
             .is_some()
         {
             return Err(AdapterError::DuplicateEvidence);
         }
-        let expected_hash =
-            canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        if expected_hash != evidence.response_hash {
-            return Err(AdapterError::Encoding("response hash mismatch".into()));
-        }
-        let report = parse_defects(&evidence.content, "external-host");
         self.state
             .evidence
-            .entry(evidence.candidate_id.clone())
+            .entry(candidate_id.to_string())
             .or_default()
-            .adversary = Some(AdversaryEvidenceRecord {
-            request_id: evidence.request_id,
-            response_hash: evidence.response_hash,
+            .daemon_adversary = Some(DaemonAdversaryRecord {
+            request_id: DAEMON_ADVERSARY_REQUEST.into(),
+            response_hash: receipts_hash,
             report,
         });
         self.persist()
@@ -589,8 +589,8 @@ impl ExternalHostAdapter {
         for candidate_id in self.state.responses.keys() {
             let evidence = self.state.evidence.get(candidate_id);
             let adversary_clean = evidence
-                .and_then(|e| e.adversary.as_ref())
-                .map(|a| !a.report.inconclusive && a.report.defects.is_empty())
+                .and_then(|e| e.daemon_adversary.as_ref())
+                .map(|a| a.request_id == DAEMON_ADVERSARY_REQUEST && a.report.clean())
                 .unwrap_or(false);
             let verifier_proven = evidence
                 .and_then(|e| e.verifier.as_ref())
@@ -603,7 +603,7 @@ impl ExternalHostAdapter {
             }
             let complete_record = evidence
                 .map(|e| {
-                    e.adversary.is_some()
+                    e.daemon_adversary.is_some()
                         && e.verifier.is_some()
                         && (self.state.contract.work_kind != crate::contract::WorkKind::Visual
                             || e.visual.is_some())
@@ -847,11 +847,29 @@ mod tests {
         (adapter, requests)
     }
 
-    fn evidence_for(request: &HostEvidenceRequest, content: &str) -> (String, String) {
-        (
-            request.request_id.clone(),
-            canonical_hash(&content).unwrap(),
-        )
+
+    fn clean_adversary_report() -> crate::daemon_adversary::DaemonAdversaryReport {
+        crate::daemon_adversary::DaemonAdversaryReport {
+            defects: Vec::new(),
+            scanned_files: 1,
+            scanned_bytes: 1,
+            tree_hash: "tree".into(),
+            truncated: false,
+        }
+    }
+
+    /// The daemon's own adversary scan, recorded without any host verdict.
+    fn daemon_adversary(adapter: &mut ExternalHostAdapter, candidate_id: &str, clean: bool) {
+        let mut report = clean_adversary_report();
+        if !clean {
+            report.defects.push(crate::adversary::Defect {
+                title: "placeholder content".into(),
+                detail: "index.html contains \"lorem ipsum\"".into(),
+            });
+        }
+        adapter
+            .record_daemon_adversary(candidate_id, report, canonical_hash(&"daemon-scan").unwrap())
+            .unwrap();
     }
 
     /// The daemon's own verifier run: outcomes it produced by executing the
@@ -865,38 +883,10 @@ mod tests {
 
     #[test]
     fn evidence_requests_are_deterministic_per_candidate_and_kind() {
-        let (adapter, requests) = ready_adapter();
-        let evidence_requests = adapter.evidence_requests().unwrap();
-        assert_eq!(evidence_requests.len(), 2);
-        let again = adapter.evidence_requests().unwrap();
-        assert_eq!(evidence_requests, again);
-        let ids: std::collections::BTreeSet<&str> = evidence_requests
-            .iter()
-            .map(|r| r.request_id.as_str())
-            .collect();
-        assert_eq!(ids.len(), 2);
-        for request in &evidence_requests {
-            assert!(requests
-                .iter()
-                .any(|c| c.candidate_id == request.candidate_id));
-            assert_eq!(request.obligation_ids, vec!["builds".to_string()]);
-        }
-        assert_eq!(
-            evidence_requests
-                .iter()
-                .filter(|r| r.kind == EvidenceKind::Adversary)
-                .count(),
-            2
-        );
-        // Verifier requests are never issued to hosts: the daemon executes
-        // the contract proofs itself.
-        assert_eq!(
-            evidence_requests
-                .iter()
-                .filter(|r| r.kind == EvidenceKind::Verifier)
-                .count(),
-            0
-        );
+        let (adapter, _) = ready_adapter();
+        // General contracts issue no host evidence requests at all: the
+        // daemon executes the verifier and the adversary itself.
+        assert!(adapter.evidence_requests().unwrap().is_empty());
     }
 
     #[test]
@@ -913,14 +903,12 @@ mod tests {
                 content,
             })
             .unwrap();
-        let adversary = AdversaryEvidence {
-            request_id: "anything".into(),
-            candidate_id: request.candidate_id.clone(),
-            response_hash: canonical_hash(&"{}").unwrap(),
-            content: "{}".into(),
-        };
         assert_eq!(
-            adapter.record_adversary(adversary),
+            adapter.record_daemon_adversary(
+                &request.candidate_id,
+                clean_adversary_report(),
+                "receipts".into()
+            ),
             Err(AdapterError::EvidenceStageNotOpen)
         );
     }
@@ -928,39 +916,18 @@ mod tests {
     #[test]
     fn adversary_and_verifier_evidence_gates_completion() {
         let (mut adapter, _) = ready_adapter();
-        let requests = adapter.evidence_requests().unwrap();
-        let candidate = requests[0].candidate_id.clone();
-        let adversary_request = requests
-            .iter()
-            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary)
-            .unwrap();
-        let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
+        let candidate = adapter.responses().next().unwrap().candidate_id.clone();
+        // The daemon's scan is the only adversary evidence that exists.
         assert_eq!(
-            adapter.record_adversary(AdversaryEvidence {
-                request_id: "forged".into(),
-                candidate_id: candidate.clone(),
-                response_hash: hash.clone(),
-                content: "{\"defects\":[]}".into(),
-            }),
-            Err(AdapterError::UnknownEvidenceRequest)
+            adapter.record_daemon_adversary("nobody", clean_adversary_report(), "r".into()),
+            Err(AdapterError::UnknownCandidate)
         );
+        daemon_adversary(&mut adapter, &candidate, true);
         assert_eq!(
-            adapter.record_adversary(AdversaryEvidence {
-                request_id: request_id.clone(),
-                candidate_id: candidate.clone(),
-                response_hash: canonical_hash(&"tampered").unwrap(),
-                content: "{\"defects\":[]}".into(),
-            }),
-            Err(AdapterError::Encoding("response hash mismatch".into()))
+            adapter.record_daemon_adversary(&candidate, clean_adversary_report(), "r".into()),
+            Err(AdapterError::DuplicateEvidence)
         );
-        adapter
-            .record_adversary(AdversaryEvidence {
-                request_id,
-                candidate_id: candidate.clone(),
-                response_hash: hash,
-                content: "{\"defects\":[]}".into(),
-            })
-            .unwrap();
+        // A clean adversary scan alone does not qualify.
         assert!(matches!(
             adapter.finalize().unwrap(),
             KernelState::AwaitingEvidence
@@ -983,26 +950,9 @@ mod tests {
     #[test]
     fn unproven_verifier_blocks_completion_until_every_candidate_fails() {
         let (mut adapter, _) = ready_adapter();
-        let requests = adapter.evidence_requests().unwrap();
-        let mut seen = std::collections::BTreeSet::new();
-        for candidate in requests
-            .iter()
-            .map(|r| r.candidate_id.clone())
-            .filter(|c| seen.insert(c.clone()))
-        {
-            let adversary_request = requests
-                .iter()
-                .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary)
-                .unwrap();
-            let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
-            adapter
-                .record_adversary(AdversaryEvidence {
-                    request_id,
-                    candidate_id: candidate.clone(),
-                    response_hash: hash,
-                    content: "{\"defects\":[]}".into(),
-                })
-                .unwrap();
+        let candidates: Vec<String> = adapter.responses().map(|r| r.candidate_id.clone()).collect();
+        for candidate in candidates {
+            daemon_adversary(&mut adapter, &candidate, true);
             daemon_verify(&mut adapter, &candidate, false);
         }
         assert_eq!(adapter.finalize().unwrap(), KernelState::Failed);
@@ -1010,56 +960,32 @@ mod tests {
     }
 
     #[test]
-    fn standing_defects_fail_closed_and_inconclusive_never_cleans() {
+    fn standing_defects_fail_closed_and_truncated_never_cleans() {
         let (mut adapter, _) = ready_adapter();
-        let requests = adapter.evidence_requests().unwrap();
-        let first = requests[0].candidate_id.clone();
-        let adversary_request = requests
-            .iter()
-            .find(|r| r.candidate_id == first && r.kind == EvidenceKind::Adversary)
-            .unwrap();
-        let dirty = "{\"defects\":[{\"title\":\"fake proof\",\"detail\":\"cached result\"}]}";
-        let (request_id, hash) = evidence_for(adversary_request, dirty);
-        adapter
-            .record_adversary(AdversaryEvidence {
-                request_id,
-                candidate_id: first.clone(),
-                response_hash: hash,
-                content: dirty.into(),
-            })
-            .unwrap();
+        let mut candidates = adapter.responses().map(|r| r.candidate_id.clone());
+        let first = candidates.next().unwrap();
+        let second = candidates.next().unwrap();
+        drop(candidates);
+        // A scan with standing defects blocks qualification even with a
+        // proven verifier.
+        daemon_adversary(&mut adapter, &first, false);
+        daemon_verify(&mut adapter, &first, true);
         let record = adapter
             .candidate_evidence(&first)
             .unwrap()
-            .adversary
+            .daemon_adversary
             .as_ref()
             .unwrap();
-        assert!(!record.report.inconclusive);
         assert_eq!(record.report.defects.len(), 1);
-
-        let second = requests
-            .iter()
-            .map(|r| r.candidate_id.clone())
-            .find(|c| *c != first)
-            .unwrap();
-        let adversary_request = requests
-            .iter()
-            .find(|r| r.candidate_id == second && r.kind == EvidenceKind::Adversary)
-            .unwrap();
-        let (request_id, hash) = evidence_for(adversary_request, "could not inspect");
+        // A truncated scan is never clean, so the second candidate cannot
+        // qualify either; fully evidenced with no qualifier fails closed.
+        let mut truncated = clean_adversary_report();
+        truncated.truncated = true;
         adapter
-            .record_adversary(AdversaryEvidence {
-                request_id,
-                candidate_id: second.clone(),
-                response_hash: hash,
-                content: "could not inspect".into(),
-            })
+            .record_daemon_adversary(&second, truncated, "r".into())
             .unwrap();
         daemon_verify(&mut adapter, &second, true);
-        assert!(matches!(
-            adapter.finalize().unwrap(),
-            KernelState::AwaitingEvidence
-        ));
+        assert_eq!(adapter.finalize().unwrap(), KernelState::Failed);
     }
 
     #[test]
@@ -1080,19 +1006,7 @@ mod tests {
             .unwrap();
         assert_eq!(adapter.advance().unwrap(), HostKernelStatus::Ready);
         let requests = adapter.evidence_requests().unwrap();
-        let adversary_request = requests
-            .iter()
-            .find(|r| r.kind == EvidenceKind::Adversary)
-            .unwrap();
-        let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
-        adapter
-            .record_adversary(AdversaryEvidence {
-                request_id,
-                candidate_id: request.candidate_id.clone(),
-                response_hash: hash,
-                content: "{\"defects\":[]}".into(),
-            })
-            .unwrap();
+        daemon_adversary(&mut adapter, &request.candidate_id, true);
 
         let mut recovered = ExternalHostAdapter::open(&path).unwrap();
         assert_eq!(recovered.evidence_requests().unwrap(), requests);
@@ -1149,7 +1063,9 @@ mod tests {
     fn visual_contracts_issue_visual_evidence_requests() {
         let (adapter, _) = ready_visual_adapter();
         let requests = adapter.evidence_requests().unwrap();
-        assert_eq!(requests.len(), 4);
+        // Visual contracts issue exactly one visual request per candidate;
+        // adversary and verifier are daemon-executed, never requested.
+        assert_eq!(requests.len(), 2);
         assert_eq!(
             requests
                 .iter()
@@ -1159,7 +1075,7 @@ mod tests {
         );
         let ids: std::collections::BTreeSet<&str> =
             requests.iter().map(|r| r.request_id.as_str()).collect();
-        assert_eq!(ids.len(), 4);
+        assert_eq!(ids.len(), 2);
     }
 
     #[test]
@@ -1167,23 +1083,12 @@ mod tests {
         let (mut adapter, _) = ready_visual_adapter();
         let requests = adapter.evidence_requests().unwrap();
         let candidate = requests[0].candidate_id.clone();
-        let pick = |kind: EvidenceKind| {
-            requests
-                .iter()
-                .find(|r| r.candidate_id == candidate && r.kind == kind)
-                .unwrap()
-                .clone()
-        };
-        let adversary = pick(EvidenceKind::Adversary);
-        let visual = pick(EvidenceKind::Visual);
-        adapter
-            .record_adversary(AdversaryEvidence {
-                request_id: adversary.request_id.clone(),
-                candidate_id: candidate.clone(),
-                response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(),
-                content: "{\"defects\":[]}".into(),
-            })
-            .unwrap();
+        let visual = requests
+            .iter()
+            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Visual)
+            .unwrap()
+            .clone();
+        daemon_adversary(&mut adapter, &candidate, true);
         daemon_verify(&mut adapter, &candidate, true);
         // clean adversary + proven verifier is not enough for a visual task
         assert!(matches!(
@@ -1284,13 +1189,13 @@ mod tests {
     #[test]
     fn general_contracts_reject_visual_evidence() {
         let (mut adapter, _) = ready_adapter();
-        let requests = adapter.evidence_requests().unwrap();
-        assert!(requests.iter().all(|r| r.kind != EvidenceKind::Visual));
+        assert!(adapter.evidence_requests().unwrap().is_empty());
+        let candidate = adapter.responses().next().unwrap().candidate_id.clone();
         let content = visual_report("thesis-a");
         assert!(matches!(
             adapter.record_visual(VisualEvidence {
                 request_id: "anything".into(),
-                candidate_id: requests[0].candidate_id.clone(),
+                candidate_id: candidate,
                 response_hash: canonical_hash(&content).unwrap(),
                 content,
             }),
@@ -1314,21 +1219,8 @@ mod tests {
     fn finalize_records_the_qualified_candidate() {
         let (mut adapter, _) = ready_adapter();
         assert_eq!(adapter.qualified_candidate(), None);
-        let requests = adapter.evidence_requests().unwrap();
-        let candidate = requests[0].candidate_id.clone();
-        let adversary = requests
-            .iter()
-            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary)
-            .unwrap()
-            .clone();
-        adapter
-            .record_adversary(AdversaryEvidence {
-                request_id: adversary.request_id,
-                candidate_id: candidate.clone(),
-                response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(),
-                content: "{\"defects\":[]}".into(),
-            })
-            .unwrap();
+        let candidate = adapter.responses().next().unwrap().candidate_id.clone();
+        daemon_adversary(&mut adapter, &candidate, true);
         daemon_verify(&mut adapter, &candidate, true);
         assert!(matches!(
             adapter.finalize().unwrap(),

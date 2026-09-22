@@ -20,7 +20,7 @@ use rex_protocol::packets::{OperationStatus, PacketIdentity};
 use rex_protocol::*;
 use rex_tools::{ToolRequest, ToolResult, ToolRuntime};
 use rex_ultra::external_kernel::{
-    AdversaryEvidence, CandidateResponse, EvidenceKind, HostKernelStatus, KernelState,
+    CandidateResponse, EvidenceKind, HostKernelStatus, KernelState,
 };
 use rex_ultra::host_bridge::{
     BridgeError, UltraHostBridge, UltraHostView, DEFAULT_MINIMUM_CANDIDATES,
@@ -1007,18 +1007,16 @@ impl HarnessDaemon {
                     }
                 }
             }
-            UltraSubmissionKind::Adversary => bridge
-                .record_adversary(
+            UltraSubmissionKind::Adversary => {
+                // Adversary scans are executed by the daemon walking each
+                // candidate workspace, never reported by the host whose
+                // work is under review.
+                return Err(perr(
+                    ErrorCode::GateFailed,
+                    "adversary evidence is executed by the daemon; hosts cannot submit verdicts",
                     &t.task_id,
-                    &contract,
-                    AdversaryEvidence {
-                        request_id: req.request_id.clone(),
-                        candidate_id: req.candidate_id,
-                        response_hash: req.response_hash,
-                        content: req.content,
-                    },
-                )
-                .map_err(|e| bridge_err(&t.task_id, e))?,
+                ));
+            }
             UltraSubmissionKind::Verifier => {
                 // Verifier outcomes come from the daemon executing the
                 // frozen contract inside each candidate workspace, never
@@ -1159,9 +1157,10 @@ impl HarnessDaemon {
         Ok(root)
     }
 
-    /// The daemon-executed verifier: run every frozen contract proof inside
-    /// each candidate workspace that still lacks a verifier record, record
-    /// the outcomes, and let the kernel finalize. Hosts play no part.
+    /// The daemon-executed gates: run the adversary scan and every frozen
+    /// contract proof inside each candidate workspace that still lacks the
+    /// record, record the outcomes, and let the kernel finalize. Hosts play
+    /// no part.
     fn run_daemon_verifier(
         &self,
         t: &DurableTask,
@@ -1180,7 +1179,7 @@ impl HarnessDaemon {
         ) {
             return Ok(());
         }
-        let pending: Vec<String> = adapter
+        let pending_verifier: Vec<String> = adapter
             .responses()
             .map(|r| r.candidate_id.clone())
             .filter(|cid| {
@@ -1190,8 +1189,32 @@ impl HarnessDaemon {
                     .is_none()
             })
             .collect();
+        let pending_adversary: Vec<String> = adapter
+            .responses()
+            .map(|r| r.candidate_id.clone())
+            .filter(|cid| {
+                adapter
+                    .candidate_evidence(cid)
+                    .and_then(|e| e.daemon_adversary.as_ref())
+                    .is_none()
+            })
+            .collect();
         drop(adapter);
-        for candidate_id in pending {
+        for candidate_id in pending_adversary {
+            let root = self.candidate_root(&t.task_id, &candidate_id);
+            let report = rex_ultra::daemon_adversary::scan(&root);
+            let receipts_hash = hash_json(&report)?;
+            let view = bridge
+                .record_daemon_adversary(&t.task_id, &candidate_id, report, receipts_hash)
+                .map_err(|e| bridge_err(&t.task_id, e))?;
+            // A recorded scan can settle the kernel (qualified or failed
+            // closed); later candidates then keep their incomplete records
+            // as the honest state of the run.
+            if !matches!(view.kernel_state, KernelState::AwaitingEvidence) {
+                return Ok(());
+            }
+        }
+        for candidate_id in pending_verifier {
             let root = self.candidate_root(&t.task_id, &candidate_id);
             let outcomes = rex_ultra::daemon_verify::execute_proofs(contract, &root);
             let receipts_hash = hash_json(&outcomes)?;
@@ -1199,9 +1222,12 @@ impl HarnessDaemon {
                 .iter()
                 .map(|o| (o.obligation_id.clone(), o.proven))
                 .collect();
-            bridge
+            let view = bridge
                 .record_daemon_verifier(&t.task_id, &candidate_id, map, receipts_hash)
                 .map_err(|e| bridge_err(&t.task_id, e))?;
+            if !matches!(view.kernel_state, KernelState::AwaitingEvidence) {
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -2168,11 +2194,12 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(view.status, "ready");
-        assert_eq!(view.kernel_state, "awaiting_evidence");
-        // The daemon has already executed the contract proofs inside every
-        // candidate workspace; hosts are only asked for adversary input.
-        assert_eq!(view.evidence_requests.len(), 3);
-        let candidate = view.evidence_requests[0].candidate_id.clone();
+        // The daemon has already executed the adversary scan and the
+        // contract proofs inside every candidate workspace; the clean
+        // bundles qualify the first candidate without any host input.
+        assert_eq!(view.kernel_state, "completed");
+        assert!(view.evidence_requests.is_empty());
+        let candidate = view.candidate_requests[0].candidate_id.clone();
         // A host claiming verifier outcomes is rejected: the daemon runs
         // the verifier, hosts never set verdicts.
         let forged_verdict = daemon.ultra_submit(ultra_req(
@@ -2185,26 +2212,17 @@ mod tests {
             "{\"outcomes\":[{\"obligation_id\":\"ob-1\",\"status\":\"proven\"}]}",
         ));
         assert!(forged_verdict.is_err());
-        let pending: Vec<UltraEvidenceRequestView> = view
-            .evidence_requests
-            .iter()
-            .filter(|r| r.candidate_id == candidate)
-            .cloned()
-            .collect();
-        for r in &pending {
-            view = daemon
-                .ultra_submit(ultra_req(
-                &ex.task_id,
-                &cap_of(&ex),
-                ex.lease.epoch,
-                    UltraSubmissionKind::Adversary,
-                    &r.request_id,
-                    &r.candidate_id,
-                    "{\"defects\":[]}",
-                ))
-                .unwrap();
-        }
-        assert_eq!(view.kernel_state, "completed");
+        // A host claiming a clean adversary scan is likewise rejected.
+        let forged_adversary = daemon.ultra_submit(ultra_req(
+            &ex.task_id,
+            &cap_of(&ex),
+            ex.lease.epoch,
+            UltraSubmissionKind::Adversary,
+            "anything",
+            &candidate,
+            "{\"defects\":[]}",
+        ));
+        assert!(forged_adversary.is_err());
         let reopened =
             HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
         let again = reopened
@@ -2385,26 +2403,8 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let candidate = view.evidence_requests[0].candidate_id.clone();
-        let pending: Vec<UltraEvidenceRequestView> = view
-            .evidence_requests
-            .iter()
-            .filter(|r| r.candidate_id == candidate)
-            .cloned()
-            .collect();
-        for r in &pending {
-            view = daemon
-                .ultra_submit(ultra_req(
-                &ex.task_id,
-                &cap_of(&ex),
-                ex.lease.epoch,
-                    UltraSubmissionKind::Adversary,
-                    &r.request_id,
-                    &r.candidate_id,
-                    "{\"defects\":[]}",
-                ))
-                .unwrap();
-        }
+        // The daemon-executed gates qualify the first clean candidate with
+        // no host input at all.
         assert_eq!(view.kernel_state, "completed");
         // AUDIT FREEZE: even with a completed kernel, promotion fails closed
         // and writes nothing into the workspace.
@@ -2612,26 +2612,15 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let candidate = view.evidence_requests[0].candidate_id.clone();
-        for r in view
-            .evidence_requests
+        // The daemon-executed gates qualified a candidate with no host
+        // input; qualification order is the kernel's deterministic
+        // candidate-id order, not submission order.
+        let candidate = view
+            .candidate_requests
             .iter()
-            .filter(|r| r.candidate_id == candidate)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            view = daemon
-                .ultra_submit(ultra_req(
-                &ex.task_id,
-                &cap_of(&ex),
-                ex.lease.epoch,
-                    UltraSubmissionKind::Adversary,
-                    &r.request_id,
-                    &r.candidate_id,
-                    "{\"defects\":[]}",
-                ))
-                .unwrap();
-        }
+            .map(|c| c.candidate_id.clone())
+            .min()
+            .unwrap();
         assert_eq!(view.kernel_state, "completed");
         // AUDIT FREEZE: promotion fails closed; the proof bundle records no
         // promotion rather than claiming one.

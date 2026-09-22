@@ -449,9 +449,7 @@ impl PromotionStore {
 mod tests {
     use super::*;
     use crate::contract::{AcceptanceContract, Obligation, Proof};
-    use crate::external_kernel::{
-        AdversaryEvidence, CandidateResponse, EvidenceKind, VerifierEvidence,
-    };
+    use crate::external_kernel::CandidateResponse;
     use tempfile::tempdir;
 
     fn contract() -> AcceptanceContract {
@@ -489,19 +487,18 @@ mod tests {
             })
             .unwrap();
         adapter.advance().unwrap();
-        let requests = adapter.evidence_requests().unwrap();
-        let adversary = requests
-            .iter()
-            .find(|r| r.kind == EvidenceKind::Adversary)
-            .unwrap()
-            .clone();
         adapter
-            .record_adversary(AdversaryEvidence {
-                request_id: adversary.request_id,
-                candidate_id: request.candidate_id.clone(),
-                response_hash: canonical_hash(&"{\"defects\":[]}").unwrap(),
-                content: "{\"defects\":[]}".into(),
-            })
+            .record_daemon_adversary(
+                &request.candidate_id,
+                crate::daemon_adversary::DaemonAdversaryReport {
+                    defects: Vec::new(),
+                    scanned_files: 1,
+                    scanned_bytes: 1,
+                    tree_hash: "tree".into(),
+                    truncated: false,
+                },
+                canonical_hash(&"daemon-scan").unwrap(),
+            )
             .unwrap();
         adapter
             .record_daemon_verifier(
