@@ -113,6 +113,10 @@ pub const DAEMON_VERIFIER_REQUEST: &str = "daemon-verifier";
 /// host claiming "clean".
 pub const DAEMON_ADVERSARY_REQUEST: &str = "daemon-adversary";
 
+/// Request id carried by daemon-executed visual records: the daemon
+/// decoded the declared artifacts itself and measured the pixels.
+pub const DAEMON_VISUAL_REQUEST: &str = "daemon-visual";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerifierEvidence {
     pub request_id: String,
@@ -128,6 +132,25 @@ pub struct VisualEvidence {
     pub candidate_id: String,
     pub response_hash: String,
     pub content: String,
+}
+
+/// The daemon's own visual verification: pixel metrics decoded from the
+/// content-addressed artifacts the host's visual declaration pointed at,
+/// plus the pass/fail the daemon computed. A host's description of its
+/// own render is never the gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonVisualRecord {
+    pub request_id: String,
+    pub response_hash: String,
+    pub thesis_id: String,
+    /// One entry per declared screenshot artifact, decoded by the daemon.
+    pub metrics: Vec<crate::pixel::PixelMetrics>,
+    pub replay_hash: String,
+    /// 8x8 average hash of the desktop render, used for the machine
+    /// distinct-thesis check.
+    pub ahash: u64,
+    pub passed: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -160,6 +183,8 @@ pub struct CandidateEvidence {
     pub verifier: Option<VerifierEvidenceRecord>,
     #[serde(default)]
     pub visual: Option<VisualEvidenceRecord>,
+    #[serde(default)]
+    pub daemon_visual: Option<DaemonVisualRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -562,6 +587,81 @@ impl ExternalHostAdapter {
         self.persist()
     }
 
+    /// Record the daemon's own visual verification for one candidate. The
+    /// daemon decoded the declared artifacts itself; the record binds the
+    /// thesis to measured pixels. The machine distinct-thesis check runs
+    /// here: a render too close to another candidate's already-recorded
+    /// render cannot pass, however it arrived.
+    pub fn record_daemon_visual(
+        &mut self,
+        candidate_id: &str,
+        mut record: DaemonVisualRecord,
+    ) -> Result<(), AdapterError> {
+        if self.state.contract.work_kind != crate::contract::WorkKind::Visual {
+            return Err(AdapterError::InvalidEvidence(
+                "daemon visual record for a non-visual contract".into(),
+            ));
+        }
+        if !self.state.host_attached || self.state.kernel.state != KernelState::AwaitingEvidence {
+            return Err(AdapterError::EvidenceStageNotOpen);
+        }
+        if !self.state.responses.contains_key(candidate_id) {
+            return Err(AdapterError::UnknownCandidate);
+        }
+        // The daemon verifies what the host declared; a visual record
+        // without the host's declaration has nothing to bind to.
+        let declared = self
+            .state
+            .evidence
+            .get(candidate_id)
+            .and_then(|e| e.visual.as_ref())
+            .ok_or(AdapterError::InvalidEvidence(
+                "no host visual declaration to verify".into(),
+            ))?;
+        if declared.report.thesis_id != record.thesis_id {
+            return Err(AdapterError::InvalidEvidence(
+                "daemon visual record thesis does not match the declaration".into(),
+            ));
+        }
+        if self
+            .state
+            .evidence
+            .get(candidate_id)
+            .and_then(|e| e.daemon_visual.as_ref())
+            .is_some()
+        {
+            return Err(AdapterError::DuplicateEvidence);
+        }
+        record.request_id = DAEMON_VISUAL_REQUEST.into();
+        if record.passed {
+            for (other_id, existing) in &self.state.evidence {
+                if other_id == candidate_id {
+                    continue;
+                }
+                let Some(other) = existing.daemon_visual.as_ref() else {
+                    continue;
+                };
+                if !other.passed {
+                    continue;
+                }
+                let distance = crate::pixel::ahash_distance(record.ahash, other.ahash);
+                if distance < crate::pixel::MIN_AHASH_DISTANCE {
+                    record.passed = false;
+                    record.detail = format!(
+                        "render is not machine-distinct from candidate {other_id} (ahash distance {distance})"
+                    );
+                    break;
+                }
+            }
+        }
+        self.state
+            .evidence
+            .entry(candidate_id.to_string())
+            .or_default()
+            .daemon_visual = Some(record);
+        self.persist()
+    }
+
     pub fn candidate_evidence(&self, candidate_id: &str) -> Option<&CandidateEvidence> {
         self.state.evidence.get(candidate_id)
     }
@@ -584,49 +684,72 @@ impl ExternalHostAdapter {
         if self.state.kernel.state != KernelState::AwaitingEvidence {
             return Ok(self.state.kernel.state);
         }
-        let mut qualified: Option<String> = None;
+        let visual_contract = self.state.contract.work_kind == crate::contract::WorkKind::Visual;
         let mut fully_evidenced = true;
+        // The winner is chosen from the whole field, never first-clean:
+        // every candidate must be fully evidenced, then the highest score
+        // wins with the smallest candidate id breaking ties.
+        let mut best: Option<(u64, String)> = None;
         for candidate_id in self.state.responses.keys() {
             let evidence = self.state.evidence.get(candidate_id);
-            let adversary_clean = evidence
-                .and_then(|e| e.daemon_adversary.as_ref())
-                .map(|a| a.request_id == DAEMON_ADVERSARY_REQUEST && a.report.clean())
-                .unwrap_or(false);
-            let verifier_proven = evidence
-                .and_then(|e| e.verifier.as_ref())
-                .map(|v| v.all_proven && v.request_id == DAEMON_VERIFIER_REQUEST)
-                .unwrap_or(false);
-            let visual_ok = self.state.contract.work_kind != crate::contract::WorkKind::Visual
-                || evidence.and_then(|e| e.visual.as_ref()).is_some();
-            if adversary_clean && verifier_proven && visual_ok && qualified.is_none() {
-                qualified = Some(candidate_id.clone());
-            }
             let complete_record = evidence
                 .map(|e| {
                     e.daemon_adversary.is_some()
                         && e.verifier.is_some()
-                        && (self.state.contract.work_kind != crate::contract::WorkKind::Visual
-                            || e.visual.is_some())
+                        && (!visual_contract || (e.visual.is_some() && e.daemon_visual.is_some()))
                 })
                 .unwrap_or(false);
             if !complete_record {
                 fully_evidenced = false;
+                continue;
+            }
+            let evidence = evidence.expect("complete record");
+            let adversary_clean = evidence
+                .daemon_adversary
+                .as_ref()
+                .map(|a| a.request_id == DAEMON_ADVERSARY_REQUEST && a.report.clean())
+                .unwrap_or(false);
+            let verifier_proven = evidence
+                .verifier
+                .as_ref()
+                .map(|v| v.all_proven && v.request_id == DAEMON_VERIFIER_REQUEST)
+                .unwrap_or(false);
+            let visual_ok = !visual_contract
+                || evidence
+                    .daemon_visual
+                    .as_ref()
+                    .map(|v| v.request_id == DAEMON_VISUAL_REQUEST && v.passed)
+                    .unwrap_or(false);
+            if !(adversary_clean && verifier_proven && visual_ok) {
+                continue;
+            }
+            let score = candidate_score(evidence, visual_contract);
+            let replace = match &best {
+                None => true,
+                Some((best_score, best_id)) => {
+                    score > *best_score || (score == *best_score && *candidate_id < *best_id)
+                }
+            };
+            if replace {
+                best = Some((score, candidate_id.clone()));
             }
         }
-        if let Some(candidate_id) = qualified {
-            self.state.qualified_candidate = Some(candidate_id);
-            self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Complete)
+        if fully_evidenced && !self.state.responses.is_empty() {
+            if let Some((_, candidate_id)) = best {
+                self.state.qualified_candidate = Some(candidate_id);
+                self.state.kernel = transition(self.state.kernel.clone(), KernelEvent::Complete)
+                    .map_err(AdapterError::Kernel)?;
+                self.persist()?;
+            } else {
+                self.state.kernel = transition(
+                    self.state.kernel.clone(),
+                    KernelEvent::Fail {
+                        reason: "every candidate rejected by adversary, verifier or visual evidence".into(),
+                    },
+                )
                 .map_err(AdapterError::Kernel)?;
-            self.persist()?;
-        } else if fully_evidenced && !self.state.responses.is_empty() {
-            self.state.kernel = transition(
-                self.state.kernel.clone(),
-                KernelEvent::Fail {
-                    reason: "every candidate rejected by adversary or verifier evidence".into(),
-                },
-            )
-            .map_err(AdapterError::Kernel)?;
-            self.persist()?;
+                self.persist()?;
+            }
         }
         Ok(self.state.kernel.state)
     }
@@ -641,6 +764,31 @@ impl ExternalHostAdapter {
         fs::write(&temporary, bytes).map_err(io_error)?;
         fs::rename(&temporary, path).map_err(io_error)
     }
+}
+
+/// Deterministic quality score over daemon-measured evidence. Visual
+/// candidates score on measured pixel richness - distinct colors weighted
+/// above luma variance - so a fuller render beats a thinner one. General
+/// contracts carry no quality signal beyond pass/fail, so every qualifier
+/// scores zero and the smallest candidate id wins the tie; nothing
+/// claims otherwise.
+fn candidate_score(evidence: &CandidateEvidence, visual_contract: bool) -> u64 {
+    if !visual_contract {
+        return 0;
+    }
+    evidence
+        .daemon_visual
+        .as_ref()
+        .map(|record| {
+            record
+                .metrics
+                .iter()
+                .map(|m| {
+                    (m.distinct_colors.min(4096) as u64) * 65_536 + m.luma_variance.min(65_535)
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 fn io_error(error: std::io::Error) -> AdapterError {
@@ -872,6 +1020,28 @@ mod tests {
             .unwrap();
     }
 
+    /// A daemon visual record as the daemon would produce it.
+    fn daemon_visual_record(thesis: &str, ahash: u64, passed: bool) -> DaemonVisualRecord {
+        DaemonVisualRecord {
+            request_id: String::new(),
+            response_hash: "receipts".into(),
+            thesis_id: thesis.into(),
+            metrics: vec![crate::pixel::PixelMetrics {
+                artifact_hash: "a".repeat(64),
+                width: 1280,
+                height: 800,
+                distinct_colors: 100,
+                mean_luma: 120,
+                luma_variance: 900,
+                ahash,
+            }],
+            replay_hash: "c".repeat(64),
+            ahash,
+            passed,
+            detail: "decoded and measured by the daemon".into(),
+        }
+    }
+
     /// The daemon's own verifier run: outcomes it produced by executing the
     /// contract, recorded without any host verdict.
     fn daemon_verify(adapter: &mut ExternalHostAdapter, candidate_id: &str, proven: bool) {
@@ -943,8 +1113,21 @@ mod tests {
             Err(AdapterError::DuplicateEvidence)
         );
 
+        // The rest of the field is not evidenced yet: never first-clean.
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::AwaitingEvidence
+        ));
+        let other = adapter
+            .responses()
+            .map(|r| r.candidate_id.clone())
+            .find(|c| *c != candidate)
+            .unwrap();
+        daemon_adversary(&mut adapter, &other, false);
+        daemon_verify(&mut adapter, &other, true);
         assert_eq!(adapter.finalize().unwrap(), KernelState::Completed);
         assert_eq!(adapter.kernel().state, KernelState::Completed);
+        assert_eq!(adapter.qualified_candidate(), Some(candidate.as_str()));
     }
 
     #[test]
@@ -1118,6 +1301,47 @@ mod tests {
                 content: good,
             })
             .unwrap();
+        // The host's own declaration is still not the gate: the daemon
+        // must decode and measure the pixels itself.
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::AwaitingEvidence
+        ));
+        adapter
+            .record_daemon_visual(&candidate, daemon_visual_record("thesis-a", 0xAAAA_5555_AAAA_5555, true))
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::AwaitingEvidence
+        ));
+        // The rest of the field must be evidenced before anyone wins.
+        let other = adapter
+            .responses()
+            .map(|r| r.candidate_id.clone())
+            .find(|c| *c != candidate)
+            .unwrap();
+        let other_visual = adapter
+            .evidence_requests()
+            .unwrap()
+            .iter()
+            .find(|r| r.candidate_id == other && r.kind == EvidenceKind::Visual)
+            .unwrap()
+            .request_id
+            .clone();
+        let good_other = visual_report("thesis-b");
+        adapter
+            .record_visual(VisualEvidence {
+                request_id: other_visual,
+                candidate_id: other.clone(),
+                response_hash: canonical_hash(&good_other).unwrap(),
+                content: good_other,
+            })
+            .unwrap();
+        daemon_adversary(&mut adapter, &other, true);
+        daemon_verify(&mut adapter, &other, true);
+        adapter
+            .record_daemon_visual(&other, daemon_visual_record("thesis-b", 0x5555_AAAA_5555_AAAA, true))
+            .unwrap();
         assert!(matches!(
             adapter.finalize().unwrap(),
             KernelState::Completed
@@ -1224,8 +1448,113 @@ mod tests {
         daemon_verify(&mut adapter, &candidate, true);
         assert!(matches!(
             adapter.finalize().unwrap(),
+            KernelState::AwaitingEvidence
+        ));
+        let other = adapter
+            .responses()
+            .map(|r| r.candidate_id.clone())
+            .find(|c| *c != candidate)
+            .unwrap();
+        daemon_adversary(&mut adapter, &other, true);
+        daemon_verify(&mut adapter, &other, false);
+        assert!(matches!(
+            adapter.finalize().unwrap(),
             KernelState::Completed
         ));
         assert_eq!(adapter.qualified_candidate(), Some(candidate.as_str()));
+    }
+
+    #[test]
+    fn the_winner_is_the_best_score_not_the_first_clean() {
+        let (mut adapter, _) = ready_visual_adapter();
+        let mut ids = adapter.responses().map(|r| r.candidate_id.clone());
+        let first = ids.next().unwrap();
+        let second = ids.next().unwrap();
+        drop(ids);
+        // The first candidate is gated clean but plain; the second is
+        // gated clean with a richer render. Both submit host declarations.
+        let mut rich = daemon_visual_record("thesis-b", 0b1111_0000_1111_0000, true);
+        rich.metrics[0].distinct_colors = 4000;
+        rich.metrics[0].luma_variance = 60_000;
+        let plain = daemon_visual_record("thesis-a", 0b0000_1111_0000_1111, true);
+        for (candidate, thesis) in [(&first, "thesis-a"), (&second, "thesis-b")] {
+            let good = visual_report(thesis);
+            adapter
+                .record_visual(VisualEvidence {
+                    request_id: adapter
+                        .evidence_requests()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r.candidate_id == *candidate && r.kind == EvidenceKind::Visual)
+                        .unwrap()
+                        .request_id
+                        .clone(),
+                    candidate_id: candidate.clone(),
+                    response_hash: canonical_hash(&good).unwrap(),
+                    content: good,
+                })
+                .unwrap();
+            daemon_adversary(&mut adapter, candidate, true);
+            daemon_verify(&mut adapter, candidate, true);
+        }
+        adapter
+            .record_daemon_visual(&first, plain)
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::AwaitingEvidence
+        ));
+        adapter.record_daemon_visual(&second, rich).unwrap();
+        assert_eq!(adapter.finalize().unwrap(), KernelState::Completed);
+        assert_eq!(adapter.qualified_candidate(), Some(second.as_str()));
+    }
+
+    #[test]
+    fn renders_too_close_to_another_candidate_fail_the_machine_check() {
+        let (mut adapter, _) = ready_visual_adapter();
+        let mut ids = adapter.responses().map(|r| r.candidate_id.clone());
+        let first = ids.next().unwrap();
+        let second = ids.next().unwrap();
+        drop(ids);
+        adapter
+            .record_daemon_visual(&first, daemon_visual_record("thesis-a", 0xFFFF_0000_FFFF_0000, true))
+            .unwrap_err(); // no host declaration yet: nothing to bind to
+        for (candidate, thesis) in [(&first, "thesis-a"), (&second, "thesis-b")] {
+            let good = visual_report(thesis);
+            adapter
+                .record_visual(VisualEvidence {
+                    request_id: adapter
+                        .evidence_requests()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r.candidate_id == *candidate && r.kind == EvidenceKind::Visual)
+                        .unwrap()
+                        .request_id
+                        .clone(),
+                    candidate_id: candidate.clone(),
+                    response_hash: canonical_hash(&good).unwrap(),
+                    content: good,
+                })
+                .unwrap();
+            daemon_adversary(&mut adapter, candidate, true);
+            daemon_verify(&mut adapter, candidate, true);
+        }
+        adapter
+            .record_daemon_visual(&first, daemon_visual_record("thesis-a", 0xFFFF_0000_FFFF_0000, true))
+            .unwrap();
+        // One bit apart: the second render is a copycat and cannot pass.
+        adapter
+            .record_daemon_visual(&second, daemon_visual_record("thesis-b", 0xFFFF_0000_FFFF_0001, true))
+            .unwrap();
+        let record = adapter
+            .candidate_evidence(&second)
+            .unwrap()
+            .daemon_visual
+            .as_ref()
+            .unwrap();
+        assert!(!record.passed);
+        assert!(record.detail.contains("not machine-distinct"));
+        assert_eq!(adapter.finalize().unwrap(), KernelState::Completed);
+        assert_eq!(adapter.qualified_candidate(), Some(first.as_str()));
     }
 }

@@ -1199,7 +1199,29 @@ impl HarnessDaemon {
                     .is_none()
             })
             .collect();
+        // Visual contracts: the daemon decodes the artifacts the host's
+        // visual declaration pointed at. Candidates without a declaration
+        // yet simply wait - their host owes the declaration.
+        let pending_visual: Vec<(String, rex_ultra::taste::TasteGateReport)> = adapter
+            .responses()
+            .filter_map(|r| {
+                let evidence = adapter.candidate_evidence(&r.candidate_id)?;
+                if evidence.daemon_visual.is_some() {
+                    return None;
+                }
+                evidence
+                    .visual
+                    .as_ref()
+                    .map(|v| (r.candidate_id.clone(), v.report.clone()))
+            })
+            .collect();
         drop(adapter);
+        for (candidate_id, declaration) in pending_visual {
+            let view = self.run_daemon_visual(&t.task_id, bridge, &candidate_id, &declaration)?;
+            if !matches!(view.kernel_state, KernelState::AwaitingEvidence) {
+                return Ok(());
+            }
+        }
         for candidate_id in pending_adversary {
             let root = self.candidate_root(&t.task_id, &candidate_id);
             let report = rex_ultra::daemon_adversary::scan(&root);
@@ -1230,6 +1252,64 @@ impl HarnessDaemon {
             }
         }
         Ok(())
+    }
+
+    /// The daemon-executed visual gate: read every declared artifact from
+    /// the content-addressed store (which re-hashes on read), decode the
+    /// pixels, and record measured metrics. Any missing, tampered or
+    /// undecodable artifact fails the candidate honestly.
+    fn run_daemon_visual(
+        &self,
+        task_id: &str,
+        bridge: &UltraHostBridge,
+        candidate_id: &str,
+        declaration: &rex_ultra::taste::TasteGateReport,
+    ) -> Result<UltraHostView, ProtocolError> {
+        let store = rex_ultra::artifacts::ArtifactStore::open(&self.root)
+            .map_err(|e| internal(e.to_string()))?;
+        let mut metrics = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        let mut desktop_ahash: Option<u64> = None;
+        for shot in &declaration.screenshots {
+            match store
+                .get(&shot.artifact_hash)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| rex_ultra::pixel::decode_metrics(&bytes, &shot.artifact_hash))
+            {
+                Ok(m) => {
+                    if let Err(floor) = m.passes_floor() {
+                        failures.push(format!("{:?} viewport: {floor}", shot.viewport));
+                    }
+                    if shot.viewport == rex_ultra::taste::ViewportClass::Desktop {
+                        desktop_ahash = Some(m.ahash);
+                    }
+                    metrics.push(m);
+                }
+                Err(e) => failures.push(format!("{:?} viewport: {e}", shot.viewport)),
+            }
+        }
+        if store.get(&declaration.interaction_replay_hash).is_err() {
+            failures.push("interaction replay artifact is not in the store".into());
+        }
+        let passed = failures.is_empty() && metrics.len() == declaration.screenshots.len();
+        let detail = if passed {
+            "every declared artifact decoded and passed the pixel floor".to_string()
+        } else {
+            format!("pixel gate failed: {}", failures.join("; "))
+        };
+        let record = rex_ultra::external_kernel::DaemonVisualRecord {
+            request_id: String::new(),
+            response_hash: hash_json(&metrics)?,
+            thesis_id: declaration.thesis_id.clone(),
+            metrics,
+            replay_hash: declaration.interaction_replay_hash.clone(),
+            ahash: desktop_ahash.unwrap_or(0),
+            passed,
+            detail,
+        };
+        bridge
+            .record_daemon_visual(task_id, candidate_id, record)
+            .map_err(|e| bridge_err(task_id, e))
     }
 
     pub fn proof_bundle(&self, req: TaskRefRequest) -> Result<TaskProofBundle, ProtocolError> {
@@ -2236,6 +2316,210 @@ mod tests {
         assert_eq!(again.kernel_state, "completed");
         assert!(again.evidence_requests.is_empty());
     }
+    fn make_png(width: u32, height: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgb.extend_from_slice(&f(x, y));
+            }
+        }
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgb).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn visual_ultra_loop_is_gated_by_daemon_decoded_pixels() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut r = req("r-visual");
+        r.task = "build a website landing page with animation".into();
+        let ex = daemon.execute(r).unwrap();
+        let open = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
+            })
+            .unwrap();
+        assert_eq!(open.candidate_requests[0].work_kind, "visual");
+        let mut view = open.clone();
+        for (i, c) in open.candidate_requests.iter().enumerate() {
+            let content = format!(
+                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
+            );
+            view = daemon
+                .ultra_submit(ultra_req(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    UltraSubmissionKind::Candidate,
+                    &c.candidate_id,
+                    &c.candidate_id,
+                    &content,
+                ))
+                .unwrap();
+        }
+        // Daemon adversary and verifier records exist, but visual work
+        // waits for the host's declaration and the daemon's pixel check.
+        assert_eq!(view.kernel_state, "awaiting_evidence");
+        assert_eq!(view.evidence_requests.len(), 3);
+        let put = |bytes: &[u8], kind: &str| {
+            daemon
+                .artifact_put(ArtifactPutRequest {
+                    task_id: ex.task_id.clone(),
+                    capability: cap_of(&ex),
+                    lease_epoch: ex.lease.epoch,
+                    kind: kind.into(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    candidate_id: None,
+                    round: None,
+                })
+                .unwrap()
+                .sha256
+        };
+        // Candidate 2 renders richest; the daemon must pick it over the
+        // earlier declarations. Renders are pairwise machine-distinct.
+        let renders = [
+            make_png(128, 96, |x, y| [(x % 64) as u8 * 4, (y % 32) as u8 * 8, 0]),
+            make_png(128, 96, |x, y| [0, (x % 32) as u8 * 8, (y % 64) as u8 * 4]),
+            make_png(128, 96, |x, y| [(x % 256) as u8, (y % 256) as u8, ((x * y) % 256) as u8]),
+        ];
+        let phone = |i: u32| {
+            make_png(64, 128, move |x, y| {
+                [
+                    255 - ((x + i * 16) % 64) as u8 * 4,
+                    ((y + i * 32) % 128) as u8 * 2,
+                    (7 + i) as u8,
+                ]
+            })
+        };
+        let requests = view.evidence_requests.clone();
+        for (i, request) in requests.iter().enumerate() {
+            let desktop = put(&renders[i], "screenshot");
+            let phone_hash = put(&phone(i as u32), "screenshot");
+            let replay = put(format!("replay-bytes-{i}").as_bytes(), "replay");
+            let report = serde_json::json!({
+                "thesis_id": format!("thesis-{i}"),
+                "screenshots": [
+                    {"viewport": "desktop", "artifact_hash": desktop},
+                    {"viewport": "phone", "artifact_hash": phone_hash},
+                ],
+                "interaction_replay_hash": replay,
+                "forbidden_patterns_hit": [],
+                "critic_clean": true,
+            })
+            .to_string();
+            view = daemon
+                .ultra_submit(ultra_req(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    UltraSubmissionKind::Visual,
+                    &request.request_id,
+                    &request.candidate_id,
+                    &report,
+                ))
+                .unwrap();
+        }
+        assert_eq!(view.kernel_state, "completed");
+        let expected = &view.candidate_requests[2].candidate_id;
+        let bundle = daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: ex.task_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(bundle.qualified_candidate.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn visual_declaration_with_garbage_pixels_cannot_qualify() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut r = req("r-visual-garbage");
+        r.task = "build a website landing page with animation".into();
+        let ex = daemon.execute(r).unwrap();
+        let open = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
+            })
+            .unwrap();
+        let mut view = open.clone();
+        for (i, c) in open.candidate_requests.iter().enumerate() {
+            let content = format!(
+                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
+            );
+            view = daemon
+                .ultra_submit(ultra_req(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    UltraSubmissionKind::Candidate,
+                    &c.candidate_id,
+                    &c.candidate_id,
+                    &content,
+                ))
+                .unwrap();
+        }
+        // Every declaration points at bytes that are not a PNG. The daemon
+        // decodes for itself, so the claims fail honestly and the kernel
+        // fails closed instead of trusting the manifest.
+        let requests = view.evidence_requests.clone();
+        for (i, request) in requests.iter().enumerate() {
+            let put = |bytes: &[u8]| {
+                daemon
+                    .artifact_put(ArtifactPutRequest {
+                        task_id: ex.task_id.clone(),
+                        capability: cap_of(&ex),
+                        lease_epoch: ex.lease.epoch,
+                        kind: "screenshot".into(),
+                        bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        candidate_id: None,
+                        round: None,
+                    })
+                    .unwrap()
+                    .sha256
+            };
+            let report = serde_json::json!({
+                "thesis_id": format!("thesis-{i}"),
+                "screenshots": [
+                    {"viewport": "desktop", "artifact_hash": put(format!("fake-desktop-{i}").as_bytes())},
+                    {"viewport": "phone", "artifact_hash": put(format!("fake-phone-{i}").as_bytes())},
+                ],
+                "interaction_replay_hash": put(format!("fake-replay-{i}").as_bytes()),
+                "forbidden_patterns_hit": [],
+                "critic_clean": true,
+            })
+            .to_string();
+            view = daemon
+                .ultra_submit(ultra_req(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    UltraSubmissionKind::Visual,
+                    &request.request_id,
+                    &request.candidate_id,
+                    &report,
+                ))
+                .unwrap();
+        }
+        assert_eq!(view.kernel_state, "failed");
+    }
+
     #[test]
     fn ultra_loop_rejects_human_tasks_and_forged_submissions() {
         let d = tempdir().unwrap();

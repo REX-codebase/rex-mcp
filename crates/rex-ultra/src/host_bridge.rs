@@ -185,6 +185,24 @@ impl UltraHostBridge {
         self.view(task_id, &mut adapter)
     }
 
+    /// Record the daemon's own visual verification for one candidate,
+    /// then re-run finalization. Only the daemon calls this.
+    pub fn record_daemon_visual(
+        &self,
+        task_id: &str,
+        candidate_id: &str,
+        record: crate::external_kernel::DaemonVisualRecord,
+    ) -> Result<UltraHostView, BridgeError> {
+        let mut adapter = self.load_existing(task_id)?.ok_or(BridgeError::Adapter(
+            AdapterError::EvidenceStageNotOpen,
+        ))?;
+        adapter
+            .record_daemon_visual(candidate_id, record)
+            .map_err(BridgeError::Adapter)?;
+        adapter.finalize().map_err(BridgeError::Adapter)?;
+        self.view(task_id, &mut adapter)
+    }
+
     /// The current durable view; never creates or mutates state.
     pub fn current_view(&self, task_id: &str) -> Result<UltraHostView, BridgeError> {
         let mut adapter = self.load_existing(task_id)?.ok_or(BridgeError::Adapter(
@@ -365,9 +383,13 @@ mod tests {
         // The daemon's clean adversary scan alone does not qualify.
         let candidate = view.candidate_requests[0].candidate_id.clone();
         daemon_adversary(&bridge, "task-abc", &candidate, true);
-        // The daemon executes the contract proofs itself; its clean verdict
-        // qualifies the candidate and completes the kernel.
         let after = daemon_verify(&bridge, "task-abc", &candidate, true);
+        // The rest of the field is not evidenced yet: never first-clean.
+        assert_eq!(after.kernel_state, KernelState::AwaitingEvidence);
+        // Once the whole field is gated, the qualifying candidate wins.
+        let other = view.candidate_requests[1].candidate_id.clone();
+        daemon_adversary(&bridge, "task-abc", &other, false);
+        let after = daemon_verify(&bridge, "task-abc", &other, true);
         assert_eq!(after.kernel_state, KernelState::Completed);
 
         let bridge = UltraHostBridge::open(directory.path()).unwrap();
