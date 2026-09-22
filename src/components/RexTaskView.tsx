@@ -108,7 +108,7 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
   const terminalLine = !status
     ? ""
     : status.state === "completed"
-      ? "Completed - every gate passed and the winning candidate was promoted."
+      ? "Completed - recorded by the daemon. Independent Ultra verification is disabled pending rebuild, so this is not yet a verified result."
       : status.state === "failed"
         ? "Failed - the gates refused the work; the reason is in the evidence below."
         : status.state === "cancelled"

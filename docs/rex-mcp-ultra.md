@@ -1,5 +1,16 @@
 # REX MCP Ultra mode: host loop, recovery, and the truth boundary
 
+> **AUDIT FREEZE (2026-09-22).** An independent adversarial audit of main
+> `d5b913b` found that the external Ultra path did not provide the
+> guarantees described below: adversary/verifier/visual verdicts were
+> host-supplied values, promotion could commit with every acceptance gate
+> un-rerun, Standard `rex_submit` could complete an Ultra task, and
+> promotion wrote through pre-existing symlinks. Until the protocol-2.0
+> rebuild lands, `rex_ultra_promote` fails closed, Ultra tasks cannot
+> complete through `rex_submit`, and no claim in this document should be
+> treated as enforced. This document will be rewritten to match the
+> rebuilt enforcement; until then it describes intent, not behavior.
+
 Ultra is the second, host-driven orchestrator. The host agent owns all
 inference; REX owns durable state, branch workspaces, evidence, leases,
 budgets and every deterministic gate. REX can keep work resumable and

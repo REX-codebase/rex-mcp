@@ -459,7 +459,18 @@ impl HarnessDaemon {
     }
 
     pub fn submit(&self, req: SubmitRequest) -> Result<SubmitResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let t0 = self.live(&req.task_id, req.lease_epoch)?;
+        // State-machine join (audit finding 2): an Ultra task can never
+        // complete, or advance, through the Standard submission path. Its
+        // only terminal route is a rebuilt, fully gated Ultra promotion.
+        if t0.ultra {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "ultra tasks cannot use rex_submit; completion is only possible through a gated Ultra promotion",
+                &t0.task_id,
+            ));
+        }
+        let mut t = t0;
         let open = t
             .open_action
             .clone()
@@ -806,9 +817,21 @@ impl HarnessDaemon {
         &self,
         req: rex_protocol::UltraPromoteRequest,
     ) -> Result<rex_protocol::UltraPromoteResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let t = self.live(&req.task_id, req.lease_epoch)?;
         require_agent(&t)?;
         require_ultra(&t)?;
+        // AUDIT FREEZE (2026-09-22): the external Ultra path was found to be a
+        // host-assertion recorder, not an independent verifier. Promotion is
+        // disabled until the rebuilt kernel (daemon-executed gates, isolated
+        // candidate workspaces, signed proof) lands. Fail closed.
+        return Err(perr(
+            ErrorCode::GateFailed,
+            "external Ultra promotion is disabled: the 2026-09-22 independent audit found no independent verification on this path; pending the protocol-2.0 rebuild",
+            &t.task_id,
+        ));
+        #[allow(unreachable_code)]
+        {
+        let mut t = t;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
         let contract = contract_from_plan(&t.task, &t.plan);
         let receipt = bridge
@@ -839,6 +862,7 @@ impl HarnessDaemon {
             gates_not_rerun: receipt.gates_not_rerun,
             detail: receipt.detail,
         })
+        }
     }
 
     /// Assemble and persist the machine-readable proof bundle for one task:
@@ -1893,7 +1917,7 @@ mod tests {
         );
     }
     #[test]
-    fn ultra_promotion_commits_the_winning_bundle_into_the_workspace() {
+    fn ultra_promotion_fails_closed_during_the_audit_freeze() {
         let d = tempdir().unwrap();
         let w = d.path().join("ws");
         fs::create_dir_all(&w).unwrap();
@@ -1960,18 +1984,16 @@ mod tests {
             };
         }
         assert_eq!(view.kernel_state, "completed");
-        let receipt = daemon
+        // AUDIT FREEZE: even with a completed kernel, promotion fails closed
+        // and writes nothing into the workspace.
+        let err = daemon
             .ultra_promote(rex_protocol::UltraPromoteRequest {
                 task_id: ex.task_id.clone(),
                 lease_epoch: ex.lease.epoch,
             })
-            .unwrap();
-        assert_eq!(receipt.state, "committed");
-        assert_eq!(receipt.candidate_id, candidate);
-        assert!(!receipt.staging_hash.is_empty());
-        assert!(fs::read_to_string(w.join("result.txt"))
-            .unwrap()
-            .starts_with("PASS"));
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::GateFailed);
+        assert!(fs::read(w.join("result.txt")).is_err());
         let events = daemon
             .events(EventsRequest {
                 task_id: ex.task_id.clone(),
@@ -1979,16 +2001,7 @@ mod tests {
                 limit: None,
             })
             .unwrap();
-        assert!(events.events.iter().any(|e| e.kind == "ultra_promotion"));
-        // a second promotion is deterministic and reports the same bundle
-        let again = daemon
-            .ultra_promote(rex_protocol::UltraPromoteRequest {
-                task_id: ex.task_id.clone(),
-                lease_epoch: ex.lease.epoch,
-            })
-            .unwrap();
-        assert_eq!(again.state, "committed");
-        assert_eq!(again.bundle_hash, receipt.bundle_hash);
+        assert!(!events.events.iter().any(|e| e.kind == "ultra_promotion"));
     }
     #[test]
     fn host_resume_requires_and_rotates_the_handle() {
@@ -2087,7 +2100,9 @@ mod tests {
         let w = d.path().join("ws");
         let root = d.path().join("state");
         let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
-        let first = daemon.execute(req("r-follow-completed")).unwrap();
+        let mut standard = req("r-follow-completed");
+        standard.ultra = false;
+        let first = daemon.execute(standard).unwrap();
         fs::write(w.join("proof.txt"), "verified").unwrap();
         let receipt = daemon
             .read(ReadRequest {
@@ -2199,13 +2214,15 @@ mod tests {
             };
         }
         assert_eq!(view.kernel_state, "completed");
-        let receipt = daemon
+        // AUDIT FREEZE: promotion fails closed; the proof bundle records no
+        // promotion rather than claiming one.
+        let err = daemon
             .ultra_promote(rex_protocol::UltraPromoteRequest {
                 task_id: ex.task_id.clone(),
                 lease_epoch: ex.lease.epoch,
             })
-            .unwrap();
-        assert_eq!(receipt.state, "committed");
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::GateFailed);
         let bundle = daemon
             .proof_bundle(TaskRefRequest {
                 task_id: ex.task_id.clone(),
@@ -2216,7 +2233,7 @@ mod tests {
             bundle.qualified_candidate.as_deref(),
             Some(candidate.as_str())
         );
-        assert_eq!(bundle.promotion_state.as_deref(), Some("committed"));
+        assert_eq!(bundle.promotion_state, None);
         assert!(bundle.skill_plan.is_some());
         assert!(!bundle.events.is_empty());
         assert!(!bundle.bundle_hash.is_empty());
@@ -2237,6 +2254,6 @@ mod tests {
             persisted["bundle_hash"].as_str().unwrap(),
             bundle.bundle_hash
         );
-        assert_eq!(persisted["promotion_state"].as_str().unwrap(), "committed");
+        assert!(persisted["promotion_state"].is_null());
     }
 }
