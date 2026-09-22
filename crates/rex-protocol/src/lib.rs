@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Wire version. Major bumps break; minor bumps add optional fields only.
-pub const PROTOCOL_VERSION: &str = "1.1";
+pub const PROTOCOL_VERSION: &str = "2.0";
 
 pub mod packets;
 pub mod schema;
@@ -44,6 +44,7 @@ pub enum ToolName {
     UltraSubmit,
     UltraPromote,
     Proof,
+    HumanStop,
 }
 
 impl ToolName {
@@ -65,6 +66,7 @@ impl ToolName {
             ToolName::UltraSubmit => "rex_ultra_submit",
             ToolName::UltraPromote => "rex_ultra_promote",
             ToolName::Proof => "rex_proof",
+            ToolName::HumanStop => "rex_human_stop",
         }
     }
 
@@ -86,6 +88,7 @@ impl ToolName {
             "rex_ultra_submit" => ToolName::UltraSubmit,
             "rex_ultra_promote" => ToolName::UltraPromote,
             "rex_proof" => ToolName::Proof,
+            "rex_human_stop" => ToolName::HumanStop,
             _ => return None,
         })
     }
@@ -108,6 +111,7 @@ impl ToolName {
             ToolName::UltraSubmit,
             ToolName::UltraPromote,
             ToolName::Proof,
+            ToolName::HumanStop,
         ]
     }
 }
@@ -286,6 +290,13 @@ pub struct ExecuteResponse {
     /// trusted human launcher path. Never logged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_resume_handle: Option<String>,
+    /// Per-task unforgeable capability, issued at creation and re-issued on
+    /// every verified resume. Required on every operational call (next,
+    /// read, edit, search, run, test, submit, cancel, ultra_*). The daemon
+    /// stores only its SHA-256. Never logged. Knowledge of the task id and
+    /// lease epoch alone authorizes nothing (protocol 2.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_capability: Option<String>,
     pub next: Option<ActionSpec>,
     pub lease: LeaseView,
     /// The Fable completion discipline every operator must honor. Host
@@ -305,6 +316,9 @@ pub struct LeaseView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NextRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     /// Heartbeat: keeps the lease alive and proves the host is still
     /// working. The daemon rejects calls on a lapsed lease.
     pub lease_epoch: u64,
@@ -321,6 +335,9 @@ pub struct NextResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,6 +357,9 @@ pub struct ReadResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
     pub path: String,
     /// Create when absent, else exact expected-content replacement.
@@ -359,6 +379,9 @@ pub struct EditResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -383,6 +406,9 @@ pub struct SearchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
     pub argv: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,6 +429,9 @@ pub struct RunResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
     /// A named recipe from the task's allowlist (e.g. "cargo-test").
     pub recipe: String,
@@ -420,6 +449,9 @@ pub struct TestResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
     pub action_id: String,
     /// Free-form account of what was done.
@@ -509,6 +541,9 @@ pub struct ResultResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelRequest {
     pub task_id: String,
+    /// Operator cancellation requires the per-task capability. The distinct
+    /// final human Stop is rex_human_stop, a separate authority.
+    pub capability: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -518,6 +553,19 @@ pub struct CancelResponse {
     pub task_id: String,
     pub state: TaskState,
     pub final_reason: String,
+}
+
+/// rex_human_stop: the final human Stop. A separate authority from operator
+/// cancel: it requires the daemon's human-stop token, which exists only in
+/// the trusted local launcher's state dir (0600), never in MCP payloads an
+/// agent can mint. It fences the task terminally in every phase, even
+/// against an agent operator, and its effect cannot be rolled back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HumanStopRequest {
+    pub task_id: String,
+    pub human_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// What the host is submitting into the Ultra external-host loop.
@@ -536,6 +584,9 @@ pub enum UltraSubmissionKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UltraPromoteRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
 }
 
@@ -557,6 +608,9 @@ pub struct UltraPromoteResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UltraOpenRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
 }
 
@@ -568,6 +622,9 @@ pub struct UltraOpenRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UltraSubmitRequest {
     pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
     pub lease_epoch: u64,
     pub kind: UltraSubmissionKind,
     pub request_id: String,
@@ -655,6 +712,7 @@ mod tests {
                 "rex_ultra_submit",
                 "rex_ultra_promote",
                 "rex_proof",
+                "rex_human_stop",
             ]
         );
         for t in ToolName::all() {
@@ -763,15 +821,21 @@ mod tests {
         assert_eq!(ev.after_seq, 0);
         assert!(ev.limit.is_none());
 
-        let sub: SubmitRequest = serde_json::from_str(
-            r#"{"task_id":"task-1","lease_epoch":1,"action_id":"a","narrative":"done"}"#,
-        )
+        let sub: SubmitRequest = serde_json::from_str(concat!(
+            r#"{"task_id":"task-1","capability":"cap-0123456789abcdef0123456789abcdef0123456789abcdef","#,
+            r#""lease_epoch":1,"action_id":"a","narrative":"done"}"#
+        ))
         .unwrap();
         assert!(sub.evidence.is_empty());
+        // Protocol 2.0 fails closed: capability-bearing calls MUST NOT
+        // deserialize into a usable request without the capability.
+        let no_cap =
+            r#"{"task_id":"task-1","lease_epoch":1,"action_id":"a","narrative":"done"}"#;
+        assert!(serde_json::from_str::<SubmitRequest>(no_cap).is_err());
     }
 
     #[test]
-    fn protocol_version_is_v1_1() {
-        assert_eq!(PROTOCOL_VERSION, "1.1");
+    fn protocol_version_is_v2_0() {
+        assert_eq!(PROTOCOL_VERSION, "2.0");
     }
 }

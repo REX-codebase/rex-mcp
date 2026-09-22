@@ -180,7 +180,8 @@ pub fn tool_descriptors() -> Vec<Value> {
             ToolName::Status => ("Get durable task state.", task_ref_schema()),
             ToolName::Events => ("Read the append-only task event stream.", extend(task_ref_schema(), json!({"after_seq":{"type":"integer"},"limit":{"type":"integer"}}), &[])),
             ToolName::Result => ("Read a terminal result and proof bundle.", task_ref_schema()),
-            ToolName::Cancel => ("Cancel a non-terminal task.", extend(task_ref_schema(), json!({"reason":{"type":"string"}}), &[])),
+            ToolName::Cancel => ("Operator-cancel a non-terminal task; requires the per-task capability.", json!({"type":"object","required":["task_id","capability"],"properties":{"task_id":{"type":"string"},"capability":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false})),
+            ToolName::HumanStop => ("Final human Stop for any task; requires the trusted launcher's human-stop token, terminal in every phase.", json!({"type":"object","required":["task_id","human_token"],"properties":{"task_id":{"type":"string"},"human_token":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false})),
             ToolName::UltraOpen => ("Open the Ultra external-host loop: fetch the open candidate or adversary/verifier/visual evidence requests.", task_epoch_schema()),
             ToolName::UltraPromote => ("Promote the qualified Ultra candidate bundle into the task workspace with verified rollback.", task_epoch_schema()),
             ToolName::Proof => ("Fetch the deterministic per-task proof bundle: frozen plan, kernel state, evidence outcomes, skill plan, promotion receipt, events and bundle hash.", task_ref_schema()),
@@ -198,7 +199,7 @@ fn task_ref_schema() -> Value {
     json!({"type":"object","required":["task_id"],"properties":{"task_id":{"type":"string"}},"additionalProperties":false})
 }
 fn task_epoch_schema() -> Value {
-    json!({"type":"object","required":["task_id","lease_epoch"],"properties":{"task_id":{"type":"string"},"lease_epoch":{"type":"integer"}},"additionalProperties":false})
+    json!({"type":"object","required":["task_id","capability","lease_epoch"],"properties":{"task_id":{"type":"string"},"capability":{"type":"string"},"lease_epoch":{"type":"integer"}},"additionalProperties":false})
 }
 fn extend(mut base: Value, props: Value, required: &[&str]) -> Value {
     if let (Some(dst), Some(src)) = (base["properties"].as_object_mut(), props.as_object()) {
@@ -257,7 +258,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 16);
+        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 17);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"], "active");
         let task_id = rows[2]["result"]["structuredContent"]["task_id"]
             .as_str()

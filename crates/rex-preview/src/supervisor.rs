@@ -570,6 +570,10 @@ fn mime(p: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Several tests bind from the shared preview port range; serialize them
+    // so a concurrently running test cannot occupy a port another test
+    // expects to bind or skip.
+    static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn temp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("rex-preview-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
@@ -578,6 +582,7 @@ mod tests {
     }
     #[test]
     fn static_preview_is_real_and_cancel_cleans_listener() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
         let w = temp("static");
         let app = w.join("app");
         fs::create_dir(&app).unwrap();
@@ -620,6 +625,7 @@ mod tests {
     }
     #[test]
     fn occupied_reserved_ports_are_skipped() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
         let guards: Vec<TcpListener> = (PORT_MIN..PORT_MIN + 3)
             .map(|p| TcpListener::bind((Ipv4Addr::LOCALHOST, p)).unwrap())
             .collect();
@@ -629,6 +635,7 @@ mod tests {
     }
     #[test]
     fn browser_capture_is_real_and_actions_reach_page() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
         let w = temp("browser");
         let app = w.join("app");
         fs::create_dir(&app).unwrap();

@@ -61,11 +61,24 @@ fn shell_client_runs_a_full_task_lifecycle_over_stdio() {
         .map(|e| !e.is_empty())
         .unwrap_or(false));
 
-    // Human stop is final even for an agent-operator task.
-    let cancel = client
+    // Operator cancel without the per-task capability is unauthorized:
+    // task id plus the (status-visible) lease epoch authorize nothing.
+    let denied = client
         .call_tool(
             "rex_cancel",
-            json!({ "task_id": task_id, "reason": "human stop from shell" }),
+            json!({ "task_id": task_id, "reason": "forged operator cancel" }),
+        );
+    assert!(denied.is_err(), "capability-less cancel must be denied");
+
+    // Human stop is a distinct authority: the trusted local launcher reads
+    // the daemon's human-stop token from the state dir. Final even for an
+    // agent-operator task.
+    let token = std::fs::read_to_string(state.join("human-stop-token"))
+        .expect("daemon issues a human-stop token");
+    let cancel = client
+        .call_tool(
+            "rex_human_stop",
+            json!({ "task_id": task_id, "human_token": token.trim(), "reason": "human stop from shell" }),
         )
         .unwrap();
     assert_eq!(

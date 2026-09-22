@@ -76,7 +76,8 @@ fn full_caller_driven_lifecycle_over_stdio() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names.len(), 16);
+    assert_eq!(names.len(), 17);
+    assert!(names.contains(&"rex_human_stop"));
     assert!(names.contains(&"rex_execute") && names.contains(&"rex_submit"));
 
     // Execute: durable task, frozen plan, first action issued.
@@ -90,30 +91,31 @@ fn full_caller_driven_lifecycle_over_stdio() {
     assert_eq!(ex["state"], "active");
     let task_id = ex["task_id"].as_str().unwrap().to_string();
     let epoch = ex["lease"]["epoch"].as_u64().unwrap();
+    let cap = ex["task_capability"].as_str().unwrap();
     let action1 = ex["next"]["action_id"].as_str().unwrap().to_string();
 
     // Work under custody: read, edit, run.
     let read = s.tool(
         "rex_read",
-        json!({"task_id":task_id,"lease_epoch":epoch,"path":"note.txt"}),
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,"path":"note.txt"}),
     );
     assert_eq!(read["content"], "hello rex");
     let sub1 = s.tool(
         "rex_submit",
-        json!({"task_id":task_id,"lease_epoch":epoch,
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
         "action_id":action1,"narrative":"read it"}),
     );
     assert_eq!(sub1["accepted"], true);
     let action2 = sub1["next"]["action_id"].as_str().unwrap().to_string();
     let edit = s.tool(
         "rex_edit",
-        json!({"task_id":task_id,"lease_epoch":epoch,
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
         "path":"note.txt","expected":"hello rex","replacement":"hello rex\nworld"}),
     );
     assert!(edit["bytes_written"].as_u64().unwrap() > 0);
     let run = s.tool(
         "rex_run",
-        json!({"task_id":task_id,"lease_epoch":epoch,
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
         "argv":["cat","note.txt"]}),
     );
     assert!(run["stdout"].as_str().unwrap().contains("world"));
@@ -122,7 +124,7 @@ fn full_caller_driven_lifecycle_over_stdio() {
     // rejected with repair feedback, and the action stays open.
     let bogus = s.tool(
         "rex_submit",
-        json!({"task_id":task_id,"lease_epoch":epoch,
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
         "action_id":action2,"narrative":"trust me"}),
     );
     assert_eq!(bogus["accepted"], false);
@@ -137,7 +139,7 @@ fn full_caller_driven_lifecycle_over_stdio() {
     let run_receipt = run["receipt"].as_str().unwrap();
     let sub2 = s.tool(
         "rex_submit",
-        json!({"task_id":task_id,"lease_epoch":epoch,
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
         "action_id":action2,"narrative":"appended and verified",
         "evidence":{"edit":edit_receipt,"run":run_receipt}}),
     );
@@ -171,14 +173,15 @@ fn full_caller_driven_lifecycle_over_stdio() {
     );
     let t3 = ex3["task_id"].as_str().unwrap().to_string();
     let e3 = ex3["lease"]["epoch"].as_u64().unwrap();
+    let cap3 = ex3["task_capability"].as_str().unwrap();
     let denied = s2.tool(
         "rex_read",
-        json!({"task_id":t3,"lease_epoch":e3,"path":"../outside"}),
+        json!({"task_id":t3,"capability":cap3,"lease_epoch":e3,"path":"../outside"}),
     );
     assert_eq!(denied["data"]["code"], "scope_denied");
     let after = s2.tool(
         "rex_submit",
-        json!({"task_id":t3,"lease_epoch":e3,
+        json!({"task_id":t3,"capability":cap3,"lease_epoch":e3,
         "action_id":ex3["next"]["action_id"],"narrative":"try anyway"}),
     );
     assert_eq!(after["data"]["code"], "unauthorized");
@@ -259,9 +262,10 @@ fn mutations_require_trusted_launcher_approval_over_stdio() {
     );
     let task_id = ex["task_id"].as_str().unwrap();
     let epoch = ex["lease"]["epoch"].as_u64().unwrap();
+    let cap = ex["task_capability"].as_str().unwrap();
     let err = s.tool(
         "rex_edit",
-        json!({"task_id":task_id,"lease_epoch":epoch,
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
         "path":"x.txt","replacement":"nope","create":true}),
     );
     assert_eq!(err["data"]["code"], "approval_required");

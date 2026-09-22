@@ -588,13 +588,22 @@ fn rex_task_proof(task_id: String) -> Result<serde_json::Value, String> {
     rex_shell_call("rex_proof", serde_json::json!({ "task_id": task_id }))
 }
 
-/// The permanent human Stop for an agent-driven task: cancel fences the
-/// lease and is final even against an agent operator.
+/// The permanent human Stop for an agent-driven task: a distinct authority
+/// from operator cancel. The trusted local launcher reads the daemon's
+/// human-stop token (0600 in the shared state dir); an MCP host cannot mint
+/// it. Final in every phase, even against an agent operator.
 #[tauri::command]
 fn rex_task_stop(task_id: String) -> Result<serde_json::Value, String> {
+    let token_path = rex_mcp::client::default_state_dir().join("human-stop-token");
+    let token = std::fs::read_to_string(&token_path)
+        .map_err(|e| format!("human-stop token unavailable: {e}"))?;
     rex_shell_call(
-        "rex_cancel",
-        serde_json::json!({ "task_id": task_id, "reason": "human stop from REX UI" }),
+        "rex_human_stop",
+        serde_json::json!({
+            "task_id": task_id,
+            "human_token": token.trim(),
+            "reason": "human stop from REX UI",
+        }),
     )
 }
 

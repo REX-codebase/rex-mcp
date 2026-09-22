@@ -102,6 +102,12 @@ struct DurableTask {
     /// never stored; it rotates on every accepted resume.
     #[serde(default)]
     host_resume_handle_hash: Option<String>,
+    /// SHA-256 of the per-task operational capability (protocol 2.0). The
+    /// capability itself is only ever held by the task's operator; every
+    /// operational call must present it. Empty means a pre-2.0 record,
+    /// which can never match a presented capability: it fails closed.
+    #[serde(default)]
+    task_capability_hash: String,
     /// Persisted store schema, independent of the wire protocol string.
     /// Schema 1 records predate this field and migrate on load; unknown
     /// future versions fail closed.
@@ -114,6 +120,10 @@ pub struct HarnessDaemon {
     policy: DaemonPolicy,
     custody: Arc<Mutex<CustodyRegistry>>,
     tools: CustodiedToolRuntime,
+    /// SHA-256 of the human-stop token. The token itself lives only in
+    /// `<root>/human-stop-token` (0600) for the trusted local launcher;
+    /// the daemon never stores it in task state or logs.
+    human_token_hash: String,
 }
 
 impl HarnessDaemon {
@@ -128,11 +138,57 @@ impl HarnessDaemon {
         ));
         let runtime = ToolRuntime::new(&policy.workspace).map_err(|e| internal(e.detail))?;
         let tools = CustodiedToolRuntime::new(runtime, custody.clone());
+        let human_token_hash = load_or_create_human_token(&root)?;
         Ok(Self {
             root,
             policy,
             custody,
             tools,
+            human_token_hash,
+        })
+    }
+
+    /// The final human Stop: terminal fence for any task, gated on the
+    /// human-stop token that only the trusted local launcher can read.
+    /// Distinct from operator `cancel`, which requires the task capability.
+    pub fn human_stop(&self, req: HumanStopRequest) -> Result<CancelResponse, ProtocolError> {
+        if hex_sha256(req.human_token.as_bytes()) != self.human_token_hash {
+            return Err(perr(
+                ErrorCode::Unauthorized,
+                "invalid human-stop token",
+                &req.task_id,
+            ));
+        }
+        let mut t = self.load(&req.task_id)?;
+        if t.state.is_terminal() {
+            return Ok(CancelResponse {
+                task_id: t.task_id,
+                state: t.state,
+                final_reason: t.terminal_reason.unwrap_or_else(|| "terminal".into()),
+            });
+        }
+        {
+            let mut reg = self
+                .custody
+                .lock()
+                .map_err(|_| internal("custody registry poisoned"))?;
+            // The human stop is final in every phase, never gated on the
+            // operator's state, even for an agent-operated task.
+            reg.human_stop(&t.grant_id, now_ms()).map_err(custody_err)?;
+        }
+        t.operation_status = OperationStatus::Aborted;
+        t.state = TaskState::Cancelled;
+        let why = req
+            .reason
+            .unwrap_or_else(|| "human stop (final)".into());
+        t.terminal_reason = Some(why.clone());
+        t.open_action = None;
+        self.append_event(&mut t, "human_stop", json!({"reason":why}))?;
+        self.persist(&t)?;
+        Ok(CancelResponse {
+            task_id: t.task_id,
+            state: t.state,
+            final_reason: why,
         })
     }
 
@@ -148,15 +204,16 @@ impl HarnessDaemon {
                 ));
             }
             let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
+            let capability = self.rotate_capability(&mut task)?;
             if let Some(follow_up) = req
                 .follow_up
                 .as_deref()
                 .filter(|text| !text.trim().is_empty())
             {
                 self.append_event(&mut task, "host_follow_up", json!({ "text": follow_up }))?;
-                self.persist(&task)?;
             }
-            return Ok(self.execute_view(&task, true, Some(handle)));
+            self.persist(&task)?;
+            return Ok(self.execute_view(&task, true, Some(handle), Some(capability)));
         }
         if let Some(task) = self.find_by_request(&req.request_id)? {
             if task.request_hash != request_hash(&req)? {
@@ -168,19 +225,21 @@ impl HarnessDaemon {
             }
             let mut task = task;
             let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
+            let capability = self.rotate_capability(&mut task)?;
             if let Some(follow_up) = req
                 .follow_up
                 .as_deref()
                 .filter(|text| !text.trim().is_empty())
             {
                 self.append_event(&mut task, "host_follow_up", json!({ "text": follow_up }))?;
-                self.persist(&task)?;
             }
-            return Ok(self.execute_view(&task, true, Some(handle)));
+            self.persist(&task)?;
+            return Ok(self.execute_view(&task, true, Some(handle), Some(capability)));
         }
         let now = now_ms();
         let task_id = format!("task-{}", random_id());
         let host_resume_handle = format!("hrh-{}", random_hex(24));
+        let task_capability = format!("cap-{}", random_hex(24));
         let plan = req
             .plan
             .clone()
@@ -308,6 +367,7 @@ impl HarnessDaemon {
             },
             ultra_skill_plan_hash: None,
             host_resume_handle_hash: Some(hex_sha256(host_resume_handle.as_bytes())),
+            task_capability_hash: hex_sha256(task_capability.as_bytes()),
             store_schema_version: STORE_SCHEMA_VERSION,
         };
         let plan_hash = task.plan_hash.clone();
@@ -319,11 +379,11 @@ impl HarnessDaemon {
             "steps":step_count,"protocol":PROTOCOL_VERSION,"ultra":req.ultra}),
         )?;
         self.persist(&task)?;
-        Ok(self.execute_view(&task, false, Some(host_resume_handle)))
+        Ok(self.execute_view(&task, false, Some(host_resume_handle), Some(task_capability)))
     }
 
     pub fn next(&self, req: NextRequest) -> Result<NextResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         self.heartbeat(&mut t)?;
         self.persist(&t)?;
         Ok(NextResponse {
@@ -334,7 +394,7 @@ impl HarnessDaemon {
     }
 
     pub fn read(&self, req: ReadRequest) -> Result<ReadResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         let result = self.call_tool(&mut t, ToolRequest::ReadFile { path: req.path })?;
         let mut content = result.output.unwrap_or_default();
         if let Some((start, len)) = req.byte_range {
@@ -353,7 +413,7 @@ impl HarnessDaemon {
     }
 
     pub fn edit(&self, req: EditRequest) -> Result<EditResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         let tool = if req.create {
             ToolRequest::CreateFile {
                 path: req.path,
@@ -381,7 +441,7 @@ impl HarnessDaemon {
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<SearchResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         let out = self.call_tool(
             &mut t,
             ToolRequest::SearchFiles {
@@ -397,7 +457,7 @@ impl HarnessDaemon {
     }
 
     pub fn run(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         let out = self.call_tool(
             &mut t,
             ToolRequest::RunCommand {
@@ -429,6 +489,7 @@ impl HarnessDaemon {
         };
         let run = self.run(RunRequest {
             task_id: req.task_id.clone(),
+            capability: req.capability.clone(),
             lease_epoch: req.lease_epoch,
             argv,
             timeout_ms: Some(10 * 60 * 1000),
@@ -459,7 +520,7 @@ impl HarnessDaemon {
     }
 
     pub fn submit(&self, req: SubmitRequest) -> Result<SubmitResponse, ProtocolError> {
-        let t0 = self.live(&req.task_id, req.lease_epoch)?;
+        let t0 = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         // State-machine join (audit finding 2): an Ultra task can never
         // complete, or advance, through the Standard submission path. Its
         // only terminal route is a rebuilt, fully gated Ultra promotion.
@@ -644,7 +705,19 @@ impl HarnessDaemon {
     }
 
     pub fn cancel(&self, req: CancelRequest) -> Result<CancelResponse, ProtocolError> {
-        let mut t = self.load(&req.task_id)?;
+        // Operator cancellation: the per-task capability is the authority.
+        // The distinct final human Stop is `human_stop`, a separate route.
+        let t0 = self.load(&req.task_id)?;
+        if t0.task_capability_hash.is_empty()
+            || hex_sha256(req.capability.as_bytes()) != t0.task_capability_hash
+        {
+            return Err(perr(
+                ErrorCode::Unauthorized,
+                "invalid task capability",
+                &req.task_id,
+            ));
+        }
+        let mut t = t0;
         if t.state.is_terminal() {
             return Ok(CancelResponse {
                 task_id: t.task_id,
@@ -711,6 +784,7 @@ impl HarnessDaemon {
             ToolName::UltraSubmit => go!(args, ultra_submit),
             ToolName::UltraPromote => go!(args, ultra_promote),
             ToolName::Proof => go!(args, proof_bundle),
+            ToolName::HumanStop => go!(args, human_stop),
         }
     }
 
@@ -718,7 +792,7 @@ impl HarnessDaemon {
     /// The first open attaches the host at the task's lease epoch; later
     /// opens are pure views over the durable kernel.
     pub fn ultra_open(&self, req: UltraOpenRequest) -> Result<UltraViewResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         require_agent(&t)?;
         require_ultra(&t)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
@@ -753,7 +827,7 @@ impl HarnessDaemon {
         &self,
         req: UltraSubmitRequest,
     ) -> Result<UltraViewResponse, ProtocolError> {
-        let mut t = self.live(&req.task_id, req.lease_epoch)?;
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         require_agent(&t)?;
         require_ultra(&t)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
@@ -817,7 +891,7 @@ impl HarnessDaemon {
         &self,
         req: rex_protocol::UltraPromoteRequest,
     ) -> Result<rex_protocol::UltraPromoteResponse, ProtocolError> {
-        let t = self.live(&req.task_id, req.lease_epoch)?;
+        let t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         require_agent(&t)?;
         require_ultra(&t)?;
         // AUDIT FREEZE (2026-09-22): the external Ultra path was found to be a
@@ -1046,8 +1120,20 @@ impl HarnessDaemon {
         Ok(out)
     }
 
-    fn live(&self, id: &str, epoch: u64) -> Result<DurableTask, ProtocolError> {
+    fn live(&self, id: &str, epoch: u64, capability: &str) -> Result<DurableTask, ProtocolError> {
         let t = self.load(id)?;
+        // Authorization first: a presented capability whose hash does not
+        // match is denied before any state or lease detail is revealed.
+        // Pre-2.0 records carry an empty hash and fail closed.
+        if t.task_capability_hash.is_empty()
+            || hex_sha256(capability.as_bytes()) != t.task_capability_hash
+        {
+            return Err(perr(
+                ErrorCode::Unauthorized,
+                "invalid task capability",
+                id,
+            ));
+        }
         if t.state.is_terminal() {
             return Err(perr(ErrorCode::TaskTerminal, "task is terminal", id));
         }
@@ -1075,6 +1161,15 @@ impl HarnessDaemon {
         t.heartbeat_seq = lease.next_seq;
         t.lease_expires_ms = lease.expires_ms;
         Ok(())
+    }
+
+    /// Mint a fresh operational capability and rotate the stored hash.
+    /// Called at creation and on every verified resume: the rotated
+    /// resume handle vouches for the new capability.
+    fn rotate_capability(&self, t: &mut DurableTask) -> Result<String, ProtocolError> {
+        let capability = format!("cap-{}", random_hex(24));
+        t.task_capability_hash = hex_sha256(capability.as_bytes());
+        Ok(capability)
     }
 
     fn verify_and_rotate_resume_handle(
@@ -1114,12 +1209,14 @@ impl HarnessDaemon {
         t: &DurableTask,
         resumed: bool,
         host_resume_handle: Option<String>,
+        task_capability: Option<String>,
     ) -> ExecuteResponse {
         ExecuteResponse {
             task_id: t.task_id.clone(),
             state: t.state,
             resumed,
             host_resume_handle,
+            task_capability,
             next: t.open_action.clone(),
             lease: lease_view(t),
             discipline: Some(operator_discipline()),
@@ -1420,6 +1517,33 @@ fn atomic_json<T: Serialize>(path: &Path, v: &T) -> Result<(), ProtocolError> {
     fs::write(&tmp, bytes).map_err(internal)?;
     fs::rename(tmp, path).map_err(internal)
 }
+/// Load or create the daemon's human-stop token. The token file is the
+/// human authority boundary: only the trusted local launcher can read a
+/// 0600 file in the daemon state dir; a remote MCP host cannot mint one.
+fn load_or_create_human_token(root: &Path) -> Result<String, ProtocolError> {
+    let path = root.join("human-stop-token");
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(hex_sha256(trimmed.as_bytes()));
+        }
+    }
+    let token = format!("hst-{}", random_hex(32));
+    {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path).map_err(internal)?;
+        f.write_all(token.as_bytes()).map_err(internal)?;
+        f.sync_all().map_err(internal)?;
+    }
+    Ok(hex_sha256(token.as_bytes()))
+}
+
 fn safe_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() < 200
@@ -1617,6 +1741,7 @@ mod tests {
         let got = daemon
             .read(ReadRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
                 path: "hello.txt".into(),
                 byte_range: None,
@@ -1626,6 +1751,7 @@ mod tests {
         let c = daemon
             .cancel(CancelRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 reason: Some("stop".into()),
             })
             .unwrap();
@@ -1644,6 +1770,7 @@ mod tests {
         let e = daemon
             .read(ReadRequest {
                 task_id: ex2.task_id.clone(),
+                capability: cap_of(&ex2),
                 lease_epoch: ex2.lease.epoch,
                 path: "../escape".into(),
                 byte_range: None,
@@ -1667,19 +1794,22 @@ mod tests {
         r.host = HostKind::Human;
         let ex = daemon.execute(r).unwrap();
         // Hosts receive the Fable completion discipline at task start.
+        let cap = cap_of(&ex);
         let disc = ex.discipline.unwrap();
         assert!(disc.contains("declare completion") && disc.contains("evidence"));
         // Human cancel goes through the terminal human-stop fence.
         let c = daemon
             .cancel(CancelRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap.clone(),
                 reason: Some("stop button".into()),
             })
             .unwrap();
         assert_eq!(c.state, TaskState::Cancelled);
         let e = daemon
             .next(NextRequest {
-                task_id: ex.task_id,
+                task_id: ex.task_id.clone(),
+                capability: cap,
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap_err();
@@ -1694,7 +1824,8 @@ mod tests {
         let ex = daemon.execute(req("r3")).unwrap();
         let e = daemon
             .edit(EditRequest {
-                task_id: ex.task_id,
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
                 path: "x".into(),
                 expected: None,
@@ -1704,8 +1835,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::ApprovalRequired);
     }
+    fn cap_of(r: &ExecuteResponse) -> String {
+        r.task_capability.clone().expect("capability issued")
+    }
     fn ultra_req(
         task: &str,
+        capability: &str,
         epoch: u64,
         kind: UltraSubmissionKind,
         request_id: &str,
@@ -1714,6 +1849,7 @@ mod tests {
     ) -> UltraSubmitRequest {
         UltraSubmitRequest {
             task_id: task.into(),
+            capability: capability.into(),
             lease_epoch: epoch,
             kind,
             request_id: request_id.into(),
@@ -1732,6 +1868,7 @@ mod tests {
         let open = daemon
             .ultra_open(UltraOpenRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap();
@@ -1748,6 +1885,7 @@ mod tests {
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
+                    &cap_of(&ex),
                     ex.lease.epoch,
                     UltraSubmissionKind::Candidate,
                     &c.candidate_id,
@@ -1770,8 +1908,9 @@ mod tests {
             view = match r.kind.as_str() {
                 "adversary" => daemon
                     .ultra_submit(ultra_req(
-                        &ex.task_id,
-                        ex.lease.epoch,
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
                         UltraSubmissionKind::Adversary,
                         &r.request_id,
                         &r.candidate_id,
@@ -1780,8 +1919,9 @@ mod tests {
                     .unwrap(),
                 _ => daemon
                     .ultra_submit(ultra_req(
-                        &ex.task_id,
-                        ex.lease.epoch,
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
                         UltraSubmissionKind::Verifier,
                         &r.request_id,
                         &r.candidate_id,
@@ -1796,6 +1936,7 @@ mod tests {
         let again = reopened
             .ultra_open(UltraOpenRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap();
@@ -1815,6 +1956,7 @@ mod tests {
         let e = daemon
             .ultra_open(UltraOpenRequest {
                 task_id: human.task_id.clone(),
+                capability: cap_of(&human),
                 lease_epoch: human.lease.epoch,
             })
             .unwrap_err();
@@ -1823,13 +1965,15 @@ mod tests {
         let open = daemon
             .ultra_open(UltraOpenRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap();
         let target = &open.candidate_requests[0];
         let mut forged = ultra_req(
-            &ex.task_id,
-            ex.lease.epoch,
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
             UltraSubmissionKind::Candidate,
             &target.candidate_id,
             &target.candidate_id,
@@ -1839,8 +1983,9 @@ mod tests {
         let e = daemon.ultra_submit(forged).unwrap_err();
         assert_eq!(e.code, ErrorCode::GateFailed);
         let unknown = ultra_req(
-            &ex.task_id,
-            ex.lease.epoch,
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
             UltraSubmissionKind::Candidate,
             "not-a-candidate",
             "not-a-candidate",
@@ -1861,7 +2006,8 @@ mod tests {
         let ex = daemon.execute(standard).unwrap();
         let error = daemon
             .ultra_open(UltraOpenRequest {
-                task_id: ex.task_id,
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap_err();
@@ -1881,6 +2027,7 @@ mod tests {
         let open = daemon
             .ultra_open(UltraOpenRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap();
@@ -1895,6 +2042,7 @@ mod tests {
         let again = daemon
             .ultra_open(UltraOpenRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap();
@@ -1927,6 +2075,7 @@ mod tests {
         let open = daemon
             .ultra_open(UltraOpenRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap();
@@ -1934,6 +2083,7 @@ mod tests {
         assert!(daemon
             .ultra_promote(rex_protocol::UltraPromoteRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch
             })
             .is_err());
@@ -1944,6 +2094,7 @@ mod tests {
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
+                    &cap_of(&ex),
                     ex.lease.epoch,
                     UltraSubmissionKind::Candidate,
                     &c.candidate_id,
@@ -1963,8 +2114,9 @@ mod tests {
             view = match r.kind.as_str() {
                 "adversary" => daemon
                     .ultra_submit(ultra_req(
-                        &ex.task_id,
-                        ex.lease.epoch,
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
                         UltraSubmissionKind::Adversary,
                         &r.request_id,
                         &r.candidate_id,
@@ -1973,8 +2125,9 @@ mod tests {
                     .unwrap(),
                 _ => daemon
                     .ultra_submit(ultra_req(
-                        &ex.task_id,
-                        ex.lease.epoch,
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
                         UltraSubmissionKind::Verifier,
                         &r.request_id,
                         &r.candidate_id,
@@ -1989,6 +2142,7 @@ mod tests {
         let err = daemon
             .ultra_promote(rex_protocol::UltraPromoteRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap_err();
@@ -2107,6 +2261,7 @@ mod tests {
         let receipt = daemon
             .read(ReadRequest {
                 task_id: first.task_id.clone(),
+                capability: cap_of(&first),
                 lease_epoch: first.lease.epoch,
                 path: "proof.txt".into(),
                 byte_range: None,
@@ -2117,6 +2272,7 @@ mod tests {
         let completed = daemon
             .submit(SubmitRequest {
                 task_id: first.task_id.clone(),
+                capability: cap_of(&first),
                 lease_epoch: first.lease.epoch,
                 action_id: first.next.unwrap().action_id,
                 narrative: "Completed after a verified run".into(),
@@ -2165,6 +2321,7 @@ mod tests {
         let open = daemon
             .ultra_open(UltraOpenRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap();
@@ -2174,6 +2331,7 @@ mod tests {
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
+                    &cap_of(&ex),
                     ex.lease.epoch,
                     UltraSubmissionKind::Candidate,
                     &c.candidate_id,
@@ -2193,8 +2351,9 @@ mod tests {
             view = match r.kind.as_str() {
                 "adversary" => daemon
                     .ultra_submit(ultra_req(
-                        &ex.task_id,
-                        ex.lease.epoch,
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
                         UltraSubmissionKind::Adversary,
                         &r.request_id,
                         &r.candidate_id,
@@ -2203,8 +2362,9 @@ mod tests {
                     .unwrap(),
                 _ => daemon
                     .ultra_submit(ultra_req(
-                        &ex.task_id,
-                        ex.lease.epoch,
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
                         UltraSubmissionKind::Verifier,
                         &r.request_id,
                         &r.candidate_id,
@@ -2219,6 +2379,7 @@ mod tests {
         let err = daemon
             .ultra_promote(rex_protocol::UltraPromoteRequest {
                 task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
             .unwrap_err();
@@ -2255,5 +2416,170 @@ mod tests {
             bundle.bundle_hash
         );
         assert!(persisted["promotion_state"].is_null());
+    
+    }
+
+    #[test]
+    fn operational_calls_require_the_task_capability() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        fs::create_dir_all(&w).unwrap();
+        fs::write(w.join("note.txt"), "hi").unwrap();
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("r-authz")).unwrap();
+        // Audit exploit: task id plus the status-visible lease epoch must
+        // authorize nothing. Missing capability -> unauthorized.
+        let bare = daemon
+            .read(ReadRequest {
+                task_id: ex.task_id.clone(),
+                capability: String::new(),
+                lease_epoch: ex.lease.epoch,
+                path: "note.txt".into(),
+                byte_range: None,
+            })
+            .unwrap_err();
+        assert_eq!(bare.code, ErrorCode::Unauthorized);
+        // Forged capability -> unauthorized.
+        let forged = daemon
+            .read(ReadRequest {
+                task_id: ex.task_id.clone(),
+                capability: "cap-forged".into(),
+                lease_epoch: ex.lease.epoch,
+                path: "note.txt".into(),
+                byte_range: None,
+            })
+            .unwrap_err();
+        assert_eq!(forged.code, ErrorCode::Unauthorized);
+        // Another task's capability -> unauthorized (no cross-task deputy).
+        let other = daemon.execute(req("r-authz-other")).unwrap();
+        let cross = daemon
+            .read(ReadRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&other),
+                lease_epoch: ex.lease.epoch,
+                path: "note.txt".into(),
+                byte_range: None,
+            })
+            .unwrap_err();
+        assert_eq!(cross.code, ErrorCode::Unauthorized);
+        // The real capability works.
+        let ok = daemon
+            .read(ReadRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                path: "note.txt".into(),
+                byte_range: None,
+            })
+            .unwrap();
+        assert_eq!(ok.content, "hi");
+        // Operator cancel requires the capability too.
+        let denied = daemon
+            .cancel(CancelRequest {
+                task_id: ex.task_id.clone(),
+                capability: "cap-forged".into(),
+                reason: None,
+            })
+            .unwrap_err();
+        assert_eq!(denied.code, ErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn human_stop_is_a_distinct_final_authority() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("r-hstop")).unwrap();
+        // Wrong token -> unauthorized; the task stays active.
+        let bad = daemon
+            .human_stop(HumanStopRequest {
+                task_id: ex.task_id.clone(),
+                human_token: "hst-forged".into(),
+                reason: None,
+            })
+            .unwrap_err();
+        assert_eq!(bad.code, ErrorCode::Unauthorized);
+        assert_eq!(
+            daemon
+                .status(TaskRefRequest {
+                    task_id: ex.task_id.clone()
+                })
+                .unwrap()
+                .state,
+            TaskState::Active
+        );
+        // The daemon-issued token (0600 in the state dir) stops an
+        // agent-operated task finally, without the task capability.
+        let token = fs::read_to_string(root.join("human-stop-token")).unwrap();
+        let stopped = daemon
+            .human_stop(HumanStopRequest {
+                task_id: ex.task_id.clone(),
+                human_token: token.trim().into(),
+                reason: Some("stop".into()),
+            })
+            .unwrap();
+        assert_eq!(stopped.state, TaskState::Cancelled);
+        // Final: even the legitimate capability cannot act on a stopped task.
+        let after = daemon
+            .read(ReadRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                path: "x".into(),
+                byte_range: None,
+            })
+            .unwrap_err();
+        assert_eq!(after.code, ErrorCode::TaskTerminal);
+        // The token file is not world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(root.join("human-stop-token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn resume_reissues_a_rotated_capability() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        fs::create_dir_all(&w).unwrap();
+        fs::write(w.join("n.txt"), "v").unwrap();
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let a = daemon.execute(req("r-rot")).unwrap();
+        let original = cap_of(&a);
+        let mut resume = req("r-rot");
+        resume.resume_handle = a.host_resume_handle.clone();
+        let b = daemon.execute(resume).unwrap();
+        let rotated = cap_of(&b);
+        assert_ne!(original, rotated, "capability rotates on resume");
+        // The pre-rotation capability no longer authorizes.
+        let stale = daemon
+            .read(ReadRequest {
+                task_id: a.task_id.clone(),
+                capability: original,
+                lease_epoch: b.lease.epoch,
+                path: "n.txt".into(),
+                byte_range: None,
+            })
+            .unwrap_err();
+        assert_eq!(stale.code, ErrorCode::Unauthorized);
+        let ok = daemon
+            .read(ReadRequest {
+                task_id: a.task_id.clone(),
+                capability: rotated,
+                lease_epoch: b.lease.epoch,
+                path: "n.txt".into(),
+                byte_range: None,
+            })
+            .unwrap();
+        assert_eq!(ok.content, "v");
     }
 }
