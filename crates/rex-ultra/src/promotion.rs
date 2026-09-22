@@ -1,12 +1,30 @@
-//! Evidence-gated promotion and verified rollback (architecture section J).
+//! Evidence-gated promotion with symlink-safe application and an atomic,
+//! crash-safe tree swap (architecture section J; audit findings 4 and 12).
 //!
-//! Sequence: require a completed kernel with a recorded qualified candidate,
-//! revalidate the winning sealed bundle, snapshot the destination, stage the
-//! bundle in a scratch workspace, rerun REX-checkable gates on the stage,
-//! write a prepare receipt, apply only while the destination still equals
-//! the captured hash, validate the resulting tree, then commit. Any failure
-//! after staging restores the snapshot and verifies the restore; an
-//! unverifiable rollback becomes CorruptState, never best-effort state.
+//! The destination is never written file-by-file. The complete next tree is
+//! built in a private sibling directory: bundle files are written and bundle
+//! deletes are removed through descriptor-relative `openat` operations with
+//! `O_NOFOLLOW` on every component, so no symlink anywhere in the tree can
+//! redirect a write outside it (audit finding 4). REX-checkable gates rerun
+//! on that stage, a prepare receipt is persisted, the destination hash is
+//! re-verified (compare-and-swap guard), and the swap itself is one atomic
+//! `renameat2(RENAME_EXCHANGE)` on Linux - readers never observe a partial
+//! tree (audit finding 12). The exchange preserves the old tree at the
+//! scratch path, so rollback is a swap-back, not a copy; there is no
+//! snapshot whose loss could make a restore unverifiable mid-sequence.
+//!
+//! Crash safety: the durable receipt plus the stage/backup directories make
+//! every crash point recoverable. A crash before the swap leaves the
+//! destination untouched (RolledBack). A crash after the swap but before the
+//! commit record is healed to Committed on the next promote call. An
+//! unknown destination state is restored from the preserved old tree and
+//! verified; an unverifiable restore is CorruptState, never a guess.
+//!
+//! Honest limits: symlinks in the destination are not part of the tree
+//! contract (tree hashes skip them) and a committed promotion replaces the
+//! tree with the staged one, which contains no symlinks. On non-Linux
+//! systems the swap falls back to two renames with a small crash window;
+//! the receipt records which method was used and recovery covers the window.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -40,6 +58,10 @@ pub struct PromotionReceipt {
     pub gates_not_rerun: Vec<String>,
     pub state: PromotionState,
     pub detail: String,
+    /// How the tree swap was performed ("rename_exchange" or
+    /// "rename_fallback"); empty when no swap was attempted.
+    #[serde(default)]
+    pub swap: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +71,9 @@ pub enum PromotionError {
     InvalidBundle(String),
     DestinationChanged,
     GateFailure(Vec<String>),
+    /// A symlink stood where the bundle needed to write or delete;
+    /// promotion refuses to follow it rather than escape the tree.
+    SymlinkRefused(String),
     Io(String),
     Encoding(String),
 }
@@ -64,6 +89,11 @@ pub struct BundleFile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SealedCandidateBundle {
     pub files: Vec<BundleFile>,
+    /// Paths removed from the tree by this promotion. Deletions are
+    /// representable because the staged tree replaces the destination
+    /// wholesale (audit finding 12).
+    #[serde(default)]
+    pub deletes: Vec<String>,
 }
 
 const MAX_BUNDLE_FILES: usize = 64;
@@ -96,13 +126,13 @@ pub fn validate_bundle_path(path: &str) -> Result<(), PromotionError> {
 pub fn parse_bundle(content: &str) -> Result<SealedCandidateBundle, PromotionError> {
     let bundle: SealedCandidateBundle = serde_json::from_str(content)
         .map_err(|e| PromotionError::InvalidBundle(format!("not a sealed bundle: {e}")))?;
-    if bundle.files.is_empty() {
-        return Err(PromotionError::InvalidBundle("bundle has no files".into()));
+    if bundle.files.is_empty() && bundle.deletes.is_empty() {
+        return Err(PromotionError::InvalidBundle("bundle changes nothing".into()));
     }
-    if bundle.files.len() > MAX_BUNDLE_FILES {
+    if bundle.files.len() + bundle.deletes.len() > MAX_BUNDLE_FILES {
         return Err(PromotionError::InvalidBundle(format!(
-            "{} files exceeds {MAX_BUNDLE_FILES}",
-            bundle.files.len()
+            "{} entries exceeds {MAX_BUNDLE_FILES}",
+            bundle.files.len() + bundle.deletes.len()
         )));
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -121,11 +151,20 @@ pub fn parse_bundle(content: &str) -> Result<SealedCandidateBundle, PromotionErr
             )));
         }
     }
+    for delete in &bundle.deletes {
+        validate_bundle_path(delete)?;
+        if !seen.insert(delete.clone()) {
+            return Err(PromotionError::InvalidBundle(format!(
+                "path {delete:?} is both written and deleted"
+            )));
+        }
+    }
     Ok(bundle)
 }
 
 /// Deterministic recursive tree hash over sorted (path, content-hash) pairs.
-/// Errors honestly when the tree exceeds the entry bound.
+/// Symlinks are not part of the tree contract and are skipped, never
+/// followed. Errors honestly when the tree exceeds the entry bound.
 pub fn tree_hash(root: &Path) -> Result<String, PromotionError> {
     let mut entries: BTreeMap<String, String> = BTreeMap::new();
     let mut total_bytes: u64 = 0;
@@ -198,34 +237,334 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), PromotionError> {
     Ok(())
 }
 
-fn clear_tree(dir: &Path) -> Result<(), PromotionError> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    let read = fs::read_dir(dir).map_err(|e| PromotionError::Io(e.to_string()))?;
-    for entry in read.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() && !kind.is_symlink() {
-            fs::remove_dir_all(&path).map_err(|e| PromotionError::Io(e.to_string()))?;
-        } else {
-            fs::remove_file(&path).map_err(|e| PromotionError::Io(e.to_string()))?;
+/// Descriptor-relative filesystem operations. Every path component is
+/// opened with O_NOFOLLOW relative to an owned directory descriptor, so a
+/// symlink anywhere in a bundle path refuses the operation instead of
+/// redirecting it outside the tree. This is the mechanism behind the
+/// finding-4 fix; the stage-only apply above it is the structure.
+#[cfg(unix)]
+mod dirfd {
+    use super::PromotionError;
+    use std::ffi::CString;
+    use std::io::{self, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::path::PathBuf;
+
+    /// Owned directory descriptor.
+    pub struct DirFd(RawFd);
+
+    impl Drop for DirFd {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+            }
         }
+    }
+
+    fn map_err(op: &str, name: &str, e: io::Error) -> PromotionError {
+        match e.raw_os_error() {
+            Some(libc::ELOOP) => PromotionError::SymlinkRefused(format!(
+                "{op}: component {name:?} is a symlink; promotion never follows symlinks"
+            )),
+            _ => PromotionError::Io(format!("{op} {name:?}: {e}")),
+        }
+    }
+
+    fn c_name(name: &str) -> Result<CString, PromotionError> {
+        CString::new(name)
+            .map_err(|_| PromotionError::InvalidBundle(format!("NUL in path component {name:?}")))
+    }
+
+    pub fn open_root(path: &std::path::Path) -> Result<DirFd, PromotionError> {
+        let c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| PromotionError::Io("NUL in root path".into()))?;
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(PromotionError::Io(format!(
+                "open root {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(DirFd(fd))
+    }
+
+    fn dup_fd(dir: &DirFd) -> Result<DirFd, PromotionError> {
+        let fd = unsafe { libc::fcntl(dir.0, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(PromotionError::Io(format!(
+                "dup dirfd: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(DirFd(fd))
+    }
+
+    fn open_dir(parent: &DirFd, name: &str) -> io::Result<DirFd> {
+        let c = c_name(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
+        let fd = unsafe {
+            libc::openat(
+                parent.0,
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(DirFd(fd))
+    }
+
+    /// Linux reports ENOTDIR (not ELOOP) for O_NOFOLLOW|O_DIRECTORY on a
+    /// symlink; look at the component to tell a symlink refusal apart from
+    /// an ordinary not-a-directory conflict.
+    fn classify_dir_err(parent: &DirFd, name: &str, e: io::Error) -> PromotionError {
+        if e.raw_os_error() == Some(libc::ENOTDIR) {
+            if let Ok(c) = c_name(name) {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstatat(parent.0, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) }
+                    == 0
+                    && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+                {
+                    return PromotionError::SymlinkRefused(format!(
+                        "open dir: component {name:?} is a symlink; promotion never follows symlinks"
+                    ));
+                }
+            }
+        }
+        map_err("open dir", name, e)
+    }
+
+    fn ensure_dir(parent: &DirFd, name: &str) -> Result<DirFd, PromotionError> {
+        match open_dir(parent, name) {
+            Ok(d) => Ok(d),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                let c = c_name(name)?;
+                if unsafe { libc::mkdirat(parent.0, c.as_ptr(), 0o755) } != 0 {
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(map_err("mkdir", name, e));
+                    }
+                }
+                open_dir(parent, name).map_err(|e| map_err("open dir", name, e))
+            }
+            Err(e) => Err(classify_dir_err(parent, name, e)),
+        }
+    }
+
+    /// Write one bundle file, creating intermediate directories. A symlink
+    /// in any component refuses the write instead of being followed.
+    pub fn write_file(root: &DirFd, rel: &str, bytes: &[u8]) -> Result<(), PromotionError> {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let mut dir = dup_fd(root)?;
+        for part in &parts[..parts.len() - 1] {
+            dir = ensure_dir(&dir, part)?;
+        }
+        let name = parts[parts.len() - 1];
+        let c = c_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                dir.0,
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        if fd < 0 {
+            return Err(map_err("write file", rel, io::Error::last_os_error()));
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0
+            || (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        {
+            return Err(PromotionError::Io(format!(
+                "write file {rel:?}: target is not a regular file"
+            )));
+        }
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| PromotionError::Io(format!("write file {rel:?}: {e}")))
+    }
+
+    /// Remove one delete target (file, symlink, or directory tree), never
+    /// following a symlink. Returns false when the path is already absent.
+    pub fn remove_path(root: &DirFd, rel: &str) -> Result<bool, PromotionError> {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let mut dir = dup_fd(root)?;
+        for part in &parts[..parts.len() - 1] {
+            match open_dir(&dir, part) {
+                Ok(d) => dir = d,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+                Err(e) => return Err(classify_dir_err(&dir, part, e)),
+            }
+        }
+        let name = parts[parts.len() - 1];
+        let c = c_name(name)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dir.0, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(false);
+            }
+            return Err(map_err("stat", rel, e));
+        }
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            remove_dir_tree(&dir, name)?;
+        } else if unsafe { libc::unlinkat(dir.0, c.as_ptr(), 0) } != 0 {
+            return Err(map_err("unlink", rel, io::Error::last_os_error()));
+        }
+        Ok(true)
+    }
+
+    fn remove_dir_tree(parent: &DirFd, name: &str) -> Result<(), PromotionError> {
+        let dir = open_dir(parent, name).map_err(|e| map_err("open dir", name, e))?;
+        // Entries are read through the descriptor itself, so the walk stays
+        // inside this directory even if names are moved mid-delete.
+        #[cfg(target_os = "linux")]
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", dir.0));
+        #[cfg(not(target_os = "linux"))]
+        let fd_path = PathBuf::from(format!("/dev/fd/{}", dir.0));
+        let read = std::fs::read_dir(&fd_path)
+            .map_err(|e| PromotionError::Io(format!("read dir {name:?}: {e}")))?;
+        for entry in read.flatten() {
+            let entry_name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| PromotionError::Io("non-UTF8 name in tree".into()))?;
+            let kind = entry
+                .file_type()
+                .map_err(|e| PromotionError::Io(e.to_string()))?;
+            if kind.is_dir() {
+                remove_dir_tree(&dir, &entry_name)?;
+            } else {
+                let c = c_name(&entry_name)?;
+                if unsafe { libc::unlinkat(dir.0, c.as_ptr(), 0) } != 0 {
+                    return Err(map_err("unlink", &entry_name, io::Error::last_os_error()));
+                }
+            }
+        }
+        drop(dir);
+        let c = c_name(name)?;
+        if unsafe { libc::unlinkat(parent.0, c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            return Err(map_err("rmdir", name, io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+mod dirfd {
+    use super::PromotionError;
+
+    /// The confined apply is unix-only; elsewhere promotion refuses to
+    /// stage rather than apply unconfined.
+    pub struct DirFd;
+
+    pub fn open_root(_path: &std::path::Path) -> Result<DirFd, PromotionError> {
+        Err(PromotionError::Io(
+            "symlink-safe promotion requires unix descriptor-relative operations".into(),
+        ))
+    }
+
+    pub fn write_file(_root: &DirFd, _rel: &str, _bytes: &[u8]) -> Result<(), PromotionError> {
+        unreachable!()
+    }
+
+    pub fn remove_path(_root: &DirFd, _rel: &str) -> Result<bool, PromotionError> {
+        unreachable!()
+    }
+}
+
+fn fsync_dir(path: &Path) -> Result<(), PromotionError> {
+    fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| PromotionError::Io(format!("fsync {}: {e}", path.display())))
+}
+
+fn remove_tree_quiet(path: &Path) {
+    if path.exists() {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn rename_exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))
+    };
+    let a_c = c(a)?;
+    let b_c = c(b)?;
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a_c.as_ptr(),
+            libc::AT_FDCWD,
+            b_c.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
-fn apply_bundle(bundle: &SealedCandidateBundle, root: &Path) -> Result<(), PromotionError> {
-    for file in &bundle.files {
-        let target = root.join(&file.path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| PromotionError::Io(e.to_string()))?;
+/// Move the staged tree onto the destination in one atomic exchange where
+/// the OS supports it, preserving the old tree for rollback. Returns the
+/// method used; the receipt records it honestly.
+fn swap_trees(stage: &Path, destination: &Path, backup: &Path) -> Result<String, PromotionError> {
+    #[cfg(all(unix, target_os = "linux"))]
+    {
+        match rename_exchange(stage, destination) {
+            Ok(()) => return Ok("rename_exchange".into()),
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
+            Err(e) => return Err(PromotionError::Io(format!("rename exchange: {e}"))),
         }
-        fs::write(&target, &file.content).map_err(|e| PromotionError::Io(e.to_string()))?;
     }
-    Ok(())
+    // Fallback: two renames with a small crash window. The durable prepare
+    // receipt plus the backup directory make that window recoverable.
+    fs::rename(destination, backup)
+        .map_err(|e| PromotionError::Io(format!("backup rename: {e}")))?;
+    fs::rename(stage, destination)
+        .map_err(|e| PromotionError::Io(format!("stage rename: {e}")))?;
+    Ok("rename_fallback".into())
+}
+
+/// Undo a landed swap: put the preserved old tree back at the destination.
+/// After a Linux exchange the old tree sits at the stage path; after the
+/// fallback it sits at the backup path.
+fn restore_trees(stage: &Path, destination: &Path, backup: &Path) -> Result<(), PromotionError> {
+    #[cfg(all(unix, target_os = "linux"))]
+    {
+        if stage.exists() {
+            rename_exchange(stage, destination)
+                .map_err(|e| PromotionError::Io(format!("restore exchange: {e}")))?;
+            return Ok(());
+        }
+    }
+    if backup.exists() {
+        if destination.exists() {
+            // Move the bad new tree aside first; restore must not lose it
+            // before the old tree is back.
+            fs::rename(destination, stage)
+                .map_err(|e| PromotionError::Io(format!("restore aside rename: {e}")))?;
+        }
+        fs::rename(backup, destination)
+            .map_err(|e| PromotionError::Io(format!("restore rename: {e}")))?;
+        return Ok(());
+    }
+    Err(PromotionError::Io(
+        "no preserved tree to restore from".into(),
+    ))
 }
 
 /// REX-checkable gates re-run on the stage: file proofs are deterministic
@@ -266,6 +605,19 @@ fn rerun_gates(
     (rerun, not_rerun, failed)
 }
 
+fn validate_task_id(task_id: &str) -> Result<(), PromotionError> {
+    if task_id.is_empty()
+        || !task_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(PromotionError::InvalidBundle(
+            "invalid task id for promotion store".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct PromotionStore {
     dir: PathBuf,
 }
@@ -289,15 +641,7 @@ impl PromotionStore {
     }
 
     fn receipt_path(&self, task_id: &str) -> Result<PathBuf, PromotionError> {
-        if task_id.is_empty()
-            || !task_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
-            return Err(PromotionError::InvalidBundle(
-                "invalid task id for promotion store".into(),
-            ));
-        }
+        validate_task_id(task_id)?;
         Ok(self.dir.join(format!("receipt-{task_id}.json")))
     }
 
@@ -310,9 +654,77 @@ impl PromotionStore {
         fs::rename(&temporary, &path).map_err(|e| PromotionError::Io(e.to_string()))
     }
 
+    /// Heal a dangling Prepared receipt from a crashed promotion. Every
+    /// crash point maps to one recovery: the swap never landed (destination
+    /// untouched -> RolledBack), the swap landed but the commit record was
+    /// lost (-> Committed), or the destination is unknown (-> restore the
+    /// preserved old tree and verify, else CorruptState).
+    fn recover_prepared(
+        &self,
+        mut prior: PromotionReceipt,
+        destination: &Path,
+        stage: &Path,
+        backup: &Path,
+    ) -> Result<PromotionReceipt, PromotionError> {
+        // The fallback window can leave the destination missing with the
+        // old tree at the backup path; put it back before judging.
+        if !destination.exists() && backup.exists() {
+            fs::rename(backup, destination)
+                .map_err(|e| PromotionError::Io(format!("recovery rename: {e}")))?;
+        }
+        let dest_hash = if destination.is_dir() {
+            Some(tree_hash(destination)?)
+        } else {
+            None
+        };
+        if !prior.staging_hash.is_empty() && dest_hash.as_ref() == Some(&prior.staging_hash) {
+            // The swap landed before the crash; only the commit record was
+            // lost. The old tree at the scratch path is now disposable.
+            remove_tree_quiet(stage);
+            remove_tree_quiet(backup);
+            prior.state = PromotionState::Committed;
+            prior.detail =
+                "recovered a crashed promotion: the swap had landed; commit record repaired".into();
+            return Ok(prior);
+        }
+        if dest_hash.as_ref() == Some(&prior.destination_hash_before) {
+            // The swap never landed; nothing to undo.
+            remove_tree_quiet(stage);
+            remove_tree_quiet(backup);
+            prior.state = PromotionState::RolledBack;
+            prior.detail = "recovered a crashed promotion: destination was never swapped".into();
+            return Ok(prior);
+        }
+        if !destination.exists() && stage.exists() {
+            // Post-exchange crash with the destination gone is not
+            // reachable through either swap path; treat the scratch tree
+            // as the only candidate old tree and move it back.
+            let _ = fs::rename(stage, destination);
+        }
+        let restored = if destination.exists() {
+            restore_trees(stage, destination, backup)
+        } else {
+            Err(PromotionError::Io("no recoverable tree".into()))
+        };
+        remove_tree_quiet(stage);
+        remove_tree_quiet(backup);
+        match (restored, tree_hash(destination)) {
+            (Ok(()), Ok(restored_hash)) if restored_hash == prior.destination_hash_before => {
+                prior.state = PromotionState::RolledBack;
+                prior.detail = "recovered a crashed promotion; restore verified".into();
+            }
+            _ => {
+                prior.state = PromotionState::CorruptState;
+                prior.detail = "crashed promotion recovery is unverifiable".into();
+            }
+        }
+        Ok(prior)
+    }
+
     /// Full promotion sequence for one task. Durable receipts mark each
-    /// boundary; a failure after staging restores and verifies the snapshot,
-    /// and an unverifiable restore is CorruptState, never a guess.
+    /// boundary; the destination changes only through one atomic swap, and
+    /// any failure restores and verifies the old tree. An unverifiable
+    /// restore is CorruptState, never best-effort state.
     pub fn promote(
         &self,
         task_id: &str,
@@ -332,59 +744,39 @@ impl PromotionStore {
             .find(|r| r.candidate_id == candidate_id)
             .ok_or(PromotionError::NoQualifiedCandidate)?;
         let bundle = parse_bundle(&response.content)?;
-        let bundle_hash = canonical_hash(&response.content)
-            .map_err(|e| PromotionError::Encoding(e.to_string()))?;
+        let bundle_hash =
+            canonical_hash(&response.content).map_err(|e| PromotionError::Encoding(e.to_string()))?;
+        validate_task_id(task_id)?;
+        if !destination.is_dir() {
+            return Err(PromotionError::Io(
+                "promotion destination is not a directory".into(),
+            ));
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| PromotionError::Io("promotion destination has no parent".into()))?;
+        let stage = parent.join(format!(".rex-stage-{task_id}"));
+        let backup = parent.join(format!(".rex-backup-{task_id}"));
 
         // Recover a dangling prepare from a crashed promotion before
-        // snapshotting again: a dirty destination is never a new base.
-        // Unverifiable recovery is CorruptState and refuses to promote.
+        // staging again: a dirty or unknown destination is never a new base.
         if let Some(prior) = self.receipt(task_id)? {
             if prior.state == PromotionState::Prepared {
-                let snapshot = self.dir.join(format!("snapshot-{task_id}"));
-                clear_tree(destination)
-                    .and_then(|()| copy_tree(&snapshot, destination))
-                    .ok();
-                let mut recovered = prior;
-                match tree_hash(destination) {
-                    Ok(restored) if restored == recovered.destination_hash_before => {
-                        recovered.state = PromotionState::RolledBack;
-                        recovered.detail = "recovered a crashed promotion; restore verified".into();
-                    }
-                    _ => {
-                        recovered.state = PromotionState::CorruptState;
-                        recovered.detail = "crashed promotion recovery is unverifiable".into();
-                    }
-                }
-                let corrupt = recovered.state == PromotionState::CorruptState;
+                let recovered = self.recover_prepared(prior, destination, &stage, &backup)?;
                 self.persist_receipt(&recovered)?;
-                if corrupt {
-                    return Ok(recovered);
+                match recovered.state {
+                    PromotionState::CorruptState | PromotionState::Committed => {
+                        return Ok(recovered)
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Snapshot the destination before any mutation.
         let destination_hash_before = tree_hash(destination)?;
-        let snapshot = self.dir.join(format!("snapshot-{task_id}"));
-        if snapshot.exists() {
-            fs::remove_dir_all(&snapshot).map_err(|e| PromotionError::Io(e.to_string()))?;
-        }
-        copy_tree(destination, &snapshot)?;
-
-        // Stage the bundle on a private copy and rerun REX-checkable gates.
-        let stage = self.dir.join(format!("stage-{task_id}"));
-        if stage.exists() {
-            fs::remove_dir_all(&stage).map_err(|e| PromotionError::Io(e.to_string()))?;
-        }
-        copy_tree(destination, &stage)?;
-
-        let finish = |receipt: PromotionReceipt| -> Result<PromotionReceipt, PromotionError> {
-            self.persist_receipt(&receipt)?;
-            Ok(receipt)
-        };
         let mut receipt = PromotionReceipt {
             task_id: task_id.to_string(),
-            candidate_id: candidate_id.clone(),
+            candidate_id,
             bundle_hash,
             destination_hash_before: destination_hash_before.clone(),
             staging_hash: String::new(),
@@ -392,11 +784,26 @@ impl PromotionStore {
             gates_not_rerun: Vec::new(),
             state: PromotionState::Prepared,
             detail: "staged".into(),
+            swap: String::new(),
         };
 
-        let applied = apply_bundle(&bundle, &stage);
+        // Build the complete next tree in a private sibling directory.
+        remove_tree_quiet(&stage);
+        remove_tree_quiet(&backup);
+        copy_tree(destination, &stage)?;
+
         let outcome: Result<(), PromotionError> = (|| {
-            applied?;
+            // Confined application: every component of every bundle path is
+            // opened descriptor-relative with O_NOFOLLOW.
+            let root = dirfd::open_root(&stage)?;
+            for file in &bundle.files {
+                dirfd::write_file(&root, &file.path, file.content.as_bytes())?;
+            }
+            for delete in &bundle.deletes {
+                dirfd::remove_path(&root, delete)?;
+            }
+            drop(root);
+            fsync_dir(&stage)?;
             let (rerun, not_rerun, failed) = rerun_gates(contract, &stage);
             receipt.gates_rerun = rerun;
             receipt.gates_not_rerun = not_rerun;
@@ -404,42 +811,62 @@ impl PromotionStore {
                 return Err(PromotionError::GateFailure(failed));
             }
             receipt.staging_hash = tree_hash(&stage)?;
-            // A prepare receipt exists before any destination mutation.
+            // A prepare receipt is durable before any swap attempt.
             self.persist_receipt(&receipt)?;
-            // Compare-and-swap: the destination must not have moved.
+            fsync_dir(&self.dir)?;
+            // Compare-and-swap guard: the destination must not have moved.
             if tree_hash(destination)? != destination_hash_before {
                 return Err(PromotionError::DestinationChanged);
             }
-            apply_bundle(&bundle, destination)?;
+            // The single mutation of the destination: one atomic exchange.
+            receipt.swap = swap_trees(&stage, destination, &backup)?;
+            fsync_dir(parent)?;
             if tree_hash(destination)? != receipt.staging_hash {
                 return Err(PromotionError::Io(
-                    "destination hash mismatch after apply".into(),
+                    "destination hash mismatch after swap".into(),
                 ));
             }
             receipt.state = PromotionState::Committed;
-            receipt.detail = "promoted and destination hash verified".into();
+            receipt.detail = format!(
+                "promoted via {} swap; destination hash verified",
+                receipt.swap
+            );
             Ok(())
         })();
 
         match outcome {
-            Ok(()) => finish(receipt),
+            Ok(()) => {
+                // The old tree survives only as scratch; drop it.
+                remove_tree_quiet(&stage);
+                remove_tree_quiet(&backup);
+                self.persist_receipt(&receipt)?;
+                Ok(receipt)
+            }
             Err(error) => {
-                // Roll back: restore the snapshot and verify the restore.
-                clear_tree(destination)
-                    .and_then(|()| copy_tree(&snapshot, destination))
-                    .ok();
-                match tree_hash(destination) {
-                    Ok(restored) if restored == destination_hash_before => {
+                // Roll back. If the swap landed, swap the preserved old
+                // tree back; otherwise the destination was never touched.
+                let swap_landed = !receipt.staging_hash.is_empty()
+                    && matches!(tree_hash(destination), Ok(now) if now == receipt.staging_hash);
+                let mut restore_error: Option<PromotionError> = None;
+                if swap_landed {
+                    if let Err(e) = restore_trees(&stage, destination, &backup) {
+                        restore_error = Some(e);
+                    }
+                }
+                remove_tree_quiet(&stage);
+                remove_tree_quiet(&backup);
+                match (restore_error, tree_hash(destination)) {
+                    (None, Ok(restored)) if restored == destination_hash_before => {
                         receipt.state = PromotionState::RolledBack;
                         receipt.detail = format!("rolled back and verified after: {error:?}");
-                        finish(receipt)
                     }
                     _ => {
                         receipt.state = PromotionState::CorruptState;
                         receipt.detail = format!("rollback unverifiable after: {error:?}");
-                        finish(receipt)
                     }
                 }
+                self.persist_receipt(&receipt)?;
+                Ok(receipt)
             }
         }
     }
@@ -471,6 +898,14 @@ mod tests {
     fn bundle(files: &[(&str, &str)]) -> String {
         serde_json::json!({
             "files": files.iter().map(|(path, content)| serde_json::json!({"path":path,"content":content})).collect::<Vec<_>>()
+        })
+        .to_string()
+    }
+
+    fn bundle_with_deletes(files: &[(&str, &str)], deletes: &[&str]) -> String {
+        serde_json::json!({
+            "files": files.iter().map(|(path, content)| serde_json::json!({"path":path,"content":content})).collect::<Vec<_>>(),
+            "deletes": deletes,
         })
         .to_string()
     }
@@ -529,6 +964,7 @@ mod tests {
         assert_eq!(receipt.state, PromotionState::Committed);
         assert_eq!(receipt.destination_hash_before, before);
         assert_eq!(receipt.gates_rerun, vec!["o1".to_string()]);
+        assert!(!receipt.swap.is_empty(), "receipt records the swap method");
         assert_eq!(
             fs::read_to_string(destination.join("result.txt")).unwrap(),
             "PASS\n"
@@ -539,6 +975,9 @@ mod tests {
         );
         assert_eq!(tree_hash(&destination).unwrap(), receipt.staging_hash);
         assert_eq!(store.receipt("task-1").unwrap(), Some(receipt));
+        // No scratch trees survive a committed promotion.
+        assert!(!directory.path().join(".rex-stage-task-1").exists());
+        assert!(!directory.path().join(".rex-backup-task-1").exists());
     }
 
     #[test]
@@ -563,6 +1002,14 @@ mod tests {
         assert!(parse_bundle(&bundle(&[("same.txt", "x"), ("same.txt", "y")])).is_err());
         assert!(parse_bundle("not json").is_err());
         assert!(parse_bundle(&serde_json::json!({"files":[]}).to_string()).is_err());
+        // Deletes are validated exactly like writes.
+        assert!(parse_bundle(&bundle_with_deletes(&[], &["../evil.txt"])).is_err());
+        assert!(parse_bundle(&bundle_with_deletes(&[], &["/abs.txt"])).is_err());
+        assert!(
+            parse_bundle(&bundle_with_deletes(&[("a.txt", "x")], &["a.txt"])).is_err(),
+            "a path cannot be both written and deleted"
+        );
+        assert!(parse_bundle(&bundle_with_deletes(&[], &["a.txt", "a.txt"])).is_err());
     }
 
     #[test]
@@ -588,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_failure_rolls_back_to_a_verified_snapshot() {
+    fn stage_apply_failure_leaves_the_destination_untouched() {
         let directory = tempdir().unwrap();
         let destination = directory.path().join("dest");
         fs::create_dir_all(&destination).unwrap();
@@ -604,80 +1051,225 @@ mod tests {
         assert_eq!(tree_hash(&destination).unwrap(), before);
         assert!(destination.join("result.txt").is_dir());
     }
-    fn simulate_crashed_promotion(
-        store: &PromotionStore,
-        task_id: &str,
-        destination: &Path,
-    ) -> String {
-        // A prepare receipt plus snapshot, then uncommitted destination
-        // dirt: exactly what a crash between prepare and commit leaves.
-        let before = tree_hash(destination).unwrap();
-        let snapshot = store.dir.join(format!("snapshot-{task_id}"));
-        if snapshot.exists() {
-            fs::remove_dir_all(&snapshot).unwrap();
-        }
-        copy_tree(destination, &snapshot).unwrap();
-        store
-            .persist_receipt(&PromotionReceipt {
-                task_id: task_id.into(),
-                candidate_id: "crashed".into(),
-                bundle_hash: "b".repeat(64),
-                destination_hash_before: before.clone(),
-                staging_hash: String::new(),
-                gates_rerun: vec![],
-                gates_not_rerun: vec![],
-                state: PromotionState::Prepared,
-                detail: "staged".into(),
-            })
-            .unwrap();
-        fs::write(destination.join("junk.txt"), "half-applied").unwrap();
-        fs::write(destination.join("keep.txt"), "dirtied").unwrap();
-        before
-    }
 
+    #[cfg(unix)]
     #[test]
-    fn crashed_promotion_recovers_before_promoting_again() {
+    fn symlink_parent_escape_is_impossible() {
+        // Audit finding 4's exact exploit: destination holds a symlink to an
+        // outside directory and the winning bundle writes through it.
+        use std::os::unix::fs::symlink;
         let directory = tempdir().unwrap();
         let destination = directory.path().join("dest");
+        let outside = directory.path().join("outside");
         fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&outside).unwrap();
         fs::write(destination.join("keep.txt"), "original").unwrap();
+        symlink(&outside, destination.join("linked")).unwrap();
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
-        simulate_crashed_promotion(&store, "task-5", &destination);
-        let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
+        let adapter = completed_adapter(
+            &contract(),
+            &bundle(&[("result.txt", "PASS\n"), ("linked/pwned.txt", "escape")]),
+        );
         let receipt = store
             .promote("task-5", &adapter, &contract(), &destination)
             .unwrap();
         assert_eq!(receipt.state, PromotionState::Committed);
-        // The dirty state was rolled back first, then the bundle applied.
+        // The outside directory was never written.
+        assert!(!outside.join("pwned.txt").exists());
+        // The symlink is gone from the promoted tree; the path is now a
+        // real directory inside the workspace holding the bundle's file.
+        let meta = fs::symlink_metadata(destination.join("linked")).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
         assert_eq!(
-            fs::read_to_string(destination.join("keep.txt")).unwrap(),
-            "original"
+            fs::read_to_string(destination.join("linked/pwned.txt")).unwrap(),
+            "escape"
         );
-        assert!(!destination.join("junk.txt").exists());
+        assert_eq!(tree_hash(&destination).unwrap(), receipt.staging_hash);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_writes_never_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let directory = tempdir().unwrap();
+        let root_path = directory.path().join("root");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root_path).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("victim.txt"), "precious").unwrap();
+        symlink(outside.join("victim.txt"), root_path.join("file-link")).unwrap();
+        symlink(&outside, root_path.join("dir-link")).unwrap();
+        let root = dirfd::open_root(&root_path).unwrap();
+        // Final component symlink: refused, target untouched.
+        match dirfd::write_file(&root, "file-link", b"pwned") {
+            Err(PromotionError::SymlinkRefused(_)) => {}
+            other => panic!("expected SymlinkRefused, got {other:?}"),
+        }
+        // Intermediate component symlink: refused, target untouched.
+        match dirfd::write_file(&root, "dir-link/pwned.txt", b"pwned") {
+            Err(PromotionError::SymlinkRefused(_)) => {}
+            other => panic!("expected SymlinkRefused, got {other:?}"),
+        }
         assert_eq!(
-            fs::read_to_string(destination.join("result.txt")).unwrap(),
-            "PASS\n"
+            fs::read_to_string(outside.join("victim.txt")).unwrap(),
+            "precious"
         );
+        assert!(!outside.join("pwned.txt").exists());
     }
 
     #[test]
-    fn crashed_promotion_with_unverifiable_restore_is_corrupt_state() {
+    fn deletes_are_applied_and_committed() {
         let directory = tempdir().unwrap();
         let destination = directory.path().join("dest");
         fs::create_dir_all(&destination).unwrap();
         fs::write(destination.join("keep.txt"), "original").unwrap();
+        fs::write(destination.join("old.txt"), "stale").unwrap();
+        fs::create_dir_all(destination.join("obsolete/nested")).unwrap();
+        fs::write(destination.join("obsolete/nested/junk.txt"), "junk").unwrap();
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
-        simulate_crashed_promotion(&store, "task-6", &destination);
-        fs::remove_dir_all(store.dir.join("snapshot-task-6")).unwrap();
-        let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
+        let adapter = completed_adapter(
+            &contract(),
+            &bundle_with_deletes(
+                &[("result.txt", "PASS\n")],
+                &["old.txt", "obsolete", "already-absent.txt"],
+            ),
+        );
         let receipt = store
             .promote("task-6", &adapter, &contract(), &destination)
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::Committed);
+        assert!(!destination.join("old.txt").exists());
+        assert!(!destination.join("obsolete").exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("keep.txt")).unwrap(),
+            "original"
+        );
+        assert_eq!(tree_hash(&destination).unwrap(), receipt.staging_hash);
+    }
+
+    #[test]
+    fn crashed_promotion_before_swap_recovers_and_promotes() {
+        // Prepare receipt on disk, destination untouched: exactly what a
+        // crash between the durable prepare and the swap leaves.
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let before = tree_hash(&destination).unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        store
+            .persist_receipt(&PromotionReceipt {
+                task_id: "task-7".into(),
+                candidate_id: "crashed".into(),
+                bundle_hash: "b".repeat(64),
+                destination_hash_before: before,
+                staging_hash: "f".repeat(64),
+                gates_rerun: vec![],
+                gates_not_rerun: vec![],
+                state: PromotionState::Prepared,
+                detail: "staged".into(),
+                swap: String::new(),
+            })
+            .unwrap();
+        let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
+        let receipt = store
+            .promote("task-7", &adapter, &contract(), &destination)
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::Committed);
+        assert_eq!(
+            fs::read_to_string(destination.join("result.txt")).unwrap(),
+            "PASS\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("keep.txt")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn crashed_promotion_after_swap_recovers_to_committed() {
+        // The swap landed but the commit record was lost: destination holds
+        // the new tree, the scratch path holds the old one, and the durable
+        // receipt still says Prepared.
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let before = tree_hash(&destination).unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        let stage = directory.path().join(".rex-stage-task-8");
+        copy_tree(&destination, &stage).unwrap();
+        fs::write(stage.join("result.txt"), "PASS\n").unwrap();
+        let staging_hash = tree_hash(&stage).unwrap();
+        store
+            .persist_receipt(&PromotionReceipt {
+                task_id: "task-8".into(),
+                candidate_id: "crashed".into(),
+                bundle_hash: "b".repeat(64),
+                destination_hash_before: before,
+                staging_hash: staging_hash.clone(),
+                gates_rerun: vec!["o1".into()],
+                gates_not_rerun: vec![],
+                state: PromotionState::Prepared,
+                detail: "staged".into(),
+                swap: String::new(),
+            })
+            .unwrap();
+        // Simulate the landed swap: new tree at destination, old at stage.
+        let holding = directory.path().join("holding");
+        fs::rename(&destination, &holding).unwrap();
+        fs::rename(&stage, &destination).unwrap();
+        fs::rename(&holding, &stage).unwrap();
+        assert_eq!(tree_hash(&destination).unwrap(), staging_hash);
+        let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
+        let receipt = store
+            .promote("task-8", &adapter, &contract(), &destination)
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::Committed);
+        assert!(receipt.detail.contains("swap had landed"));
+        assert_eq!(
+            fs::read_to_string(destination.join("result.txt")).unwrap(),
+            "PASS\n"
+        );
+        // The preserved old tree was cleaned up.
+        assert!(!stage.exists());
+    }
+
+    #[test]
+    fn crashed_promotion_with_unverifiable_restore_is_corrupt_state() {
+        // A prepared promotion whose destination no longer matches either
+        // known hash, with no preserved old tree anywhere: fail closed.
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let before = tree_hash(&destination).unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        store
+            .persist_receipt(&PromotionReceipt {
+                task_id: "task-9".into(),
+                candidate_id: "crashed".into(),
+                bundle_hash: "b".repeat(64),
+                destination_hash_before: before,
+                staging_hash: "f".repeat(64),
+                gates_rerun: vec![],
+                gates_not_rerun: vec![],
+                state: PromotionState::Prepared,
+                detail: "staged".into(),
+                swap: String::new(),
+            })
+            .unwrap();
+        fs::write(destination.join("junk.txt"), "foreign dirt").unwrap();
+        fs::write(destination.join("keep.txt"), "dirtied").unwrap();
+        let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
+        let receipt = store
+            .promote("task-9", &adapter, &contract(), &destination)
             .unwrap();
         assert_eq!(receipt.state, PromotionState::CorruptState);
         // Fail closed: nothing was promoted onto an unverifiable base.
         assert!(!destination.join("result.txt").exists());
         assert_eq!(
-            store.receipt("task-6").unwrap().unwrap().state,
+            store.receipt("task-9").unwrap().unwrap().state,
             PromotionState::CorruptState
         );
     }

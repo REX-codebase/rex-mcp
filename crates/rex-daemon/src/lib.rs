@@ -1391,8 +1391,10 @@ impl HarnessDaemon {
     }
 
     /// Promotion and the terminal task transition as one crash-safe step.
-    /// The MCP surface keeps this frozen until the rebuilt promotion path
-    /// (phase F) lands; the join itself is exercised directly.
+    /// The MCP surface keeps this frozen until mandatory promotion gates
+    /// are enforced (the compiled-contracts phase); the rebuilt symlink-safe
+    /// promotion path underneath it landed with phase F, and the join
+    /// itself is exercised directly.
     #[allow(dead_code)]
     pub(crate) fn promote_and_join(
         &self,
