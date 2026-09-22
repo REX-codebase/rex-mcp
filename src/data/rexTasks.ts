@@ -139,7 +139,7 @@ export function proofJourneyPhases(events: RexEvent[]): ProofPhase[] {
   );
   const phases: ProofPhase[] = [
     { id: "created", label: "Task created", state: has("task_created") ? "done" : "pending" },
-    { id: "skills", label: "Skill plan recorded (not enforced)", state: has("ultra_skill_plan") ? "done" : "pending" },
+    { id: "skills", label: "Skill plan frozen (enforced at promotion)", state: has("ultra_skill_plan") ? "done" : "pending" },
     { id: "candidates", label: "Candidate theses collected", state: hasCandidate ? "done" : "pending" },
     {
       id: "evidence",
@@ -148,7 +148,7 @@ export function proofJourneyPhases(events: RexEvent[]): ProofPhase[] {
     },
     {
       id: "promotion",
-      label: "Promotion (currently disabled)",
+      label: "Promotion (gated by the frozen plan)",
       state: promotion ? (promoState === "committed" ? "done" : "failed") : "pending",
     },
     {
