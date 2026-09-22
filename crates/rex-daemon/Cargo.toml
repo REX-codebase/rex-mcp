@@ -13,6 +13,7 @@ rex-prompt = { path = "../rex-prompt" }
 rex-ultra = { path = "../rex-ultra" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

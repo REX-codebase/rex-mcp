@@ -6,7 +6,10 @@
 //! decides completion from evidence. The trusted launcher, not an MCP
 //! payload, decides whether mutations are pre-approved.
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use rex_custody::capability::{hex_sha256, random_hex};
+use rex_ultra::artifacts::{ArtifactError, ArtifactStore};
 use rex_custody::{
     AgentProtocol, CapabilitySet, CapabilityToken, CompletionClaim, CompletionContract,
     Consumption, CustodiedToolRuntime, CustodyAcceptance, CustodyBudgets, CustodyError,
@@ -124,6 +127,8 @@ pub struct HarnessDaemon {
     /// `<root>/human-stop-token` (0600) for the trusted local launcher;
     /// the daemon never stores it in task state or logs.
     human_token_hash: String,
+    /// Content-addressed immutable artifact store under `<root>/evidence`.
+    artifacts: ArtifactStore,
 }
 
 impl HarnessDaemon {
@@ -139,12 +144,14 @@ impl HarnessDaemon {
         let runtime = ToolRuntime::new(&policy.workspace).map_err(|e| internal(e.detail))?;
         let tools = CustodiedToolRuntime::new(runtime, custody.clone());
         let human_token_hash = load_or_create_human_token(&root)?;
+        let artifacts = ArtifactStore::open(&root).map_err(|e| internal(e.to_string()))?;
         Ok(Self {
             root,
             policy,
             custody,
             tools,
             human_token_hash,
+            artifacts,
         })
     }
 
@@ -755,6 +762,77 @@ impl HarnessDaemon {
 
     /// Single entry point shared by the MCP server and tests: deserialize
     /// the tool arguments, run the typed method, serialize the response.
+    /// rex_artifact_put: anchor evidence bytes in the content-addressed
+    /// immutable artifact store. Hosts may store evidence; they cannot
+    /// alter it afterwards, and reusing one digest across candidates or
+    /// rounds is rejected. Later gates cite the returned digest and the
+    /// daemon re-hashes stored bytes when resolving it.
+    pub fn artifact_put(
+        &self,
+        req: ArtifactPutRequest,
+    ) -> Result<ArtifactPutResponse, ProtocolError> {
+        let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
+        if req.kind.trim().is_empty() || req.kind.len() > 64 {
+            return Err(perr(
+                ErrorCode::MalformedRequest,
+                "artifact kind must be 1-64 chars",
+                &req.task_id,
+            ));
+        }
+        let bytes = B64.decode(req.bytes_base64.as_bytes()).map_err(|e| {
+            perr(
+                ErrorCode::MalformedRequest,
+                format!("bytes_base64 is not valid base64: {e}"),
+                &req.task_id,
+            )
+        })?;
+        let (binding, fresh) = self
+            .artifacts
+            .put(
+                &t.task_id,
+                req.kind.trim(),
+                &bytes,
+                req.candidate_id.clone(),
+                req.round,
+            )
+            .map_err(|e| match e {
+                ArtifactError::TooLarge { .. } | ArtifactError::Io(_) => perr(
+                    ErrorCode::MalformedRequest,
+                    e.to_string(),
+                    &req.task_id,
+                ),
+                ArtifactError::ReusedDigest { .. } => perr(
+                    ErrorCode::IdempotencyConflict,
+                    e.to_string(),
+                    &req.task_id,
+                ),
+                ArtifactError::Tampered { .. } | ArtifactError::Missing { .. } => {
+                    perr(ErrorCode::Internal, e.to_string(), &req.task_id)
+                }
+            })?;
+        self.append_event(
+            &mut t,
+            "artifact_registered",
+            serde_json::json!({
+                "sha256": binding.sha256,
+                "kind": binding.kind,
+                "bytes": binding.bytes,
+                "candidate_id": binding.candidate_id,
+                "round": binding.round,
+                "fresh": fresh,
+            }),
+        )?;
+        self.persist(&t)?;
+        Ok(ArtifactPutResponse {
+            sha256: binding.sha256,
+            bytes: binding.bytes,
+            candidate_id: binding.candidate_id,
+            round: binding.round,
+            fresh,
+            recorded_ms: binding.recorded_ms,
+        })
+    }
+
     pub fn dispatch(&self, tool: ToolName, args: Value) -> Result<Value, ProtocolError> {
         fn parse<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, ProtocolError> {
             serde_json::from_value(v).map_err(|e| {
@@ -785,6 +863,7 @@ impl HarnessDaemon {
             ToolName::UltraPromote => go!(args, ultra_promote),
             ToolName::Proof => go!(args, proof_bundle),
             ToolName::HumanStop => go!(args, human_stop),
+            ToolName::ArtifactPut => go!(args, artifact_put),
         }
     }
 
@@ -2581,5 +2660,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ok.content, "v");
+    }
+
+    #[test]
+    fn artifact_put_is_capability_gated_and_digest_bound() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("r-artifact")).unwrap();
+        let put = |capability: &str, epoch: u64, bytes_b64: &str, cand: Option<&str>, round: Option<u64>| {
+            daemon.artifact_put(ArtifactPutRequest {
+                task_id: ex.task_id.clone(),
+                capability: capability.into(),
+                lease_epoch: epoch,
+                kind: "screenshot".into(),
+                bytes_base64: bytes_b64.into(),
+                candidate_id: cand.map(str::to_string),
+                round,
+            })
+        };
+        let shot = base64::engine::general_purpose::STANDARD.encode(b"png-v1");
+        // Missing and forged capabilities are unauthorized.
+        assert_eq!(put("", ex.lease.epoch, &shot, Some("cand-1"), Some(1)).unwrap_err().code, ErrorCode::Unauthorized);
+        assert_eq!(put("cap-forged", ex.lease.epoch, &shot, Some("cand-1"), Some(1)).unwrap_err().code, ErrorCode::Unauthorized);
+        // Stale epoch is sequencing failure, not authorization.
+        assert_eq!(put(&cap_of(&ex), ex.lease.epoch + 9, &shot, Some("cand-1"), Some(1)).unwrap_err().code, ErrorCode::StaleLease);
+        // Garbage base64 is malformed, never stored.
+        assert_eq!(put(&cap_of(&ex), ex.lease.epoch, "!!!not-base64!!!", Some("cand-1"), Some(1)).unwrap_err().code, ErrorCode::MalformedRequest);
+        // The real capability stores bytes and returns their digest.
+        let ok = put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-1"), Some(1)).unwrap();
+        assert!(ok.fresh);
+        assert_eq!(ok.bytes, 6);
+        assert_eq!(ok.sha256.len(), 64);
+        // Stored bytes land read-only under evidence/artifacts/<sha256>.
+        let path = root.join("evidence/artifacts").join(&ok.sha256);
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o444);
+        }
+        // Idempotent replay of the identical binding.
+        let again = put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-1"), Some(1)).unwrap();
+        assert!(!again.fresh);
+        assert_eq!(again.sha256, ok.sha256);
+        // Reused digest across candidates or rounds is rejected.
+        assert_eq!(put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-2"), Some(1)).unwrap_err().code, ErrorCode::IdempotencyConflict);
+        assert_eq!(put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-1"), Some(2)).unwrap_err().code, ErrorCode::IdempotencyConflict);
+        // The registration is on the durable event stream.
+        let evs = daemon
+            .events(EventsRequest { task_id: ex.task_id.clone(), after_seq: 0, limit: None })
+            .unwrap();
+        assert!(evs.events.iter().any(|e| e.kind == "artifact_registered"
+            && e.detail["sha256"] == serde_json::json!(ok.sha256)));
     }
 }

@@ -185,6 +185,7 @@ pub fn tool_descriptors() -> Vec<Value> {
             ToolName::UltraOpen => ("Open the Ultra external-host loop: fetch the open candidate or adversary/verifier/visual evidence requests.", task_epoch_schema()),
             ToolName::UltraPromote => ("Promote the qualified Ultra candidate bundle into the task workspace with verified rollback.", task_epoch_schema()),
             ToolName::Proof => ("Fetch the deterministic per-task proof bundle: frozen plan, kernel state, evidence outcomes, skill plan, promotion receipt, events and bundle hash.", task_ref_schema()),
+            ToolName::ArtifactPut => ("Store evidence bytes in the daemon's content-addressed immutable artifact store, bound to this task (optionally a candidate and round); cite the returned digest as evidence. Stored bytes cannot be altered and one digest cannot be reused across candidates or rounds.", extend(task_epoch_schema(), json!({"kind":{"type":"string"},"bytes_base64":{"type":"string"},"candidate_id":{"type":"string"},"round":{"type":"integer"}}), &["kind","bytes_base64"])),
             ToolName::UltraSubmit => ("Submit one Ultra candidate response or one adversary/verifier/visual evidence item. For candidates, request_id and candidate_id are the answered candidate id.", extend(task_epoch_schema(), json!({"kind":{"enum":["candidate","adversary","verifier","visual"]},"request_id":{"type":"string"},"candidate_id":{"type":"string"},"response_hash":{"type":"string"},"content":{"type":"string"}}), &["kind","request_id","candidate_id","response_hash","content"])),
         };
         // All schemas are objects, even the helper-created ones.
@@ -258,7 +259,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 17);
+        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 18);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"], "active");
         let task_id = rows[2]["result"]["structuredContent"]["task_id"]
             .as_str()

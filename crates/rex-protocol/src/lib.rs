@@ -45,6 +45,7 @@ pub enum ToolName {
     UltraPromote,
     Proof,
     HumanStop,
+    ArtifactPut,
 }
 
 impl ToolName {
@@ -67,6 +68,7 @@ impl ToolName {
             ToolName::UltraPromote => "rex_ultra_promote",
             ToolName::Proof => "rex_proof",
             ToolName::HumanStop => "rex_human_stop",
+            ToolName::ArtifactPut => "rex_artifact_put",
         }
     }
 
@@ -89,6 +91,7 @@ impl ToolName {
             "rex_ultra_promote" => ToolName::UltraPromote,
             "rex_proof" => ToolName::Proof,
             "rex_human_stop" => ToolName::HumanStop,
+            "rex_artifact_put" => ToolName::ArtifactPut,
             _ => return None,
         })
     }
@@ -112,6 +115,7 @@ impl ToolName {
             ToolName::UltraPromote,
             ToolName::Proof,
             ToolName::HumanStop,
+            ToolName::ArtifactPut,
         ]
     }
 }
@@ -560,6 +564,40 @@ pub struct CancelResponse {
 /// the trusted local launcher's state dir (0600), never in MCP payloads an
 /// agent can mint. It fences the task terminally in every phase, even
 /// against an agent operator, and its effect cannot be rolled back.
+/// rex_artifact_put: store evidence bytes in the daemon's content-addressed
+/// immutable artifact store, bound to this task (and optionally a candidate
+/// and round). The returned digest is what later evidence citations must
+/// resolve to; bytes cannot be altered after this call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactPutRequest {
+    pub task_id: String,
+    /// Per-task capability issued by rex_execute. Required: task id plus
+    /// lease epoch is sequencing information, not authorization.
+    pub capability: String,
+    pub lease_epoch: u64,
+    /// Evidence kind, e.g. "screenshot", "log", "verdict".
+    pub kind: String,
+    /// Base64-encoded artifact bytes (standard alphabet, padding required).
+    pub bytes_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactPutResponse {
+    pub sha256: String,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u64>,
+    /// False when this exact binding already existed (idempotent replay).
+    pub fresh: bool,
+    pub recorded_ms: u128,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HumanStopRequest {
     pub task_id: String,
@@ -713,6 +751,7 @@ mod tests {
                 "rex_ultra_promote",
                 "rex_proof",
                 "rex_human_stop",
+                "rex_artifact_put",
             ]
         );
         for t in ToolName::all() {
