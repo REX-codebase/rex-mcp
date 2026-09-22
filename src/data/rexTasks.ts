@@ -143,7 +143,7 @@ export function proofJourneyPhases(events: RexEvent[]): ProofPhase[] {
     { id: "candidates", label: "Candidate theses collected", state: hasCandidate ? "done" : "pending" },
     {
       id: "evidence",
-      label: "Evidence submitted (gates not independently enforced)",
+      label: "Evidence through the daemon-executed gates",
       state: hasEvidence ? (promotion || terminal ? "done" : "active") : "pending",
     },
     {
