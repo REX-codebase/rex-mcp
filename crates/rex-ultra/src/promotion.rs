@@ -71,7 +71,7 @@ const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_TREE_ENTRIES: usize = 100_000;
 const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
-fn validate_bundle_path(path: &str) -> Result<(), PromotionError> {
+pub fn validate_bundle_path(path: &str) -> Result<(), PromotionError> {
     let invalid = |reason: &str| PromotionError::InvalidBundle(format!("path {path:?}: {reason}"));
     if path.is_empty() {
         return Err(invalid("empty"));
@@ -503,19 +503,12 @@ mod tests {
                 content: "{\"defects\":[]}".into(),
             })
             .unwrap();
-        let verifier = requests
-            .iter()
-            .find(|r| r.kind == EvidenceKind::Verifier)
-            .unwrap()
-            .clone();
-        let verdict = "{\"outcomes\":[{\"obligation_id\":\"o1\",\"status\":\"proven\"}]}";
         adapter
-            .record_verifier(VerifierEvidence {
-                request_id: verifier.request_id,
-                candidate_id: request.candidate_id.clone(),
-                response_hash: canonical_hash(&verdict).unwrap(),
-                content: verdict.into(),
-            })
+            .record_daemon_verifier(
+                &request.candidate_id,
+                std::collections::BTreeMap::from([("o1".to_string(), true)]),
+                canonical_hash(&"daemon-run").unwrap(),
+            )
             .unwrap();
         assert!(matches!(
             adapter.finalize().unwrap(),

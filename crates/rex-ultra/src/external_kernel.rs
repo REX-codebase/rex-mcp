@@ -112,6 +112,11 @@ pub struct AdversaryEvidence {
     pub content: String,
 }
 
+/// Request id carried by daemon-executed verifier records: proves the
+/// outcomes were produced by the daemon running the contract, never by a
+/// host claiming "proven".
+pub const DAEMON_VERIFIER_REQUEST: &str = "daemon-verifier";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerifierEvidence {
     pub request_id: String,
@@ -380,7 +385,10 @@ impl ExternalHostAdapter {
             .iter()
             .map(|o| o.id.clone())
             .collect();
-        let mut kinds = vec![EvidenceKind::Adversary, EvidenceKind::Verifier];
+        // The verifier is executed by the daemon inside each candidate
+        // workspace; hosts are only ever asked for adversary and (visual)
+        // pixel inputs, never for verdicts on their own work.
+        let mut kinds = vec![EvidenceKind::Adversary];
         if self.state.contract.work_kind == crate::contract::WorkKind::Visual {
             kinds.push(EvidenceKind::Visual);
         }
@@ -453,47 +461,30 @@ impl ExternalHostAdapter {
         self.persist()
     }
 
-    pub fn record_verifier(&mut self, evidence: VerifierEvidence) -> Result<(), AdapterError> {
-        let expected =
-            self.expect_evidence_request(EvidenceKind::Verifier, &evidence.candidate_id)?;
-        if evidence.request_id != expected {
-            return Err(AdapterError::UnknownEvidenceRequest);
+    /// Record the daemon's own verifier execution for one candidate. The
+    /// daemon runs every contract proof inside the candidate workspace and
+    /// records the outcomes itself; host-submitted verifier verdicts do not
+    /// exist on this path.
+    pub fn record_daemon_verifier(
+        &mut self,
+        candidate_id: &str,
+        outcomes: BTreeMap<String, bool>,
+        receipts_hash: String,
+    ) -> Result<(), AdapterError> {
+        if !self.state.host_attached || self.state.kernel.state != KernelState::AwaitingEvidence {
+            return Err(AdapterError::EvidenceStageNotOpen);
+        }
+        if !self.state.responses.contains_key(candidate_id) {
+            return Err(AdapterError::UnknownCandidate);
         }
         if self
             .state
             .evidence
-            .get(&evidence.candidate_id)
+            .get(candidate_id)
             .and_then(|e| e.verifier.as_ref())
             .is_some()
         {
             return Err(AdapterError::DuplicateEvidence);
-        }
-        let expected_hash =
-            canonical_hash(&evidence.content).map_err(|e| AdapterError::Encoding(e.to_string()))?;
-        if expected_hash != evidence.response_hash {
-            return Err(AdapterError::Encoding("response hash mismatch".into()));
-        }
-        #[derive(Deserialize)]
-        struct RawOutcome {
-            obligation_id: String,
-            status: String,
-        }
-        #[derive(Deserialize)]
-        struct RawOutcomes {
-            outcomes: Vec<RawOutcome>,
-        }
-        let raw: RawOutcomes = serde_json::from_str(&evidence.content)
-            .map_err(|e| AdapterError::InvalidEvidence(e.to_string()))?;
-        let mut outcomes = BTreeMap::new();
-        for outcome in raw.outcomes {
-            if outcomes
-                .insert(outcome.obligation_id.clone(), outcome.status == "proven")
-                .is_some()
-            {
-                return Err(AdapterError::InvalidEvidence(
-                    "duplicate obligation outcome".into(),
-                ));
-            }
         }
         let all_proven = !self.state.contract.obligations.is_empty()
             && self
@@ -504,11 +495,11 @@ impl ExternalHostAdapter {
                 .all(|o| outcomes.get(&o.id) == Some(&true));
         self.state
             .evidence
-            .entry(evidence.candidate_id.clone())
+            .entry(candidate_id.to_string())
             .or_default()
             .verifier = Some(VerifierEvidenceRecord {
-            request_id: evidence.request_id,
-            response_hash: evidence.response_hash,
+            request_id: DAEMON_VERIFIER_REQUEST.into(),
+            response_hash: receipts_hash,
             outcomes,
             all_proven,
         });
@@ -603,7 +594,7 @@ impl ExternalHostAdapter {
                 .unwrap_or(false);
             let verifier_proven = evidence
                 .and_then(|e| e.verifier.as_ref())
-                .map(|v| v.all_proven)
+                .map(|v| v.all_proven && v.request_id == DAEMON_VERIFIER_REQUEST)
                 .unwrap_or(false);
             let visual_ok = self.state.contract.work_kind != crate::contract::WorkKind::Visual
                 || evidence.and_then(|e| e.visual.as_ref()).is_some();
@@ -863,18 +854,27 @@ mod tests {
         )
     }
 
+    /// The daemon's own verifier run: outcomes it produced by executing the
+    /// contract, recorded without any host verdict.
+    fn daemon_verify(adapter: &mut ExternalHostAdapter, candidate_id: &str, proven: bool) {
+        let outcomes = std::collections::BTreeMap::from([("builds".to_string(), proven)]);
+        adapter
+            .record_daemon_verifier(candidate_id, outcomes, canonical_hash(&proven).unwrap())
+            .unwrap();
+    }
+
     #[test]
     fn evidence_requests_are_deterministic_per_candidate_and_kind() {
         let (adapter, requests) = ready_adapter();
         let evidence_requests = adapter.evidence_requests().unwrap();
-        assert_eq!(evidence_requests.len(), 4);
+        assert_eq!(evidence_requests.len(), 2);
         let again = adapter.evidence_requests().unwrap();
         assert_eq!(evidence_requests, again);
         let ids: std::collections::BTreeSet<&str> = evidence_requests
             .iter()
             .map(|r| r.request_id.as_str())
             .collect();
-        assert_eq!(ids.len(), 4);
+        assert_eq!(ids.len(), 2);
         for request in &evidence_requests {
             assert!(requests
                 .iter()
@@ -888,12 +888,14 @@ mod tests {
                 .count(),
             2
         );
+        // Verifier requests are never issued to hosts: the daemon executes
+        // the contract proofs itself.
         assert_eq!(
             evidence_requests
                 .iter()
                 .filter(|r| r.kind == EvidenceKind::Verifier)
                 .count(),
-            2
+            0
         );
     }
 
@@ -932,11 +934,6 @@ mod tests {
             .iter()
             .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Adversary)
             .unwrap();
-        let verifier_request = requests
-            .iter()
-            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier)
-            .unwrap();
-
         let (request_id, hash) = evidence_for(adversary_request, "{\"defects\":[]}");
         assert_eq!(
             adapter.record_adversary(AdversaryEvidence {
@@ -969,24 +966,13 @@ mod tests {
             KernelState::AwaitingEvidence
         ));
 
-        let verifier_content =
-            "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
-        let (request_id, hash) = evidence_for(verifier_request, verifier_content);
-        adapter
-            .record_verifier(VerifierEvidence {
-                request_id: request_id.clone(),
-                candidate_id: candidate.clone(),
-                response_hash: hash,
-                content: verifier_content.into(),
-            })
-            .unwrap();
+        daemon_verify(&mut adapter, &candidate, true);
         assert_eq!(
-            adapter.record_verifier(VerifierEvidence {
-                request_id,
-                candidate_id: candidate.clone(),
-                response_hash: canonical_hash(&verifier_content).unwrap(),
-                content: verifier_content.into(),
-            }),
+            adapter.record_daemon_verifier(
+                &candidate,
+                std::collections::BTreeMap::from([("builds".to_string(), true)]),
+                "receipts".into()
+            ),
             Err(AdapterError::DuplicateEvidence)
         );
 
@@ -1017,21 +1003,7 @@ mod tests {
                     content: "{\"defects\":[]}".into(),
                 })
                 .unwrap();
-            let verifier_request = requests
-                .iter()
-                .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier)
-                .unwrap();
-            let verifier_content =
-                "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"failed\"}]}";
-            let (request_id, hash) = evidence_for(verifier_request, verifier_content);
-            adapter
-                .record_verifier(VerifierEvidence {
-                    request_id,
-                    candidate_id: candidate.clone(),
-                    response_hash: hash,
-                    content: verifier_content.into(),
-                })
-                .unwrap();
+            daemon_verify(&mut adapter, &candidate, false);
         }
         assert_eq!(adapter.finalize().unwrap(), KernelState::Failed);
         assert_eq!(adapter.kernel().state, KernelState::Failed);
@@ -1083,21 +1055,7 @@ mod tests {
                 content: "could not inspect".into(),
             })
             .unwrap();
-        let verifier_request = requests
-            .iter()
-            .find(|r| r.candidate_id == second && r.kind == EvidenceKind::Verifier)
-            .unwrap();
-        let verifier_content =
-            "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
-        let (request_id, hash) = evidence_for(verifier_request, verifier_content);
-        adapter
-            .record_verifier(VerifierEvidence {
-                request_id,
-                candidate_id: second.clone(),
-                response_hash: hash,
-                content: verifier_content.into(),
-            })
-            .unwrap();
+        daemon_verify(&mut adapter, &second, true);
         assert!(matches!(
             adapter.finalize().unwrap(),
             KernelState::AwaitingEvidence
@@ -1138,21 +1096,7 @@ mod tests {
 
         let mut recovered = ExternalHostAdapter::open(&path).unwrap();
         assert_eq!(recovered.evidence_requests().unwrap(), requests);
-        let verifier_request = requests
-            .iter()
-            .find(|r| r.kind == EvidenceKind::Verifier)
-            .unwrap();
-        let verifier_content =
-            "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
-        let (request_id, hash) = evidence_for(verifier_request, verifier_content);
-        recovered
-            .record_verifier(VerifierEvidence {
-                request_id,
-                candidate_id: request.candidate_id.clone(),
-                response_hash: hash,
-                content: verifier_content.into(),
-            })
-            .unwrap();
+        daemon_verify(&mut recovered, &request.candidate_id, true);
         assert_eq!(recovered.finalize().unwrap(), KernelState::Completed);
         let reloaded = ExternalHostAdapter::open(&path).unwrap();
         assert_eq!(reloaded.kernel().state, KernelState::Completed);
@@ -1205,7 +1149,7 @@ mod tests {
     fn visual_contracts_issue_visual_evidence_requests() {
         let (adapter, _) = ready_visual_adapter();
         let requests = adapter.evidence_requests().unwrap();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 4);
         assert_eq!(
             requests
                 .iter()
@@ -1215,7 +1159,7 @@ mod tests {
         );
         let ids: std::collections::BTreeSet<&str> =
             requests.iter().map(|r| r.request_id.as_str()).collect();
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 4);
     }
 
     #[test]
@@ -1231,7 +1175,6 @@ mod tests {
                 .clone()
         };
         let adversary = pick(EvidenceKind::Adversary);
-        let verifier = pick(EvidenceKind::Verifier);
         let visual = pick(EvidenceKind::Visual);
         adapter
             .record_adversary(AdversaryEvidence {
@@ -1241,16 +1184,7 @@ mod tests {
                 content: "{\"defects\":[]}".into(),
             })
             .unwrap();
-        let verifier_content =
-            "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
-        adapter
-            .record_verifier(VerifierEvidence {
-                request_id: verifier.request_id.clone(),
-                candidate_id: candidate.clone(),
-                response_hash: canonical_hash(&verifier_content).unwrap(),
-                content: verifier_content.into(),
-            })
-            .unwrap();
+        daemon_verify(&mut adapter, &candidate, true);
         // clean adversary + proven verifier is not enough for a visual task
         assert!(matches!(
             adapter.finalize().unwrap(),
@@ -1395,20 +1329,7 @@ mod tests {
                 content: "{\"defects\":[]}".into(),
             })
             .unwrap();
-        let verifier = requests
-            .iter()
-            .find(|r| r.candidate_id == candidate && r.kind == EvidenceKind::Verifier)
-            .unwrap()
-            .clone();
-        let content = "{\"outcomes\":[{\"obligation_id\":\"builds\",\"status\":\"proven\"}]}";
-        adapter
-            .record_verifier(VerifierEvidence {
-                request_id: verifier.request_id,
-                candidate_id: candidate.clone(),
-                response_hash: canonical_hash(&content).unwrap(),
-                content: content.into(),
-            })
-            .unwrap();
+        daemon_verify(&mut adapter, &candidate, true);
         assert!(matches!(
             adapter.finalize().unwrap(),
             KernelState::Completed

@@ -10,7 +10,7 @@
 use crate::contract::{AcceptanceContract, Obligation, Proof};
 use crate::external_kernel::{
     AdapterError, AdversaryEvidence, CandidateResponse, ExternalHostAdapter, HostCandidateRequest,
-    HostEvidenceRequest, HostKernelStatus, KernelState, VerifierEvidence,
+    HostEvidenceRequest, HostKernelStatus, KernelState,
 };
 use rex_protocol::PlanStep;
 use std::fs;
@@ -159,17 +159,31 @@ impl UltraHostBridge {
         self.view(task_id, &mut adapter)
     }
 
-    pub fn record_verifier(
+    /// Record the daemon's own verifier execution for one candidate, then
+    /// re-run finalization. Only the daemon calls this: hosts never set
+    /// verifier outcomes.
+    pub fn record_daemon_verifier(
         &self,
         task_id: &str,
-        contract: &AcceptanceContract,
-        evidence: VerifierEvidence,
+        candidate_id: &str,
+        outcomes: std::collections::BTreeMap<String, bool>,
+        receipts_hash: String,
     ) -> Result<UltraHostView, BridgeError> {
-        let mut adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
+        let mut adapter = self.load_existing(task_id)?.ok_or(BridgeError::Adapter(
+            AdapterError::EvidenceStageNotOpen,
+        ))?;
         adapter
-            .record_verifier(evidence)
+            .record_daemon_verifier(candidate_id, outcomes, receipts_hash)
             .map_err(BridgeError::Adapter)?;
         adapter.finalize().map_err(BridgeError::Adapter)?;
+        self.view(task_id, &mut adapter)
+    }
+
+    /// The current durable view; never creates or mutates state.
+    pub fn current_view(&self, task_id: &str) -> Result<UltraHostView, BridgeError> {
+        let mut adapter = self.load_existing(task_id)?.ok_or(BridgeError::Adapter(
+            AdapterError::EvidenceStageNotOpen,
+        ))?;
         self.view(task_id, &mut adapter)
     }
 
@@ -249,6 +263,17 @@ mod tests {
         ]
     }
 
+    /// The daemon's own verifier run over the plan-derived contract.
+    fn daemon_verify(bridge: &UltraHostBridge, task_id: &str, candidate_id: &str, proven: bool) -> UltraHostView {
+        let outcomes = std::collections::BTreeMap::from([
+            ("step-1".to_string(), proven),
+            ("step-2".to_string(), proven),
+        ]);
+        bridge
+            .record_daemon_verifier(task_id, candidate_id, outcomes, canonical_hash(&proven).unwrap())
+            .unwrap()
+    }
+
     fn answer_requests(
         bridge: &UltraHostBridge,
         task_id: &str,
@@ -302,7 +327,7 @@ mod tests {
         let view = answer_requests(&bridge, "task-abc", &contract, &view);
         assert_eq!(view.status, HostKernelStatus::Ready);
         assert_eq!(view.kernel_state, KernelState::AwaitingEvidence);
-        assert_eq!(view.evidence_requests.len(), 4);
+        assert_eq!(view.evidence_requests.len(), 2);
 
         // One fully qualified candidate completes the kernel; evidence for
         // the remaining candidate is no longer requested afterwards.
@@ -332,23 +357,14 @@ mod tests {
                     unreachable!("general contracts issue no visual requests")
                 }
                 crate::external_kernel::EvidenceKind::Verifier => {
-                    let content = "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"},{\"obligation_id\":\"step-2\",\"status\":\"proven\"}]}";
-                    let after = bridge
-                        .record_verifier(
-                            "task-abc",
-                            &contract,
-                            VerifierEvidence {
-                                request_id: request.request_id.clone(),
-                                candidate_id: request.candidate_id.clone(),
-                                response_hash: canonical_hash(&content).unwrap(),
-                                content: content.into(),
-                            },
-                        )
-                        .unwrap();
-                    assert_eq!(after.kernel_state, KernelState::Completed);
+                    unreachable!("verifier requests are never issued to hosts")
                 }
             }
         }
+        // The daemon executes the contract proofs itself; its clean verdict
+        // qualifies the candidate and completes the kernel.
+        let after = daemon_verify(&bridge, "task-abc", &candidate, true);
+        assert_eq!(after.kernel_state, KernelState::Completed);
 
         let bridge = UltraHostBridge::open(directory.path()).unwrap();
         let final_view = bridge.open_requests("task-abc", &contract, 2, 1).unwrap();
@@ -384,21 +400,14 @@ mod tests {
                     unreachable!("general contracts issue no visual requests")
                 }
                 crate::external_kernel::EvidenceKind::Verifier => {
-                    let content = "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"failed\"},{\"obligation_id\":\"step-2\",\"status\":\"failed\"}]}";
-                    bridge
-                        .record_verifier(
-                            "task-def",
-                            &contract,
-                            VerifierEvidence {
-                                request_id: request.request_id.clone(),
-                                candidate_id: request.candidate_id.clone(),
-                                response_hash: canonical_hash(&content).unwrap(),
-                                content: content.into(),
-                            },
-                        )
-                        .unwrap();
+                    unreachable!("verifier requests are never issued to hosts")
                 }
             }
+        }
+        // The daemon's own verifier run finds every candidate wanting, so
+        // the kernel fails closed.
+        for request in &view.candidate_requests {
+            daemon_verify(&bridge, "task-def", &request.candidate_id, false);
         }
         let bridge = UltraHostBridge::open(directory.path()).unwrap();
         let final_view = bridge.open_requests("task-def", &contract, 2, 1).unwrap();

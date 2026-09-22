@@ -21,7 +21,6 @@ use rex_protocol::*;
 use rex_tools::{ToolRequest, ToolResult, ToolRuntime};
 use rex_ultra::external_kernel::{
     AdversaryEvidence, CandidateResponse, EvidenceKind, HostKernelStatus, KernelState,
-    VerifierEvidence,
 };
 use rex_ultra::host_bridge::{
     BridgeError, UltraHostBridge, UltraHostView, DEFAULT_MINIMUM_CANDIDATES,
@@ -942,6 +941,13 @@ impl HarnessDaemon {
                 t.lease_epoch,
             )
             .map_err(|e| bridge_err(&t.task_id, e))?;
+        let mut view = view;
+        if matches!(view.kernel_state, KernelState::AwaitingEvidence) {
+            self.run_daemon_verifier(&t, &bridge, &contract)?;
+            view = bridge
+                .current_view(&t.task_id)
+                .map_err(|e| bridge_err(&t.task_id, e))?;
+        }
         let plan = self.skill_plan();
         if let Some(plan) = &plan {
             if t.ultra_skill_plan_hash.as_deref() != Some(plan.plan_hash.as_str()) {
@@ -978,48 +984,72 @@ impl HarnessDaemon {
         let contract = bridge
             .frozen_contract(&t.task_id)
             .map_err(|e| bridge_err(&t.task_id, e))?;
-        let view = match req.kind {
-            UltraSubmissionKind::Candidate => bridge.record_response(
-                &t.task_id,
-                &contract,
-                CandidateResponse {
-                    candidate_id: req.request_id.clone(),
-                    response_hash: req.response_hash,
-                    content: req.content,
-                },
-            ),
-            UltraSubmissionKind::Adversary => bridge.record_adversary(
-                &t.task_id,
-                &contract,
-                AdversaryEvidence {
-                    request_id: req.request_id.clone(),
-                    candidate_id: req.candidate_id,
-                    response_hash: req.response_hash,
-                    content: req.content,
-                },
-            ),
-            UltraSubmissionKind::Verifier => bridge.record_verifier(
-                &t.task_id,
-                &contract,
-                VerifierEvidence {
-                    request_id: req.request_id.clone(),
-                    candidate_id: req.candidate_id,
-                    response_hash: req.response_hash,
-                    content: req.content,
-                },
-            ),
-            UltraSubmissionKind::Visual => bridge.record_visual(
-                &t.task_id,
-                &contract,
-                rex_ultra::external_kernel::VisualEvidence {
-                    request_id: req.request_id.clone(),
-                    candidate_id: req.candidate_id,
-                    response_hash: req.response_hash,
-                    content: req.content,
-                },
-            ),
+        let mut view = match req.kind {
+            UltraSubmissionKind::Candidate => {
+                // Candidates are sealed file bundles, materialized by the
+                // daemon into an isolated per-candidate workspace before
+                // any check runs. Prose answers are rejected here.
+                let candidate_root =
+                    self.materialize_candidate(&t.task_id, &req.request_id, &req.content)?;
+                match bridge.record_response(
+                    &t.task_id,
+                    &contract,
+                    CandidateResponse {
+                        candidate_id: req.request_id.clone(),
+                        response_hash: req.response_hash,
+                        content: req.content,
+                    },
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&candidate_root);
+                        return Err(bridge_err(&t.task_id, e));
+                    }
+                }
+            }
+            UltraSubmissionKind::Adversary => bridge
+                .record_adversary(
+                    &t.task_id,
+                    &contract,
+                    AdversaryEvidence {
+                        request_id: req.request_id.clone(),
+                        candidate_id: req.candidate_id,
+                        response_hash: req.response_hash,
+                        content: req.content,
+                    },
+                )
+                .map_err(|e| bridge_err(&t.task_id, e))?,
+            UltraSubmissionKind::Verifier => {
+                // Verifier outcomes come from the daemon executing the
+                // frozen contract inside each candidate workspace, never
+                // from the host whose work is being verified.
+                return Err(perr(
+                    ErrorCode::GateFailed,
+                    "verifier evidence is executed by the daemon; hosts cannot submit verdicts",
+                    &t.task_id,
+                ));
+            }
+            UltraSubmissionKind::Visual => bridge
+                .record_visual(
+                    &t.task_id,
+                    &contract,
+                    rex_ultra::external_kernel::VisualEvidence {
+                        request_id: req.request_id.clone(),
+                        candidate_id: req.candidate_id,
+                        response_hash: req.response_hash,
+                        content: req.content,
+                    },
+                )
+                .map_err(|e| bridge_err(&t.task_id, e))?,
+        };
+        // Whenever the evidence stage is open, the daemon runs the contract
+        // proofs itself for every candidate still missing a verifier record.
+        if matches!(view.kernel_state, KernelState::AwaitingEvidence) {
+            self.run_daemon_verifier(&t, &bridge, &contract)?;
+            view = bridge
+                .current_view(&t.task_id)
+                .map_err(|e| bridge_err(&t.task_id, e))?;
         }
-        .map_err(|e| bridge_err(&t.task_id, e))?;
         self.append_event(
             &mut t,
             "ultra_submission",
@@ -1091,6 +1121,91 @@ impl HarnessDaemon {
     /// frozen plan, kernel state, qualified candidate, bound skill plan,
     /// promotion receipt, full event stream and a deterministic bundle hash.
     /// This is the artifact the proof journey and release evidence build on.
+    /// Isolated workspace root for one Ultra candidate.
+    fn candidate_root(&self, task_id: &str, candidate_id: &str) -> PathBuf {
+        self.root
+            .join("workspaces")
+            .join("candidates")
+            .join(task_id)
+            .join(candidate_id)
+    }
+
+    /// Materialize a candidate's sealed bundle into its isolated workspace.
+    /// Returns the workspace root; the tree contains exactly the bundle.
+    fn materialize_candidate(
+        &self,
+        task_id: &str,
+        candidate_id: &str,
+        content: &str,
+    ) -> Result<PathBuf, ProtocolError> {
+        let bundle = rex_ultra::promotion::parse_bundle(content).map_err(|e| {
+            perr(
+                ErrorCode::GateFailed,
+                format!("candidate content is not a sealed file bundle: {e:?}"),
+                task_id,
+            )
+        })?;
+        let root = self.candidate_root(task_id, candidate_id);
+        if root.exists() {
+            fs::remove_dir_all(&root).map_err(internal)?;
+        }
+        for file in &bundle.files {
+            let dest = root.join(&file.path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(internal)?;
+            }
+            fs::write(&dest, &file.content).map_err(internal)?;
+        }
+        Ok(root)
+    }
+
+    /// The daemon-executed verifier: run every frozen contract proof inside
+    /// each candidate workspace that still lacks a verifier record, record
+    /// the outcomes, and let the kernel finalize. Hosts play no part.
+    fn run_daemon_verifier(
+        &self,
+        t: &DurableTask,
+        bridge: &UltraHostBridge,
+        contract: &rex_ultra::contract::AcceptanceContract,
+    ) -> Result<(), ProtocolError> {
+        let Some(adapter) = bridge
+            .load_existing(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?
+        else {
+            return Ok(());
+        };
+        if !matches!(
+            adapter.kernel().state,
+            rex_ultra::external_kernel::KernelState::AwaitingEvidence
+        ) {
+            return Ok(());
+        }
+        let pending: Vec<String> = adapter
+            .responses()
+            .map(|r| r.candidate_id.clone())
+            .filter(|cid| {
+                adapter
+                    .candidate_evidence(cid)
+                    .and_then(|e| e.verifier.as_ref())
+                    .is_none()
+            })
+            .collect();
+        drop(adapter);
+        for candidate_id in pending {
+            let root = self.candidate_root(&t.task_id, &candidate_id);
+            let outcomes = rex_ultra::daemon_verify::execute_proofs(contract, &root);
+            let receipts_hash = hash_json(&outcomes)?;
+            let map: BTreeMap<String, bool> = outcomes
+                .iter()
+                .map(|o| (o.obligation_id.clone(), o.proven))
+                .collect();
+            bridge
+                .record_daemon_verifier(&t.task_id, &candidate_id, map, receipts_hash)
+                .map_err(|e| bridge_err(&t.task_id, e))?;
+        }
+        Ok(())
+    }
+
     pub fn proof_bundle(&self, req: TaskRefRequest) -> Result<TaskProofBundle, ProtocolError> {
         let t = self.load(&req.task_id)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
@@ -2033,9 +2148,13 @@ mod tests {
             open.candidate_requests[0].obligation_ids,
             vec!["ob-1".to_string()]
         );
+        // Candidates are sealed file bundles, materialized by the daemon
+        // into isolated workspaces before any check runs.
         let mut view = open.clone();
-        for c in &open.candidate_requests {
-            let content = format!("candidate answer {}", c.candidate_id);
+        for (i, c) in open.candidate_requests.iter().enumerate() {
+            let content = format!(
+                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
+            );
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
@@ -2050,8 +2169,22 @@ mod tests {
         }
         assert_eq!(view.status, "ready");
         assert_eq!(view.kernel_state, "awaiting_evidence");
-        assert_eq!(view.evidence_requests.len(), 6);
+        // The daemon has already executed the contract proofs inside every
+        // candidate workspace; hosts are only asked for adversary input.
+        assert_eq!(view.evidence_requests.len(), 3);
         let candidate = view.evidence_requests[0].candidate_id.clone();
+        // A host claiming verifier outcomes is rejected: the daemon runs
+        // the verifier, hosts never set verdicts.
+        let forged_verdict = daemon.ultra_submit(ultra_req(
+            &ex.task_id,
+            &cap_of(&ex),
+            ex.lease.epoch,
+            UltraSubmissionKind::Verifier,
+            "anything",
+            &candidate,
+            "{\"outcomes\":[{\"obligation_id\":\"ob-1\",\"status\":\"proven\"}]}",
+        ));
+        assert!(forged_verdict.is_err());
         let pending: Vec<UltraEvidenceRequestView> = view
             .evidence_requests
             .iter()
@@ -2059,30 +2192,17 @@ mod tests {
             .cloned()
             .collect();
         for r in &pending {
-            view = match r.kind.as_str() {
-                "adversary" => daemon
-                    .ultra_submit(ultra_req(
-                    &ex.task_id,
-                    &cap_of(&ex),
-                    ex.lease.epoch,
-                        UltraSubmissionKind::Adversary,
-                        &r.request_id,
-                        &r.candidate_id,
-                        "{\"defects\":[]}",
-                    ))
-                    .unwrap(),
-                _ => daemon
-                    .ultra_submit(ultra_req(
-                    &ex.task_id,
-                    &cap_of(&ex),
-                    ex.lease.epoch,
-                        UltraSubmissionKind::Verifier,
-                        &r.request_id,
-                        &r.candidate_id,
-                        "{\"outcomes\":[{\"obligation_id\":\"ob-1\",\"status\":\"proven\"}]}",
-                    ))
-                    .unwrap(),
-            };
+            view = daemon
+                .ultra_submit(ultra_req(
+                &ex.task_id,
+                &cap_of(&ex),
+                ex.lease.epoch,
+                    UltraSubmissionKind::Adversary,
+                    &r.request_id,
+                    &r.candidate_id,
+                    "{\"defects\":[]}",
+                ))
+                .unwrap();
         }
         assert_eq!(view.kernel_state, "completed");
         let reopened =
@@ -2250,8 +2370,9 @@ mod tests {
             .is_err());
         let mut view = open.clone();
         for (i, c) in open.candidate_requests.iter().enumerate() {
-            let content =
-                format!("{{\"files\":[{{\"path\":\"result.txt\",\"content\":\"PASS {i}\"}}]}}");
+            let content = format!(
+                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}},{{\"path\":\"result.txt\",\"content\":\"PASS {i}\"}}]}}"
+            );
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
@@ -2272,30 +2393,17 @@ mod tests {
             .cloned()
             .collect();
         for r in &pending {
-            view = match r.kind.as_str() {
-                "adversary" => daemon
-                    .ultra_submit(ultra_req(
-                    &ex.task_id,
-                    &cap_of(&ex),
-                    ex.lease.epoch,
-                        UltraSubmissionKind::Adversary,
-                        &r.request_id,
-                        &r.candidate_id,
-                        "{\"defects\":[]}",
-                    ))
-                    .unwrap(),
-                _ => daemon
-                    .ultra_submit(ultra_req(
-                    &ex.task_id,
-                    &cap_of(&ex),
-                    ex.lease.epoch,
-                        UltraSubmissionKind::Verifier,
-                        &r.request_id,
-                        &r.candidate_id,
-                        "{\"outcomes\":[{\"obligation_id\":\"ob-1\",\"status\":\"proven\"}]}",
-                    ))
-                    .unwrap(),
-            };
+            view = daemon
+                .ultra_submit(ultra_req(
+                &ex.task_id,
+                &cap_of(&ex),
+                ex.lease.epoch,
+                    UltraSubmissionKind::Adversary,
+                    &r.request_id,
+                    &r.candidate_id,
+                    "{\"defects\":[]}",
+                ))
+                .unwrap();
         }
         assert_eq!(view.kernel_state, "completed");
         // AUDIT FREEZE: even with a completed kernel, promotion fails closed
@@ -2489,7 +2597,9 @@ mod tests {
             .unwrap();
         let mut view = open.clone();
         for (i, c) in open.candidate_requests.iter().enumerate() {
-            let content = format!("{{\"files\":[{{\"path\":\"out.txt\",\"content\":\"v{i}\"}}]}}");
+            let content = format!(
+                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}},{{\"path\":\"out.txt\",\"content\":\"v{i}\"}}]}}"
+            );
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
@@ -2510,30 +2620,17 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>()
         {
-            view = match r.kind.as_str() {
-                "adversary" => daemon
-                    .ultra_submit(ultra_req(
-                    &ex.task_id,
-                    &cap_of(&ex),
-                    ex.lease.epoch,
-                        UltraSubmissionKind::Adversary,
-                        &r.request_id,
-                        &r.candidate_id,
-                        "{\"defects\":[]}",
-                    ))
-                    .unwrap(),
-                _ => daemon
-                    .ultra_submit(ultra_req(
-                    &ex.task_id,
-                    &cap_of(&ex),
-                    ex.lease.epoch,
-                        UltraSubmissionKind::Verifier,
-                        &r.request_id,
-                        &r.candidate_id,
-                        "{\"outcomes\":[{\"obligation_id\":\"ob-1\",\"status\":\"proven\"}]}",
-                    ))
-                    .unwrap(),
-            };
+            view = daemon
+                .ultra_submit(ultra_req(
+                &ex.task_id,
+                &cap_of(&ex),
+                ex.lease.epoch,
+                    UltraSubmissionKind::Adversary,
+                    &r.request_id,
+                    &r.candidate_id,
+                    "{\"defects\":[]}",
+                ))
+                .unwrap();
         }
         assert_eq!(view.kernel_state, "completed");
         // AUDIT FREEZE: promotion fails closed; the proof bundle records no
@@ -2645,6 +2742,105 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(denied.code, ErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn ultra_candidates_get_isolated_workspaces_and_daemon_verdicts() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("r-isolation")).unwrap();
+        let open = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
+            })
+            .unwrap();
+        // Prose candidates are rejected: only sealed file bundles become
+        // isolated workspaces.
+        let prose = daemon.ultra_submit(ultra_req(
+            &ex.task_id,
+            &cap_of(&ex),
+            ex.lease.epoch,
+            UltraSubmissionKind::Candidate,
+            &open.candidate_requests[0].candidate_id,
+            &open.candidate_requests[0].candidate_id,
+            "trust me, the work is done",
+        ));
+        assert!(prose.is_err());
+        // A bundle with a traversal path is rejected before any write.
+        let escape = daemon.ultra_submit(ultra_req(
+            &ex.task_id,
+            &cap_of(&ex),
+            ex.lease.epoch,
+            UltraSubmissionKind::Candidate,
+            &open.candidate_requests[0].candidate_id,
+            &open.candidate_requests[0].candidate_id,
+            "{\"files\":[{\"path\":\"../escape.txt\",\"content\":\"x\"}]}",
+        ));
+        assert!(escape.is_err());
+        // Candidate 0 satisfies the contract; candidates 1 and 2 do not.
+        for (i, c) in open.candidate_requests.iter().enumerate() {
+            let body = if i == 0 {
+                format!("{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}")
+            } else {
+                format!("{{\"files\":[{{\"path\":\"other.txt\",\"content\":\"v{i}\"}}]}}")
+            };
+            daemon
+                .ultra_submit(ultra_req(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    UltraSubmissionKind::Candidate,
+                    &c.candidate_id,
+                    &c.candidate_id,
+                    &body,
+                ))
+                .unwrap();
+        }
+        // Each candidate materialized into its own isolated root.
+        let cand_dir = root.join("workspaces/candidates").join(&ex.task_id);
+        let entries: Vec<_> = fs::read_dir(&cand_dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 3);
+        let winner = &open.candidate_requests[0].candidate_id;
+        assert!(cand_dir.join(winner).join("hello.txt").exists());
+        assert!(!cand_dir.join(winner).join("other.txt").exists());
+        // Clean adversary input for every candidate: the daemon verifier
+        // has already decided which trees actually satisfy the contract,
+        // so only candidate 0 can qualify and complete the kernel.
+        let mut view = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
+            })
+            .unwrap();
+        for r in view.evidence_requests.clone() {
+            view = daemon
+                .ultra_submit(ultra_req(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    UltraSubmissionKind::Adversary,
+                    &r.request_id,
+                    &r.candidate_id,
+                    "{\"defects\":[]}",
+                ))
+                .unwrap();
+        }
+        assert_eq!(view.kernel_state, "completed");
+        // The qualified candidate is the one the daemon's own verifier
+        // proved - never a host's say-so.
+        let proof = daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: ex.task_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(proof.qualified_candidate.as_deref(), Some(winner.as_str()));
     }
 
     #[test]
