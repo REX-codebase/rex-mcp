@@ -20,6 +20,14 @@
 //! unknown destination state is restored from the preserved old tree and
 //! verified; an unverifiable restore is CorruptState, never a guess.
 //!
+//! Mandatory gates are enforced here (audit findings 7 and 10): every
+//! obligation proof that the daemon can execute is re-executed on a
+//! scratch copy of the stage - never on the tree that gets promoted, so
+//! gate side effects cannot leak into the workspace - and any obligation
+//! the daemon cannot re-execute, plus any required skill gate that is
+//! unsupported, blocks the commit. There is no "not rerun, promoted
+//! anyway" state.
+//!
 //! Honest limits: symlinks in the destination are not part of the tree
 //! contract (tree hashes skip them) and a committed promotion replaces the
 //! tree with the staged one, which contains no symlinks. On non-Linux
@@ -33,6 +41,7 @@ use std::path::{Path, PathBuf};
 
 use crate::contract::{AcceptanceContract, Proof};
 use crate::external_kernel::{ExternalHostAdapter, KernelState};
+use crate::skills::{CompiledGate, GateExec};
 use rex_protocol::schema::canonical_hash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +71,21 @@ pub struct PromotionReceipt {
     /// "rename_fallback"); empty when no swap was attempted.
     #[serde(default)]
     pub swap: String,
+    /// One outcome per compiled skill gate, in plan order. A required
+    /// gate never disappears from this list.
+    #[serde(default)]
+    pub skill_gates: Vec<SkillGateOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillGateOutcome {
+    /// "pack/id" of the compiled gate.
+    pub gate: String,
+    pub required: bool,
+    /// "passed", "failed", or "unsupported". Unsupported required gates
+    /// block the promotion; optional ones are only reported.
+    pub outcome: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +98,10 @@ pub enum PromotionError {
     /// A symlink stood where the bundle needed to write or delete;
     /// promotion refuses to follow it rather than escape the tree.
     SymlinkRefused(String),
+    /// Mandatory gates the daemon could not execute: promotion never
+    /// commits with an unverified obligation or an unsupported required
+    /// skill gate (audit findings 7 and 10).
+    GatesNotRerun(Vec<String>),
     Io(String),
     Encoding(String),
 }
@@ -166,10 +194,16 @@ pub fn parse_bundle(content: &str) -> Result<SealedCandidateBundle, PromotionErr
 /// Symlinks are not part of the tree contract and are skipped, never
 /// followed. Errors honestly when the tree exceeds the entry bound.
 pub fn tree_hash(root: &Path) -> Result<String, PromotionError> {
+    canonical_hash(&tree_entries(root)?).map_err(|e| PromotionError::Encoding(e.to_string()))
+}
+
+/// The (path, content-hash) entries behind the tree hash, for the native
+/// scope-diff gate.
+pub fn tree_entries(root: &Path) -> Result<BTreeMap<String, String>, PromotionError> {
     let mut entries: BTreeMap<String, String> = BTreeMap::new();
     let mut total_bytes: u64 = 0;
     collect_tree(root, root, &mut entries, &mut total_bytes)?;
-    canonical_hash(&entries).map_err(|e| PromotionError::Encoding(e.to_string()))
+    Ok(entries)
 }
 
 fn collect_tree(
@@ -567,42 +601,96 @@ fn restore_trees(stage: &Path, destination: &Path, backup: &Path) -> Result<(), 
     ))
 }
 
-/// REX-checkable gates re-run on the stage: file proofs are deterministic
-/// here; command and behavior proofs need a host or custody grant and are
-/// recorded as not re-run.
-fn rerun_gates(
-    contract: &AcceptanceContract,
-    stage: &Path,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut rerun = Vec::new();
-    let mut not_rerun = Vec::new();
-    let mut failed = Vec::new();
-    for obligation in &contract.obligations {
-        match &obligation.proof {
-            Proof::FileExists { path } => {
-                let ok = fs::metadata(stage.join(path))
-                    .map(|m| m.is_file() && m.len() > 0)
-                    .unwrap_or(false);
-                if ok {
-                    rerun.push(obligation.id.clone())
-                } else {
-                    failed.push(obligation.id.clone())
+/// The native scope-diff gate: the staged tree may differ from the
+/// pre-promotion tree exactly at the sealed bundle's declared paths. Any
+/// other change - a gate command writing into the stage would be one -
+/// fails the gate by naming the undeclared paths.
+fn scope_diff_check(
+    bundle: &SealedCandidateBundle,
+    before: &BTreeMap<String, String>,
+    stage: &BTreeMap<String, String>,
+) -> Result<(), Vec<String>> {
+    let mut declared: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for file in &bundle.files {
+        declared.insert(file.path.as_str());
+    }
+    for delete in &bundle.deletes {
+        declared.insert(delete.as_str());
+    }
+    let mut undeclared = Vec::new();
+    for (path, hash) in stage {
+        match before.get(path) {
+            Some(prior) if prior == hash => {}
+            _ => {
+                if !declared.contains(path.as_str()) {
+                    undeclared.push(format!("{path} changed without a bundle declaration"));
                 }
             }
-            Proof::FileContains { path, needle } => {
-                let ok = fs::read_to_string(stage.join(path))
-                    .map(|c| c.contains(needle))
-                    .unwrap_or(false);
-                if ok {
-                    rerun.push(obligation.id.clone())
-                } else {
-                    failed.push(obligation.id.clone())
-                }
-            }
-            _ => not_rerun.push(obligation.id.clone()),
         }
     }
-    (rerun, not_rerun, failed)
+    for path in before.keys() {
+        if !stage.contains_key(path) && !declared.contains(path.as_str()) {
+            undeclared.push(format!("{path} removed without a bundle delete"));
+        }
+    }
+    if undeclared.is_empty() {
+        Ok(())
+    } else {
+        Err(undeclared)
+    }
+}
+
+/// One skill gate executed against the gate-check copy. Returns the
+/// recorded outcome; blocking is decided by the caller from required.
+fn run_skill_gate(
+    gate: &CompiledGate,
+    check_root: &Path,
+    bundle: &SealedCandidateBundle,
+    before: &BTreeMap<String, String>,
+    stage: &BTreeMap<String, String>,
+) -> SkillGateOutcome {
+    let name = format!("{}/{}", gate.pack, gate.id);
+    let record = |outcome: &str, detail: String| SkillGateOutcome {
+        gate: name.clone(),
+        required: gate.required,
+        outcome: outcome.into(),
+        detail,
+    };
+    match &gate.exec {
+        GateExec::Unsupported => record(
+            "unsupported",
+            format!("daemon cannot execute this gate: {}", gate.command_hint),
+        ),
+        GateExec::ScopeDiffVsBundle => match scope_diff_check(bundle, before, stage) {
+            Ok(()) => record("passed", "changed surface equals the declared bundle paths".into()),
+            Err(undeclared) => record(
+                "failed",
+                format!("undeclared changes: {}", undeclared.join("; ")),
+            ),
+        },
+        GateExec::Command { argv } => {
+            let runtime = match rex_tools::ToolRuntime::new(check_root) {
+                Ok(r) => r,
+                Err(e) => return record("failed", format!("tool runtime: {}", e.detail)),
+            };
+            let allowed: Vec<&str> = argv.first().map(|a| vec![a.as_str()]).unwrap_or_default();
+            let result = runtime.execute_trusted_scoring(
+                argv,
+                None,
+                crate::daemon_verify::MAX_PROOF_COMMAND_MS,
+                &allowed,
+            );
+            if result.ok && result.receipt.exit_code == Some(0) {
+                record("passed", format!("{} exited 0", argv.join(" ")))
+            } else {
+                let detail = result
+                    .error
+                    .map(|e| e.detail)
+                    .unwrap_or_else(|| format!("exit code {:?}", result.receipt.exit_code));
+                record("failed", format!("{}: {}", argv.join(" "), detail))
+            }
+        }
+    }
 }
 
 fn validate_task_id(task_id: &str) -> Result<(), PromotionError> {
@@ -723,14 +811,17 @@ impl PromotionStore {
 
     /// Full promotion sequence for one task. Durable receipts mark each
     /// boundary; the destination changes only through one atomic swap, and
-    /// any failure restores and verifies the old tree. An unverifiable
-    /// restore is CorruptState, never best-effort state.
+    /// any failure restores and verifies the old tree. Every mandatory
+    /// gate is re-executed before the prepare receipt is written; a gate
+    /// the daemon cannot run blocks the commit. An unverifiable restore is
+    /// CorruptState, never best-effort state.
     pub fn promote(
         &self,
         task_id: &str,
         adapter: &ExternalHostAdapter,
         contract: &AcceptanceContract,
         destination: &Path,
+        skill_gates: &[CompiledGate],
     ) -> Result<PromotionReceipt, PromotionError> {
         if adapter.kernel().state != KernelState::Completed {
             return Err(PromotionError::KernelNotCompleted);
@@ -757,6 +848,7 @@ impl PromotionStore {
             .ok_or_else(|| PromotionError::Io("promotion destination has no parent".into()))?;
         let stage = parent.join(format!(".rex-stage-{task_id}"));
         let backup = parent.join(format!(".rex-backup-{task_id}"));
+        let gatecheck = parent.join(format!(".rex-gatecheck-{task_id}"));
 
         // Recover a dangling prepare from a crashed promotion before
         // staging again: a dirty or unknown destination is never a new base.
@@ -785,11 +877,13 @@ impl PromotionStore {
             state: PromotionState::Prepared,
             detail: "staged".into(),
             swap: String::new(),
+            skill_gates: Vec::new(),
         };
 
         // Build the complete next tree in a private sibling directory.
         remove_tree_quiet(&stage);
         remove_tree_quiet(&backup);
+        remove_tree_quiet(&gatecheck);
         copy_tree(destination, &stage)?;
 
         let outcome: Result<(), PromotionError> = (|| {
@@ -804,13 +898,73 @@ impl PromotionStore {
             }
             drop(root);
             fsync_dir(&stage)?;
-            let (rerun, not_rerun, failed) = rerun_gates(contract, &stage);
-            receipt.gates_rerun = rerun;
+            // The tree that gets promoted is hashed now, before any check
+            // runs: gate commands execute on a scratch copy so their side
+            // effects can never reach the workspace.
+            let entries_before = tree_entries(destination)?;
+            let entries_stage = tree_entries(&stage)?;
+            receipt.staging_hash =
+                canonical_hash(&entries_stage).map_err(|e| PromotionError::Encoding(e.to_string()))?;
+            copy_tree(&stage, &gatecheck)?;
+
+            // Obligation proofs: every daemon-executable proof re-executes
+            // on the gate-check copy; anything else is not re-run and
+            // blocks below.
+            let mut executable = AcceptanceContract {
+                task: contract.task.clone(),
+                work_kind: contract.work_kind.clone(),
+                obligations: Vec::new(),
+                forbidden_regressions: contract.forbidden_regressions.clone(),
+            };
+            for obligation in &contract.obligations {
+                match &obligation.proof {
+                    Proof::BehaviorEvidence { .. } => {
+                        receipt.gates_not_rerun.push(obligation.id.clone())
+                    }
+                    _ => executable.obligations.push(obligation.clone()),
+                }
+            }
+            let outcomes = crate::daemon_verify::execute_proofs(&executable, &gatecheck);
+            let mut failed = Vec::new();
+            for outcome in outcomes {
+                if outcome.proven {
+                    receipt.gates_rerun.push(outcome.obligation_id);
+                } else {
+                    failed.push(format!("{}: {}", outcome.obligation_id, outcome.detail));
+                }
+            }
+
+            // Skill gates from the frozen compiled plan.
+            let mut not_rerun = receipt.gates_not_rerun.clone();
+            for gate in skill_gates {
+                let outcome =
+                    run_skill_gate(gate, &gatecheck, &bundle, &entries_before, &entries_stage);
+                if gate.required && outcome.outcome != "passed" {
+                    if outcome.outcome == "unsupported" {
+                        not_rerun.push(format!(
+                            "{} (required skill gate unsupported: {})",
+                            outcome.gate, gate.command_hint
+                        ));
+                    } else {
+                        failed.push(format!(
+                            "{} (required skill gate): {}",
+                            outcome.gate, outcome.detail
+                        ));
+                    }
+                }
+                receipt.skill_gates.push(outcome);
+            }
+            remove_tree_quiet(&gatecheck);
             receipt.gates_not_rerun = not_rerun;
+
             if !failed.is_empty() {
                 return Err(PromotionError::GateFailure(failed));
             }
-            receipt.staging_hash = tree_hash(&stage)?;
+            if !receipt.gates_not_rerun.is_empty() {
+                return Err(PromotionError::GatesNotRerun(
+                    receipt.gates_not_rerun.clone(),
+                ));
+            }
             // A prepare receipt is durable before any swap attempt.
             self.persist_receipt(&receipt)?;
             fsync_dir(&self.dir)?;
@@ -828,7 +982,7 @@ impl PromotionStore {
             }
             receipt.state = PromotionState::Committed;
             receipt.detail = format!(
-                "promoted via {} swap; destination hash verified",
+                "promoted via {} swap; all mandatory gates re-executed and passed",
                 receipt.swap
             );
             Ok(())
@@ -839,6 +993,7 @@ impl PromotionStore {
                 // The old tree survives only as scratch; drop it.
                 remove_tree_quiet(&stage);
                 remove_tree_quiet(&backup);
+                remove_tree_quiet(&gatecheck);
                 self.persist_receipt(&receipt)?;
                 Ok(receipt)
             }
@@ -855,6 +1010,7 @@ impl PromotionStore {
                 }
                 remove_tree_quiet(&stage);
                 remove_tree_quiet(&backup);
+                remove_tree_quiet(&gatecheck);
                 match (restore_error, tree_hash(destination)) {
                     (None, Ok(restored)) if restored == destination_hash_before => {
                         receipt.state = PromotionState::RolledBack;
@@ -959,7 +1115,7 @@ mod tests {
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
         let receipt = store
-            .promote("task-1", &adapter, &contract(), &destination)
+            .promote("task-1", &adapter, &contract(), &destination, &[])
             .unwrap();
         assert_eq!(receipt.state, PromotionState::Committed);
         assert_eq!(receipt.destination_hash_before, before);
@@ -988,7 +1144,7 @@ mod tests {
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
         let adapter = ExternalHostAdapter::new(contract(), 1).unwrap();
         assert_eq!(
-            store.promote("task-2", &adapter, &contract(), &destination),
+            store.promote("task-2", &adapter, &contract(), &destination, &[]),
             Err(PromotionError::KernelNotCompleted)
         );
         assert!(store.receipt("task-2").unwrap().is_none());
@@ -1023,7 +1179,7 @@ mod tests {
         // The bundle builds the wrong content; the staged gate must catch it.
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "FAIL\n")]));
         let receipt = store
-            .promote("task-3", &adapter, &contract(), &destination)
+            .promote("task-3", &adapter, &contract(), &destination, &[])
             .unwrap();
         assert_eq!(receipt.state, PromotionState::RolledBack);
         assert_eq!(tree_hash(&destination).unwrap(), before);
@@ -1045,7 +1201,7 @@ mod tests {
         let store = PromotionStore::open(directory.path().join("state")).unwrap();
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
         let receipt = store
-            .promote("task-4", &adapter, &contract(), &destination)
+            .promote("task-4", &adapter, &contract(), &destination, &[])
             .unwrap();
         assert_eq!(receipt.state, PromotionState::RolledBack);
         assert_eq!(tree_hash(&destination).unwrap(), before);
@@ -1071,7 +1227,7 @@ mod tests {
             &bundle(&[("result.txt", "PASS\n"), ("linked/pwned.txt", "escape")]),
         );
         let receipt = store
-            .promote("task-5", &adapter, &contract(), &destination)
+            .promote("task-5", &adapter, &contract(), &destination, &[])
             .unwrap();
         assert_eq!(receipt.state, PromotionState::Committed);
         // The outside directory was never written.
@@ -1135,7 +1291,7 @@ mod tests {
             ),
         );
         let receipt = store
-            .promote("task-6", &adapter, &contract(), &destination)
+            .promote("task-6", &adapter, &contract(), &destination, &[])
             .unwrap();
         assert_eq!(receipt.state, PromotionState::Committed);
         assert!(!destination.join("old.txt").exists());
@@ -1169,11 +1325,12 @@ mod tests {
                 state: PromotionState::Prepared,
                 detail: "staged".into(),
                 swap: String::new(),
+                skill_gates: Vec::new(),
             })
             .unwrap();
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
         let receipt = store
-            .promote("task-7", &adapter, &contract(), &destination)
+            .promote("task-7", &adapter, &contract(), &destination, &[])
             .unwrap();
         assert_eq!(receipt.state, PromotionState::Committed);
         assert_eq!(
@@ -1213,6 +1370,7 @@ mod tests {
                 state: PromotionState::Prepared,
                 detail: "staged".into(),
                 swap: String::new(),
+                skill_gates: Vec::new(),
             })
             .unwrap();
         // Simulate the landed swap: new tree at destination, old at stage.
@@ -1223,7 +1381,7 @@ mod tests {
         assert_eq!(tree_hash(&destination).unwrap(), staging_hash);
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
         let receipt = store
-            .promote("task-8", &adapter, &contract(), &destination)
+            .promote("task-8", &adapter, &contract(), &destination, &[])
             .unwrap();
         assert_eq!(receipt.state, PromotionState::Committed);
         assert!(receipt.detail.contains("swap had landed"));
@@ -1257,13 +1415,14 @@ mod tests {
                 state: PromotionState::Prepared,
                 detail: "staged".into(),
                 swap: String::new(),
+                skill_gates: Vec::new(),
             })
             .unwrap();
         fs::write(destination.join("junk.txt"), "foreign dirt").unwrap();
         fs::write(destination.join("keep.txt"), "dirtied").unwrap();
         let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
         let receipt = store
-            .promote("task-9", &adapter, &contract(), &destination)
+            .promote("task-9", &adapter, &contract(), &destination, &[])
             .unwrap();
         assert_eq!(receipt.state, PromotionState::CorruptState);
         // Fail closed: nothing was promoted onto an unverifiable base.
@@ -1272,5 +1431,353 @@ mod tests {
             store.receipt("task-9").unwrap().unwrap().state,
             PromotionState::CorruptState
         );
+    }
+    #[test]
+    fn behavior_obligations_block_promotion_as_not_rerun() {
+        // Audit finding 7: host-judged behavior claims must never ride
+        // through promotion unverified.
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let before = tree_hash(&destination).unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        let contract = AcceptanceContract {
+            task: "produce the result".into(),
+            work_kind: crate::contract::WorkKind::General,
+            obligations: vec![Obligation {
+                id: "o-behavior".into(),
+                statement: "it feels right".into(),
+                proof: Proof::BehaviorEvidence {
+                    description: "host judges the vibe".into(),
+                },
+            }],
+            forbidden_regressions: vec![],
+        };
+        let mut adapter = ExternalHostAdapter::new(contract.clone(), 1).unwrap();
+        adapter.attach_host(1).unwrap();
+        let request = adapter.requests().unwrap().remove(0);
+        let content = bundle(&[("result.txt", "PASS\n")]);
+        adapter
+            .record_response(CandidateResponse {
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content,
+            })
+            .unwrap();
+        adapter.advance().unwrap();
+        adapter
+            .record_daemon_adversary(
+                &request.candidate_id,
+                crate::daemon_adversary::DaemonAdversaryReport {
+                    defects: Vec::new(),
+                    scanned_files: 1,
+                    scanned_bytes: 1,
+                    tree_hash: "tree".into(),
+                    truncated: false,
+                },
+                canonical_hash(&"daemon-scan").unwrap(),
+            )
+            .unwrap();
+        adapter
+            .record_daemon_verifier(
+                &request.candidate_id,
+                std::collections::BTreeMap::from([("o-behavior".to_string(), true)]),
+                canonical_hash(&"daemon-run").unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::Completed
+        ));
+        let receipt = store
+            .promote("task-g1", &adapter, &contract, &destination, &[])
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::RolledBack);
+        assert_eq!(receipt.gates_not_rerun, vec!["o-behavior".to_string()]);
+        assert!(receipt.detail.contains("GatesNotRerun"));
+        assert_eq!(tree_hash(&destination).unwrap(), before);
+        assert!(!destination.join("result.txt").exists());
+    }
+
+    #[test]
+    fn command_proofs_rerun_on_the_stage_and_side_effects_never_leak() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        let contract = AcceptanceContract {
+            task: "produce the result".into(),
+            work_kind: crate::contract::WorkKind::General,
+            obligations: vec![
+                Obligation {
+                    id: "o-file".into(),
+                    statement: "result exists".into(),
+                    proof: Proof::FileContains {
+                        path: "result.txt".into(),
+                        needle: "PASS".into(),
+                    },
+                },
+                Obligation {
+                    id: "o-cmd".into(),
+                    statement: "check runs".into(),
+                    proof: Proof::CommandSucceeds {
+                        argv: vec!["true".into()],
+                        cwd: None,
+                        timeout_ms: Some(5_000),
+                    },
+                },
+                Obligation {
+                    id: "o-dirt".into(),
+                    statement: "a check with a side effect".into(),
+                    proof: Proof::CommandSucceeds {
+                        argv: vec!["touch".into(), "gate-dirt.txt".into()],
+                        cwd: None,
+                        timeout_ms: Some(5_000),
+                    },
+                },
+            ],
+            forbidden_regressions: vec![],
+        };
+        let content = bundle(&[("result.txt", "PASS\n")]);
+        let mut adapter = ExternalHostAdapter::new(contract.clone(), 1).unwrap();
+        adapter.attach_host(1).unwrap();
+        let request = adapter.requests().unwrap().remove(0);
+        adapter
+            .record_response(CandidateResponse {
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content,
+            })
+            .unwrap();
+        adapter.advance().unwrap();
+        adapter
+            .record_daemon_adversary(
+                &request.candidate_id,
+                crate::daemon_adversary::DaemonAdversaryReport {
+                    defects: Vec::new(),
+                    scanned_files: 1,
+                    scanned_bytes: 1,
+                    tree_hash: "tree".into(),
+                    truncated: false,
+                },
+                canonical_hash(&"daemon-scan").unwrap(),
+            )
+            .unwrap();
+        adapter
+            .record_daemon_verifier(
+                &request.candidate_id,
+                std::collections::BTreeMap::from([
+                    ("o-file".to_string(), true),
+                    ("o-cmd".to_string(), true),
+                    ("o-dirt".to_string(), true),
+                ]),
+                canonical_hash(&"daemon-run").unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::Completed
+        ));
+        let receipt = store
+            .promote("task-g2", &adapter, &contract, &destination, &[])
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::Committed);
+        assert_eq!(
+            receipt.gates_rerun,
+            vec!["o-file".to_string(), "o-cmd".to_string(), "o-dirt".to_string()]
+        );
+        // The gate command ran on the scratch copy only: its side effect
+        // never reached the promoted tree.
+        assert!(!destination.join("gate-dirt.txt").exists());
+        assert_eq!(tree_hash(&destination).unwrap(), receipt.staging_hash);
+        assert!(!directory.path().join(".rex-gatecheck-task-g2").exists());
+    }
+
+    #[test]
+    fn failing_command_proof_rolls_back() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let before = tree_hash(&destination).unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        let contract = AcceptanceContract {
+            task: "produce the result".into(),
+            work_kind: crate::contract::WorkKind::General,
+            obligations: vec![Obligation {
+                id: "o-cmd".into(),
+                statement: "check runs".into(),
+                proof: Proof::CommandSucceeds {
+                    argv: vec!["false".into()],
+                    cwd: None,
+                    timeout_ms: Some(5_000),
+                },
+            }],
+            forbidden_regressions: vec![],
+        };
+        let content = bundle(&[("result.txt", "PASS\n")]);
+        let mut adapter = ExternalHostAdapter::new(contract.clone(), 1).unwrap();
+        adapter.attach_host(1).unwrap();
+        let request = adapter.requests().unwrap().remove(0);
+        adapter
+            .record_response(CandidateResponse {
+                candidate_id: request.candidate_id.clone(),
+                response_hash: canonical_hash(&content).unwrap(),
+                content,
+            })
+            .unwrap();
+        adapter.advance().unwrap();
+        adapter
+            .record_daemon_adversary(
+                &request.candidate_id,
+                crate::daemon_adversary::DaemonAdversaryReport {
+                    defects: Vec::new(),
+                    scanned_files: 1,
+                    scanned_bytes: 1,
+                    tree_hash: "tree".into(),
+                    truncated: false,
+                },
+                canonical_hash(&"daemon-scan").unwrap(),
+            )
+            .unwrap();
+        adapter
+            .record_daemon_verifier(
+                &request.candidate_id,
+                std::collections::BTreeMap::from([("o-cmd".to_string(), true)]),
+                canonical_hash(&"daemon-run").unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            adapter.finalize().unwrap(),
+            KernelState::Completed
+        ));
+        let receipt = store
+            .promote("task-g3", &adapter, &contract, &destination, &[])
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::RolledBack);
+        assert_eq!(tree_hash(&destination).unwrap(), before);
+        assert!(!destination.join("result.txt").exists());
+    }
+
+    #[test]
+    fn skill_gates_enforce_and_optional_gates_only_report() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "original").unwrap();
+        let before = tree_hash(&destination).unwrap();
+        let store = PromotionStore::open(directory.path().join("state")).unwrap();
+        let adapter = completed_adapter(&contract(), &bundle(&[("result.txt", "PASS\n")]));
+        let gate = |pack: &str, id: &str, required: bool, exec: crate::skills::GateExec| {
+            crate::skills::CompiledGate {
+                pack: pack.into(),
+                id: id.into(),
+                command_hint: "hint".into(),
+                required,
+                exec,
+            }
+        };
+        // Required unsupported gate blocks (finding 10: no silent pass).
+        let receipt = store
+            .promote(
+                "task-g4",
+                &adapter,
+                &contract(),
+                &destination,
+                &[gate("pack", "native-only", true, crate::skills::GateExec::Unsupported)],
+            )
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::RolledBack);
+        assert_eq!(receipt.skill_gates.len(), 1);
+        assert_eq!(receipt.skill_gates[0].outcome, "unsupported");
+        assert!(!receipt.gates_not_rerun.is_empty());
+        assert_eq!(tree_hash(&destination).unwrap(), before);
+        // Required failing command gate blocks.
+        let receipt = store
+            .promote(
+                "task-g5",
+                &adapter,
+                &contract(),
+                &destination,
+                &[gate(
+                    "pack",
+                    "fails",
+                    true,
+                    crate::skills::GateExec::Command {
+                        argv: vec!["false".into()],
+                    },
+                )],
+            )
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::RolledBack);
+        assert_eq!(receipt.skill_gates[0].outcome, "failed");
+        assert_eq!(tree_hash(&destination).unwrap(), before);
+        // Optional unsupported gate only reports; the scope-diff native
+        // gate passes and the promotion commits.
+        let receipt = store
+            .promote(
+                "task-g6",
+                &adapter,
+                &contract(),
+                &destination,
+                &[
+                    gate("shared-laws", "scope-diff", true, crate::skills::GateExec::ScopeDiffVsBundle),
+                    gate("pack", "advisory", false, crate::skills::GateExec::Unsupported),
+                    gate(
+                        "pack",
+                        "passes",
+                        true,
+                        crate::skills::GateExec::Command {
+                            argv: vec!["true".into()],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(receipt.state, PromotionState::Committed);
+        assert_eq!(receipt.skill_gates.len(), 3);
+        assert_eq!(receipt.skill_gates[0].outcome, "passed");
+        assert_eq!(receipt.skill_gates[1].outcome, "unsupported");
+        assert_eq!(
+            fs::read_to_string(destination.join("result.txt")).unwrap(),
+            "PASS\n"
+        );
+    }
+
+    #[test]
+    fn scope_diff_names_undeclared_changes() {
+        let bundle = parse_bundle(&bundle_with_deletes(
+            &[("declared.txt", "new")],
+            &["gone.txt"],
+        ))
+        .unwrap();
+        let before = BTreeMap::from([
+            ("declared.txt".to_string(), "h0".to_string()),
+            ("gone.txt".to_string(), "h1".to_string()),
+            ("keep.txt".to_string(), "h2".to_string()),
+        ]);
+        // Clean case: declared write + declared delete.
+        let stage = BTreeMap::from([
+            ("declared.txt".to_string(), "h3".to_string()),
+            ("keep.txt".to_string(), "h2".to_string()),
+        ]);
+        assert!(scope_diff_check(&bundle, &before, &stage).is_ok());
+        // Undeclared write, undeclared modification, undeclared delete.
+        let dirty = BTreeMap::from([
+            ("declared.txt".to_string(), "h3".to_string()),
+            ("keep.txt".to_string(), "h4".to_string()),
+            ("extra.txt".to_string(), "h5".to_string()),
+            ("gone.txt".to_string(), "h1".to_string()),
+        ]);
+        let undeclared = scope_diff_check(&bundle, &before, &dirty).unwrap_err();
+        assert!(undeclared.iter().any(|u| u.contains("extra.txt")));
+        assert!(undeclared.iter().any(|u| u.contains("keep.txt")));
+        let missing = BTreeMap::from([
+            ("declared.txt".to_string(), "h3".to_string()),
+        ]);
+        let undeclared = scope_diff_check(&bundle, &before, &missing).unwrap_err();
+        assert!(undeclared.iter().any(|u| u.contains("keep.txt removed")));
     }
 }

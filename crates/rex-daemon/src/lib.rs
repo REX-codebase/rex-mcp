@@ -130,6 +130,33 @@ pub struct HarnessDaemon {
     artifacts: ArtifactStore,
 }
 
+/// Project a compiled skill plan into the protocol view. `executable`
+/// tells the UI exactly which gates the daemon will run at promotion and
+/// which are advisory-only - no "bound" pack implies an enforced gate.
+fn skill_plan_view(plan: rex_ultra::skills::CompiledSkillPlan) -> SkillPlanView {
+    SkillPlanView {
+        plan_hash: plan.plan_hash,
+        compiler_version: plan.compiler_version,
+        selected: plan
+            .selected
+            .iter()
+            .map(|p| format!("{}@{}", p.id, p.version))
+            .collect(),
+        gates: plan
+            .gates
+            .iter()
+            .map(|g| SkillGateView {
+                pack: g.pack.clone(),
+                id: g.id.clone(),
+                command_hint: g.command_hint.clone(),
+                required: g.required,
+                executable: !matches!(g.exec, rex_ultra::skills::GateExec::Unsupported),
+            })
+            .collect(),
+        unsupported: plan.unsupported,
+    }
+}
+
 impl HarnessDaemon {
     pub fn open(root: impl Into<PathBuf>, mut policy: DaemonPolicy) -> Result<Self, ProtocolError> {
         let root = root.into();
@@ -952,19 +979,45 @@ impl HarnessDaemon {
                 .current_view(&t.task_id)
                 .map_err(|e| bridge_err(&t.task_id, e))?;
         }
-        let plan = self.skill_plan();
-        if let Some(plan) = &plan {
-            if t.ultra_skill_plan_hash.as_deref() != Some(plan.plan_hash.as_str()) {
-                t.ultra_skill_plan_hash = Some(plan.plan_hash.clone());
-                self.append_event(
-                    &mut t,
-                    "ultra_skill_plan",
-                    json!({"plan_hash":plan.plan_hash,
-                    "selected":plan.selected,"unsupported":plan.unsupported}),
-                )?;
-                self.persist(&t)?;
+        // The compiled skill plan is frozen exactly once, at first open;
+        // later opens load the frozen plan and check it against the task
+        // record. Promotion enforces this plan's gates, never a recompute
+        // over a workspace the candidates already changed.
+        let plan = match bridge
+            .frozen_skill_plan(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?
+        {
+            Some(frozen) => {
+                if t.ultra_skill_plan_hash.as_deref() != Some(frozen.plan_hash.as_str()) {
+                    return Err(perr(
+                        ErrorCode::Internal,
+                        "frozen skill plan does not match the task record",
+                        &t.task_id,
+                    ));
+                }
+                Some(skill_plan_view(frozen))
             }
-        }
+            None => {
+                let compiled = self.compile_skill_plan();
+                if let Some(compiled) = compiled {
+                    bridge
+                        .freeze_skill_plan(&t.task_id, &compiled)
+                        .map_err(|e| bridge_err(&t.task_id, e))?;
+                    t.ultra_skill_plan_hash = Some(compiled.plan_hash.clone());
+                    let view_for_event = skill_plan_view(compiled);
+                    self.append_event(
+                        &mut t,
+                        "ultra_skill_plan",
+                        json!({"plan_hash":view_for_event.plan_hash,
+                        "selected":view_for_event.selected,"unsupported":view_for_event.unsupported}),
+                    )?;
+                    self.persist(&t)?;
+                    Some(view_for_event)
+                } else {
+                    None
+                }
+            }
+        };
         Ok(ultra_view(t.task_id.clone(), &view, plan))
     }
 
@@ -1066,7 +1119,8 @@ impl HarnessDaemon {
         let view = bridge
             .current_view(&t.task_id)
             .map_err(|e| bridge_err(&t.task_id, e))?;
-        Ok(ultra_view(t.task_id.clone(), &view, self.skill_plan()))
+        let plan = self.task_skill_plan_view(&t.task_id);
+        Ok(ultra_view(t.task_id.clone(), &view, plan))
     }
 
     /// Promote the qualified candidate into the task workspace. Live lease,
@@ -1076,44 +1130,20 @@ impl HarnessDaemon {
         &self,
         req: rex_protocol::UltraPromoteRequest,
     ) -> Result<rex_protocol::UltraPromoteResponse, ProtocolError> {
-        let t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
-        require_agent(&t)?;
-        require_ultra(&t)?;
-        // AUDIT FREEZE (2026-09-22): the external Ultra path was found to be a
-        // host-assertion recorder, not an independent verifier. Promotion is
-        // disabled until the rebuilt kernel (daemon-executed gates, isolated
-        // candidate workspaces, signed proof) lands. Fail closed.
-        return Err(perr(
-            ErrorCode::GateFailed,
-            "external Ultra promotion is disabled: the 2026-09-22 independent audit found no independent verification on this path; pending the protocol-2.0 rebuild",
-            &t.task_id,
-        ));
-        #[allow(unreachable_code)]
-        {
-        let mut t = t;
-        let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
-        let contract = bridge
-            .frozen_contract(&t.task_id)
-            .map_err(|e| bridge_err(&t.task_id, e))?;
-        let receipt = bridge
-            .promote(&t.task_id, &contract, &self.policy.workspace)
-            .map_err(|e| bridge_err(&t.task_id, e))?;
+        // The rebuild is in place: daemon-executed evidence, isolated
+        // candidate workspaces, a joined crash-safe state machine, and
+        // promotion that re-executes every mandatory gate on a confined
+        // stage before one atomic swap. Promotion runs through the same
+        // joined path as the internal caller.
+        let receipt = self.promote_and_join(&req)?;
         let state = match receipt.state {
             rex_ultra::promotion::PromotionState::Prepared => "prepared",
             rex_ultra::promotion::PromotionState::Committed => "committed",
             rex_ultra::promotion::PromotionState::RolledBack => "rolled_back",
             rex_ultra::promotion::PromotionState::CorruptState => "corrupt_state",
         };
-        self.append_event(
-            &mut t,
-            "ultra_promotion",
-            json!({"state":state,
-            "candidate_id":receipt.candidate_id,"bundle_hash":receipt.bundle_hash,
-            "staging_hash":receipt.staging_hash}),
-        )?;
-        self.persist(&t)?;
         Ok(rex_protocol::UltraPromoteResponse {
-            task_id: t.task_id.clone(),
+            task_id: receipt.task_id.clone(),
             state: state.into(),
             candidate_id: receipt.candidate_id,
             bundle_hash: receipt.bundle_hash,
@@ -1123,7 +1153,6 @@ impl HarnessDaemon {
             gates_not_rerun: receipt.gates_not_rerun,
             detail: receipt.detail,
         })
-        }
     }
 
     /// Assemble and persist the machine-readable proof bundle for one task:
@@ -1418,12 +1447,29 @@ impl HarnessDaemon {
                 &t.task_id,
             ));
         }
+        // Promotion enforces the skill plan frozen at ultra_open, never a
+        // recompute over a workspace candidates already changed.
+        let plan = bridge
+            .frozen_skill_plan(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?
+            .ok_or_else(|| {
+                perr(
+                    ErrorCode::GateFailed,
+                    "no skill plan is frozen for this task; call rex_ultra_open first",
+                    &t.task_id,
+                )
+            })?;
         // The promotion store commits with its own crash-safe receipt
         // sequence; the join below turns a committed receipt into the
         // task's terminal state. A crash between the two is healed by the
         // next join (daemon open sweep or any later call).
         let receipt = bridge
-            .promote(&t.task_id, &contract, &self.policy.workspace)
+            .promote(
+                &t.task_id,
+                &contract,
+                &self.policy.workspace,
+                &plan.gates,
+            )
             .map_err(|e| bridge_err(&t.task_id, e))?;
         self.append_event(
             &mut t,
@@ -1540,31 +1586,27 @@ impl HarnessDaemon {
         Ok(bundle)
     }
 
-    fn skill_plan(&self) -> Option<SkillPlanView> {
+    /// The task's bound skill plan: the frozen plan when ultra_open
+    /// compiled one, otherwise a fresh workspace-level compile for
+    /// informational views.
+    fn task_skill_plan_view(&self, task_id: &str) -> Option<SkillPlanView> {
+        let bridge = UltraHostBridge::open(&self.root).ok()?;
+        match bridge.frozen_skill_plan(task_id) {
+            Ok(Some(frozen)) => Some(skill_plan_view(frozen)),
+            _ => self.skill_plan(),
+        }
+    }
+
+    fn compile_skill_plan(&self) -> Option<rex_ultra::skills::CompiledSkillPlan> {
         let facts = rex_ultra::skills::collect_repository_facts(&self.policy.workspace);
         let mut registry = rex_ultra::skill_packs::first_class_registry();
         registry.extend(rex_ultra::generated_packs::broad_registry(&facts));
-        let plan = rex_ultra::skills::compile_plan(&facts, &registry).ok()?;
-        Some(SkillPlanView {
-            plan_hash: plan.plan_hash,
-            compiler_version: plan.compiler_version,
-            selected: plan
-                .selected
-                .iter()
-                .map(|p| format!("{}@{}", p.id, p.version))
-                .collect(),
-            gates: plan
-                .gates
-                .iter()
-                .map(|g| SkillGateView {
-                    pack: g.pack.clone(),
-                    id: g.id.clone(),
-                    command_hint: g.command_hint.clone(),
-                    required: g.required,
-                })
-                .collect(),
-            unsupported: plan.unsupported,
-        })
+        rex_ultra::skills::compile_plan(&facts, &registry).ok()
+    }
+
+    fn skill_plan(&self) -> Option<SkillPlanView> {
+        let plan = self.compile_skill_plan()?;
+        Some(skill_plan_view(plan))
     }
 
     fn call_tool(
@@ -2855,8 +2897,9 @@ mod tests {
         // durable) but the daemon dies before the task transition persists.
         let bridge = UltraHostBridge::open(&root).unwrap();
         let contract = bridge.frozen_contract(&ex.task_id).unwrap();
+        let plan = bridge.frozen_skill_plan(&ex.task_id).unwrap().unwrap();
         let receipt = bridge
-            .promote(&ex.task_id, &contract, &w)
+            .promote(&ex.task_id, &contract, &w, &plan.gates)
             .unwrap();
         assert_eq!(
             receipt.state,
@@ -2986,17 +3029,23 @@ mod tests {
         // The daemon-executed gates qualify the first clean candidate with
         // no host input at all.
         assert_eq!(view.kernel_state, "completed");
-        // AUDIT FREEZE: even with a completed kernel, promotion fails closed
-        // and writes nothing into the workspace.
-        let err = daemon
+        // The rebuilt path promotes through the joined state machine:
+        // every mandatory gate re-executes on a confined stage, the swap is
+        // atomic, and the task completes only on a committed receipt.
+        let promoted = daemon
             .ultra_promote(rex_protocol::UltraPromoteRequest {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::GateFailed);
-        assert!(fs::read(w.join("result.txt")).is_err());
+            .unwrap();
+        assert_eq!(promoted.state, "committed");
+        assert!(!promoted.gates_rerun.is_empty());
+        assert!(promoted.gates_not_rerun.is_empty());
+        let written = fs::read_to_string(w.join("result.txt")).unwrap();
+        assert!(written.starts_with("PASS"));
+        let t = daemon.load(&ex.task_id).unwrap();
+        assert_eq!(t.state, TaskState::Completed);
         let events = daemon
             .events(EventsRequest {
                 task_id: ex.task_id.clone(),
@@ -3004,7 +3053,7 @@ mod tests {
                 limit: None,
             })
             .unwrap();
-        assert!(!events.events.iter().any(|e| e.kind == "ultra_promotion"));
+        assert!(events.events.iter().any(|e| e.kind == "ultra_promotion"));
     }
     #[test]
     fn host_resume_requires_and_rotates_the_handle() {
@@ -3202,16 +3251,16 @@ mod tests {
             .min()
             .unwrap();
         assert_eq!(view.kernel_state, "completed");
-        // AUDIT FREEZE: promotion fails closed; the proof bundle records no
-        // promotion rather than claiming one.
-        let err = daemon
+        // The rebuilt promotion commits through the joined state machine;
+        // the proof bundle records the committed receipt.
+        let promoted = daemon
             .ultra_promote(rex_protocol::UltraPromoteRequest {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
             })
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::GateFailed);
+            .unwrap();
+        assert_eq!(promoted.state, "committed");
         let bundle = daemon
             .proof_bundle(TaskRefRequest {
                 task_id: ex.task_id.clone(),
@@ -3222,7 +3271,7 @@ mod tests {
             bundle.qualified_candidate.as_deref(),
             Some(candidate.as_str())
         );
-        assert_eq!(bundle.promotion_state, None);
+        assert_eq!(bundle.promotion_state.as_deref(), Some("committed"));
         assert!(bundle.skill_plan.is_some());
         assert!(!bundle.events.is_empty());
         assert!(!bundle.bundle_hash.is_empty());
@@ -3243,7 +3292,10 @@ mod tests {
             persisted["bundle_hash"].as_str().unwrap(),
             bundle.bundle_hash
         );
-        assert!(persisted["promotion_state"].is_null());
+        assert_eq!(
+            persisted["promotion_state"].as_str().unwrap(),
+            "committed"
+        );
     
     }
 

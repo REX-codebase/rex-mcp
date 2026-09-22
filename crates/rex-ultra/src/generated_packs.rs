@@ -23,7 +23,12 @@ pub struct LanguageTemplate {
     /// Tool probed on PATH by `collect_repository_facts`.
     pub tool: &'static str,
     pub test_gate: &'static str,
+    /// Executable form of the test gate; daemon-compiled, never host input.
+    pub test_argv: &'static [&'static str],
     pub lint_gate: Option<&'static str>,
+    /// Executable form of the lint gate when one exists; prose-only lints
+    /// are honestly Unsupported.
+    pub lint_argv: Option<&'static [&'static str]>,
 }
 
 pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
@@ -33,7 +38,9 @@ pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
         manifests: &["pyproject.toml"],
         tool: "python3",
         test_gate: "python3 -m pytest",
+        test_argv: &["python3", "-m", "pytest"],
         lint_gate: Some("python3 -m py_compile on changed files"),
+        lint_argv: None,
     },
     LanguageTemplate {
         language: "javascript",
@@ -41,7 +48,9 @@ pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
         manifests: &["package.json"],
         tool: "node",
         test_gate: "npm test",
+        test_argv: &["npm", "test"],
         lint_gate: Some("node --check on changed files"),
+        lint_argv: None,
     },
     LanguageTemplate {
         language: "typescript",
@@ -49,7 +58,9 @@ pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
         manifests: &["tsconfig.json"],
         tool: "npx",
         test_gate: "npm test",
+        test_argv: &["npm", "test"],
         lint_gate: Some("npx tsc --noEmit"),
+        lint_argv: Some(&["npx", "tsc", "--noEmit"]),
     },
     LanguageTemplate {
         language: "go",
@@ -57,7 +68,9 @@ pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
         manifests: &["go.mod"],
         tool: "go",
         test_gate: "go test ./...",
+        test_argv: &["go", "test", "./..."],
         lint_gate: Some("go vet ./..."),
+        lint_argv: Some(&["go", "vet", "./..."]),
     },
     LanguageTemplate {
         language: "ruby",
@@ -65,7 +78,9 @@ pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
         manifests: &["Gemfile"],
         tool: "ruby",
         test_gate: "bundle exec rake test",
+        test_argv: &["bundle", "exec", "rake", "test"],
         lint_gate: Some("ruby -c on changed files"),
+        lint_argv: None,
     },
     LanguageTemplate {
         language: "java",
@@ -73,7 +88,9 @@ pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
         manifests: &["pom.xml", "build.gradle"],
         tool: "javac",
         test_gate: "mvn test or gradle test per build file",
+        test_argv: &[],
         lint_gate: Some("javac on changed files"),
+        lint_argv: None,
     },
     LanguageTemplate {
         language: "c",
@@ -81,7 +98,9 @@ pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
         manifests: &["Makefile"],
         tool: "gcc",
         test_gate: "make test",
+        test_argv: &["make", "test"],
         lint_gate: Some("gcc -fsyntax-only on changed files"),
+        lint_argv: None,
     },
     LanguageTemplate {
         language: "cpp",
@@ -89,7 +108,9 @@ pub const LANGUAGE_TEMPLATES: &[LanguageTemplate] = &[
         manifests: &["CMakeLists.txt"],
         tool: "g++",
         test_gate: "ctest",
+        test_argv: &["ctest"],
         lint_gate: Some("g++ -fsyntax-only on changed files"),
+        lint_argv: None,
     },
 ];
 
@@ -146,16 +167,33 @@ pub fn broad_registry(facts: &RepositoryFacts) -> Vec<SkillPackManifest> {
         })
         .map(|template| {
             let tool_detected = facts.detected_tools.contains(template.tool);
+            let test_exec = if template.test_argv.is_empty() {
+                // No single executable form (e.g. "mvn test or gradle
+                // test"): the required gate honestly blocks promotion
+                // until the pack teaches the daemon one.
+                crate::skills::GateExec::Unsupported
+            } else {
+                crate::skills::GateExec::Command {
+                    argv: template.test_argv.iter().map(|a| a.to_string()).collect(),
+                }
+            };
             let mut gates = vec![GateTemplate {
                 id: format!("generated-{}-test", template.language),
                 command_hint: template.test_gate.to_string(),
                 required: true,
+                exec: test_exec,
             }];
             if let Some(lint) = template.lint_gate {
                 gates.push(GateTemplate {
                     id: format!("generated-{}-lint", template.language),
                     command_hint: lint.to_string(),
                     required: false,
+                    exec: match template.lint_argv {
+                        Some(argv) => crate::skills::GateExec::Command {
+                            argv: argv.iter().map(|a| a.to_string()).collect(),
+                        },
+                        None => crate::skills::GateExec::Unsupported,
+                    },
                 });
             }
             SkillPackManifest {

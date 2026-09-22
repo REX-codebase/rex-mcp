@@ -705,6 +705,10 @@ pub struct SkillGateView {
     pub id: String,
     pub command_hint: String,
     pub required: bool,
+    /// True when the daemon executes this gate at promotion; false means
+    /// the gate is advisory or honestly unenforceable, never a silent pass.
+    #[serde(default)]
+    pub executable: bool,
 }
 
 /// The compiled, version-pinned skill plan bound to a task: what was

@@ -9,12 +9,28 @@
 
 use crate::skills::{CertificationStatus, GateTemplate, RuleModule, Selector, SkillPackManifest};
 
-fn gate(id: &str, command_hint: &str, required: bool) -> GateTemplate {
+fn gate(id: &str, command_hint: &str, required: bool, exec: crate::skills::GateExec) -> GateTemplate {
     GateTemplate {
         id: id.into(),
         command_hint: command_hint.into(),
         required,
+        exec,
     }
+}
+
+fn command_gate(id: &str, command_hint: &str, required: bool, argv: &[&str]) -> GateTemplate {
+    gate(
+        id,
+        command_hint,
+        required,
+        crate::skills::GateExec::Command {
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+        },
+    )
+}
+
+fn unsupported_gate(id: &str, command_hint: &str, required: bool) -> GateTemplate {
+    gate(id, command_hint, required, crate::skills::GateExec::Unsupported)
 }
 
 fn rule(id: &str, statement: &str) -> RuleModule {
@@ -85,23 +101,23 @@ pub fn three_d() -> SkillPackManifest {
             ),
         ],
         vec![
-            gate("build", "bundle the scene with the pinned toolchain", true),
-            gate(
+            unsupported_gate("build", "bundle the scene with the pinned toolchain", true),
+            unsupported_gate(
                 "pixel-evidence-desktop",
                 "headless screenshot at the declared desktop viewport, hash recorded",
                 true,
             ),
-            gate(
+            unsupported_gate(
                 "pixel-evidence-phone",
                 "headless screenshot at the declared phone viewport, hash recorded",
                 true,
             ),
-            gate(
+            unsupported_gate(
                 "interaction-replay",
                 "recorded replay of the central behavior input",
                 true,
             ),
-            gate(
+            unsupported_gate(
                 "frame-budget",
                 "measured frame times against the declared budget",
                 false,
@@ -130,10 +146,10 @@ pub fn html_motion() -> SkillPackManifest {
             rule("score-boundary", "any audio is original or inside its declared rights boundary"),
         ],
         vec![
-            gate("timeline-probe", "assert the declared timeline duration and easing curves exist", true),
-            gate("frame-difference", "sampled frame differences prove continuous motion over the window", true),
-            gate("deterministic-capture", "two captures of the same run match within tolerance", true),
-            gate("audio-boundary", "audio assets carry their declared rights metadata", false),
+            unsupported_gate("timeline-probe", "assert the declared timeline duration and easing curves exist", true),
+            unsupported_gate("frame-difference", "sampled frame differences prove continuous motion over the window", true),
+            unsupported_gate("deterministic-capture", "two captures of the same run match within tolerance", true),
+            unsupported_gate("audio-boundary", "audio assets carry their declared rights metadata", false),
         ],
     )
 }
@@ -168,14 +184,14 @@ pub fn svg() -> SkillPackManifest {
             ),
         ],
         vec![
-            gate("xml-parse", "the artwork parses as valid XML/SVG", true),
-            gate(
+            unsupported_gate("xml-parse", "the artwork parses as valid XML/SVG", true),
+            unsupported_gate(
                 "viewbox-check",
                 "viewBox present and consistent with the declared aspect",
                 true,
             ),
-            gate("a11y-check", "role/img, title and desc present", true),
-            gate(
+            unsupported_gate("a11y-check", "role/img, title and desc present", true),
+            unsupported_gate(
                 "raster-export",
                 "rasterized export at the declared sizes matches within tolerance",
                 false,
@@ -214,10 +230,10 @@ pub fn rust() -> SkillPackManifest {
             ),
         ],
         vec![
-            gate("cargo-test", "cargo test passes for the workspace", true),
-            gate("clippy-deny", "cargo clippy with warnings denied", true),
-            gate("fmt-check", "cargo fmt --check is clean", true),
-            gate("doc-build", "cargo doc builds without broken links", false),
+            command_gate("cargo-test", "cargo test passes for the workspace", true, &["cargo", "test"]),
+            command_gate("clippy-deny", "cargo clippy with warnings denied", true, &["cargo", "clippy", "--", "-D", "warnings"]),
+            command_gate("fmt-check", "cargo fmt --check is clean", true, &["cargo", "fmt", "--check"]),
+            command_gate("doc-build", "cargo doc builds without broken links", false, &["cargo", "doc", "--no-deps"]),
         ],
     )
 }
@@ -252,8 +268,9 @@ pub fn shared_laws() -> SkillPackManifest {
         ],
         gates: vec![gate(
             "scope-diff",
-            "the changed surface matches the declared scope",
+            "the changed surface matches the sealed bundle's declared paths",
             true,
+            crate::skills::GateExec::ScopeDiffVsBundle,
         )],
         required_tools: vec![],
         provenance: "shared engineering laws, frozen architecture 2026-09-20".into(),

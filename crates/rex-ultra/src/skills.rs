@@ -61,11 +61,31 @@ pub struct RuleModule {
     pub statement: String,
 }
 
+/// How a gate is checked. The command_hint stays human-readable prose;
+/// this field decides what the daemon can actually enforce. A required
+/// gate the daemon cannot execute blocks promotion honestly rather than
+/// being silently treated as passed (audit finding 10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GateExec {
+    /// Run this argv on the staged tree under the subprocess sandbox;
+    /// exit 0 passes. Argv is daemon-compiled pack data, never host input.
+    Command { argv: Vec<String> },
+    /// Daemon-native check: the tree the promotion applies differs from
+    /// the pre-promotion tree exactly at the sealed bundle's declared
+    /// paths - no undeclared writes, no undeclared deletes.
+    ScopeDiffVsBundle,
+    /// The daemon cannot execute this gate yet. A required one blocks
+    /// promotion; an optional one is reported, never enforced.
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateTemplate {
     pub id: String,
     pub command_hint: String,
     pub required: bool,
+    pub exec: GateExec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +135,7 @@ pub struct CompiledGate {
     pub id: String,
     pub command_hint: String,
     pub required: bool,
+    pub exec: GateExec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -349,6 +370,7 @@ pub fn compile_plan(
                 id: g.id.clone(),
                 command_hint: g.command_hint.clone(),
                 required: g.required,
+                exec: g.exec.clone(),
             })
         })
         .collect();
@@ -489,6 +511,7 @@ mod tests {
                 id: "g1".into(),
                 command_hint: "run tests".into(),
                 required: true,
+                exec: GateExec::Unsupported,
             }],
             required_tools: vec![],
             provenance: "test registry".into(),

@@ -12,7 +12,6 @@ use crate::external_kernel::{
     AdapterError, CandidateResponse, ExternalHostAdapter, HostCandidateRequest, HostEvidenceRequest,
     HostKernelStatus, KernelState,
 };
-use rex_protocol::PlanStep;
 use std::fs;
 use std::path::PathBuf;
 
@@ -38,32 +37,6 @@ pub struct UltraHostView {
     pub evidence_requests: Vec<HostEvidenceRequest>,
 }
 
-/// Deterministic contract for the external kernel: one behavior obligation
-/// per frozen plan step, so candidate and verifier requests bind to the same
-/// plan the daemon froze at task creation.
-pub fn contract_from_plan(task: &str, plan: &[PlanStep]) -> AcceptanceContract {
-    let obligations = plan
-        .iter()
-        .enumerate()
-        .map(|(index, step)| Obligation {
-            id: format!("step-{}", index + 1),
-            statement: step
-                .acceptance
-                .clone()
-                .unwrap_or_else(|| step.instructions.clone()),
-            proof: Proof::BehaviorEvidence {
-                description: step.instructions.clone(),
-            },
-        })
-        .collect();
-    AcceptanceContract {
-        task: task.to_string(),
-        work_kind: crate::contract::classify_work_kind(task),
-        obligations,
-        forbidden_regressions: Vec::new(),
-    }
-}
-
 pub struct UltraHostBridge {
     dir: PathBuf,
 }
@@ -85,6 +58,56 @@ impl UltraHostBridge {
         let path = self.path(task_id)?;
         let adapter = ExternalHostAdapter::open(&path).map_err(BridgeError::Adapter)?;
         Ok(adapter.contract().clone())
+    }
+
+    /// Persist the compiled skill plan bound at ultra_open. The plan is
+    /// frozen once; later reads load it, never recompute it, so the gates
+    /// that apply at promotion are exactly the gates bound at open
+    /// (audit findings 9 and 10).
+    pub fn freeze_skill_plan(
+        &self,
+        task_id: &str,
+        plan: &crate::skills::CompiledSkillPlan,
+    ) -> Result<(), BridgeError> {
+        let path = self.skill_plan_path(task_id)?;
+        if path.exists() {
+            let existing = self.frozen_skill_plan(task_id)?;
+            if existing.as_ref() != Some(plan) {
+                return Err(BridgeError::Io(format!(
+                    "a different skill plan is already frozen for task {task_id}"
+                )));
+            }
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(plan).map_err(|e| BridgeError::Io(e.to_string()))?;
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, bytes).map_err(|e| BridgeError::Io(e.to_string()))?;
+        fs::rename(&temporary, &path).map_err(|e| BridgeError::Io(e.to_string()))
+    }
+
+    pub fn frozen_skill_plan(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<crate::skills::CompiledSkillPlan>, BridgeError> {
+        let path = self.skill_plan_path(task_id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).map_err(|e| BridgeError::Io(e.to_string()))?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| BridgeError::Io(format!("frozen skill plan is unreadable: {e}")))
+    }
+
+    fn skill_plan_path(&self, task_id: &str) -> Result<PathBuf, BridgeError> {
+        if task_id.is_empty()
+            || !task_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(BridgeError::InvalidTaskId);
+        }
+        Ok(self.dir.join(format!("skill-plan-{task_id}.json")))
     }
 
     fn path(&self, task_id: &str) -> Result<PathBuf, BridgeError> {
@@ -230,12 +253,13 @@ impl UltraHostBridge {
         task_id: &str,
         contract: &AcceptanceContract,
         destination: &std::path::Path,
+        skill_gates: &[crate::skills::CompiledGate],
     ) -> Result<crate::promotion::PromotionReceipt, BridgeError> {
         let adapter = self.load_or_create(task_id, contract, DEFAULT_MINIMUM_CANDIDATES)?;
         let store =
             crate::promotion::PromotionStore::open(&self.dir).map_err(BridgeError::Promotion)?;
         store
-            .promote(task_id, &adapter, contract, destination)
+            .promote(task_id, &adapter, contract, destination, skill_gates)
             .map_err(BridgeError::Promotion)
     }
 
@@ -274,17 +298,31 @@ mod tests {
     use rex_protocol::schema::canonical_hash;
     use tempfile::tempdir;
 
-    fn plan() -> Vec<PlanStep> {
-        vec![
-            PlanStep {
-                instructions: "build the thing".into(),
-                acceptance: Some("it builds".into()),
-            },
-            PlanStep {
-                instructions: "prove the thing".into(),
-                acceptance: None,
-            },
-        ]
+    /// Executable test contract: the flattening contract_from_plan helper
+    /// was removed with audit finding 7; tests use daemon-executable proofs.
+    fn test_contract() -> AcceptanceContract {
+        AcceptanceContract {
+            task: "do it".into(),
+            work_kind: crate::contract::WorkKind::General,
+            obligations: vec![
+                crate::contract::Obligation {
+                    id: "step-1".into(),
+                    statement: "it builds".into(),
+                    proof: crate::contract::Proof::FileContains {
+                        path: "result.txt".into(),
+                        needle: "built".into(),
+                    },
+                },
+                crate::contract::Obligation {
+                    id: "step-2".into(),
+                    statement: "prove the thing".into(),
+                    proof: crate::contract::Proof::FileExists {
+                        path: "result.txt".into(),
+                    },
+                },
+            ],
+            forbidden_regressions: vec![],
+        }
     }
 
     /// The daemon's own adversary scan over the plan-derived contract.
@@ -348,19 +386,30 @@ mod tests {
     }
 
     #[test]
-    fn plan_becomes_a_deterministic_contract() {
-        let contract = contract_from_plan("do it", &plan());
-        assert_eq!(contract.obligations.len(), 2);
-        assert_eq!(contract.obligations[0].id, "step-1");
-        assert_eq!(contract.obligations[0].statement, "it builds");
-        assert_eq!(contract.obligations[1].statement, "prove the thing");
-        assert_eq!(contract_from_plan("do it", &plan()), contract);
+    fn frozen_skill_plan_roundtrips_and_conflicts() {
+        let directory = tempdir().unwrap();
+        let bridge = UltraHostBridge::open(directory.path()).unwrap();
+        let facts = crate::skills::RepositoryFacts::default();
+        let plan =
+            crate::skills::compile_plan(&facts, &crate::skill_packs::first_class_registry())
+                .unwrap();
+        assert!(bridge.frozen_skill_plan("task-plan").unwrap().is_none());
+        bridge.freeze_skill_plan("task-plan", &plan).unwrap();
+        assert_eq!(
+            bridge.frozen_skill_plan("task-plan").unwrap(),
+            Some(plan.clone())
+        );
+        // Idempotent re-freeze of the same plan; a different one conflicts.
+        bridge.freeze_skill_plan("task-plan", &plan).unwrap();
+        let mut other = plan.clone();
+        other.compiler_version = "different".into();
+        assert!(bridge.freeze_skill_plan("task-plan", &other).is_err());
     }
 
     #[test]
     fn full_external_host_lifecycle_across_restarts() {
         let directory = tempdir().unwrap();
-        let contract = contract_from_plan("do it", &plan());
+        let contract = test_contract();
 
         let bridge = UltraHostBridge::open(directory.path()).unwrap();
         let view = bridge.open_requests("task-abc", &contract, 2, 1).unwrap();
@@ -401,7 +450,7 @@ mod tests {
     #[test]
     fn unqualified_candidates_fail_closed_across_restart() {
         let directory = tempdir().unwrap();
-        let contract = contract_from_plan("do it", &plan());
+        let contract = test_contract();
         let bridge = UltraHostBridge::open(directory.path()).unwrap();
         let view = bridge.open_requests("task-def", &contract, 2, 1).unwrap();
         let view = answer_requests(&bridge, "task-def", &contract, &view);
@@ -424,7 +473,7 @@ mod tests {
     fn task_ids_cannot_escape_the_store() {
         let directory = tempdir().unwrap();
         let bridge = UltraHostBridge::open(directory.path()).unwrap();
-        let contract = contract_from_plan("do it", &plan());
+        let contract = test_contract();
         assert_eq!(
             bridge
                 .open_requests("../escape", &contract, 2, 1)
@@ -435,12 +484,5 @@ mod tests {
             bridge.open_requests("", &contract, 2, 1).unwrap_err(),
             BridgeError::InvalidTaskId
         );
-    }
-    #[test]
-    fn contract_from_plan_classifies_visual_work() {
-        let visual = contract_from_plan("build a website landing page", &[]);
-        assert_eq!(visual.work_kind, crate::contract::WorkKind::Visual);
-        let general = contract_from_plan("tune the batch scheduler", &[]);
-        assert_eq!(general.work_kind, crate::contract::WorkKind::General);
     }
 }
