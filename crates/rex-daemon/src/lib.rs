@@ -242,6 +242,9 @@ impl HarnessDaemon {
             }
             let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
             let capability = self.rotate_capability(&mut task)?;
+            if self.renew_lease_on_resume(&mut task)? {
+                self.append_event(&mut task, "lease_renewed_on_resume", json!({}))?;
+            }
             if let Some(follow_up) = req
                 .follow_up
                 .as_deref()
@@ -263,6 +266,9 @@ impl HarnessDaemon {
             let mut task = task;
             let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
             let capability = self.rotate_capability(&mut task)?;
+            if self.renew_lease_on_resume(&mut task)? {
+                self.append_event(&mut task, "lease_renewed_on_resume", json!({}))?;
+            }
             if let Some(follow_up) = req
                 .follow_up
                 .as_deref()
@@ -1876,6 +1882,65 @@ impl HarnessDaemon {
     }
 
     /// Mint a fresh operational capability and rotate the stored hash.
+
+    /// A verified resume (the rotated host handle) also renews a lapsed
+    /// lease: docs/rex-mcp-ultra.md promises that an expired lease plus the
+    /// current handle resumes the task. Without this, a host working longer
+    /// than one lease window between calls - exactly the long Ultra loop -
+    /// bricked its own task with no recovery path.
+    fn renew_lease_on_resume(&self, t: &mut DurableTask) -> Result<bool, ProtocolError> {
+        if now_ms() < t.lease_expires_ms {
+            return Ok(false);
+        }
+        let phase = {
+            let reg = self
+                .custody
+                .lock()
+                .map_err(|_| internal("custody registry poisoned"))?;
+            reg.grant(&t.grant_id)
+                .map(|g| (g.phase, g.resume_secret.clone()))
+        };
+        match phase {
+            Some((rex_custody::CustodyPhase::Active, _)) => {
+                // The grant was never swept (same daemon process): a plain
+                // heartbeat extends both lease views.
+                self.heartbeat(t)?;
+            }
+            Some((rex_custody::CustodyPhase::Suspended, secret)) => {
+                let mut reg = self
+                    .custody
+                    .lock()
+                    .map_err(|_| internal("custody registry poisoned"))?;
+                let token = reg
+                    .resume(&t.grant_id, &secret, now_ms())
+                    .map_err(|e| match e {
+                        CustodyError::GrantReleased(_) => perr(
+                            ErrorCode::StaleLease,
+                            "lease expired beyond the resume grace window",
+                            &t.task_id,
+                        ),
+                        other => custody_err(other),
+                    })?;
+                t.token = token;
+                let grant = reg
+                    .grant(&t.grant_id)
+                    .ok_or_else(|| internal("grant missing after resume"))?;
+                t.lease_epoch = grant.lease.epoch;
+                t.lease_expires_ms = grant.lease.expires_ms;
+                t.heartbeat_seq = grant.lease.next_seq;
+                t.resume_nonce = grant.lease.next_seq;
+            }
+            _ => {
+                return Err(perr(
+                    ErrorCode::StaleLease,
+                    "lease expired beyond the resume grace window",
+                    &t.task_id,
+                ));
+            }
+        }
+        Ok(true)
+    }
+
     /// Called at creation and on every verified resume: the rotated
     /// resume handle vouches for the new capability.
     fn rotate_capability(&self, t: &mut DurableTask) -> Result<String, ProtocolError> {
@@ -4133,5 +4198,74 @@ mod tests {
         submit.candidate_id = target.candidate_id.clone();
         let e = daemon.ultra_submit(submit).unwrap_err();
         assert_eq!(e.code, ErrorCode::GateFailed);
+    }
+    #[test]
+    fn verified_resume_renews_a_lapsed_lease() {
+        // Live Ultra runs work longer than one lease window between calls;
+        // docs promise an expired lease plus the current handle still resumes.
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("rrenew")).unwrap();
+        let handle = ex.host_resume_handle.clone().unwrap();
+        // Force the lease into the past in the persisted store.
+        let file = root.join("tasks").join(&ex.task_id).join("task.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("lease_expires_ms".into(), serde_json::json!(1));
+        fs::write(&file, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+        // Same-process lapse: resume renews the un-swept grant via heartbeat.
+        let mut resume_req = req("rrenew-ignored");
+        resume_req.task_id = Some(ex.task_id.clone());
+        resume_req.resume_handle = Some(handle.clone());
+        let r1 = daemon.execute(resume_req).unwrap();
+        assert!(r1.resumed);
+        assert!(r1.lease.expires_ms_from_now > 0);
+        let cap1 = r1.task_capability.clone().unwrap();
+        let n1 = daemon
+            .next(NextRequest {
+                task_id: ex.task_id.clone(),
+                lease_epoch: r1.lease.epoch,
+                capability: cap1,
+            })
+            .unwrap();
+        assert_eq!(n1.state, TaskState::Active);
+        // Cross-restart lapse: recovery suspends the grant; resume must
+        // reactivate it through the custody resume path (epoch bumps).
+        let epoch_before = r1.lease.epoch;
+        let mut v2: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        v2.as_object_mut()
+            .unwrap()
+            .insert("lease_expires_ms".into(), serde_json::json!(1));
+        fs::write(&file, serde_json::to_vec_pretty(&v2).unwrap()).unwrap();
+        // Lapse the custody grant as well so recovery suspends it.
+        let grants_dir = root.join("custody").join("grants");
+        for entry in fs::read_dir(&grants_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let mut g: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            g.as_object_mut()
+                .unwrap()
+                .get_mut("lease")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("expires_ms".into(), serde_json::json!(1));
+            fs::write(&path, serde_json::to_vec_pretty(&g).unwrap()).unwrap();
+        }
+        drop(daemon);
+        let daemon2 = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let mut resume_req2 = req("rrenew-ignored-2");
+        resume_req2.task_id = Some(ex.task_id.clone());
+        resume_req2.resume_handle = Some(r1.host_resume_handle.clone().unwrap());
+        let r2 = daemon2.execute(resume_req2).unwrap();
+        assert!(r2.resumed);
+        assert!(r2.lease.epoch > epoch_before);
+        assert!(r2.lease.expires_ms_from_now > 0);
     }
 }

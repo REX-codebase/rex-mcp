@@ -2622,6 +2622,8 @@ dependencies = [
 name = "rex-daemon"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "png 0.18.1",
  "rex-custody",
  "rex-prompt",
  "rex-protocol",
@@ -2746,6 +2748,8 @@ dependencies = [
 name = "rex-ultra"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "png 0.18.1",
  "rex-prompt",
  "rex-protocol",
  "rex-providers",
