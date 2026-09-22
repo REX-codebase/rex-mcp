@@ -650,6 +650,14 @@ pub struct UltraOpenRequest {
     /// lease epoch is sequencing information, not authorization.
     pub capability: String,
     pub lease_epoch: u64,
+    /// Host-drafted acceptance contract (JSON text; may be embedded in
+    /// prose). Required the first time an Ultra task is opened: the daemon
+    /// parses and validates it deterministically, freezes it, and executes
+    /// its proofs itself. On later opens a supplied draft must hash-match
+    /// the frozen contract. Obligations whose proof is host-judged
+    /// behavior prose are rejected: the external path executes every proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_draft: Option<String>,
 }
 
 /// rex_ultra_submit request: one candidate response or one evidence item.

@@ -128,6 +128,17 @@ pub struct AcceptanceContract {
     pub forbidden_regressions: Vec<ForbiddenRegression>,
 }
 
+/// Obligation ids whose proof is host-judged behavior prose. The external
+/// kernel executes every proof itself, so these fail closed at open.
+pub fn non_executable_obligations(contract: &AcceptanceContract) -> Vec<String> {
+    contract
+        .obligations
+        .iter()
+        .filter(|o| matches!(o.proof, Proof::BehaviorEvidence { .. }))
+        .map(|o| o.id.clone())
+        .collect()
+}
+
 pub const MAX_OBLIGATIONS: usize = 24;
 pub const MAX_REGRESSIONS: usize = 12;
 const MAX_FIELD_CHARS: usize = 2_000;

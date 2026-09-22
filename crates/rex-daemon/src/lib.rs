@@ -24,7 +24,7 @@ use rex_ultra::external_kernel::{
     VerifierEvidence,
 };
 use rex_ultra::host_bridge::{
-    contract_from_plan, BridgeError, UltraHostBridge, UltraHostView, DEFAULT_MINIMUM_CANDIDATES,
+    BridgeError, UltraHostBridge, UltraHostView, DEFAULT_MINIMUM_CANDIDATES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -875,7 +875,65 @@ impl HarnessDaemon {
         require_agent(&t)?;
         require_ultra(&t)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
-        let contract = contract_from_plan(&t.task, &t.plan);
+        let contract = if bridge.exists(&t.task_id) {
+            let frozen = bridge
+                .frozen_contract(&t.task_id)
+                .map_err(|e| bridge_err(&t.task_id, e))?;
+            if let Some(draft) = req.contract_draft.as_deref() {
+                let reparsed = rex_ultra::contract::parse_contract(draft, &t.task)
+                    .map_err(|errors| {
+                        perr(
+                            ErrorCode::MalformedRequest,
+                            format!("contract draft is invalid: {}", errors.join("; ")),
+                            &t.task_id,
+                        )
+                    })?;
+                if hash_json(&reparsed)? != hash_json(&frozen)? {
+                    return Err(perr(
+                        ErrorCode::IdempotencyConflict,
+                        "contract draft does not match the contract frozen at ultra_open",
+                        &t.task_id,
+                    ));
+                }
+            }
+            frozen
+        } else {
+            // First open freezes the contract. A draft is mandatory and
+            // every proof must be daemon-executable; host-judged behavior
+            // prose fails closed here rather than at promotion.
+            let draft = req.contract_draft.as_deref().ok_or_else(|| {
+                perr(
+                    ErrorCode::MalformedRequest,
+                    "ultra_open requires contract_draft: a JSON acceptance contract whose obligations all carry daemon-executable proofs (file_exists/file_contains/command_succeeds/command_output_contains)",
+                    &t.task_id,
+                )
+            })?;
+            let parsed = rex_ultra::contract::parse_contract(draft, &t.task).map_err(|errors| {
+                perr(
+                    ErrorCode::MalformedRequest,
+                    format!("contract draft is invalid: {}", errors.join("; ")),
+                    &t.task_id,
+                )
+            })?;
+            let non_executable = rex_ultra::contract::non_executable_obligations(&parsed);
+            if !non_executable.is_empty() {
+                return Err(perr(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "obligations with host-judged behavior proofs are not accepted on the external path: {}",
+                        non_executable.join(", ")
+                    ),
+                    &t.task_id,
+                ));
+            }
+            self.append_event(
+                &mut t,
+                "ultra_contract_frozen",
+                json!({"contract_hash": hash_json(&parsed)?}),
+            )?;
+            self.persist(&t)?;
+            parsed
+        };
         let view = bridge
             .open_requests(
                 &t.task_id,
@@ -910,7 +968,16 @@ impl HarnessDaemon {
         require_agent(&t)?;
         require_ultra(&t)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
-        let contract = contract_from_plan(&t.task, &t.plan);
+        if !bridge.exists(&t.task_id) {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "ultra kernel is not open for this task; call rex_ultra_open with a contract draft first",
+                &t.task_id,
+            ));
+        }
+        let contract = bridge
+            .frozen_contract(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?;
         let view = match req.kind {
             UltraSubmissionKind::Candidate => bridge.record_response(
                 &t.task_id,
@@ -986,7 +1053,9 @@ impl HarnessDaemon {
         {
         let mut t = t;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
-        let contract = contract_from_plan(&t.task, &t.plan);
+        let contract = bridge
+            .frozen_contract(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?;
         let receipt = bridge
             .promote(&t.task_id, &contract, &self.policy.workspace)
             .map_err(|e| bridge_err(&t.task_id, e))?;
@@ -1914,6 +1983,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::ApprovalRequired);
     }
+    /// A minimal contract draft whose proofs are all daemon-executable.
+    fn valid_draft() -> &'static str {
+        r#"{"obligations":[{"id":"ob-1","statement":"hello.txt exists and says hello","proof":{"kind":"file_contains","path":"hello.txt","needle":"hello"}}],"forbidden_regressions":[]}"#
+    }
+
     fn cap_of(r: &ExecuteResponse) -> String {
         r.task_capability.clone().expect("capability issued")
     }
@@ -1949,14 +2023,15 @@ mod tests {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap();
         assert_eq!(open.status, "collecting");
-        assert_eq!(open.candidate_requests.len(), 2);
+        assert_eq!(open.candidate_requests.len(), 3);
         assert!(open.evidence_requests.is_empty());
         assert_eq!(
             open.candidate_requests[0].obligation_ids,
-            vec!["step-1".to_string()]
+            vec!["ob-1".to_string()]
         );
         let mut view = open.clone();
         for c in &open.candidate_requests {
@@ -1975,7 +2050,7 @@ mod tests {
         }
         assert_eq!(view.status, "ready");
         assert_eq!(view.kernel_state, "awaiting_evidence");
-        assert_eq!(view.evidence_requests.len(), 4);
+        assert_eq!(view.evidence_requests.len(), 6);
         let candidate = view.evidence_requests[0].candidate_id.clone();
         let pending: Vec<UltraEvidenceRequestView> = view
             .evidence_requests
@@ -2004,7 +2079,7 @@ mod tests {
                         UltraSubmissionKind::Verifier,
                         &r.request_id,
                         &r.candidate_id,
-                        "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"}]}",
+                        "{\"outcomes\":[{\"obligation_id\":\"ob-1\",\"status\":\"proven\"}]}",
                     ))
                     .unwrap(),
             };
@@ -2017,6 +2092,7 @@ mod tests {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap();
         assert_eq!(again.kernel_state, "completed");
@@ -2037,6 +2113,7 @@ mod tests {
                 task_id: human.task_id.clone(),
                 capability: cap_of(&human),
                 lease_epoch: human.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::ScopeDenied);
@@ -2046,6 +2123,7 @@ mod tests {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap();
         let target = &open.candidate_requests[0];
@@ -2088,6 +2166,7 @@ mod tests {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ScopeDenied);
@@ -2108,6 +2187,7 @@ mod tests {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap();
         let plan = open.skill_plan.expect("skill plan bound");
@@ -2123,6 +2203,7 @@ mod tests {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap();
         assert_eq!(again.skill_plan.unwrap().plan_hash, hash);
@@ -2156,6 +2237,7 @@ mod tests {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap();
         // promotion before completion fails closed
@@ -2210,7 +2292,7 @@ mod tests {
                         UltraSubmissionKind::Verifier,
                         &r.request_id,
                         &r.candidate_id,
-                        "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"}]}",
+                        "{\"outcomes\":[{\"obligation_id\":\"ob-1\",\"status\":\"proven\"}]}",
                     ))
                     .unwrap(),
             };
@@ -2402,6 +2484,7 @@ mod tests {
                 task_id: ex.task_id.clone(),
                 capability: cap_of(&ex),
                 lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
             })
             .unwrap();
         let mut view = open.clone();
@@ -2447,7 +2530,7 @@ mod tests {
                         UltraSubmissionKind::Verifier,
                         &r.request_id,
                         &r.candidate_id,
-                        "{\"outcomes\":[{\"obligation_id\":\"step-1\",\"status\":\"proven\"}]}",
+                        "{\"outcomes\":[{\"obligation_id\":\"ob-1\",\"status\":\"proven\"}]}",
                     ))
                     .unwrap(),
             };
@@ -2714,5 +2797,61 @@ mod tests {
             .unwrap();
         assert!(evs.events.iter().any(|e| e.kind == "artifact_registered"
             && e.detail["sha256"] == serde_json::json!(ok.sha256)));
+    }
+
+    #[test]
+    fn ultra_open_requires_an_executable_frozen_contract() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req("r-contract")).unwrap();
+        let open = |draft: Option<&str>| {
+            daemon.ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: draft.map(str::to_string),
+            })
+        };
+        // No draft on first open fails closed: a plan-derived contract
+        // would flatten every obligation into host-judged prose.
+        let e = open(None).unwrap_err();
+        assert_eq!(e.code, ErrorCode::MalformedRequest);
+        // Host-judged behavior proofs are rejected, not flattened.
+        let behavior = r#"{"obligations":[{"id":"ob-1","statement":"it works","proof":{"kind":"behavior_evidence","description":"check it works"}}]}"#;
+        let e = open(Some(behavior)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::MalformedRequest);
+        assert!(e.message.contains("ob-1"));
+        // Malformed JSON is rejected with explainable errors.
+        let e = open(Some("not a contract")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::MalformedRequest);
+        // A valid executable draft opens and freezes; the candidate floor
+        // is the taste floor (3), not the old two-candidate race.
+        let view = open(Some(valid_draft())).unwrap();
+        assert_eq!(view.candidate_requests.len(), 3);
+        // Re-opening with the same draft is idempotent...
+        let view2 = open(Some(valid_draft())).unwrap();
+        assert_eq!(view2.candidate_requests.len(), 3);
+        // ...but a conflicting draft is an idempotency conflict, never a
+        // silent contract swap.
+        let other = r#"{"obligations":[{"id":"ob-2","statement":"other","proof":{"kind":"file_exists","path":"x.txt"}}]}"#;
+        let e = open(Some(other)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::IdempotencyConflict);
+        // Ultra submit before open fails closed (fresh task, never opened).
+        let ex2 = daemon.execute(req("r-contract-2")).unwrap();
+        let target = &view.candidate_requests[0];
+        let mut submit = ultra_req(
+            &ex2.task_id,
+            &cap_of(&ex2),
+            ex2.lease.epoch,
+            UltraSubmissionKind::Candidate,
+            &target.candidate_id,
+            &target.candidate_id,
+            "answer",
+        );
+        submit.candidate_id = target.candidate_id.clone();
+        let e = daemon.ultra_submit(submit).unwrap_err();
+        assert_eq!(e.code, ErrorCode::GateFailed);
     }
 }

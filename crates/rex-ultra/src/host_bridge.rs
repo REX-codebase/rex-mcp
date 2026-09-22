@@ -16,7 +16,10 @@ use rex_protocol::PlanStep;
 use std::fs;
 use std::path::PathBuf;
 
-pub const DEFAULT_MINIMUM_CANDIDATES: usize = 2;
+/// External Ultra never competes fewer theses than the taste floor: a
+/// two-candidate race cannot satisfy MIN_DISTINCT_THESES, so the floor is
+/// the same constant.
+pub const DEFAULT_MINIMUM_CANDIDATES: usize = crate::taste::MIN_DISTINCT_THESES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeError {
@@ -70,6 +73,18 @@ impl UltraHostBridge {
         let dir = root.into().join("ultra");
         fs::create_dir_all(&dir).map_err(|e| BridgeError::Io(e.to_string()))?;
         Ok(Self { dir })
+    }
+
+    /// True when a frozen kernel already exists for this task.
+    pub fn exists(&self, task_id: &str) -> bool {
+        self.path(task_id).map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// The contract frozen at ultra_open for this task.
+    pub fn frozen_contract(&self, task_id: &str) -> Result<AcceptanceContract, BridgeError> {
+        let path = self.path(task_id)?;
+        let adapter = ExternalHostAdapter::open(&path).map_err(BridgeError::Adapter)?;
+        Ok(adapter.contract().clone())
     }
 
     fn path(&self, task_id: &str) -> Result<PathBuf, BridgeError> {

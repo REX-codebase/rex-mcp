@@ -258,6 +258,11 @@ impl ExternalHostAdapter {
         &self.state.kernel
     }
 
+    /// The acceptance contract frozen at kernel creation.
+    pub fn contract(&self) -> &AcceptanceContract {
+        &self.state.contract
+    }
+
     pub fn requests(&self) -> Result<Vec<HostCandidateRequest>, AdapterError> {
         let contract_hash = canonical_hash(&self.state.contract)
             .map_err(|e| AdapterError::Encoding(e.to_string()))?;
