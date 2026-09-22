@@ -13,14 +13,23 @@ promotion, proof bundles) - see docs/rex-mcp-ultra.md.
 
 ## Install
 
+The release install surface is one command, matching what stdio MCP hosts
+already accept:
+
 ```sh
-scripts/rex-mcp-install.sh            # builds and installs ~/.rex/bin/rex-mcp
+npx --yes @rex-codebase/rex-mcp@latest
 ```
 
-Requirements: Rust stable (`rustup`), git. The installer builds
-`cargo build --release -p rex-mcp` and copies the binary. No network
-access, telemetry, or background service is installed; rex-mcp runs only
-while a host keeps its stdio session open.
+The npm package contains the native binary. It does not require Rust, clone the
+repository, install a daemon, or send telemetry. It supports Linux x64/arm64,
+macOS x64/arm64 and Windows x64. REX runs only while a host keeps its stdio
+session open.
+
+The package is staged but intentionally unpublished while this repository is
+private. Maintainers can still build from source with
+`scripts/rex-mcp-install.sh` (requires Rust and git). The private packaging
+workflow builds every native target and emits one unpublished `.tgz`; publishing
+that reviewed tarball later is a single `npm publish <file> --access public`.
 
 ## Claude Code
 
@@ -29,7 +38,7 @@ claude mcp add rex --scope user \
   --env REX_STATE_DIR=$HOME/.rex/harness \
   --env REX_WORKSPACE=/path/to/project \
   --env REX_APPROVE_TASK_MUTATIONS=1 \
-  -- ~/.rex/bin/rex-mcp
+  -- npx --yes @rex-codebase/rex-mcp@latest
 ```
 
 Set `REX_APPROVE_TASK_MUTATIONS=1` only when you accept that this host may
@@ -45,7 +54,8 @@ Add to the MCP servers config (`~/.antigravity/mcp_config.json`):
 {
   "mcpServers": {
     "rex": {
-      "command": "/home/USER/.rex/bin/rex-mcp",
+      "command": "npx",
+      "args": ["--yes", "@rex-codebase/rex-mcp@latest"],
       "env": {
         "REX_STATE_DIR": "/home/USER/.rex/harness",
         "REX_WORKSPACE": "/path/to/project",
@@ -112,7 +122,7 @@ recovery suspends lapsed leases and the daemon reloads every task record.
 ## Update
 
 ```sh
-git pull && scripts/rex-mcp-install.sh   # rebuild and reinstall in place
+npx --yes @rex-codebase/rex-mcp@latest     # hosts resolve the released package
 ```
 
 Hosts pick up the new binary on their next MCP session start. Durable

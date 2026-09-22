@@ -1,0 +1,82 @@
+name: Build unpublished REX MCP npm package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package_dir: linux-x64
+            binary: rex-mcp
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package_dir: linux-arm64
+            binary: rex-mcp
+          - os: macos-13
+            target: x86_64-apple-darwin
+            package_dir: darwin-x64
+            binary: rex-mcp
+          - os: macos-14
+            target: aarch64-apple-darwin
+            package_dir: darwin-arm64
+            binary: rex-mcp
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package_dir: win32-x64
+            binary: rex-mcp.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+      - run: cargo build --locked --release -p rex-mcp --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          mkdir -p staging/${{ matrix.package_dir }}
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} staging/${{ matrix.package_dir }}/${{ matrix.binary }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rex-mcp-${{ matrix.package_dir }}
+          path: staging/${{ matrix.package_dir }}/${{ matrix.binary }}
+          if-no-files-found: error
+
+  package:
+    needs: binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rex-mcp-*
+          path: staging
+          merge-multiple: false
+      - run: |
+          mkdir -p binaries
+          for d in staging/rex-mcp-*; do
+            platform="${d##*/rex-mcp-}"
+            mkdir -p "binaries/$platform"
+            cp "$d"/* "binaries/$platform/"
+          done
+          cd packages/rex-mcp-npm
+          npm test
+          REX_MCP_BINARIES_DIR="$GITHUB_WORKSPACE/binaries" npm run pack:private
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rex-mcp-npm-unpublished
+          path: packages/rex-mcp-npm/*.tgz
+          if-no-files-found: error

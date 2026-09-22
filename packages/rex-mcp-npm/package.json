@@ -1,0 +1,27 @@
+{
+  "name": "@rex-codebase/rex-mcp",
+  "version": "0.1.0",
+  "description": "One-command launcher for the local REX Harness MCP server",
+  "license": "UNLICENSED",
+  "private": false,
+  "type": "commonjs",
+  "bin": {
+    "rex-mcp": "bin/rex-mcp.cjs"
+  },
+  "files": [
+    "bin/",
+    "vendor/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "pack:private": "node scripts/stage-binaries.cjs && npm pack"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
