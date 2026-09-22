@@ -155,3 +155,64 @@ pub fn hex_sha256(data: &[u8]) -> String {
     h.update(data);
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// HMAC-SHA256 (RFC 2104) over `msg` with `key`, hex-encoded. Used by the
+/// daemon to MAC proof bundles with its daemon-held key: a state editor
+/// that can rewrite task/event files but cannot read the 0600 key file
+/// cannot mint a valid bundle MAC.
+pub fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let reduced = if key.len() > BLOCK {
+        let mut h = Sha256::new();
+        h.update(key);
+        h.finalize().to_vec()
+    } else {
+        key.to_vec()
+    };
+    let mut k = [0u8; BLOCK];
+    k[..reduced.len()].copy_from_slice(&reduced);
+    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(msg);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner_digest);
+    outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod hmac_tests {
+    use super::hmac_sha256_hex;
+
+    #[test]
+    fn rfc4231_test_case_1() {
+        // key = 0x0b x 20, data = "Hi There"
+        let key = [0x0bu8; 20];
+        assert_eq!(
+            hmac_sha256_hex(&key, b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn rfc4231_test_case_2() {
+        // key = "Jefe", data = "what do ya want for nothing?"
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn long_key_is_reduced() {
+        let key = [0xaau8; 131];
+        // RFC 4231 test case 6
+        assert_eq!(
+            hmac_sha256_hex(&key, b"Test Using Larger Than Block-Size Key - Hash Key First"),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+}

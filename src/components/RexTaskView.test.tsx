@@ -22,7 +22,15 @@ vi.mock("../data/rexTasks", async (importOriginal) => {
         { seq: 2, ts_ms: 2, kind: "task_completed", detail: {} },
       ],
     })),
-    rexTaskProof: vi.fn(async () => ({ proof: null })),
+    rexTaskProof: vi.fn(async () => ({
+      task_id: "t-1",
+      state: "completed",
+      kernel_state: "completed",
+      qualified_candidate: "candidate-1",
+      promotion_state: "committed",
+      skill_plan: { selected: ["rust-core"], unsupported: [] },
+      bundle_hash: "ab".repeat(32),
+    })),
     rexTaskStop: vi.fn(),
     rexTaskFollowUp: vi.fn(),
   };

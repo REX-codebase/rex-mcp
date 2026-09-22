@@ -76,7 +76,7 @@ fn full_caller_driven_lifecycle_over_stdio() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names.len(), 18);
+    assert_eq!(names.len(), 19);
     assert!(names.contains(&"rex_human_stop"));
     assert!(names.contains(&"rex_execute") && names.contains(&"rex_submit"));
 

@@ -8,7 +8,7 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use rex_custody::capability::{hex_sha256, random_hex};
+use rex_custody::capability::{hex_sha256, hmac_sha256_hex, random_hex};
 use rex_ultra::artifacts::{ArtifactError, ArtifactStore};
 use rex_custody::{
     AgentProtocol, CapabilitySet, CapabilityToken, CompletionClaim, CompletionContract,
@@ -892,6 +892,7 @@ impl HarnessDaemon {
             ToolName::UltraSubmit => go!(args, ultra_submit),
             ToolName::UltraPromote => go!(args, ultra_promote),
             ToolName::Proof => go!(args, proof_bundle),
+            ToolName::ProofVerify => go!(args, verify_proof_bundle),
             ToolName::HumanStop => go!(args, human_stop),
             ToolName::ArtifactPut => go!(args, artifact_put),
         }
@@ -1500,12 +1501,71 @@ impl HarnessDaemon {
     }
 
     pub fn proof_bundle(&self, req: TaskRefRequest) -> Result<TaskProofBundle, ProtocolError> {
-        let t = self.load(&req.task_id)?;
+        let bundle = self.assemble_proof_bundle(&req.task_id)?;
+        let dir = self.root.join("proofs");
+        fs::create_dir_all(&dir).map_err(internal)?;
+        let path = dir.join(format!("{}.json", bundle.task_id));
+        let temporary = path.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&bundle).map_err(internal)?,
+        )
+        .map_err(internal)?;
+        fs::rename(&temporary, &path).map_err(internal)?;
+        Ok(bundle)
+    }
+
+    /// The content hash binding every field of a bundle except the hash
+    /// and MAC themselves. Assembly computes it over fresh state; the
+    /// verifier recomputes it over a persisted bundle, so editing any
+    /// persisted field without the daemon key is detected.
+    fn proof_content_hash(b: &TaskProofBundle) -> Result<String, ProtocolError> {
+        hash_json(&(
+            b.proof_version,
+            &b.task_id,
+            &b.request_hash,
+            &b.task,
+            &b.plan,
+            b.state,
+            &b.kernel_state,
+            &b.qualified_candidate,
+            &b.skill_plan,
+            &b.skill_plan_hash,
+            &b.promotion_state,
+            &b.promotion,
+            &b.evidence_manifest,
+            &b.events_chain_head,
+            &b.events,
+        ))
+    }
+
+    /// Assemble the proof bundle from immutable records only: the frozen
+    /// skill plan (never a fresh recompile for ultra tasks), the event
+    /// log folded into a hash chain, per-candidate evidence manifests,
+    /// and the promotion receipt. The same immutable state always yields
+    /// the same bundle hash; that is what makes the bundle verifiable.
+    fn assemble_proof_bundle(&self, task_id: &str) -> Result<TaskProofBundle, ProtocolError> {
+        let t = self.load(task_id)?;
         let bridge = UltraHostBridge::open(&self.root).map_err(|e| bridge_err(&t.task_id, e))?;
         let adapter = bridge
             .load_existing(&t.task_id)
             .map_err(|e| bridge_err(&t.task_id, e))?;
-        let (kernel_state, qualified_candidate) = match &adapter {
+        // Frozen-plan drift is tamper evidence; fail assembly closed.
+        if let Some(frozen) = bridge
+            .frozen_skill_plan(&t.task_id)
+            .map_err(|e| bridge_err(&t.task_id, e))?
+        {
+            match t.ultra_skill_plan_hash.as_deref() {
+                Some(recorded) if recorded == frozen.plan_hash => {}
+                _ => {
+                    return Err(internal(format!(
+                        "frozen skill plan hash drift for {}",
+                        t.task_id
+                    )))
+                }
+            }
+        }
+        let (kernel_state, qualified_candidate, evidence_manifest) = match &adapter {
             Some(adapter) => {
                 let state = match adapter.kernel().state {
                     KernelState::New => "new",
@@ -1516,14 +1576,64 @@ impl HarnessDaemon {
                     KernelState::Failed => "failed",
                     KernelState::Revoked => "revoked",
                 };
+                let visual_contract =
+                    adapter.contract().work_kind == rex_ultra::contract::WorkKind::Visual;
+                let mut manifest: BTreeMap<String, CandidateProofManifest> = BTreeMap::new();
+                for response in adapter.responses() {
+                    let evidence = adapter
+                        .candidate_evidence(&response.candidate_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let adversary_record_hash = evidence
+                        .daemon_adversary
+                        .as_ref()
+                        .and_then(|r| serde_json::to_value(r).ok())
+                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok()).map(|b| hex_sha256(&b));
+                    let verifier_record_hash = evidence
+                        .verifier
+                        .as_ref()
+                        .and_then(|r| serde_json::to_value(r).ok())
+                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok()).map(|b| hex_sha256(&b));
+                    let visual_record_hash = evidence
+                        .visual
+                        .as_ref()
+                        .and_then(|r| serde_json::to_value(r).ok())
+                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok()).map(|b| hex_sha256(&b));
+                    let daemon_visual_record_hash = evidence
+                        .daemon_visual
+                        .as_ref()
+                        .and_then(|r| serde_json::to_value(r).ok())
+                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok()).map(|b| hex_sha256(&b));
+                    let fully_evidenced = evidence.daemon_adversary.is_some()
+                        && evidence.verifier.is_some()
+                        && (!visual_contract
+                            || (evidence.visual.is_some() && evidence.daemon_visual.is_some()));
+                    manifest.insert(
+                        response.candidate_id.clone(),
+                        CandidateProofManifest {
+                            response_hash_recorded: response.response_hash.clone(),
+                            response_hash_recomputed:
+                                rex_protocol::schema::canonical_hash(&response.content)
+                                    .map_err(internal)?,
+                            adversary_record_hash,
+                            verifier_record_hash,
+                            visual_record_hash,
+                            daemon_visual_record_hash,
+                            fully_evidenced,
+                        },
+                    );
+                }
                 (
                     Some(state.to_string()),
                     adapter.qualified_candidate().map(str::to_string),
+                    manifest,
                 )
             }
-            None => (None, None),
+            None => (None, None, BTreeMap::new()),
         };
-        let skill_plan = self.skill_plan();
+        // The frozen plan when one exists; informational compile otherwise.
+        let skill_plan = self.task_skill_plan_view(&t.task_id);
+        let skill_plan_hash = t.ultra_skill_plan_hash.clone();
         let store = rex_ultra::promotion::PromotionStore::open(self.root.join("ultra"))
             .map_err(|e| internal(format!("promotion store: {e:?}")))?;
         let promotion = store
@@ -1538,7 +1648,7 @@ impl HarnessDaemon {
             }
             .to_string()
         });
-        let events = self
+        let mut events = self
             .events(EventsRequest {
                 task_id: t.task_id.clone(),
                 after_seq: 0,
@@ -1546,20 +1656,17 @@ impl HarnessDaemon {
             })
             .unwrap()
             .events;
-        let bundle_hash = hash_json(&(
-            &t.task_id,
-            &t.request_hash,
-            &t.task,
-            &t.plan,
-            t.state,
-            &kernel_state,
-            &qualified_candidate,
-            &skill_plan,
-            &promotion_state,
-            &promotion,
-            &events,
-        ))?;
-        let bundle = TaskProofBundle {
+        events.sort_by_key(|e| e.seq);
+        // Append-only hash chain over the canonical event log.
+        let mut events_chain_head = hex_sha256(b"rex-proof-events-genesis");
+        for event in &events {
+            let canonical =
+                rex_protocol::schema::canonical_json(event).map_err(internal)?;
+            events_chain_head = hex_sha256(
+                format!("{events_chain_head}:{}", hex_sha256(&canonical)).as_bytes(),
+            );
+        }
+        let mut bundle = TaskProofBundle {
             task_id: t.task_id.clone(),
             request_hash: t.request_hash.clone(),
             task: t.task.clone(),
@@ -1571,19 +1678,72 @@ impl HarnessDaemon {
             promotion_state,
             promotion,
             events,
-            bundle_hash,
+            bundle_hash: String::new(),
+            proof_version: 2,
+            skill_plan_hash,
+            evidence_manifest,
+            events_chain_head,
+            bundle_mac: String::new(),
         };
-        let dir = self.root.join("proofs");
-        fs::create_dir_all(&dir).map_err(internal)?;
-        let path = dir.join(format!("{}.json", t.task_id));
-        let temporary = path.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(&bundle).map_err(internal)?,
-        )
-        .map_err(internal)?;
-        fs::rename(&temporary, &path).map_err(internal)?;
+        bundle.bundle_hash = Self::proof_content_hash(&bundle)?;
+        let proof_key = load_or_create_proof_key(&self.root)?;
+        bundle.bundle_mac =
+            hmac_sha256_hex(proof_key.as_bytes(), bundle.bundle_hash.as_bytes());
         Ok(bundle)
+    }
+
+    /// Independently verify the persisted proof bundle: the MAC must
+    /// validate against the daemon-held key (a state editor without the
+    /// key cannot forge it), a fresh assembly from current immutable
+    /// records must reproduce the same hash (the proof is deterministic
+    /// and bound to the frozen plan), and every recorded candidate
+    /// response hash must match the stored content.
+    pub fn verify_proof_bundle(
+        &self,
+        req: TaskRefRequest,
+    ) -> Result<ProofVerificationReport, ProtocolError> {
+        let fresh = self.assemble_proof_bundle(&req.task_id)?;
+        let proof_key = load_or_create_proof_key(&self.root)?;
+        let path = self
+            .root
+            .join("proofs")
+            .join(format!("{}.json", fresh.task_id));
+        let persisted: Option<TaskProofBundle> = match fs::read(&path) {
+            Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(internal)?),
+            Err(_) => None,
+        };
+        let manifest_ok = |m: &BTreeMap<String, CandidateProofManifest>| {
+            m.values()
+                .all(|c| c.response_hash_recorded == c.response_hash_recomputed)
+        };
+        let (persisted_present, content_hash_consistent, mac_valid, deterministic, response_hashes_verified) =
+            match &persisted {
+                Some(p) => (
+                    true,
+                    Self::proof_content_hash(p)? == p.bundle_hash,
+                    hmac_sha256_hex(proof_key.as_bytes(), p.bundle_hash.as_bytes())
+                        == p.bundle_mac,
+                    p.bundle_hash == fresh.bundle_hash,
+                    manifest_ok(&p.evidence_manifest) && manifest_ok(&fresh.evidence_manifest),
+                ),
+                None => (false, false, false, false, manifest_ok(&fresh.evidence_manifest)),
+            };
+        let verdict = persisted_present
+            && content_hash_consistent
+            && mac_valid
+            && deterministic
+            && response_hashes_verified;
+        Ok(ProofVerificationReport {
+            task_id: fresh.task_id,
+            persisted_present,
+            content_hash_consistent,
+            mac_valid,
+            deterministic,
+            response_hashes_verified,
+            events_chain_head: fresh.events_chain_head,
+            bundle_hash: fresh.bundle_hash,
+            verdict,
+        })
     }
 
     /// The task's bound skill plan: the frozen plan when ultra_open
@@ -1939,7 +2099,27 @@ fn make_action(task_id: &str, idx: usize, step: &PlanStep, max_wall_ms: u64) -> 
         max_wall_ms,
     }
 }
-/// The machine-readable proof bundle for one task.
+/// Per-candidate immutable evidence manifest: what the host submitted
+/// (recorded hash vs recomputed hash of the stored content) and the
+/// canonical hashes of the daemon's own evidence records.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateProofManifest {
+    pub response_hash_recorded: String,
+    pub response_hash_recomputed: String,
+    #[serde(default)]
+    pub adversary_record_hash: Option<String>,
+    #[serde(default)]
+    pub verifier_record_hash: Option<String>,
+    #[serde(default)]
+    pub visual_record_hash: Option<String>,
+    #[serde(default)]
+    pub daemon_visual_record_hash: Option<String>,
+    pub fully_evidenced: bool,
+}
+
+/// The machine-readable proof bundle for one task. Version 2 binds the
+/// frozen skill plan, carries per-candidate evidence manifests, a
+/// hash-chained event log, and a MAC keyed by the daemon-held proof key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskProofBundle {
     pub task_id: String,
@@ -1954,6 +2134,38 @@ pub struct TaskProofBundle {
     pub promotion: Option<rex_ultra::promotion::PromotionReceipt>,
     pub events: Vec<TaskEvent>,
     pub bundle_hash: String,
+    #[serde(default)]
+    pub proof_version: u32,
+    #[serde(default)]
+    pub skill_plan_hash: Option<String>,
+    #[serde(default)]
+    pub evidence_manifest: BTreeMap<String, CandidateProofManifest>,
+    #[serde(default)]
+    pub events_chain_head: String,
+    #[serde(default)]
+    pub bundle_mac: String,
+}
+
+/// The outcome of independently verifying a persisted proof bundle
+/// against the daemon-held key and a fresh assembly from current
+/// immutable records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofVerificationReport {
+    pub task_id: String,
+    pub persisted_present: bool,
+    /// The persisted bundle's own content re-hashes to its stored
+    /// bundle_hash: no field was edited after the hash was taken.
+    pub content_hash_consistent: bool,
+    pub mac_valid: bool,
+    /// The persisted bundle hash equals a fresh assembly: the proof did
+    /// not drift when the workspace or other mutable inputs changed.
+    pub deterministic: bool,
+    /// Every candidate's recorded response hash matches the recomputed
+    /// hash of the stored content in both persisted and fresh bundles.
+    pub response_hashes_verified: bool,
+    pub events_chain_head: String,
+    pub bundle_hash: String,
+    pub verdict: bool,
 }
 
 fn require_agent(t: &DurableTask) -> Result<(), ProtocolError> {
@@ -2094,6 +2306,35 @@ fn load_or_create_human_token(root: &Path) -> Result<String, ProtocolError> {
         f.sync_all().map_err(internal)?;
     }
     Ok(hex_sha256(token.as_bytes()))
+}
+
+/// Load or create the daemon-held proof-bundle MAC key. Same authority
+/// boundary as the human-stop token: a 0600 file in the daemon state dir a
+/// remote MCP host cannot read, so it cannot mint a valid bundle MAC.
+fn load_or_create_proof_key(root: &Path) -> Result<String, ProtocolError> {
+    let dir = root.join("proofs");
+    fs::create_dir_all(&dir).map_err(internal)?;
+    let path = dir.join("hmac-key");
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let key = format!("prk-{}", random_hex(32));
+    {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path).map_err(internal)?;
+        f.write_all(key.as_bytes()).map_err(internal)?;
+        f.sync_all().map_err(internal)?;
+    }
+    Ok(key)
 }
 
 fn safe_id(s: &str) -> bool {
@@ -3054,6 +3295,228 @@ mod tests {
             })
             .unwrap();
         assert!(events.events.iter().any(|e| e.kind == "ultra_promotion"));
+    }
+
+    /// A fully promoted ultra task: frozen plan, committed receipt,
+    /// daemon-executed evidence, completed durable task.
+    fn promoted_ultra_task(
+        tag: &str,
+    ) -> (tempfile::TempDir, HarnessDaemon, String, std::path::PathBuf) {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        fs::create_dir_all(&w).unwrap();
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let ex = daemon.execute(req(tag)).unwrap();
+        let open = daemon
+            .ultra_open(UltraOpenRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                contract_draft: Some(valid_draft().into()),
+            })
+            .unwrap();
+        for (i, c) in open.candidate_requests.iter().enumerate() {
+            let content = format!(
+                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}},{{\"path\":\"result.txt\",\"content\":\"PASS {i}\"}}]}}"
+            );
+            daemon
+                .ultra_submit(ultra_req(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    UltraSubmissionKind::Candidate,
+                    &c.candidate_id,
+                    &c.candidate_id,
+                    &content,
+                ))
+                .unwrap();
+        }
+        daemon
+            .ultra_promote(rex_protocol::UltraPromoteRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+            })
+            .unwrap();
+        (d, daemon, ex.task_id.clone(), w)
+    }
+
+    #[test]
+    fn proof_bundle_binds_frozen_plan_chains_events_and_verifies() {
+        let (_d, daemon, task_id, _w) = promoted_ultra_task("r-proofv2");
+        let bundle = daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: task_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(bundle.proof_version, 2);
+        let plan_hash = bundle.skill_plan_hash.clone().unwrap();
+        assert_eq!(bundle.skill_plan.unwrap().plan_hash, plan_hash);
+        assert_ne!(
+            bundle.events_chain_head,
+            rex_custody::capability::hex_sha256(b"rex-proof-events-genesis")
+        );
+        assert_eq!(bundle.bundle_mac.len(), 64);
+        assert!(!bundle.evidence_manifest.is_empty());
+        for manifest in bundle.evidence_manifest.values() {
+            assert_eq!(
+                manifest.response_hash_recorded, manifest.response_hash_recomputed,
+                "stored candidate content matches its recorded hash"
+            );
+            assert!(manifest.fully_evidenced);
+            assert!(manifest.adversary_record_hash.is_some());
+            assert!(manifest.verifier_record_hash.is_some());
+        }
+        let report = daemon
+            .verify_proof_bundle(TaskRefRequest { task_id })
+            .unwrap();
+        assert!(report.persisted_present);
+        assert!(report.content_hash_consistent);
+        assert!(report.mac_valid);
+        assert!(report.deterministic);
+        assert!(report.response_hashes_verified);
+        assert!(report.verdict);
+    }
+
+    #[test]
+    fn proof_bundle_is_deterministic_under_workspace_mutation() {
+        let (_d, daemon, task_id, w) = promoted_ultra_task("r-proofdet");
+        let first = daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: task_id.clone(),
+            })
+            .unwrap();
+        // Mutate the workspace: a fresh skill-plan compile would see
+        // different repository facts, but the proof binds the frozen plan.
+        fs::create_dir_all(w.join("src")).unwrap();
+        fs::write(w.join("src").join("extra.rs"), "fn extra() {}").unwrap();
+        fs::write(w.join("README.md"), "changed after promotion").unwrap();
+        let second = daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: task_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(first.bundle_hash, second.bundle_hash);
+        let report = daemon
+            .verify_proof_bundle(TaskRefRequest { task_id })
+            .unwrap();
+        assert!(report.deterministic);
+        assert!(report.verdict);
+    }
+
+    #[test]
+    fn proof_verification_detects_persisted_bundle_tampering() {
+        let (d, daemon, task_id, _w) = promoted_ultra_task("r-prooftamper");
+        daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: task_id.clone(),
+            })
+            .unwrap();
+        // A state editor rewrites the persisted bundle but cannot recompute
+        // the MAC without the daemon-held key.
+        let path = d
+            .path()
+            .join("state")
+            .join("proofs")
+            .join(format!("{task_id}.json"));
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["state"] = json!("failed");
+        value["qualified_candidate"] = json!("forged-candidate");
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let report = daemon
+            .verify_proof_bundle(TaskRefRequest { task_id })
+            .unwrap();
+        assert!(report.persisted_present);
+        assert!(
+            !report.content_hash_consistent,
+            "edited fields no longer hash to the stored bundle hash"
+        );
+        assert!(report.mac_valid, "the MAC honestly covers the unedited hash");
+        assert!(
+            report.deterministic,
+            "the stored hash still equals a fresh assembly; the content check is what catches the edit"
+        );
+        assert!(!report.verdict);
+    }
+
+    #[test]
+    fn proof_verification_detects_event_log_tampering() {
+        let (d, daemon, task_id, _w) = promoted_ultra_task("r-proofev");
+        daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: task_id.clone(),
+            })
+            .unwrap();
+        // Drop the promotion event from the durable log: the chain head
+        // changes and the persisted bundle no longer reassembles.
+        let log = d
+            .path()
+            .join("state")
+            .join("tasks")
+            .join(&task_id)
+            .join("events.jsonl");
+        let kept: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("ultra_promotion"))
+            .map(str::to_string)
+            .collect();
+        fs::write(&log, kept.join("\n") + "\n").unwrap();
+        let report = daemon
+            .verify_proof_bundle(TaskRefRequest { task_id })
+            .unwrap();
+        assert!(!report.deterministic, "edited event log breaks the chain");
+        assert!(!report.verdict);
+    }
+
+    #[test]
+    fn proof_verification_detects_adapter_content_drift() {
+        let (d, daemon, task_id, _w) = promoted_ultra_task("r-proofdrift");
+        daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: task_id.clone(),
+            })
+            .unwrap();
+        // Rewrite a stored candidate response body in place: the recorded
+        // response hash no longer matches the stored content.
+        let adapter_path = d
+            .path()
+            .join("state")
+            .join("ultra")
+            .join(format!("{task_id}.json"));
+        let raw = fs::read_to_string(&adapter_path).unwrap();
+        assert!(raw.contains("PASS 0"));
+        fs::write(&adapter_path, raw.replacen("PASS 0", "PWNED", 1)).unwrap();
+        let report = daemon
+            .verify_proof_bundle(TaskRefRequest { task_id })
+            .unwrap();
+        assert!(
+            !report.response_hashes_verified,
+            "edited candidate content is caught by hash comparison"
+        );
+        assert!(!report.verdict);
+    }
+
+    #[test]
+    fn proof_bundle_fails_closed_on_frozen_plan_drift() {
+        let (d, daemon, task_id, _w) = promoted_ultra_task("r-proofplandrift");
+        // Corrupt the recorded frozen-plan hash in the durable task state.
+        let task_path = d
+            .path()
+            .join("state")
+            .join("tasks")
+            .join(&task_id)
+            .join("task.json");
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&task_path).unwrap()).unwrap();
+        value["ultra_skill_plan_hash"] = json!("0".repeat(64));
+        fs::write(&task_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let err = daemon
+            .proof_bundle(TaskRefRequest { task_id })
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("frozen skill plan hash drift"));
     }
     #[test]
     fn host_resume_requires_and_rotates_the_handle() {

@@ -184,7 +184,8 @@ pub fn tool_descriptors() -> Vec<Value> {
             ToolName::HumanStop => ("Final human Stop for any task; requires the trusted launcher's human-stop token, terminal in every phase.", json!({"type":"object","required":["task_id","human_token"],"properties":{"task_id":{"type":"string"},"human_token":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false})),
             ToolName::UltraOpen => ("Open the Ultra external-host loop: fetch the open candidate or adversary/verifier/visual evidence requests.", task_epoch_schema()),
             ToolName::UltraPromote => ("Promote the qualified Ultra candidate bundle into the task workspace with verified rollback.", task_epoch_schema()),
-            ToolName::Proof => ("Fetch the deterministic per-task proof bundle: frozen plan, kernel state, evidence outcomes, skill plan, promotion receipt, events and bundle hash.", task_ref_schema()),
+            ToolName::Proof => ("Fetch the deterministic per-task proof bundle: frozen plan, kernel state, per-candidate evidence manifests, promotion receipt, hash-chained events, bundle hash and daemon MAC.", task_ref_schema()),
+            ToolName::ProofVerify => ("Independently verify the persisted proof bundle: MAC against the daemon-held key, deterministic reassembly from immutable records, and candidate response-hash integrity.", task_ref_schema()),
             ToolName::ArtifactPut => ("Store evidence bytes in the daemon's content-addressed immutable artifact store, bound to this task (optionally a candidate and round); cite the returned digest as evidence. Stored bytes cannot be altered and one digest cannot be reused across candidates or rounds.", extend(task_epoch_schema(), json!({"kind":{"type":"string"},"bytes_base64":{"type":"string"},"candidate_id":{"type":"string"},"round":{"type":"integer"}}), &["kind","bytes_base64"])),
             ToolName::UltraSubmit => ("Submit one Ultra candidate response or one adversary/verifier/visual evidence item. For candidates, request_id and candidate_id are the answered candidate id.", extend(task_epoch_schema(), json!({"kind":{"enum":["candidate","adversary","verifier","visual"]},"request_id":{"type":"string"},"candidate_id":{"type":"string"},"response_hash":{"type":"string"},"content":{"type":"string"}}), &["kind","request_id","candidate_id","response_hash","content"])),
         };
@@ -259,7 +260,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 18);
+        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 19);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"], "active");
         let task_id = rows[2]["result"]["structuredContent"]["task_id"]
             .as_str()

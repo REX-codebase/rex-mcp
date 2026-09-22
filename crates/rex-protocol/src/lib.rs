@@ -44,6 +44,7 @@ pub enum ToolName {
     UltraSubmit,
     UltraPromote,
     Proof,
+    ProofVerify,
     HumanStop,
     ArtifactPut,
 }
@@ -67,6 +68,7 @@ impl ToolName {
             ToolName::UltraSubmit => "rex_ultra_submit",
             ToolName::UltraPromote => "rex_ultra_promote",
             ToolName::Proof => "rex_proof",
+            ToolName::ProofVerify => "rex_proof_verify",
             ToolName::HumanStop => "rex_human_stop",
             ToolName::ArtifactPut => "rex_artifact_put",
         }
@@ -90,6 +92,7 @@ impl ToolName {
             "rex_ultra_submit" => ToolName::UltraSubmit,
             "rex_ultra_promote" => ToolName::UltraPromote,
             "rex_proof" => ToolName::Proof,
+            "rex_proof_verify" => ToolName::ProofVerify,
             "rex_human_stop" => ToolName::HumanStop,
             "rex_artifact_put" => ToolName::ArtifactPut,
             _ => return None,
@@ -114,6 +117,7 @@ impl ToolName {
             ToolName::UltraSubmit,
             ToolName::UltraPromote,
             ToolName::Proof,
+            ToolName::ProofVerify,
             ToolName::HumanStop,
             ToolName::ArtifactPut,
         ]
@@ -762,6 +766,7 @@ mod tests {
                 "rex_ultra_submit",
                 "rex_ultra_promote",
                 "rex_proof",
+                "rex_proof_verify",
                 "rex_human_stop",
                 "rex_artifact_put",
             ]
