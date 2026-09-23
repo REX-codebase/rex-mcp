@@ -70,6 +70,10 @@ pub struct ExecOptions {
     pub json: bool,
     pub yes: bool,
     pub dry_run: bool,
+    /// Internal disambiguator for parallel-family runs (e.g. tournament
+    /// contestants): each tag gets its own staged workspace directory.
+    /// Not a CLI flag.
+    pub run_tag: Option<String>,
 }
 
 #[derive(Debug)]
@@ -279,7 +283,7 @@ fn panic_missing_approval() -> ! {
     std::process::exit(1);
 }
 
-pub fn run_exec(mut opts: ExecOptions) -> Result<i32, ExecError> {
+pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
     if opts.task.trim().is_empty() {
         return Err(ExecError::usage("no task given: rex exec --task \"...\""));
     }
@@ -325,8 +329,11 @@ pub fn run_exec(mut opts: ExecOptions) -> Result<i32, ExecError> {
             "auto_approve": opts.yes,
             "workspace": opts.workspace.as_ref().map(|w| w.display().to_string()),
         });
-        println!("{}", serde_json::to_string_pretty(&config).unwrap());
-        return Ok(0);
+        return Ok(ExecOutput {
+            code: 0,
+            receipt: config,
+            workspace: None,
+        });
     }
 
     let (agent, runs_root) = build_agent()?;
@@ -341,7 +348,8 @@ pub fn run_exec(mut opts: ExecOptions) -> Result<i32, ExecError> {
                     .map_err(|e| ExecError::internal(format!("cannot resolve cwd: {e}")))?
                     .join(src)
             };
-            let dst = runs_root.join("cli-workspace");
+            let suffix = opts.run_tag.as_deref().unwrap_or("");
+            let dst = runs_root.join(format!("cli-workspace{suffix}"));
             if dst.exists() {
                 std::fs::remove_dir_all(&dst)
                     .map_err(|e| ExecError::internal(format!("cannot clear staging dir: {e}")))?;
@@ -378,6 +386,7 @@ pub fn run_exec(mut opts: ExecOptions) -> Result<i32, ExecError> {
         Err(e) => eprintln!("rex: warning: receipt is unsigned: {e}"),
     }
     let out = Value::Object(receipt_map);
+    let code = if completed { 0 } else { 3 };
 
     if opts.json {
         println!("{}", serde_json::to_string(&out).unwrap());
@@ -394,7 +403,28 @@ pub fn run_exec(mut opts: ExecOptions) -> Result<i32, ExecError> {
         }
     }
 
-    Ok(if completed { 0 } else { 3 })
+    Ok(ExecOutput {
+        code,
+        receipt: out,
+        workspace: staged_workspace,
+    })
+}
+
+/// A single headless run without any printing: the tournament driver.
+pub struct ExecOutput {
+    pub code: i32,
+    pub receipt: Value,
+    pub workspace: Option<PathBuf>,
+}
+
+pub fn run_exec(opts: ExecOptions) -> Result<i32, ExecError> {
+    let dry = opts.dry_run;
+    let out = execute(opts)?;
+    // Dry runs always show their config: that is the whole point of them.
+    if dry {
+        println!("{}", serde_json::to_string_pretty(&out.receipt).unwrap());
+    }
+    Ok(out.code)
 }
 
 fn status_line(snap: &AgentSnapshot) -> String {

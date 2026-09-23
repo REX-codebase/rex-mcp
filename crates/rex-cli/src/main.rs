@@ -6,10 +6,12 @@
 
 mod cert;
 mod exec;
+mod tournament;
 
 use cert::{keygen, verify_receipt};
 use exec::{run_exec, state_dir, ExecError, ExecOptions};
 use std::process::ExitCode;
+use tournament::{run_tournament, TournamentOptions};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -18,6 +20,7 @@ fn usage() -> &'static str {
      \n\
      usage:\n\
      \x20 rex exec [--task TASK | TASK...] [options]\n\
+     \x20 rex tournament --task TASK --providers a,b [options]\n\
      \x20 rex keygen [--force]\n\
      \x20 rex verify RECEIPT.json [--public-key BASE64]\n\
      \x20 rex --version\n\
@@ -113,6 +116,86 @@ fn parse_exec(args: &[String]) -> Result<ExecOptions, ExecError> {
     Ok(opts)
 }
 
+fn parse_tournament(args: &[String]) -> Result<TournamentOptions, ExecError> {
+    let mut opts = TournamentOptions {
+        task: String::new(),
+        providers: Vec::new(),
+        model: None,
+        workspace: None,
+        max_steps: None,
+        max_tool_calls: None,
+        max_tokens: None,
+        timeout_secs: None,
+        json: false,
+        yes: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let take_value = |flag: &str, i: &mut usize| -> Result<String, ExecError> {
+            *i += 1;
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| ExecError::usage(format!("{flag} expects a value")))
+        };
+        match a {
+            "--task" => opts.task = take_value("--task", &mut i)?,
+            "--providers" => {
+                let raw = take_value("--providers", &mut i)?;
+                let mut seen = std::collections::HashSet::new();
+                opts.providers = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .filter(|p| seen.insert(p.to_string()))
+                    .map(str::to_string)
+                    .collect();
+            }
+            "--model" => opts.model = Some(take_value("--model", &mut i)?),
+            "--workspace" => {
+                opts.workspace = Some(take_value("--workspace", &mut i)?.into());
+            }
+            "--max-steps" => {
+                opts.max_steps = Some(parse_usize(
+                    &take_value("--max-steps", &mut i)?,
+                    "--max-steps",
+                )?)
+            }
+            "--max-tool-calls" => {
+                opts.max_tool_calls = Some(parse_usize(
+                    &take_value("--max-tool-calls", &mut i)?,
+                    "--max-tool-calls",
+                )?)
+            }
+            "--max-tokens" => {
+                opts.max_tokens = Some(parse_u64(
+                    &take_value("--max-tokens", &mut i)?,
+                    "--max-tokens",
+                )?)
+            }
+            "--timeout-secs" => {
+                opts.timeout_secs = Some(parse_u64(
+                    &take_value("--timeout-secs", &mut i)?,
+                    "--timeout-secs",
+                )?)
+            }
+            "--json" => opts.json = true,
+            "--yes" => opts.yes = true,
+            "--help" | "-h" => return Err(ExecError::usage(usage())),
+            other if other.starts_with('-') => {
+                return Err(ExecError::usage(format!("unknown flag '{other}'")));
+            }
+            other => {
+                return Err(ExecError::usage(format!(
+                    "unexpected argument '{other}': pass the task with --task"
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(opts)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -122,6 +205,7 @@ fn main() -> ExitCode {
             return ExitCode::from(0);
         }
         Some("exec") => parse_exec(&args[1..]).and_then(run_exec),
+        Some("tournament") => parse_tournament(&args[1..]).and_then(run_tournament),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
         Some("verify") => run_verify(&args[1..]),
         Some(other) => Err(ExecError::usage(format!(
