@@ -333,6 +333,46 @@ fn workspace_list_files(workspace: String) -> Result<Vec<String>, String> {
     Ok(files)
 }
 
+// ---------------------------------------------------------------------------
+// Git integration: user-initiated from the Git panel. The user clicks Commit
+// themselves; these do not go through the model approval gate.
+// ---------------------------------------------------------------------------
+
+/// `git status --porcelain` for the workspace.
+#[tauri::command]
+fn git_status(
+    tools: State<'_, Arc<LocalTools>>,
+    workspace: String,
+) -> Result<Vec<rex_tools::GitFile>, String> {
+    tools
+        .git_status(PathBuf::from(workspace).as_path())
+        .map_err(|e| e.to_string())
+}
+
+/// `git diff` (unstaged + staged) for a single path.
+#[tauri::command]
+fn git_diff(
+    tools: State<'_, Arc<LocalTools>>,
+    workspace: String,
+    path: String,
+) -> Result<String, String> {
+    tools
+        .git_diff(PathBuf::from(workspace).as_path(), &path)
+        .map_err(|e| e.to_string())
+}
+
+/// `git add -A` + `git commit` with the user's message.
+#[tauri::command]
+fn git_commit(
+    tools: State<'_, Arc<LocalTools>>,
+    workspace: String,
+    message: String,
+) -> Result<String, String> {
+    tools
+        .git_commit(PathBuf::from(workspace).as_path(), &message)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn preview_detect(
     preview: State<'_, Arc<NativePreview>>,
@@ -1231,6 +1271,9 @@ fn main() {
             workspace_read_file,
             workspace_write_file,
             workspace_list_files,
+            git_status,
+            git_diff,
+            git_commit,
             preview_detect,
             preview_start,
             preview_status,

@@ -937,6 +937,129 @@ impl ToolRuntime {
         }
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Git integration: user-initiated from the Git panel UI, not model
+    // tool calls. These do not go through the approval gate — the user
+    // clicks Commit themselves. All run under the sandbox via
+    // run_command_impl (env_clear, rlimits, kill-tree, capped output).
+    // ------------------------------------------------------------------
+
+    /// Validate that `workspace` is a git repo under the tool root.
+    fn git_repo(&self, workspace: &Path) -> Result<PathBuf, ToolError> {
+        let ws = workspace
+            .canonicalize()
+            .map_err(|_| err(ErrorKind::NotFound, "workspace not found"))?;
+        let root = self.root.canonicalize().map_err(io_err)?;
+        if !ws.starts_with(&root) {
+            return Err(err(
+                ErrorKind::OutsideWorkspace,
+                "workspace must sit under the tool root",
+            ));
+        }
+        if !ws.join(".git").exists() {
+            return Err(err(ErrorKind::NotFound, "not a git repository"));
+        }
+        Ok(ws)
+    }
+
+    fn git_run(&self, ws: &Path, args: &[&str]) -> Result<String, ToolError> {
+        let argv: Vec<String> = std::iter::once("git".to_string())
+            .chain(args.iter().map(|s| s.to_string()))
+            .collect();
+        // run_command_impl resolves cwd relative to the tool root, so pass
+        // the workspace as a root-relative path.
+        let root = self.root.canonicalize().map_err(io_err)?;
+        let rel = ws.strip_prefix(&root).map_err(|_| {
+            err(ErrorKind::OutsideWorkspace, "workspace must sit under the tool root")
+        })?;
+        let cwd = if rel.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            rel.to_string_lossy().to_string()
+        };
+        // run_command_impl returns Err on non-zero exit, so Ok means success.
+        // The output has "stdout:\n" / "stderr:\n" labels; strip them for git.
+        let data = self.run_command_impl(&argv, Some(&cwd), 30_000)?;
+        let raw = data.output.unwrap_or_default();
+        let stripped = raw
+            .strip_prefix("stdout:\n")
+            .unwrap_or(&raw)
+            .to_string();
+        // If stderr was included, cut it off.
+        Ok(stripped
+            .split("\nstderr:\n")
+            .next()
+            .unwrap_or(&stripped)
+            .to_string())
+    }
+
+    /// `git status --porcelain`: changed files.
+    pub fn git_status(&self, workspace: &Path) -> Result<Vec<GitFile>, ToolError> {
+        let ws = self.git_repo(workspace)?;
+        let out = self.git_run(&ws, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+        let mut files = Vec::new();
+        for line in out.lines() {
+            if line.len() < 4 {
+                continue;
+            }
+            let status = line[..2].to_string();
+            let path = line[3..].to_string();
+            // Renames show as "R  old -> new"; take the new path.
+            let path = path.split(" -> ").last().unwrap_or(&path).to_string();
+            files.push(GitFile { status, path });
+        }
+        Ok(files)
+    }
+
+    /// `git diff` for a single path (staged + unstaged).
+    pub fn git_diff(&self, workspace: &Path, path: &str) -> Result<String, ToolError> {
+        let ws = self.git_repo(workspace)?;
+        // Refuse path escapes; git would too, but fail fast with a clear error.
+        if path.contains("..") || path.starts_with('/') {
+            return Err(err(ErrorKind::OutsideWorkspace, "path escapes the workspace"));
+        }
+        let mut out = self.git_run(&ws, &["diff", "--", path])?;
+        let staged = self.git_run(&ws, &["diff", "--cached", "--", path])?;
+        if !staged.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n");
+            }
+            out.push_str(&staged);
+        }
+        Ok(out)
+    }
+
+    /// `git add -A` + `git commit`. The message is the user's own.
+    pub fn git_commit(&self, workspace: &Path, message: &str) -> Result<String, ToolError> {
+        let ws = self.git_repo(workspace)?;
+        let message = message.trim();
+        if message.is_empty() {
+            return Err(err(ErrorKind::InvalidRequest, "commit message is empty"));
+        }
+        if message.len() > 1000 {
+            return Err(err(
+                ErrorKind::InvalidRequest,
+                "commit message exceeds 1000 chars",
+            ));
+        }
+        self.git_run(&ws, &["add", "-A"])?;
+        let out = self.git_run(&ws, &["commit", "-m", message])?;
+        // Return the new commit hash.
+        let hash = self
+            .git_run(&ws, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        Ok(format!("{hash}\n{out}"))
+    }
+}
+
+/// A changed file from `git status --porcelain`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitFile {
+    /// Two-letter porcelain status (e.g. " M", "A ", "??").
+    pub status: String,
+    pub path: String,
 }
 
 struct ExecData {
@@ -1614,5 +1737,87 @@ mod diff_tests {
             .prepare(ToolRequest::ReadFile { path: "x".into() })
             .unwrap();
         assert!(rt.pending_diff(&p.call_id).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod git_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_git() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("rex-git-test-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Init a git repo.
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn git_status_and_commit() {
+        let root = temp_git();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        let rt = ToolRuntime::new(root.clone()).unwrap();
+
+        // Status shows the untracked file.
+        let files = rt.git_status(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt");
+        assert_eq!(files[0].status.trim(), "??");
+
+        // Commit it.
+        let out = rt.git_commit(&root, "test commit").unwrap();
+        assert!(out.contains("test commit") || out.len() > 0);
+
+        // Status is clean now.
+        let files = rt.git_status(&root).unwrap();
+        assert!(files.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_diff_shows_changes() {
+        let root = temp_git();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        let rt = ToolRuntime::new(root.clone()).unwrap();
+        rt.git_commit(&root, "initial").unwrap();
+
+        std::fs::write(root.join("a.txt"), "hello world").unwrap();
+        let diff = rt.git_diff(&root, "a.txt").unwrap();
+        assert!(diff.contains("hello world"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_rejects_non_repo() {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("rex-nogit-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = ToolRuntime::new(dir.clone()).unwrap();
+        let err = rt.git_status(&dir).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::NotFound));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

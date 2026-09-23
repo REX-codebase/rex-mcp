@@ -602,3 +602,20 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .workspace-editor-error{font-size:12px;color:#c0392b}
 .workspace-editor-body{border:1px solid var(--color-line);border-radius:12px;overflow:hidden;min-height:480px}
 .workspace-editor-empty{padding:32px;text-align:center;color:var(--color-faint);font-size:13px}
+
+/* Git panel. */
+.git-panel{display:flex;flex-direction:column;gap:12px;margin-top:12px}
+.git-panel-bar{display:flex;align-items:center;justify-content:space-between}
+.git-panel-error{font-size:12px;color:#c0392b}
+.git-panel-result{font-size:11px;font-family:ui-monospace,monospace;background:var(--color-wash);padding:10px;border-radius:8px;white-space:pre-wrap}
+.git-panel-empty{color:var(--color-faint);font-size:13px}
+.git-panel-files{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
+.git-panel-files button{display:flex;gap:10px;align-items:center;width:100%;text-align:left;padding:8px 10px;border:1px solid var(--color-line);border-radius:8px;background:transparent;font-size:12px;color:var(--color-text)}
+.git-panel-files button.is-selected{border-color:var(--color-accent)}
+.git-status{font-family:ui-monospace,monospace;font-size:11px;color:var(--color-accent);min-width:24px}
+.git-path{font-family:ui-monospace,monospace;font-size:12px}
+.git-panel-diff{border:1px solid var(--color-line);border-radius:12px;overflow:hidden}
+.git-panel-diff .git-path{padding:8px 12px;border-bottom:1px solid var(--color-line);display:block}
+.git-panel-diff pre{margin:0;padding:12px;font-size:11px;overflow-x:auto;max-height:320px;overflow-y:auto}
+.git-panel-commit{display:flex;gap:8px}
+.git-panel-commit input{flex:1;padding:8px 10px;border:1px solid var(--color-line);border-radius:8px;background:transparent;font-size:12px;color:var(--color-text)}

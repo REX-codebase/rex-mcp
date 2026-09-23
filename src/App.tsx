@@ -28,6 +28,7 @@ import { FableCountdown } from "./components/FableCountdown";
 import { loadFableSessionName, saveFableSessionName, fableCreateSession } from "./data/fable";
 import { TerminalView } from "./components/TerminalView";
 import { WorkspaceEditor } from "./components/WorkspaceEditor";
+import { GitPanel } from "./components/GitPanel";
 import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
   agentCancel,
@@ -81,7 +82,7 @@ export default function App() {
     try { saveOperatorMode(mode); } catch { /* storage unavailable */ }
     setOperatorMode(mode);
   };
-  const [view, setView] = useState<"task" | "settings" | "terminal" | "editor">("task");
+  const [view, setView] = useState<"task" | "settings" | "terminal" | "editor" | "git">("task");
   const [browserPhase, setBrowserPhase] = useState<"closed" | "active" | "collapsed">("closed");
   const [browserRun, setBrowserRun] = useState(0);
   const [ultra, setUltra] = useState(false);
@@ -670,6 +671,8 @@ export default function App() {
           <TerminalView />
         ) : view === "editor" ? (
           <WorkspaceEditor />
+        ) : view === "git" ? (
+          <GitPanel />
         ) : view === "settings" ? (
           <SettingsView
             motion={motion}
