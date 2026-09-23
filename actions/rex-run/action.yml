@@ -36,6 +36,19 @@ inputs:
     description: 'REX harness ref to build the CLI from'
     required: false
     default: 'main'
+  github-token:
+    description: 'Token used to post the proof summary (check run + PR comment)'
+    required: false
+    default: ${{ github.token }}
+  post-summary:
+    description: 'Post the proof-replay summary as a check run and PR comment'
+    required: false
+    default: 'true'
+
+# Required permissions on the calling workflow (GITHUB_TOKEN):
+#   checks: write         # the "verified by REX" check run
+#   pull-requests: write   # the proof-replay PR comment
+#   actions: read          # not needed; the bundle links the workflow run
 
 outputs:
   receipt:
@@ -109,3 +122,58 @@ runs:
       with:
         name: rex-receipt
         path: ${{ runner.temp }}/rex-receipt.json
+
+    - name: Proof replay
+      id: replay
+      if: always() && inputs.post-summary == 'true'
+      shell: bash
+      env:
+        REX_STATE_DIR: ${{ runner.temp }}/rex-state
+      run: |
+        set -uo pipefail
+        # The replay report is the verdict carrier; its exit code (3 on
+        # failure) must not fail this step — proof_summary.py decides.
+        "$GITHUB_WORKSPACE/rex-harness/target/release/rex" replay \
+          "$RUNNER_TEMP/rex-receipt.json" --json \
+          | tee "$RUNNER_TEMP/rex-replay.json" || true
+        [ -s "$RUNNER_TEMP/rex-replay.json" ] || echo '{}' > "$RUNNER_TEMP/rex-replay.json"
+
+    - name: Post proof summary
+      if: always() && inputs.post-summary == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REX_BUNDLE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/rex-proof"
+        REX_BUNDLE_URL="$REX_BUNDLE_URL" python3 \
+          "$GITHUB_ACTION_PATH/proof_summary.py" \
+          "$RUNNER_TEMP/rex-receipt.json" "$RUNNER_TEMP/rex-replay.json" "$out"
+        conclusion=$(jq -r .conclusion "$out/verdict.json")
+        title=$(jq -r .title "$out/verdict.json")
+
+        # "verified by REX" check run, with a link to the run bundle
+        # (the receipt artifact lives on the workflow run page).
+        gh api --method POST "repos/${{ github.repository }}/check-runs" \
+          -f name="verified by REX" \
+          -f head_sha="${{ github.sha }}" \
+          -f status="completed" \
+          -f conclusion="$conclusion" \
+          -f "output[title]=$title" \
+          -F "output[summary]=@$out/summary.md" \
+          --jq .id
+
+        # Proof-replay summary on the PR: create once, update after.
+        pr="${{ github.event.pull_request.number }}"
+        if [ -n "$pr" ]; then
+          existing=$(gh api "repos/${{ github.repository }}/issues/$pr/comments" \
+            --jq '[.[] | select(.body | contains("<!-- rex-proof-summary -->")) | .id] | first // empty')
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${{ github.repository }}/issues/comments/$existing" \
+              -F "body=<$out/summary.md" --jq .id
+          else
+            gh api --method POST "repos/${{ github.repository }}/issues/$pr/comments" \
+              -F "body=<$out/summary.md" --jq .id
+          fi
+        fi
