@@ -1386,8 +1386,10 @@ fn main() {
         )),
     ));
 
+    // Auto-update is intentionally disabled: there are no signing keys yet,
+    // so no updater plugin is registered. Re-enable with
+    // tauri_plugin_updater once TAURI_SIGNING_PRIVATE_KEY exists.
     tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(service)
         .manage(search_service)
         .manage(tools)
