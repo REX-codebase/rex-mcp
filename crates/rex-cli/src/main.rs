@@ -1,11 +1,14 @@
 //! `rex`: the REX headless CLI.
 //!
-//! Today: `rex exec` (scriptable agent runs for CI). The desktop app keeps
-//! the interactive surface; this binary is the machine surface.
+//! Today: `rex exec` (scriptable agent runs for CI), `rex keygen` and
+//! `rex verify` (signed run certificates). The desktop app keeps the
+//! interactive surface; this binary is the machine surface.
 
+mod cert;
 mod exec;
 
-use exec::{run_exec, ExecError, ExecOptions};
+use cert::{keygen, verify_receipt};
+use exec::{run_exec, state_dir, ExecError, ExecOptions};
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -15,6 +18,8 @@ fn usage() -> &'static str {
      \n\
      usage:\n\
      \x20 rex exec [--task TASK | TASK...] [options]\n\
+     \x20 rex keygen [--force]\n\
+     \x20 rex verify RECEIPT.json [--public-key BASE64]\n\
      \x20 rex --version\n\
      \n\
      options:\n\
@@ -117,6 +122,8 @@ fn main() -> ExitCode {
             return ExitCode::from(0);
         }
         Some("exec") => parse_exec(&args[1..]).and_then(run_exec),
+        Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
+        Some("verify") => run_verify(&args[1..]),
         Some(other) => Err(ExecError::usage(format!(
             "unknown command '{other}'\n{usage}",
             usage = usage()
@@ -127,6 +134,68 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("rex: error: {}", e.message);
             ExitCode::from(e.code as u8)
+        }
+    }
+}
+
+fn run_keygen(args: &[String]) -> Result<(), ExecError> {
+    let force = args.iter().any(|a| a == "--force");
+    if args.iter().any(|a| a != "--force") {
+        return Err(ExecError::usage("usage: rex keygen [--force]"));
+    }
+    match keygen(&state_dir(), force) {
+        Ok(public_key) => {
+            eprintln!("rex: signing key ready.");
+            println!("{public_key}");
+            Ok(())
+        }
+        Err(e) => Err(ExecError::internal(format!("keygen failed: {e}"))),
+    }
+}
+
+fn run_verify(args: &[String]) -> Result<i32, ExecError> {
+    let mut path: Option<&str> = None;
+    let mut public_key: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--public-key" => {
+                i += 1;
+                public_key = Some(args.get(i).map(String::as_str).ok_or_else(|| {
+                    ExecError::usage("usage: rex verify RECEIPT.json [--public-key BASE64]")
+                })?);
+            }
+            other if other.starts_with('-') => {
+                return Err(ExecError::usage(format!("unknown flag '{other}'")));
+            }
+            p => {
+                if path.is_some() {
+                    return Err(ExecError::usage(
+                        "usage: rex verify RECEIPT.json [--public-key BASE64]",
+                    ));
+                }
+                path = Some(p);
+            }
+        }
+        i += 1;
+    }
+    let path = path
+        .ok_or_else(|| ExecError::usage("usage: rex verify RECEIPT.json [--public-key BASE64]"))?;
+    let raw =
+        std::fs::read(path).map_err(|e| ExecError::usage(format!("cannot read {path}: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| ExecError::usage(format!("not valid JSON: {e}")))?;
+    match verify_receipt(value, public_key) {
+        Ok(report) => {
+            println!(
+                "valid: run {} ended as '{}', signed by {}",
+                report.run_id, report.status, report.public_key
+            );
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("rex: INVALID receipt: {e}");
+            Ok(3)
         }
     }
 }

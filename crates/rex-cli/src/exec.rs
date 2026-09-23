@@ -15,8 +15,11 @@ use rex_providers::{
     find_spec, AgentSnapshot, AgentStatus, AutonomousRunService, Budgets, FileSecretStore,
     ProviderError, ProviderService, SecretStore, TerminalReason, UreqTransport,
 };
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use crate::cert::{load_or_generate, sign_receipt};
 
 const RECEIPT_SCHEMA: &str = "rex.exec.receipt/1";
 
@@ -82,7 +85,7 @@ impl ExecError {
             message: msg.into(),
         }
     }
-    fn internal(msg: impl Into<String>) -> Self {
+    pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self {
             code: 1,
             message: msg.into(),
@@ -96,7 +99,7 @@ impl From<String> for ExecError {
     }
 }
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     std::env::var_os("REX_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -167,7 +170,7 @@ fn receipt(
     opts: &ExecOptions,
     snap: &AgentSnapshot,
     workspace: Option<&Path>,
-) -> serde_json::Value {
+) -> Map<String, Value> {
     serde_json::json!({
         "schema": RECEIPT_SCHEMA,
         "run_id": snap.id,
@@ -190,6 +193,9 @@ fn receipt(
         "prompt_hash": snap.prompt_hash,
         "workspace": workspace.map(|w| w.display().to_string()),
     })
+    .as_object()
+    .cloned()
+    .expect("receipt literal is an object")
 }
 
 type Agent = AutonomousRunService<EnvSecretStore<FileSecretStore>, UreqTransport>;
@@ -362,7 +368,16 @@ pub fn run_exec(mut opts: ExecOptions) -> Result<i32, ExecError> {
 
     let final_snap = drive(&agent, &opts, &run_id)?;
     let completed = final_snap.status == AgentStatus::Completed;
-    let out = receipt(&opts, &final_snap, staged_workspace.as_deref());
+    let mut receipt_map = receipt(&opts, &final_snap, staged_workspace.as_deref());
+
+    // Leapfrog bet 1: every receipt is signed. A failed signature must
+    // never block the run's own output, so it degrades to a warning.
+    let state = state_dir();
+    match load_or_generate(&state).and_then(|key| sign_receipt(&key, &mut receipt_map)) {
+        Ok(_) => {}
+        Err(e) => eprintln!("rex: warning: receipt is unsigned: {e}"),
+    }
+    let out = Value::Object(receipt_map);
 
     if opts.json {
         println!("{}", serde_json::to_string(&out).unwrap());
