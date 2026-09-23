@@ -103,7 +103,11 @@ after Phase 2/3 parity.)
    `tools/verify-airgap/verify_receipt.py` verifies a receipt's Ed25519
    certificate with stdlib-only Python 3.8+, no REX install, no network.
    Cross-checked against OpenSSL signatures and Rust-signed fixtures.
-10. Cross-repo proof contracts
+10. Cross-repo proof contracts — DONE (85aa481c):
+    `.rex/policy.json` declares a repo's contract (require_bid,
+    max_cost_usd, allowed_providers); `rex exec` enforces it as a
+    fail-closed gate and records it on the receipt; `rex policy`
+    shows the effective contract.
 
 Exit criteria per bet: a demo where the capability is *exercised*, not
 described — e.g. a certificate that verifies on a second machine with no
