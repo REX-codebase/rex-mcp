@@ -792,6 +792,60 @@ fn resolve_session_run(state: &std::path::Path, ident: &str) -> Result<Value, Ex
         .ok_or_else(|| ExecError::usage(format!("no run '{ident}' found by id or session name")))
 }
 
+/// Build the task text for a resumed run. The previous task is quoted
+/// (trimmed to keep the whole text under `begin`'s 4000-char limit), and when
+/// the session has compacted context (`rex compact`), the most recent
+/// history lines are appended so the new run sees distilled session context.
+fn continuation_task_text(
+    session_name: Option<&str>,
+    prev_id: &str,
+    prev_task: &str,
+    follow_up: Option<&str>,
+    history: Option<&[String]>,
+) -> String {
+    let history_section = history
+        .map(|lines| {
+            let kept: Vec<&String> = lines.iter().skip(lines.len().saturating_sub(8)).collect();
+            format!(
+                "\n\nSession history (compacted, {} of {} runs):\n{}",
+                kept.len(),
+                lines.len(),
+                kept.iter()
+                    .map(|l| format!("- {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })
+        .unwrap_or_default();
+    // `begin` rejects tasks over 4000 chars; keep the wrapped task under
+    // 3900 by trimming the quoted previous task when necessary, reserving
+    // room for the template text and any compacted history.
+    let quote_budget = 3900usize
+        .saturating_sub(300 + history_section.chars().count())
+        .clamp(500, 3000);
+    let mut quoted_prev = prev_task.to_string();
+    if quoted_prev.chars().count() > quote_budget {
+        quoted_prev = format!(
+            "{}…",
+            quoted_prev.chars().take(quote_budget).collect::<String>()
+        );
+    }
+    match (session_name, follow_up) {
+        (Some(n), Some(f)) => format!(
+            "Continuing session '{n}' (previous run {prev_id}). The workspace already holds that run's final state; pick up from there.\n\nPrevious task: {quoted_prev}\n\nFollow-up: {f}{history_section}"
+        ),
+        (Some(n), None) => format!(
+            "Continue session '{n}' from run {prev_id} where it left off. The workspace already holds that run's final state; review it and continue the work to completion.\n\nOriginal task: {quoted_prev}{history_section}"
+        ),
+        (None, Some(f)) => format!(
+            "Continuing run {prev_id}. The workspace already holds that run's final state; pick up from there.\n\nPrevious task: {quoted_prev}\n\nFollow-up: {f}"
+        ),
+        (None, None) => format!(
+            "Continue run {prev_id} where it left off. The workspace already holds that run's final state; review it and continue the work to completion.\n\nOriginal task: {quoted_prev}"
+        ),
+    }
+}
+
 /// `rex resume RUN_ID|NAME [--task T] ...`: start a new run that continues a
 /// finished session. The new run's workspace is seeded from the previous
 /// run's final workspace state and the session name (unless overridden)
@@ -916,26 +970,21 @@ pub fn run_resume(args: &[String]) -> Result<i32, ExecError> {
     };
 
     let session_name = name.or(prev_name);
-    // `begin` rejects tasks over 4000 chars; keep the wrapped task under
-    // 3900 by trimming the quoted previous task when necessary.
-    let mut quoted_prev = prev_task;
-    if quoted_prev.chars().count() > 3000 {
-        quoted_prev = format!("{}…", quoted_prev.chars().take(3000).collect::<String>());
-    }
-    let task_text = match (&session_name, &task) {
-        (Some(n), Some(f)) => format!(
-            "Continuing session '{n}' (previous run {prev_id}). The workspace already holds that run's final state; pick up from there.\n\nPrevious task: {quoted_prev}\n\nFollow-up: {f}"
-        ),
-        (Some(n), None) => format!(
-            "Continue session '{n}' from run {prev_id} where it left off. The workspace already holds that run's final state; review it and continue the work to completion.\n\nOriginal task: {quoted_prev}"
-        ),
-        (None, Some(f)) => format!(
-            "Continuing run {prev_id}. The workspace already holds that run's final state; pick up from there.\n\nPrevious task: {quoted_prev}\n\nFollow-up: {f}"
-        ),
-        (None, None) => format!(
-            "Continue run {prev_id} where it left off. The workspace already holds that run's final state; review it and continue the work to completion.\n\nOriginal task: {quoted_prev}"
-        ),
+    // A compacted session carries distilled history (`rex compact`); inject
+    // the most recent lines so the new run gets context beyond the single
+    // previous task. The ledger stays the source of truth — this is a
+    // summary, and `rex clear` drops it.
+    let history: Option<Vec<String>> = match &session_name {
+        Some(n) => crate::session::compacted_history(&state, n),
+        None => None,
     };
+    let task_text = continuation_task_text(
+        session_name.as_deref(),
+        &prev_id,
+        &prev_task,
+        task.as_deref(),
+        history.as_deref(),
+    );
 
     let short: String = prev_id
         .chars()
@@ -1144,6 +1193,60 @@ mod tests {
             let v = terminal_reason_value(&Some(reason));
             assert!(v.get("kind").is_some(), "missing kind tag: {v}");
         }
+    }
+
+    #[test]
+    fn continuation_task_injects_compacted_history() {
+        let history = vec![
+            "run-aaaa: Completed — first thing (10 tok)".to_string(),
+            "run-bbbb: Completed — second thing (20 tok)".to_string(),
+        ];
+        let text = continuation_task_text(
+            Some("alpha"),
+            "run-bbbb",
+            "second thing",
+            None,
+            Some(&history),
+        );
+        assert!(text.contains("Continue session 'alpha'"), "got: {text}");
+        assert!(
+            text.contains("Session history (compacted, 2 of 2 runs):"),
+            "got: {text}"
+        );
+        assert!(text.contains("- run-aaaa: Completed"), "got: {text}");
+        assert!(text.contains("- run-bbbb: Completed"), "got: {text}");
+        assert!(text.chars().count() < 3900);
+    }
+
+    #[test]
+    fn continuation_task_without_history_matches_legacy_shape() {
+        let text = continuation_task_text(Some("alpha"), "run-1", "do things", None, None);
+        assert!(
+            text.contains("Continue session 'alpha' from run run-1"),
+            "got: {text}"
+        );
+        assert!(text.contains("Original task: do things"), "got: {text}");
+        assert!(!text.contains("Session history"), "got: {text}");
+
+        let text = continuation_task_text(None, "run-1", "do things", Some("more"), None);
+        assert!(text.contains("Follow-up: more"), "got: {text}");
+        assert!(!text.contains("session"), "got: {text}");
+    }
+
+    #[test]
+    fn continuation_task_trims_long_previous_tasks() {
+        let long = "x".repeat(9000);
+        let history: Vec<String> = (0..20)
+            .map(|i| format!("run-{i}: Completed — thing"))
+            .collect();
+        let text = continuation_task_text(Some("alpha"), "run-9", &long, None, Some(&history));
+        assert!(text.chars().count() < 3900, "len={}", text.chars().count());
+        // Only the 8 most recent history lines survive.
+        assert!(text.contains("8 of 20 runs"), "got: {text}");
+        assert!(
+            !text.contains("- run-0:"),
+            "oldest lines must be dropped, got: {text}"
+        );
     }
 
     #[test]

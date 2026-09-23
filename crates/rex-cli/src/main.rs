@@ -14,12 +14,14 @@ mod provenance;
 mod redteam;
 mod replay;
 mod serve;
+mod session;
 mod skill;
 mod tournament;
 
 use cert::{keygen, verify_receipt};
 use exec::{run_exec, run_resume, state_dir, validate_session_name, ExecError, ExecOptions};
 use redteam::{run_redteam, RedteamOptions};
+use session::{run_clear, run_compact};
 use std::process::ExitCode;
 use tournament::{run_tournament, TournamentOptions};
 
@@ -33,6 +35,9 @@ pub(crate) fn usage() -> &'static str {
      \x20 rex resume RUN_ID|NAME [--task T] [--name N] [--provider P] [--model M]\n\
      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20[--max-steps N] [--max-tool-calls N] [--max-tokens N]\n\
      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20[--timeout-secs N] [--skill S] [--yes] [--json]\n\
+     \x20 rex compact NAME [--json]     collapse a session's run chain into\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20compacted context (used by the next resume)\n\
+     \x20 rex clear NAME [--json]       drop a session's compacted context\n\
      \x20 rex tournament --task TASK --providers a,b [options]\n\
      \x20 rex redteam --task TASK --yes [options]\n\
      \x20 rex policy --workspace DIR\n\
@@ -339,6 +344,8 @@ fn main() -> ExitCode {
         }
         Some("exec") => parse_exec(&args[1..]).and_then(run_exec),
         Some("resume") => run_resume(&args[1..]),
+        Some("compact") => run_compact(&args[1..]),
+        Some("clear") => run_clear(&args[1..]),
         Some("tournament") => parse_tournament(&args[1..]).and_then(run_tournament),
         Some("redteam") => parse_redteam(&args[1..]).and_then(run_redteam),
         Some("policy") => run_policy(&args[1..]),
