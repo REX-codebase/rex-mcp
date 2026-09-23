@@ -13,6 +13,7 @@ mod policy;
 mod provenance;
 mod redteam;
 mod replay;
+mod skill;
 mod tournament;
 
 use cert::{keygen, verify_receipt};
@@ -33,6 +34,8 @@ fn usage() -> &'static str {
      \x20 rex policy --workspace DIR\n\
      \x20 rex replay RECEIPT.json [--json]\n\
      \x20 rex checkin --file PATH\n\
+     \x20 rex skill install DIR [--force] | list | show NAME | verify [NAME]\n\
+     \x20             | remove NAME | pack DIR\n\
      \x20 rex runs [--json] [--limit N]\n\
      \x20 rex show RUN_ID [--json]\n\
      \x20 rex keygen [--force]\n\
@@ -142,6 +145,9 @@ fn parse_exec(args: &[String]) -> Result<ExecOptions, ExecError> {
             }
             "--deadman-file" => {
                 opts.deadman_file = Some(take_value("--deadman-file", &mut i)?.into());
+            }
+            "--skill" => {
+                opts.skills.push(take_value("--skill", &mut i)?);
             }
             "--help" | "-h" => return Err(ExecError::usage(usage())),
             other if other.starts_with('-') => {
@@ -326,6 +332,7 @@ fn main() -> ExitCode {
         Some("policy") => run_policy(&args[1..]),
         Some("replay") => run_replay_args(&args[1..]),
         Some("checkin") => run_checkin(&args[1..]),
+        Some("skill") => run_skill(&args[1..]),
         Some("runs") => run_runs(&args[1..]).map(|_| 0),
         Some("show") => run_show(&args[1..]),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
@@ -418,6 +425,161 @@ fn run_checkin(args: &[String]) -> Result<i32, ExecError> {
     deadman::checkin(&path).map_err(ExecError::internal)?;
     println!("checked in at {file}");
     Ok(0)
+}
+
+fn run_skill(args: &[String]) -> Result<i32, ExecError> {
+    let mut it = args.iter();
+    let sub = it
+        .next()
+        .ok_or_else(|| ExecError::usage("rex skill install|list|show|verify|remove|pack ..."))?;
+    let rest: Vec<String> = it.cloned().collect();
+    let state = exec::state_dir();
+    match sub.as_str() {
+        "install" => {
+            let mut src: Option<String> = None;
+            let mut force = false;
+            for a in &rest {
+                match a.as_str() {
+                    "--force" => force = true,
+                    "--help" | "-h" => return Err(ExecError::usage(usage())),
+                    other if other.starts_with('-') => {
+                        return Err(ExecError::usage(format!("unknown flag '{other}'")))
+                    }
+                    other => {
+                        if src.is_some() {
+                            return Err(ExecError::usage("rex skill install DIR [--force]"));
+                        }
+                        src = Some(other.to_string());
+                    }
+                }
+            }
+            let src = src.ok_or_else(|| ExecError::usage("rex skill install DIR [--force]"))?;
+            let dest = skill::install(&state, std::path::Path::new(&src), force)
+                .map_err(|e| ExecError::internal(e.to_string()))?;
+            let lock =
+                skill::verify_installed(&dest).map_err(|e| ExecError::internal(e.to_string()))?;
+            println!(
+                "installed skill '{}' v{} ({} files verified)",
+                lock.name,
+                lock.version,
+                lock.files.len()
+            );
+            Ok(0)
+        }
+        "list" => {
+            let lib = skill::library_dir(&state);
+            let mut names: Vec<String> = Vec::new();
+            if lib.exists() {
+                let entries =
+                    std::fs::read_dir(&lib).map_err(|e| ExecError::internal(e.to_string()))?;
+                for e in entries.flatten() {
+                    if e.path().is_dir() {
+                        if let Some(n) = e.file_name().to_str() {
+                            names.push(n.to_string());
+                        }
+                    }
+                }
+            }
+            names.sort();
+            for n in &names {
+                match skill::verify_installed(&lib.join(n)) {
+                    Ok(lock) => println!("{n} v{} — {}", lock.version, lock.files.len()),
+                    Err(_) => println!("{n} (BROKEN: failed verification)"),
+                }
+            }
+            if names.is_empty() {
+                println!("no skills installed");
+            }
+            Ok(0)
+        }
+        "show" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| ExecError::usage("rex skill show NAME"))?;
+            let dir = skill::library_dir(&state).join(name);
+            let lock =
+                skill::verify_installed(&dir).map_err(|e| ExecError::internal(e.to_string()))?;
+            let m = skill::read_manifest(&dir).map_err(|e| ExecError::internal(e.to_string()))?;
+            println!("{} v{}", lock.name, lock.version);
+            if !m.author.is_empty() {
+                println!("author: {}", m.author);
+            }
+            if !m.description.is_empty() {
+                println!("description: {}", m.description);
+            }
+            println!("entry: {}", m.entry);
+            println!("files:");
+            for (rel, hash) in &lock.files {
+                println!("  {rel}  {hash}");
+            }
+            Ok(0)
+        }
+        "verify" => {
+            let lib = skill::library_dir(&state);
+            let targets: Vec<String> = if rest.is_empty() {
+                let mut all = Vec::new();
+                if lib.exists() {
+                    for e in std::fs::read_dir(&lib)
+                        .map_err(|e| ExecError::internal(e.to_string()))?
+                        .flatten()
+                    {
+                        if e.path().is_dir() {
+                            if let Some(n) = e.file_name().to_str() {
+                                all.push(n.to_string());
+                            }
+                        }
+                    }
+                }
+                all
+            } else {
+                rest.clone()
+            };
+            let mut bad = 0;
+            for n in &targets {
+                match skill::verify_installed(&lib.join(n)) {
+                    Ok(lock) => println!("{n} v{}: OK", lock.version),
+                    Err(e) => {
+                        println!("{n}: FAILED — {e}");
+                        bad += 1;
+                    }
+                }
+            }
+            if targets.is_empty() {
+                println!("no skills installed");
+            }
+            Ok(if bad == 0 { 0 } else { 3 })
+        }
+        "remove" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| ExecError::usage("rex skill remove NAME"))?;
+            let dir = skill::library_dir(&state).join(name);
+            if !dir.exists() {
+                return Err(ExecError::internal(format!(
+                    "skill '{name}' is not installed"
+                )));
+            }
+            std::fs::remove_dir_all(&dir).map_err(|e| ExecError::internal(e.to_string()))?;
+            println!("removed skill '{name}'");
+            Ok(0)
+        }
+        "pack" => {
+            let src = rest
+                .first()
+                .ok_or_else(|| ExecError::usage("rex skill pack DIR"))?;
+            let m = skill::pack(std::path::Path::new(src))
+                .map_err(|e| ExecError::internal(e.to_string()))?;
+            println!(
+                "packed '{}' v{}: {} files hashed into {}",
+                m.name,
+                m.version,
+                m.files.len(),
+                skill::MANIFEST_FILE
+            );
+            Ok(0)
+        }
+        other => Err(ExecError::usage(format!("unknown skill command '{other}'"))),
+    }
 }
 
 fn run_runs(args: &[String]) -> Result<(), ExecError> {

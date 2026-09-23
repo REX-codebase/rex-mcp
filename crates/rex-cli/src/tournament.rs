@@ -113,6 +113,7 @@ pub fn run_tournament(opts: TournamentOptions) -> Result<i32, ExecError> {
             run_tag: Some(format!("-{provider}")),
             deadman_mins: None,
             deadman_file: None,
+            skills: vec![],
         };
         match execute(exec_opts) {
             Ok(out) => {

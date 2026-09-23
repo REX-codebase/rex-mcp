@@ -113,6 +113,7 @@ fn exec_opts_for(
         run_tag: None,
         deadman_mins: None,
         deadman_file: None,
+        skills: vec![],
     }
 }
 

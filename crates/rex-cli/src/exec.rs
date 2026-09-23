@@ -93,6 +93,8 @@ pub struct ExecOptions {
     pub deadman_mins: Option<u64>,
     /// Override the dead-man check-in file location.
     pub deadman_file: Option<PathBuf>,
+    /// Skill packs to load into the run, by library name. Repeatable.
+    pub skills: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -196,6 +198,7 @@ fn receipt(
     accepted_bid: Option<&crate::bid::Bid>,
     policy: Option<&crate::policy::Policy>,
     deadman: Option<Value>,
+    skills: &[crate::skill::LoadedSkill],
 ) -> Map<String, Value> {
     let status_str = serde_json::to_value(&snap.status)
         .ok()
@@ -242,6 +245,7 @@ fn receipt(
         "bid_gaps": accepted_bid.map(|b| b.proof_gaps(&status_str, snap.completion_summary.as_deref())),
         "policy": policy.map(|p| p.to_json()),
         "deadman": deadman,
+        "skills": skills.iter().map(crate::skill::to_json).collect::<Vec<_>>(),
     })
     .as_object()
     .cloned()
@@ -401,6 +405,25 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         }
     }
 
+    // Skills marketplace: load (and re-verify) each requested skill
+    // before the agent starts. A missing or tampered skill fails the run;
+    // it never silently degrades to an unskilled run.
+    let state_for_skills = state_dir();
+    let mut loaded_skills = Vec::new();
+    for name in &opts.skills {
+        loaded_skills
+            .push(crate::skill::load(&state_for_skills, name).map_err(ExecError::internal)?);
+    }
+    let effective_task = if loaded_skills.is_empty() {
+        opts.task.clone()
+    } else {
+        format!(
+            "{}\n\n{}",
+            crate::skill::prompt_block(&loaded_skills),
+            opts.task
+        )
+    };
+
     let mut budgets = Budgets::default();
     if let Some(s) = opts.max_steps {
         budgets.max_steps = s;
@@ -522,7 +545,7 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
 
     let snap = agent
         .begin_in_workspace(
-            &opts.task,
+            &effective_task,
             &opts.provider,
             opts.model.as_deref(),
             Some(budgets),
@@ -562,6 +585,7 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         accepted_bid.as_ref(),
         policy.as_ref(),
         deadman.as_ref().map(|d| d.to_json()),
+        &loaded_skills,
     );
 
     // Leapfrog bet 1: every receipt is signed. A failed signature must
