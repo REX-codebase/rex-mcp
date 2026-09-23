@@ -227,8 +227,17 @@ use base64::Engine as _;
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
     fn temp_state() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("rex-cert-test-{}", std::process::id()));
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!(
+            "rex-cert-test-{}-{}-{:?}",
+            std::process::id(),
+            n,
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
