@@ -119,7 +119,26 @@ impl Bid {
             }),
             "price_as_of": self.price_as_of,
             "cost_note": self.cost_note,
+            // The proof half of the bid: what evidence the run owes.
+            "proof": {
+                "requires_completed": true,
+                "requires_result_summary": true,
+            },
         })
+    }
+
+    /// Check the bid's proof terms against a finished run. Returns the gaps;
+    /// empty means the bid was met. Budgets need no check — the loop
+    /// enforces them, so they hold by construction.
+    pub fn proof_gaps(&self, status: &str, result_summary: Option<&str>) -> Vec<String> {
+        let mut gaps = Vec::new();
+        if status != "completed" {
+            gaps.push(format!("status is '{status}', bid required 'completed'"));
+        }
+        if result_summary.is_none_or(|s| s.trim().is_empty()) {
+            gaps.push("no result summary, bid required one".to_string());
+        }
+        gaps
     }
 }
 
@@ -222,5 +241,20 @@ mod tests {
             Some(200_000)
         );
         assert!(tokens_for_budget(3.0, "anthropic", "mystery-9").is_none());
+    }
+
+    #[test]
+    fn proof_gaps_detects_unmet_bid() {
+        let b = build_bid(
+            "anthropic",
+            Some("claude-sonnet-4-6"),
+            40,
+            200,
+            100_000,
+            1_200_000,
+        );
+        assert!(b.proof_gaps("completed", Some("did the thing")).is_empty());
+        let gaps = b.proof_gaps("failed", None);
+        assert_eq!(gaps.len(), 2);
     }
 }

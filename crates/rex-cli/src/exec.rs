@@ -182,6 +182,11 @@ fn receipt(
     workspace: Option<&Path>,
     accepted_bid: Option<&crate::bid::Bid>,
 ) -> Map<String, Value> {
+    let status_str = serde_json::to_value(&snap.status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+
     let (cost_usd_ceiling, cost_usd_estimate) = match accepted_bid {
         Some(b) => (
             b.max_cost_usd,
@@ -217,6 +222,8 @@ fn receipt(
         "cost_usd_ceiling": cost_usd_ceiling,
         "cost_usd_estimate": cost_usd_estimate,
         "cost_basis": accepted_bid.map(|_| "worst-case: all tokens at the output price"),
+        "bid_met": accepted_bid.map(|b| b.proof_gaps(&status_str, snap.completion_summary.as_deref()).is_empty()),
+        "bid_gaps": accepted_bid.map(|b| b.proof_gaps(&status_str, snap.completion_summary.as_deref())),
     })
     .as_object()
     .cloned()
