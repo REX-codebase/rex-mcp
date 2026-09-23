@@ -585,7 +585,7 @@ impl ToolRuntime {
             previous.len() as u64,
             content.len() as u64,
         );
-        r.diff = Some(simple_diff(&previous, content));
+        r.diff = Some(simple_diff(&previous, content, &relative(&self.root, &target)));
         Ok(exec(
             Some(format!(
                 "wrote {} bytes to {}",
@@ -642,7 +642,7 @@ impl ToolRuntime {
             old.len() as u64,
             new.len() as u64,
         );
-        r.diff = Some(simple_diff(&old, &new));
+        r.diff = Some(simple_diff(&old, &new, &relative(&self.root, &target)));
         Ok(exec(
             Some(format!(
                 "replaced {} occurrence(s) in {}",
@@ -1351,28 +1351,156 @@ fn command_policy(argv: &[String]) -> Result<(), ToolError> {
 fn relative(root: &Path, p: &Path) -> String {
     p.strip_prefix(root).unwrap_or(p).display().to_string()
 }
-fn simple_diff(old: &str, new: &str) -> String {
-    const L: usize = 12000;
-    let mut out = String::from("--- before\n+++ after\n");
-    for line in old.lines().take(1000) {
-        out.push('-');
-        out.push_str(line);
-        out.push('\n');
-        if out.len() > L {
-            break;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffOp {
+    Same,
+    Del,
+    Ins,
+}
+
+/// Line-oriented diff via the Myers O(ND) greedy algorithm.
+/// Inputs are capped by the caller; fine for audit-sized diffs.
+fn myers_ops(a: &[&str], b: &[&str]) -> Vec<DiffOp> {
+    use DiffOp::{Del, Ins, Same};
+    let n = a.len() as i32;
+    let m = b.len() as i32;
+    let max = (n + m) as usize;
+    if max == 0 {
+        return Vec::new();
+    }
+    let off = max as i32;
+    let idx = |k: i32| (k + off) as usize;
+    let mut v = vec![0i32; 2 * max + 1];
+    let mut trace: Vec<Vec<i32>> = Vec::new();
+    let mut d_final = 0i32;
+    'outer: for d in 0..=(n + m) {
+        trace.push(v.clone());
+        let mut k = -d;
+        while k <= d {
+            let mut x = if k == -d || (k != d && v[idx(k - 1)] < v[idx(k + 1)]) {
+                v[idx(k + 1)]
+            } else {
+                v[idx(k - 1)] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[idx(k)] = x;
+            if x >= n && y >= m {
+                d_final = d;
+                break 'outer;
+            }
+            k += 2;
         }
     }
-    for line in new.lines().take(1000) {
-        out.push('+');
-        out.push_str(line);
-        out.push('\n');
-        if out.len() > L {
-            break;
+    let mut ops = Vec::new();
+    let (mut x, mut y) = (n, m);
+    let mut d = d_final;
+    while d > 0 {
+        let vt = &trace[d as usize];
+        let k = x - y;
+        let prev_k = if k == -d || (k != d && vt[idx(k - 1)] < vt[idx(k + 1)]) {
+            k + 1
+        } else {
+            k - 1
+        };
+        let (prev_x, prev_y) = (vt[idx(prev_k)], vt[idx(prev_k)] - prev_k);
+        while x > prev_x && y > prev_y {
+            ops.push(Same);
+            x -= 1;
+            y -= 1;
         }
+        ops.push(if x == prev_x { Ins } else { Del });
+        x = prev_x;
+        y = prev_y;
+        d -= 1;
     }
-    if out.len() > L {
-        out.truncate(L);
-        out.push_str("\n[diff truncated]");
+    while x > 0 && y > 0 {
+        ops.push(Same);
+        x -= 1;
+        y -= 1;
+    }
+    ops.reverse();
+    ops
+}
+
+/// Unified diff with `@@` hunk headers, capped in size. Replaces the old
+/// before/after dump; the desktop receipt card renders this string as-is,
+/// and the CLI parses the hunk headers for diff-hunk provenance.
+fn simple_diff(old: &str, new: &str, label: &str) -> String {
+    const MAX_CHARS: usize = 12000;
+    const MAX_LINES: usize = 2000;
+    const CONTEXT: usize = 3;
+
+    let a: Vec<&str> = old.lines().take(MAX_LINES).collect();
+    let b: Vec<&str> = new.lines().take(MAX_LINES).collect();
+    let ops = myers_ops(&a, &b);
+
+    // Group ops into hunks: a change plus CONTEXT lines each side,
+    // merged when they overlap.
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < ops.len() {
+        if ops[i] == DiffOp::Same {
+            i += 1;
+            continue;
+        }
+        let start = i.saturating_sub(CONTEXT);
+        let mut last_change = i;
+        let mut j = i;
+        while j < ops.len() {
+            if ops[j] != DiffOp::Same {
+                last_change = j;
+            }
+            if j - last_change > 2 * CONTEXT {
+                break;
+            }
+            j += 1;
+        }
+        let end = (last_change + CONTEXT + 1).min(ops.len());
+        match hunks.last_mut() {
+            Some(prev) if start <= prev.1 => prev.1 = end,
+            _ => hunks.push((start, end)),
+        }
+        i = end;
+    }
+
+    let mut out = format!("--- {label}\n+++ {label}\n");
+    // Line numbers consumed before each op index.
+    let mut a_line = vec![0usize; ops.len() + 1];
+    let mut b_line = vec![0usize; ops.len() + 1];
+    for (k, op) in ops.iter().enumerate() {
+        a_line[k + 1] = a_line[k] + usize::from(*op != DiffOp::Ins);
+        b_line[k + 1] = b_line[k] + usize::from(*op != DiffOp::Del);
+    }
+    for (start, end) in hunks {
+        let (al, bl) = (a_line[start], b_line[start]);
+        let (ac, bc) = (a_line[end] - al, b_line[end] - bl);
+        // Unified convention: empty range starts at the line before.
+        let (as_, ac_) = if ac == 0 { (al.saturating_sub(1), 0) } else { (al + 1, ac) };
+        let (bs_, bc_) = if bc == 0 { (bl.saturating_sub(1), 0) } else { (bl + 1, bc) };
+        out.push_str(&format!("@@ -{as_},{ac_} +{bs_},{bc_} @@\n"));
+        for (k, op) in ops[start..end].iter().enumerate() {
+            let line = match op {
+                DiffOp::Same => a[a_line[start + k]],
+                DiffOp::Del => a[a_line[start + k]],
+                DiffOp::Ins => b[b_line[start + k]],
+            };
+            out.push(match op {
+                DiffOp::Same => ' ',
+                DiffOp::Del => '-',
+                DiffOp::Ins => '+',
+            });
+            out.push_str(line);
+            out.push('\n');
+            if out.len() > MAX_CHARS {
+                out.truncate(MAX_CHARS);
+                out.push_str("\n[diff truncated]");
+                return out;
+            }
+        }
     }
     out
 }
@@ -1840,5 +1968,58 @@ mod git_tests {
         let err = rt.git_status(&dir).unwrap_err();
         assert!(matches!(err.kind, ErrorKind::NotFound));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unified_diff_single_hunk() {
+        let d = simple_diff("a\nb\nc\n", "a\nB\nc\n", "f.txt");
+        assert!(d.starts_with("--- f.txt\n+++ f.txt\n"), "headers:\n{d}");
+        assert!(d.contains("@@ -1,3 +1,3 @@"), "hunk header:\n{d}");
+        assert!(d.contains(" a\n-b\n+B\n c\n"), "body:\n{d}");
+    }
+
+    #[test]
+    fn unified_diff_empty_old_is_pure_addition() {
+        let d = simple_diff("", "x\ny\n", "new.txt");
+        assert!(d.contains("@@ -0,0 +1,2 @@"), "header:\n{d}");
+        assert!(d.contains("+x\n+y\n"), "body:\n{d}");
+    }
+
+    #[test]
+    fn unified_diff_identical_has_no_hunks() {
+        let d = simple_diff("a\nb\n", "a\nb\n", "same.txt");
+        assert!(!d.contains("@@"), "no hunks expected:\n{d}");
+    }
+
+    #[test]
+    fn unified_diff_two_hunks() {
+        let old: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+        let mut new = old.clone();
+        new = new.replacen("line2\n", "LINE2\n", 1);
+        new = new.replacen("line18\n", "LINE18\n", 1);
+        let d = simple_diff(&old, &new, "m.txt");
+        assert_eq!(d.matches("@@").count() / 2, 2, "two hunks:\n{d}");
+        assert!(d.contains("-line2\n+LINE2\n"), "first change:\n{d}");
+        assert!(d.contains("-line18\n+LINE18\n"), "second change:\n{d}");
+    }
+
+    #[test]
+    fn unified_diff_roundtrip_applies() {
+        // Apply the diff hunks to `old` and check we get `new`.
+        let old = "one\ntwo\nthree\nfour\nfive\n";
+        let new = "one\nTWO\nthree\nfour\nFIVE\n";
+        let d = simple_diff(old, new, "r.txt");
+        let mut rebuilt: Vec<&str> = Vec::new();
+        for line in d.lines() {
+            if line.starts_with("@@") || line.starts_with("---") || line.starts_with("+++") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix(' ') {
+                rebuilt.push(rest);
+            } else if let Some(rest) = line.strip_prefix('+') {
+                rebuilt.push(rest);
+            }
+        }
+        assert_eq!(rebuilt.join("\n") + "\n", new, "diff:\n{d}");
     }
 }
