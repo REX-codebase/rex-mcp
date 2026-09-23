@@ -96,6 +96,10 @@ after Phase 2/3 parity.)
    check: signature, bid terms, bid ceiling (recomputed from the price
    table), policy, provenance shape, ledger membership. Exit 0/3.
 6. Time-locked disconnected operation (dead-man custody, verified rollback)
+   — DONE (7ca695a5): `rex exec --deadman-mins 30` arms a liveness switch;
+   check in via `rex checkin --file F` or the timer lapses and the run is
+   cancelled, trip recorded on the receipt. Verified rollback = runs happen
+   on a staged copy; the original is never touched.
 7. Plans that bid binding cost/proof-coverage commitments before execution —
    DONE (d62a443e, e34f6f51): `rex exec --bid` prints the binding bid
    (budgets + worst-case dollar ceiling), `--accept-bid` executes under it,
