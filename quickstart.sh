@@ -6,7 +6,7 @@
 # What it does:
 #   1. Checks for Node.js, npm, Rust, and system deps
 #   2. Installs frontend dependencies
-#   3. Builds the frontend
+#   3. Installs the headless `rex` CLI (rex exec --json for CI)
 #   4. Starts the Tauri dev app (or prints build instructions)
 #
 # For a production build: ./quickstart.sh --build
@@ -44,6 +44,17 @@ else
   info "Frontend dependencies already installed."
 fi
 ok "Dependencies ready."
+
+# 2b. Install the headless CLI (idempotent).
+info "Installing rex CLI…"
+cargo install --path crates/rex-cli --quiet 2>/dev/null \
+  || cargo install --path crates/rex-cli
+if command -v rex >/dev/null; then
+  ok "rex CLI installed ($(rex --version))."
+  info "Try: rex exec --dry-run --task \"say hello\" --json"
+else
+  fail "cargo install of the rex CLI failed."
+fi
 
 # 3. Build or dev.
 if [ "${1:-}" = "--build" ]; then
