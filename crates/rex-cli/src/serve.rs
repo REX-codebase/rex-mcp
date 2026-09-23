@@ -61,6 +61,7 @@ fn snapshot_json(run_id: &str, live: &LiveRun) -> Result<Value, String> {
         "elapsed_ms": snap.elapsed_ms,
         "awaiting_plan": status == "AwaitingPlan",
         "pending_approval": snap.pending_approval,
+        "plan": snap.plan,
         "error": snap.error,
     }))
 }
