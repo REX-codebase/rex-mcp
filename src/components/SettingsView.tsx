@@ -1,6 +1,7 @@
 import { SearchProviderSettings } from "./SearchProviderSettings";
 import { InstalledAgentsSettings } from "./InstalledAgentsSettings";
 import { FableMcpSettings } from "./FableMcpSettings";
+import { McpServerPanel } from "./McpServerPanel";
 import type { MotionPref } from "../data/motion";
 export type { MotionPref };
 const MOTION_OPTIONS: { id: MotionPref; label: string; hint: string }[] = [
@@ -15,6 +16,7 @@ export function SettingsView({ motion, setMotion, onReset }: { motion: MotionPre
     <InstalledAgentsSettings />
     <SearchProviderSettings />
     <FableMcpSettings />
+    <McpServerPanel />
     <section aria-label="Appearance" className="settings-section"><h2 className="eyebrow">Appearance</h2><div className="settings-row settings-row-wrap"><span className="text-sm text-text">Motion</span><div className="seg-control" role="radiogroup" aria-label="Motion preference">{MOTION_OPTIONS.map((option) => <button key={option.id} type="button" role="radio" aria-checked={motion === option.id} title={option.hint} className={`seg-option ${motion === option.id ? "is-on" : ""}`} onClick={() => setMotion(option.id)}>{option.label}</button>)}</div></div><p className="settings-note">Applies immediately and is saved on this device only.</p></section>
     <section aria-label="Keyboard shortcuts" className="settings-section"><h2 className="eyebrow">Keyboard</h2><dl className="shortcut-list"><div><dt>Ctrl + Enter</dt><dd>Run the task, or send a follow-up</dd></div><div><dt>Esc</dt><dd>Close an open menu or dialog</dd></div><div><dt>Tab</dt><dd>Move through controls</dd></div></dl></section>
     <section aria-label="Preview data" className="settings-section"><h2 className="eyebrow">Preview data</h2><div className="settings-row settings-row-wrap"><span className="text-sm text-text">Local preferences</span><button type="button" className="reset-button" onClick={onReset}>Reset to defaults</button></div><p className="settings-note">Clears preferences stored on this device. Sample runs are built into the preview and are not affected.</p></section>

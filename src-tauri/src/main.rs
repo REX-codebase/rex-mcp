@@ -6,6 +6,7 @@
 
 mod terminal;
 mod checkpoint;
+mod mcp;
 
 use rex_installed_agents::{
     discover as discover_installed_agents, run as run_installed_agent, InstalledAgentId,
@@ -406,6 +407,67 @@ fn checkpoint_restore(
     id: String,
 ) -> Result<checkpoint::Checkpoint, String> {
     checkpoints.restore(PathBuf::from(workspace).as_path(), &id)
+}
+
+// ---------------------------------------------------------------------------
+// MCP servers: attach external servers, probe them, toggle tools per server.
+// ---------------------------------------------------------------------------
+
+/// List configured MCP servers.
+#[tauri::command]
+fn mcp_list_servers(
+    mcp: State<'_, Arc<mcp::McpStore>>,
+) -> Result<Vec<mcp::McpServer>, String> {
+    mcp.list()
+}
+
+/// Add an MCP server (name + command).
+#[tauri::command]
+fn mcp_add_server(
+    mcp: State<'_, Arc<mcp::McpStore>>,
+    name: String,
+    command: String,
+) -> Result<mcp::McpServer, String> {
+    mcp.add(&name, &command)
+}
+
+/// Remove an MCP server.
+#[tauri::command]
+fn mcp_remove_server(
+    mcp: State<'_, Arc<mcp::McpStore>>,
+    id: String,
+) -> Result<(), String> {
+    mcp.remove(&id)
+}
+
+/// Enable/disable an MCP server.
+#[tauri::command]
+fn mcp_set_server_enabled(
+    mcp: State<'_, Arc<mcp::McpStore>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    mcp.set_enabled(&id, enabled)
+}
+
+/// Enable/disable a single tool on a server.
+#[tauri::command]
+fn mcp_set_tool_enabled(
+    mcp: State<'_, Arc<mcp::McpStore>>,
+    server_id: String,
+    tool_name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    mcp.set_tool_enabled(&server_id, &tool_name, enabled)
+}
+
+/// Probe a server: handshake, list tools, update the server record.
+#[tauri::command]
+fn mcp_probe_server(
+    mcp: State<'_, Arc<mcp::McpStore>>,
+    id: String,
+) -> Result<mcp::McpServer, String> {
+    mcp.probe(&id)
 }
 
 #[tauri::command]
@@ -1281,6 +1343,9 @@ fn main() {
         .manage(Arc::new(
             checkpoint::CheckpointStore::new(&config_dir()).expect("checkpoint store"),
         ))
+        .manage(Arc::new(
+            mcp::McpStore::new(&config_dir()).expect("mcp store"),
+        ))
         .invoke_handler(tauri::generate_handler![
             installed_agent_summaries,
             installed_agent_run,
@@ -1315,6 +1380,12 @@ fn main() {
             checkpoint_create,
             checkpoint_list,
             checkpoint_restore,
+            mcp_list_servers,
+            mcp_add_server,
+            mcp_remove_server,
+            mcp_set_server_enabled,
+            mcp_set_tool_enabled,
+            mcp_probe_server,
             preview_detect,
             preview_start,
             preview_status,
