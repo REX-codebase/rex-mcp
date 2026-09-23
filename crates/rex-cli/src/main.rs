@@ -8,10 +8,12 @@ mod bid;
 mod cert;
 mod exec;
 mod ledger;
+mod redteam;
 mod tournament;
 
 use cert::{keygen, verify_receipt};
 use exec::{run_exec, state_dir, ExecError, ExecOptions};
+use redteam::{run_redteam, RedteamOptions};
 use std::process::ExitCode;
 use tournament::{run_tournament, TournamentOptions};
 
@@ -23,6 +25,7 @@ fn usage() -> &'static str {
      usage:\n\
      \x20 rex exec [--task TASK | TASK...] [options]\n\
      \x20 rex tournament --task TASK --providers a,b [options]\n\
+     \x20 rex redteam --task TASK --yes [options]\n\
      \x20 rex runs [--json] [--limit N]\n\
      \x20 rex show RUN_ID [--json]\n\
      \x20 rex keygen [--force]\n\
@@ -221,6 +224,78 @@ fn parse_tournament(args: &[String]) -> Result<TournamentOptions, ExecError> {
     Ok(opts)
 }
 
+fn parse_redteam(args: &[String]) -> Result<RedteamOptions, ExecError> {
+    let mut opts = RedteamOptions {
+        task: String::new(),
+        provider: String::new(),
+        model: None,
+        workspace: None,
+        max_steps: None,
+        max_tool_calls: None,
+        max_tokens: None,
+        timeout_secs: None,
+        json: false,
+        yes: false,
+        dry_run: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let take_value = |flag: &str, i: &mut usize| -> Result<String, ExecError> {
+            *i += 1;
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| ExecError::usage(format!("{flag} expects a value")))
+        };
+        match a {
+            "--task" => opts.task = take_value("--task", &mut i)?,
+            "--provider" => opts.provider = take_value("--provider", &mut i)?,
+            "--model" => opts.model = Some(take_value("--model", &mut i)?),
+            "--workspace" => {
+                opts.workspace = Some(take_value("--workspace", &mut i)?.into());
+            }
+            "--max-steps" => {
+                opts.max_steps = Some(parse_usize(
+                    &take_value("--max-steps", &mut i)?,
+                    "--max-steps",
+                )?)
+            }
+            "--max-tool-calls" => {
+                opts.max_tool_calls = Some(parse_usize(
+                    &take_value("--max-tool-calls", &mut i)?,
+                    "--max-tool-calls",
+                )?)
+            }
+            "--max-tokens" => {
+                opts.max_tokens = Some(parse_u64(
+                    &take_value("--max-tokens", &mut i)?,
+                    "--max-tokens",
+                )?)
+            }
+            "--timeout-secs" => {
+                opts.timeout_secs = Some(parse_u64(
+                    &take_value("--timeout-secs", &mut i)?,
+                    "--timeout-secs",
+                )?)
+            }
+            "--json" => opts.json = true,
+            "--yes" => opts.yes = true,
+            "--dry-run" => opts.dry_run = true,
+            "--help" | "-h" => return Err(ExecError::usage(usage())),
+            other if other.starts_with('-') => {
+                return Err(ExecError::usage(format!("unknown flag '{other}'")));
+            }
+            other => {
+                return Err(ExecError::usage(format!(
+                    "unexpected argument '{other}': pass the task with --task"
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(opts)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -231,6 +306,7 @@ fn main() -> ExitCode {
         }
         Some("exec") => parse_exec(&args[1..]).and_then(run_exec),
         Some("tournament") => parse_tournament(&args[1..]).and_then(run_tournament),
+        Some("redteam") => parse_redteam(&args[1..]).and_then(run_redteam),
         Some("runs") => run_runs(&args[1..]).map(|_| 0),
         Some("show") => run_show(&args[1..]),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
