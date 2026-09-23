@@ -180,7 +180,11 @@ pub fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     let mut outer = Sha256::new();
     outer.update(&opad);
     outer.update(&inner_digest);
-    outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    outer
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -211,7 +215,10 @@ mod hmac_tests {
         let key = [0xaau8; 131];
         // RFC 4231 test case 6
         assert_eq!(
-            hmac_sha256_hex(&key, b"Test Using Larger Than Block-Size Key - Hash Key First"),
+            hmac_sha256_hex(
+                &key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
     }

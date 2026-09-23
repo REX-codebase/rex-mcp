@@ -971,7 +971,10 @@ impl ToolRuntime {
         // the workspace as a root-relative path.
         let root = self.root.canonicalize().map_err(io_err)?;
         let rel = ws.strip_prefix(&root).map_err(|_| {
-            err(ErrorKind::OutsideWorkspace, "workspace must sit under the tool root")
+            err(
+                ErrorKind::OutsideWorkspace,
+                "workspace must sit under the tool root",
+            )
         })?;
         let cwd = if rel.as_os_str().is_empty() {
             ".".to_string()
@@ -982,10 +985,7 @@ impl ToolRuntime {
         // The output has "stdout:\n" / "stderr:\n" labels; strip them for git.
         let data = self.run_command_impl(&argv, Some(&cwd), 30_000)?;
         let raw = data.output.unwrap_or_default();
-        let stripped = raw
-            .strip_prefix("stdout:\n")
-            .unwrap_or(&raw)
-            .to_string();
+        let stripped = raw.strip_prefix("stdout:\n").unwrap_or(&raw).to_string();
         // If stderr was included, cut it off.
         Ok(stripped
             .split("\nstderr:\n")
@@ -1017,7 +1017,10 @@ impl ToolRuntime {
         let ws = self.git_repo(workspace)?;
         // Refuse path escapes; git would too, but fail fast with a clear error.
         if path.contains("..") || path.starts_with('/') {
-            return Err(err(ErrorKind::OutsideWorkspace, "path escapes the workspace"));
+            return Err(err(
+                ErrorKind::OutsideWorkspace,
+                "path escapes the workspace",
+            ));
         }
         let mut out = self.git_run(&ws, &["diff", "--", path])?;
         let staged = self.git_run(&ws, &["diff", "--cached", "--", path])?;
@@ -1613,7 +1616,12 @@ mod tests {
             .sandbox
             .clone()
             .expect("receipt must carry the sandbox status");
-        let child_ns = r.output.unwrap().replace("stdout:\n", "").trim().to_string();
+        let child_ns = r
+            .output
+            .unwrap()
+            .replace("stdout:\n", "")
+            .trim()
+            .to_string();
         let parent_ns = std::fs::read_link("/proc/self/ns/net")
             .unwrap()
             .display()
@@ -1657,7 +1665,12 @@ mod tests {
         assert!(id.ok, "id failed: {:?}", id.error);
         let status = id.receipt.sandbox.clone().unwrap_or_default();
         if status.starts_with("applied") {
-            let uid = id.output.unwrap().replace("stdout:\n", "").trim().to_string();
+            let uid = id
+                .output
+                .unwrap()
+                .replace("stdout:\n", "")
+                .trim()
+                .to_string();
             assert_eq!(uid, "0", "userns root maps back to the real uid");
         }
         let t = run_approved(&rt, &["touch", "probe.txt"]);

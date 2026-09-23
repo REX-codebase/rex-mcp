@@ -77,9 +77,8 @@ fn seeded_candidates(daemon: &HarnessDaemon, ex: &ExecuteResponse) -> UltraViewR
     let open = open_ultra(daemon, ex);
     let mut view = open.clone();
     for (i, c) in open.candidate_requests.iter().enumerate() {
-        let content = format!(
-            "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
-        );
+        let content =
+            format!("{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}");
         view = submit(
             daemon,
             ex,
@@ -134,7 +133,8 @@ fn make_png(width: u32, height: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8>
 fn ton_618_placeholder_hashes_never_complete_a_visual_kernel() {
     let d = tempdir().unwrap();
     let w = d.path().join("ws");
-    let daemon = HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+    let daemon =
+        HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
     let ex = execute_ultra(&daemon, "r-ton618", VISUAL_TASK);
     let view = seeded_candidates(&daemon, &ex);
     assert_eq!(view.kernel_state, "awaiting_evidence");
@@ -196,11 +196,15 @@ fn ton_618_placeholder_hashes_never_complete_a_visual_kernel() {
 fn host_supplied_adversary_and_verifier_verdicts_are_rejected() {
     let d = tempdir().unwrap();
     let w = d.path().join("ws");
-    let daemon = HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+    let daemon =
+        HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
     let ex = execute_ultra(&daemon, "r-selfattest", VISUAL_TASK);
     let view = seeded_candidates(&daemon, &ex);
     let request = &view.evidence_requests[0];
-    for kind in [UltraSubmissionKind::Adversary, UltraSubmissionKind::Verifier] {
+    for kind in [
+        UltraSubmissionKind::Adversary,
+        UltraSubmissionKind::Verifier,
+    ] {
         let err = submit(
             &daemon,
             &ex,
@@ -223,7 +227,8 @@ fn ordinary_submit_cannot_complete_an_ultra_task() {
     let d = tempdir().unwrap();
     let w = d.path().join("ws");
     std::fs::create_dir_all(&w).unwrap();
-    let daemon = HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+    let daemon =
+        HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
     let ex = execute_ultra(&daemon, "r-submitbypass", "make hello");
     let next = daemon
         .next(NextRequest {
@@ -259,7 +264,8 @@ fn task_id_and_epoch_without_capability_authorize_nothing() {
     let d = tempdir().unwrap();
     let w = d.path().join("ws");
     std::fs::create_dir_all(&w).unwrap();
-    let daemon = HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+    let daemon =
+        HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
     let ex = execute_ultra(&daemon, "r-hijack", "make hello");
     let status = daemon
         .status(TaskRefRequest {
@@ -334,7 +340,8 @@ fn promotion_requires_a_completed_kernel_on_a_live_task() {
     let d = tempdir().unwrap();
     let w = d.path().join("ws");
     std::fs::create_dir_all(&w).unwrap();
-    let daemon = HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+    let daemon =
+        HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
     let ex = execute_ultra(&daemon, "r-promotegate", "make hello");
     // Before any candidate: the kernel is not complete.
     assert!(daemon
@@ -371,7 +378,8 @@ fn promotion_requires_a_completed_kernel_on_a_live_task() {
 fn visual_reports_must_resolve_to_real_decodable_bytes() {
     let d = tempdir().unwrap();
     let w = d.path().join("ws");
-    let daemon = HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+    let daemon =
+        HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
     let ex = execute_ultra(&daemon, "r-visualdrift", VISUAL_TASK);
     let view = seeded_candidates(&daemon, &ex);
     let put = |bytes: &[u8]| {
@@ -427,7 +435,8 @@ fn visual_reports_must_resolve_to_real_decodable_bytes() {
 fn artifacts_cannot_be_rebound_across_candidates() {
     let d = tempdir().unwrap();
     let w = d.path().join("ws");
-    let daemon = HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+    let daemon =
+        HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
     let ex = execute_ultra(&daemon, "r-artifactbind", VISUAL_TASK);
     let open = open_ultra(&daemon, &ex);
     let bytes = make_png(32, 32, |x, y| [x as u8, y as u8, 9]);

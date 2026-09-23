@@ -9,7 +9,6 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use rex_custody::capability::{hex_sha256, hmac_sha256_hex, random_hex};
-use rex_ultra::artifacts::{ArtifactError, ArtifactStore};
 use rex_custody::{
     AgentProtocol, CapabilitySet, CapabilityToken, CompletionClaim, CompletionContract,
     Consumption, CustodiedToolRuntime, CustodyAcceptance, CustodyBudgets, CustodyError,
@@ -19,9 +18,8 @@ use rex_custody::{
 use rex_protocol::packets::{OperationStatus, PacketIdentity};
 use rex_protocol::*;
 use rex_tools::{ToolRequest, ToolResult, ToolRuntime};
-use rex_ultra::external_kernel::{
-    CandidateResponse, EvidenceKind, HostKernelStatus, KernelState,
-};
+use rex_ultra::artifacts::{ArtifactError, ArtifactStore};
+use rex_ultra::external_kernel::{CandidateResponse, EvidenceKind, HostKernelStatus, KernelState};
 use rex_ultra::host_bridge::{
     BridgeError, UltraHostBridge, UltraHostView, DEFAULT_MINIMUM_CANDIDATES,
 };
@@ -215,9 +213,7 @@ impl HarnessDaemon {
         }
         t.operation_status = OperationStatus::Aborted;
         t.state = TaskState::Cancelled;
-        let why = req
-            .reason
-            .unwrap_or_else(|| "human stop (final)".into());
+        let why = req.reason.unwrap_or_else(|| "human stop (final)".into());
         t.terminal_reason = Some(why.clone());
         t.open_action = None;
         self.append_event(&mut t, "human_stop", json!({"reason":why}))?;
@@ -422,7 +418,12 @@ impl HarnessDaemon {
             "steps":step_count,"protocol":PROTOCOL_VERSION,"ultra":req.ultra}),
         )?;
         self.persist(&task)?;
-        Ok(self.execute_view(&task, false, Some(host_resume_handle), Some(task_capability)))
+        Ok(self.execute_view(
+            &task,
+            false,
+            Some(host_resume_handle),
+            Some(task_capability),
+        ))
     }
 
     pub fn next(&self, req: NextRequest) -> Result<NextResponse, ProtocolError> {
@@ -832,16 +833,12 @@ impl HarnessDaemon {
                 req.round,
             )
             .map_err(|e| match e {
-                ArtifactError::TooLarge { .. } | ArtifactError::Io(_) => perr(
-                    ErrorCode::MalformedRequest,
-                    e.to_string(),
-                    &req.task_id,
-                ),
-                ArtifactError::ReusedDigest { .. } => perr(
-                    ErrorCode::IdempotencyConflict,
-                    e.to_string(),
-                    &req.task_id,
-                ),
+                ArtifactError::TooLarge { .. } | ArtifactError::Io(_) => {
+                    perr(ErrorCode::MalformedRequest, e.to_string(), &req.task_id)
+                }
+                ArtifactError::ReusedDigest { .. } => {
+                    perr(ErrorCode::IdempotencyConflict, e.to_string(), &req.task_id)
+                }
                 ArtifactError::Tampered { .. } | ArtifactError::Missing { .. } => {
                     perr(ErrorCode::Internal, e.to_string(), &req.task_id)
                 }
@@ -917,8 +914,8 @@ impl HarnessDaemon {
                 .frozen_contract(&t.task_id)
                 .map_err(|e| bridge_err(&t.task_id, e))?;
             if let Some(draft) = req.contract_draft.as_deref() {
-                let reparsed = rex_ultra::contract::parse_contract(draft, &t.task)
-                    .map_err(|errors| {
+                let reparsed =
+                    rex_ultra::contract::parse_contract(draft, &t.task).map_err(|errors| {
                         perr(
                             ErrorCode::MalformedRequest,
                             format!("contract draft is invalid: {}", errors.join("; ")),
@@ -1403,11 +1400,12 @@ impl HarnessDaemon {
                     return Ok(());
                 };
                 let receipt_hash = hash_json(&receipt)?;
-                let qualified = adapter.qualified_candidate().unwrap_or("unknown").to_string();
-                t.evidence.insert(
-                    "ultra_qualified_candidate".into(),
-                    qualified.clone(),
-                );
+                let qualified = adapter
+                    .qualified_candidate()
+                    .unwrap_or("unknown")
+                    .to_string();
+                t.evidence
+                    .insert("ultra_qualified_candidate".into(), qualified.clone());
                 t.evidence
                     .insert("ultra_promotion_receipt".into(), receipt_hash.clone());
                 t.state = TaskState::Completed;
@@ -1446,7 +1444,13 @@ impl HarnessDaemon {
         let adapter = bridge
             .load_existing(&t.task_id)
             .map_err(|e| bridge_err(&t.task_id, e))?
-            .ok_or_else(|| perr(ErrorCode::GateFailed, "ultra kernel is not open", &t.task_id))?;
+            .ok_or_else(|| {
+                perr(
+                    ErrorCode::GateFailed,
+                    "ultra kernel is not open",
+                    &t.task_id,
+                )
+            })?;
         if !matches!(adapter.kernel().state, KernelState::Completed) {
             return Err(perr(
                 ErrorCode::GateFailed,
@@ -1471,12 +1475,7 @@ impl HarnessDaemon {
         // task's terminal state. A crash between the two is healed by the
         // next join (daemon open sweep or any later call).
         let receipt = bridge
-            .promote(
-                &t.task_id,
-                &contract,
-                &self.policy.workspace,
-                &plan.gates,
-            )
+            .promote(&t.task_id, &contract, &self.policy.workspace, &plan.gates)
             .map_err(|e| bridge_err(&t.task_id, e))?;
         self.append_event(
             &mut t,
@@ -1594,22 +1593,26 @@ impl HarnessDaemon {
                         .daemon_adversary
                         .as_ref()
                         .and_then(|r| serde_json::to_value(r).ok())
-                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok()).map(|b| hex_sha256(&b));
+                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok())
+                        .map(|b| hex_sha256(&b));
                     let verifier_record_hash = evidence
                         .verifier
                         .as_ref()
                         .and_then(|r| serde_json::to_value(r).ok())
-                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok()).map(|b| hex_sha256(&b));
+                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok())
+                        .map(|b| hex_sha256(&b));
                     let visual_record_hash = evidence
                         .visual
                         .as_ref()
                         .and_then(|r| serde_json::to_value(r).ok())
-                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok()).map(|b| hex_sha256(&b));
+                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok())
+                        .map(|b| hex_sha256(&b));
                     let daemon_visual_record_hash = evidence
                         .daemon_visual
                         .as_ref()
                         .and_then(|r| serde_json::to_value(r).ok())
-                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok()).map(|b| hex_sha256(&b));
+                        .and_then(|v| rex_protocol::schema::canonical_json(&v).ok())
+                        .map(|b| hex_sha256(&b));
                     let fully_evidenced = evidence.daemon_adversary.is_some()
                         && evidence.verifier.is_some()
                         && (!visual_contract
@@ -1618,9 +1621,10 @@ impl HarnessDaemon {
                         response.candidate_id.clone(),
                         CandidateProofManifest {
                             response_hash_recorded: response.response_hash.clone(),
-                            response_hash_recomputed:
-                                rex_protocol::schema::canonical_hash(&response.content)
-                                    .map_err(internal)?,
+                            response_hash_recomputed: rex_protocol::schema::canonical_hash(
+                                &response.content,
+                            )
+                            .map_err(internal)?,
                             adversary_record_hash,
                             verifier_record_hash,
                             visual_record_hash,
@@ -1666,11 +1670,9 @@ impl HarnessDaemon {
         // Append-only hash chain over the canonical event log.
         let mut events_chain_head = hex_sha256(b"rex-proof-events-genesis");
         for event in &events {
-            let canonical =
-                rex_protocol::schema::canonical_json(event).map_err(internal)?;
-            events_chain_head = hex_sha256(
-                format!("{events_chain_head}:{}", hex_sha256(&canonical)).as_bytes(),
-            );
+            let canonical = rex_protocol::schema::canonical_json(event).map_err(internal)?;
+            events_chain_head =
+                hex_sha256(format!("{events_chain_head}:{}", hex_sha256(&canonical)).as_bytes());
         }
         let mut bundle = TaskProofBundle {
             task_id: t.task_id.clone(),
@@ -1693,8 +1695,7 @@ impl HarnessDaemon {
         };
         bundle.bundle_hash = Self::proof_content_hash(&bundle)?;
         let proof_key = load_or_create_proof_key(&self.root)?;
-        bundle.bundle_mac =
-            hmac_sha256_hex(proof_key.as_bytes(), bundle.bundle_hash.as_bytes());
+        bundle.bundle_mac = hmac_sha256_hex(proof_key.as_bytes(), bundle.bundle_hash.as_bytes());
         Ok(bundle)
     }
 
@@ -1722,18 +1723,28 @@ impl HarnessDaemon {
             m.values()
                 .all(|c| c.response_hash_recorded == c.response_hash_recomputed)
         };
-        let (persisted_present, content_hash_consistent, mac_valid, deterministic, response_hashes_verified) =
-            match &persisted {
-                Some(p) => (
-                    true,
-                    Self::proof_content_hash(p)? == p.bundle_hash,
-                    hmac_sha256_hex(proof_key.as_bytes(), p.bundle_hash.as_bytes())
-                        == p.bundle_mac,
-                    p.bundle_hash == fresh.bundle_hash,
-                    manifest_ok(&p.evidence_manifest) && manifest_ok(&fresh.evidence_manifest),
-                ),
-                None => (false, false, false, false, manifest_ok(&fresh.evidence_manifest)),
-            };
+        let (
+            persisted_present,
+            content_hash_consistent,
+            mac_valid,
+            deterministic,
+            response_hashes_verified,
+        ) = match &persisted {
+            Some(p) => (
+                true,
+                Self::proof_content_hash(p)? == p.bundle_hash,
+                hmac_sha256_hex(proof_key.as_bytes(), p.bundle_hash.as_bytes()) == p.bundle_mac,
+                p.bundle_hash == fresh.bundle_hash,
+                manifest_ok(&p.evidence_manifest) && manifest_ok(&fresh.evidence_manifest),
+            ),
+            None => (
+                false,
+                false,
+                false,
+                false,
+                manifest_ok(&fresh.evidence_manifest),
+            ),
+        };
         let verdict = persisted_present
             && content_hash_consistent
             && mac_valid
@@ -1846,11 +1857,7 @@ impl HarnessDaemon {
         if t.task_capability_hash.is_empty()
             || hex_sha256(capability.as_bytes()) != t.task_capability_hash
         {
-            return Err(perr(
-                ErrorCode::Unauthorized,
-                "invalid task capability",
-                id,
-            ));
+            return Err(perr(ErrorCode::Unauthorized, "invalid task capability", id));
         }
         if t.state.is_terminal() {
             return Err(perr(ErrorCode::TaskTerminal, "task is terminal", id));
@@ -2747,9 +2754,8 @@ mod tests {
         // into isolated workspaces before any check runs.
         let mut view = open.clone();
         for (i, c) in open.candidate_requests.iter().enumerate() {
-            let content = format!(
-                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
-            );
+            let content =
+                format!("{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}");
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
@@ -2843,9 +2849,8 @@ mod tests {
         assert_eq!(open.candidate_requests[0].work_kind, "visual");
         let mut view = open.clone();
         for (i, c) in open.candidate_requests.iter().enumerate() {
-            let content = format!(
-                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
-            );
+            let content =
+                format!("{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}");
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
@@ -2881,7 +2886,9 @@ mod tests {
         let renders = [
             make_png(128, 96, |x, y| [(x % 64) as u8 * 4, (y % 32) as u8 * 8, 0]),
             make_png(128, 96, |x, y| [0, (x % 32) as u8 * 8, (y % 64) as u8 * 4]),
-            make_png(128, 96, |x, y| [(x % 256) as u8, (y % 256) as u8, ((x * y) % 256) as u8]),
+            make_png(128, 96, |x, y| {
+                [(x % 256) as u8, (y % 256) as u8, ((x * y) % 256) as u8]
+            }),
         ];
         let phone = |i: u32| {
             make_png(64, 128, move |x, y| {
@@ -2927,7 +2934,10 @@ mod tests {
                 task_id: ex.task_id.clone(),
             })
             .unwrap();
-        assert_eq!(bundle.qualified_candidate.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            bundle.qualified_candidate.as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -2949,9 +2959,8 @@ mod tests {
             .unwrap();
         let mut view = open.clone();
         for (i, c) in open.candidate_requests.iter().enumerate() {
-            let content = format!(
-                "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
-            );
+            let content =
+                format!("{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}");
             view = daemon
                 .ultra_submit(ultra_req(
                     &ex.task_id,
@@ -3039,9 +3048,9 @@ mod tests {
             .unwrap();
         let target = &open.candidate_requests[0];
         let mut forged = ultra_req(
-                    &ex.task_id,
-                    &cap_of(&ex),
-                    ex.lease.epoch,
+            &ex.task_id,
+            &cap_of(&ex),
+            ex.lease.epoch,
             UltraSubmissionKind::Candidate,
             &target.candidate_id,
             &target.candidate_id,
@@ -3051,9 +3060,9 @@ mod tests {
         let e = daemon.ultra_submit(forged).unwrap_err();
         assert_eq!(e.code, ErrorCode::GateFailed);
         let unknown = ultra_req(
-                    &ex.task_id,
-                    &cap_of(&ex),
-                    ex.lease.epoch,
+            &ex.task_id,
+            &cap_of(&ex),
+            ex.lease.epoch,
             UltraSubmissionKind::Candidate,
             "not-a-candidate",
             "not-a-candidate",
@@ -3140,9 +3149,7 @@ mod tests {
             .unwrap();
         let contents: Vec<String> = (0..open.candidate_requests.len())
             .map(|i| {
-                format!(
-                    "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
-                )
+                format!("{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}")
             })
             .collect();
         let view = drive_ultra_candidates(&daemon, &ex, &open, &contents);
@@ -3179,8 +3186,7 @@ mod tests {
         let d = tempdir().unwrap();
         let w = d.path().join("ws");
         let root = d.path().join("state");
-        let daemon =
-            HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
         let ex = daemon.execute(req("r-join-crash")).unwrap();
         let open = daemon
             .ultra_open(UltraOpenRequest {
@@ -3192,9 +3198,7 @@ mod tests {
             .unwrap();
         let contents: Vec<String> = (0..open.candidate_requests.len())
             .map(|i| {
-                format!(
-                    "{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}"
-                )
+                format!("{{\"files\":[{{\"path\":\"hello.txt\",\"content\":\"hello {i}\"}}]}}")
             })
             .collect();
         let view = drive_ultra_candidates(&daemon, &ex, &open, &contents);
@@ -3485,8 +3489,7 @@ mod tests {
             .join("state")
             .join("proofs")
             .join(format!("{task_id}.json"));
-        let mut value: Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         value["state"] = json!("failed");
         value["qualified_candidate"] = json!("forged-candidate");
         fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
@@ -3498,7 +3501,10 @@ mod tests {
             !report.content_hash_consistent,
             "edited fields no longer hash to the stored bundle hash"
         );
-        assert!(report.mac_valid, "the MAC honestly covers the unedited hash");
+        assert!(
+            report.mac_valid,
+            "the MAC honestly covers the unedited hash"
+        );
         assert!(
             report.deterministic,
             "the stored hash still equals a fresh assembly; the content check is what catches the edit"
@@ -3574,13 +3580,10 @@ mod tests {
             .join("tasks")
             .join(&task_id)
             .join("task.json");
-        let mut value: Value =
-            serde_json::from_slice(&fs::read(&task_path).unwrap()).unwrap();
+        let mut value: Value = serde_json::from_slice(&fs::read(&task_path).unwrap()).unwrap();
         value["ultra_skill_plan_hash"] = json!("0".repeat(64));
         fs::write(&task_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-        let err = daemon
-            .proof_bundle(TaskRefRequest { task_id })
-            .unwrap_err();
+        let err = daemon.proof_bundle(TaskRefRequest { task_id }).unwrap_err();
         assert!(format!("{err:?}").contains("frozen skill plan hash drift"));
     }
     #[test]
@@ -3820,11 +3823,7 @@ mod tests {
             persisted["bundle_hash"].as_str().unwrap(),
             bundle.bundle_hash
         );
-        assert_eq!(
-            persisted["promotion_state"].as_str().unwrap(),
-            "committed"
-        );
-    
+        assert_eq!(persisted["promotion_state"].as_str().unwrap(), "committed");
     }
 
     #[test]
@@ -4097,7 +4096,11 @@ mod tests {
         let root = d.path().join("state");
         let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
         let ex = daemon.execute(req("r-artifact")).unwrap();
-        let put = |capability: &str, epoch: u64, bytes_b64: &str, cand: Option<&str>, round: Option<u64>| {
+        let put = |capability: &str,
+                   epoch: u64,
+                   bytes_b64: &str,
+                   cand: Option<&str>,
+                   round: Option<u64>| {
             daemon.artifact_put(ArtifactPutRequest {
                 task_id: ex.task_id.clone(),
                 capability: capability.into(),
@@ -4110,12 +4113,44 @@ mod tests {
         };
         let shot = base64::engine::general_purpose::STANDARD.encode(b"png-v1");
         // Missing and forged capabilities are unauthorized.
-        assert_eq!(put("", ex.lease.epoch, &shot, Some("cand-1"), Some(1)).unwrap_err().code, ErrorCode::Unauthorized);
-        assert_eq!(put("cap-forged", ex.lease.epoch, &shot, Some("cand-1"), Some(1)).unwrap_err().code, ErrorCode::Unauthorized);
+        assert_eq!(
+            put("", ex.lease.epoch, &shot, Some("cand-1"), Some(1))
+                .unwrap_err()
+                .code,
+            ErrorCode::Unauthorized
+        );
+        assert_eq!(
+            put("cap-forged", ex.lease.epoch, &shot, Some("cand-1"), Some(1))
+                .unwrap_err()
+                .code,
+            ErrorCode::Unauthorized
+        );
         // Stale epoch is sequencing failure, not authorization.
-        assert_eq!(put(&cap_of(&ex), ex.lease.epoch + 9, &shot, Some("cand-1"), Some(1)).unwrap_err().code, ErrorCode::StaleLease);
+        assert_eq!(
+            put(
+                &cap_of(&ex),
+                ex.lease.epoch + 9,
+                &shot,
+                Some("cand-1"),
+                Some(1)
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::StaleLease
+        );
         // Garbage base64 is malformed, never stored.
-        assert_eq!(put(&cap_of(&ex), ex.lease.epoch, "!!!not-base64!!!", Some("cand-1"), Some(1)).unwrap_err().code, ErrorCode::MalformedRequest);
+        assert_eq!(
+            put(
+                &cap_of(&ex),
+                ex.lease.epoch,
+                "!!!not-base64!!!",
+                Some("cand-1"),
+                Some(1)
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::MalformedRequest
+        );
         // The real capability stores bytes and returns their digest.
         let ok = put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-1"), Some(1)).unwrap();
         assert!(ok.fresh);
@@ -4127,18 +4162,35 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o444);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
         }
         // Idempotent replay of the identical binding.
         let again = put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-1"), Some(1)).unwrap();
         assert!(!again.fresh);
         assert_eq!(again.sha256, ok.sha256);
         // Reused digest across candidates or rounds is rejected.
-        assert_eq!(put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-2"), Some(1)).unwrap_err().code, ErrorCode::IdempotencyConflict);
-        assert_eq!(put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-1"), Some(2)).unwrap_err().code, ErrorCode::IdempotencyConflict);
+        assert_eq!(
+            put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-2"), Some(1))
+                .unwrap_err()
+                .code,
+            ErrorCode::IdempotencyConflict
+        );
+        assert_eq!(
+            put(&cap_of(&ex), ex.lease.epoch, &shot, Some("cand-1"), Some(2))
+                .unwrap_err()
+                .code,
+            ErrorCode::IdempotencyConflict
+        );
         // The registration is on the durable event stream.
         let evs = daemon
-            .events(EventsRequest { task_id: ex.task_id.clone(), after_seq: 0, limit: None })
+            .events(EventsRequest {
+                task_id: ex.task_id.clone(),
+                after_seq: 0,
+                limit: None,
+            })
             .unwrap();
         assert!(evs.events.iter().any(|e| e.kind == "artifact_registered"
             && e.detail["sha256"] == serde_json::json!(ok.sha256)));

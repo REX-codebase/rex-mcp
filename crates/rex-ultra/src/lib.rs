@@ -9,10 +9,10 @@
 //! proof-carrying completion bundle on disk. See docs/ultra-mode.md.
 
 pub mod adversary;
+pub mod artifacts;
 pub mod bench;
 pub mod candidates;
 pub mod contract;
-pub mod artifacts;
 pub mod daemon_adversary;
 pub mod daemon_verify;
 pub mod evidence;

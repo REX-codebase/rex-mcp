@@ -26,6 +26,9 @@ pub mod session;
 pub mod timer;
 
 pub use error::FableError;
-pub use ledger::{EpistemicItem, EpistemicLedger, EpistemicStatus, Invariant, REQUIRED_INVARIANTS, REQUIRED_PROVEN};
+pub use ledger::{
+    EpistemicItem, EpistemicLedger, EpistemicStatus, Invariant, REQUIRED_INVARIANTS,
+    REQUIRED_PROVEN,
+};
 pub use session::{FablePhase, FableSession};
 pub use timer::{AuthorityTimer, DEFAULT_BUDGET_MINUTES, MIN_BUDGET_MINUTES};

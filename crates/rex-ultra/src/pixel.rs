@@ -62,7 +62,9 @@ impl PixelMetrics {
 /// is an error, never a silent pass.
 pub fn decode_metrics(bytes: &[u8], artifact_hash: &str) -> Result<PixelMetrics, String> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder.read_info().map_err(|e| format!("png header: {e}"))?;
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("png header: {e}"))?;
     let (width, height, color_type, bit_depth) = {
         let info = reader.info();
         (info.width, info.height, info.color_type, info.bit_depth)
@@ -72,13 +74,17 @@ pub fn decode_metrics(bytes: &[u8], artifact_hash: &str) -> Result<PixelMetrics,
     }
     // Bound decompression work: 16k x 16k RGBA is the hard cap.
     if width > 16_384 || height > 16_384 {
-        return Err(format!("png dimensions {width}x{height} exceed the decode cap"));
+        return Err(format!(
+            "png dimensions {width}x{height} exceed the decode cap"
+        ));
     }
     let size = reader
         .output_buffer_size()
         .ok_or_else(|| "png buffer size unknown".to_string())?;
     let mut buf = vec![0u8; size];
-    let out = reader.next_frame(&mut buf).map_err(|e| format!("png decode: {e}"))?;
+    let out = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("png decode: {e}"))?;
     let raw = &buf[..out.buffer_size()];
     let rgb = to_rgb(color_type, bit_depth, raw)?;
     Ok(metrics_from_rgb(&rgb, width, height, artifact_hash))

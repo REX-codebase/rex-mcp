@@ -103,17 +103,14 @@ impl TerminalManager {
         let id = format!("term-{}", *id_guard);
         drop(id_guard);
 
-        self.sessions
-            .lock()
-            .map_err(|e| e.to_string())?
-            .insert(
-                id.clone(),
-                TerminalSession {
-                    master: pair.master,
-                    child,
-                    writer,
-                },
-            );
+        self.sessions.lock().map_err(|e| e.to_string())?.insert(
+            id.clone(),
+            TerminalSession {
+                master: pair.master,
+                child,
+                writer,
+            },
+        );
         Ok(id)
     }
 

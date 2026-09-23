@@ -9,7 +9,12 @@
 
 use crate::skills::{CertificationStatus, GateTemplate, RuleModule, Selector, SkillPackManifest};
 
-fn gate(id: &str, command_hint: &str, required: bool, exec: crate::skills::GateExec) -> GateTemplate {
+fn gate(
+    id: &str,
+    command_hint: &str,
+    required: bool,
+    exec: crate::skills::GateExec,
+) -> GateTemplate {
     GateTemplate {
         id: id.into(),
         command_hint: command_hint.into(),
@@ -30,7 +35,12 @@ fn command_gate(id: &str, command_hint: &str, required: bool, argv: &[&str]) -> 
 }
 
 fn unsupported_gate(id: &str, command_hint: &str, required: bool) -> GateTemplate {
-    gate(id, command_hint, required, crate::skills::GateExec::Unsupported)
+    gate(
+        id,
+        command_hint,
+        required,
+        crate::skills::GateExec::Unsupported,
+    )
 }
 
 fn rule(id: &str, statement: &str) -> RuleModule {
@@ -230,10 +240,30 @@ pub fn rust() -> SkillPackManifest {
             ),
         ],
         vec![
-            command_gate("cargo-test", "cargo test passes for the workspace", true, &["cargo", "test"]),
-            command_gate("clippy-deny", "cargo clippy with warnings denied", true, &["cargo", "clippy", "--", "-D", "warnings"]),
-            command_gate("fmt-check", "cargo fmt --check is clean", true, &["cargo", "fmt", "--check"]),
-            command_gate("doc-build", "cargo doc builds without broken links", false, &["cargo", "doc", "--no-deps"]),
+            command_gate(
+                "cargo-test",
+                "cargo test passes for the workspace",
+                true,
+                &["cargo", "test"],
+            ),
+            command_gate(
+                "clippy-deny",
+                "cargo clippy with warnings denied",
+                true,
+                &["cargo", "clippy", "--", "-D", "warnings"],
+            ),
+            command_gate(
+                "fmt-check",
+                "cargo fmt --check is clean",
+                true,
+                &["cargo", "fmt", "--check"],
+            ),
+            command_gate(
+                "doc-build",
+                "cargo doc builds without broken links",
+                false,
+                &["cargo", "doc", "--no-deps"],
+            ),
         ],
     )
 }

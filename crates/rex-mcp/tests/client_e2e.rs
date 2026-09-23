@@ -63,11 +63,10 @@ fn shell_client_runs_a_full_task_lifecycle_over_stdio() {
 
     // Operator cancel without the per-task capability is unauthorized:
     // task id plus the (status-visible) lease epoch authorize nothing.
-    let denied = client
-        .call_tool(
-            "rex_cancel",
-            json!({ "task_id": task_id, "reason": "forged operator cancel" }),
-        );
+    let denied = client.call_tool(
+        "rex_cancel",
+        json!({ "task_id": task_id, "reason": "forged operator cancel" }),
+    );
     assert!(denied.is_err(), "capability-less cancel must be denied");
 
     // Human stop is a distinct authority: the trusted local launcher reads

@@ -7,8 +7,8 @@
 //! so a restore is never destructive.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -74,11 +74,14 @@ impl CheckpointStore {
         let mut count = 0u64;
         std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
         for entry in walkdir(src)? {
-            let rel = entry
-                .strip_prefix(src)
-                .map_err(|e| e.to_string())?;
+            let rel = entry.strip_prefix(src).map_err(|e| e.to_string())?;
             // Skip the checkpoint dir itself if nested, and .git.
-            if rel.components().next().map(|c| c.as_os_str() == ".git").unwrap_or(false) {
+            if rel
+                .components()
+                .next()
+                .map(|c| c.as_os_str() == ".git")
+                .unwrap_or(false)
+            {
                 continue;
             }
             let target = dst.join(rel);
@@ -170,7 +173,12 @@ impl CheckpointStore {
             if rel.as_os_str().is_empty() {
                 continue;
             }
-            if rel.components().next().map(|c| c.as_os_str() == ".git").unwrap_or(false) {
+            if rel
+                .components()
+                .next()
+                .map(|c| c.as_os_str() == ".git")
+                .unwrap_or(false)
+            {
                 continue;
             }
             if entry.is_dir() {
@@ -181,17 +189,19 @@ impl CheckpointStore {
             }
         }
         // Remove now-empty dirs (deepest first).
-        let mut dirs: Vec<PathBuf> = walkdir(&ws)?
-            .into_iter()
-            .filter(|p| p.is_dir())
-            .collect();
+        let mut dirs: Vec<PathBuf> = walkdir(&ws)?.into_iter().filter(|p| p.is_dir()).collect();
         dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
         for d in dirs {
             if d == ws {
                 continue;
             }
             let rel = d.strip_prefix(&ws).map_err(|e| e.to_string())?;
-            if rel.components().next().map(|c| c.as_os_str() == ".git").unwrap_or(false) {
+            if rel
+                .components()
+                .next()
+                .map(|c| c.as_os_str() == ".git")
+                .unwrap_or(false)
+            {
                 continue;
             }
             let _ = std::fs::remove_dir(&d);
@@ -245,11 +255,7 @@ mod tests {
 
     fn temp() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "rex-ckpt-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir = std::env::temp_dir().join(format!("rex-ckpt-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -279,8 +285,7 @@ mod tests {
 
         // The backup has the v2 content.
         let backup_dir = config.join("checkpoints").join(&backup.id);
-        let backup_content =
-            std::fs::read_to_string(backup_dir.join("a.txt")).unwrap();
+        let backup_content = std::fs::read_to_string(backup_dir.join("a.txt")).unwrap();
         assert_eq!(backup_content, "v2");
     }
 }

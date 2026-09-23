@@ -155,7 +155,9 @@ pub fn parse_bundle(content: &str) -> Result<SealedCandidateBundle, PromotionErr
     let bundle: SealedCandidateBundle = serde_json::from_str(content)
         .map_err(|e| PromotionError::InvalidBundle(format!("not a sealed bundle: {e}")))?;
     if bundle.files.is_empty() && bundle.deletes.is_empty() {
-        return Err(PromotionError::InvalidBundle("bundle changes nothing".into()));
+        return Err(PromotionError::InvalidBundle(
+            "bundle changes nothing".into(),
+        ));
     }
     if bundle.files.len() + bundle.deletes.len() > MAX_BUNDLE_FILES {
         return Err(PromotionError::InvalidBundle(format!(
@@ -362,8 +364,9 @@ mod dirfd {
         if e.raw_os_error() == Some(libc::ENOTDIR) {
             if let Ok(c) = c_name(name) {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstatat(parent.0, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) }
-                    == 0
+                if unsafe {
+                    libc::fstatat(parent.0, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+                } == 0
                     && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
                 {
                     return PromotionError::SymlinkRefused(format!(
@@ -568,8 +571,7 @@ fn swap_trees(stage: &Path, destination: &Path, backup: &Path) -> Result<String,
     // receipt plus the backup directory make that window recoverable.
     fs::rename(destination, backup)
         .map_err(|e| PromotionError::Io(format!("backup rename: {e}")))?;
-    fs::rename(stage, destination)
-        .map_err(|e| PromotionError::Io(format!("stage rename: {e}")))?;
+    fs::rename(stage, destination).map_err(|e| PromotionError::Io(format!("stage rename: {e}")))?;
     Ok("rename_fallback".into())
 }
 
@@ -662,7 +664,10 @@ fn run_skill_gate(
             format!("daemon cannot execute this gate: {}", gate.command_hint),
         ),
         GateExec::ScopeDiffVsBundle => match scope_diff_check(bundle, before, stage) {
-            Ok(()) => record("passed", "changed surface equals the declared bundle paths".into()),
+            Ok(()) => record(
+                "passed",
+                "changed surface equals the declared bundle paths".into(),
+            ),
             Err(undeclared) => record(
                 "failed",
                 format!("undeclared changes: {}", undeclared.join("; ")),
@@ -835,8 +840,8 @@ impl PromotionStore {
             .find(|r| r.candidate_id == candidate_id)
             .ok_or(PromotionError::NoQualifiedCandidate)?;
         let bundle = parse_bundle(&response.content)?;
-        let bundle_hash =
-            canonical_hash(&response.content).map_err(|e| PromotionError::Encoding(e.to_string()))?;
+        let bundle_hash = canonical_hash(&response.content)
+            .map_err(|e| PromotionError::Encoding(e.to_string()))?;
         validate_task_id(task_id)?;
         if !destination.is_dir() {
             return Err(PromotionError::Io(
@@ -903,8 +908,8 @@ impl PromotionStore {
             // effects can never reach the workspace.
             let entries_before = tree_entries(destination)?;
             let entries_stage = tree_entries(&stage)?;
-            receipt.staging_hash =
-                canonical_hash(&entries_stage).map_err(|e| PromotionError::Encoding(e.to_string()))?;
+            receipt.staging_hash = canonical_hash(&entries_stage)
+                .map_err(|e| PromotionError::Encoding(e.to_string()))?;
             copy_tree(&stage, &gatecheck)?;
 
             // Obligation proofs: every daemon-executable proof re-executes
@@ -1586,7 +1591,11 @@ mod tests {
         assert_eq!(receipt.state, PromotionState::Committed);
         assert_eq!(
             receipt.gates_rerun,
-            vec!["o-file".to_string(), "o-cmd".to_string(), "o-dirt".to_string()]
+            vec![
+                "o-file".to_string(),
+                "o-cmd".to_string(),
+                "o-dirt".to_string()
+            ]
         );
         // The gate command ran on the scratch copy only: its side effect
         // never reached the promoted tree.
@@ -1686,7 +1695,12 @@ mod tests {
                 &adapter,
                 &contract(),
                 &destination,
-                &[gate("pack", "native-only", true, crate::skills::GateExec::Unsupported)],
+                &[gate(
+                    "pack",
+                    "native-only",
+                    true,
+                    crate::skills::GateExec::Unsupported,
+                )],
             )
             .unwrap();
         assert_eq!(receipt.state, PromotionState::RolledBack);
@@ -1723,8 +1737,18 @@ mod tests {
                 &contract(),
                 &destination,
                 &[
-                    gate("shared-laws", "scope-diff", true, crate::skills::GateExec::ScopeDiffVsBundle),
-                    gate("pack", "advisory", false, crate::skills::GateExec::Unsupported),
+                    gate(
+                        "shared-laws",
+                        "scope-diff",
+                        true,
+                        crate::skills::GateExec::ScopeDiffVsBundle,
+                    ),
+                    gate(
+                        "pack",
+                        "advisory",
+                        false,
+                        crate::skills::GateExec::Unsupported,
+                    ),
                     gate(
                         "pack",
                         "passes",
@@ -1774,9 +1798,7 @@ mod tests {
         let undeclared = scope_diff_check(&bundle, &before, &dirty).unwrap_err();
         assert!(undeclared.iter().any(|u| u.contains("extra.txt")));
         assert!(undeclared.iter().any(|u| u.contains("keep.txt")));
-        let missing = BTreeMap::from([
-            ("declared.txt".to_string(), "h3".to_string()),
-        ]);
+        let missing = BTreeMap::from([("declared.txt".to_string(), "h3".to_string())]);
         let undeclared = scope_diff_check(&bundle, &before, &missing).unwrap_err();
         assert!(undeclared.iter().any(|u| u.contains("keep.txt removed")));
     }

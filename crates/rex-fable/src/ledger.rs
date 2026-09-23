@@ -97,7 +97,9 @@ impl EpistemicLedger {
         if claim.trim().is_empty() {
             return Err(FableError::EmptyClaim);
         }
-        let evidence = evidence.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        let evidence = evidence
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty());
         match status {
             EpistemicStatus::Proven => {
                 if evidence.is_none() {

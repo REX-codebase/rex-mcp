@@ -4,10 +4,10 @@
 // only - key material never crosses the bridge.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod terminal;
 mod checkpoint;
-mod mcp;
 mod cost;
+mod mcp;
+mod terminal;
 
 use rex_installed_agents::{
     discover as discover_installed_agents, run as run_installed_agent, InstalledAgentId,
@@ -257,9 +257,7 @@ fn tool_call_diff(
     tools: State<'_, Arc<LocalTools>>,
     call_id: String,
 ) -> Result<Option<rex_tools::FileDiff>, String> {
-    tools
-        .pending_diff(&call_id)
-        .map_err(|e| e.to_string())
+    tools.pending_diff(&call_id).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +277,9 @@ fn resolve_workspace_path(workspace: &str, path: &str) -> Result<PathBuf, String
     // For existing files, canonicalize to resolve symlinks. For new files,
     // canonicalize the parent.
     let canonical = if target.exists() {
-        target.canonicalize().map_err(|e| format!("cannot resolve path: {e}"))?
+        target
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve path: {e}"))?
     } else {
         let parent = target.parent().ok_or("invalid path")?;
         let canon_parent = parent
@@ -304,11 +304,7 @@ fn workspace_read_file(workspace: String, path: String) -> Result<String, String
 /// editing, so this does not go through the approval gate — the editor UI
 /// shows a dirty indicator and the write is the user's own action.
 #[tauri::command]
-fn workspace_write_file(
-    workspace: String,
-    path: String,
-    content: String,
-) -> Result<(), String> {
+fn workspace_write_file(workspace: String, path: String, content: String) -> Result<(), String> {
     let target = resolve_workspace_path(&workspace, &path)?;
     if content.len() > 2 * 1024 * 1024 {
         return Err("file exceeds 2 MiB write limit".to_string());
@@ -416,9 +412,7 @@ fn checkpoint_restore(
 
 /// List configured MCP servers.
 #[tauri::command]
-fn mcp_list_servers(
-    mcp: State<'_, Arc<mcp::McpStore>>,
-) -> Result<Vec<mcp::McpServer>, String> {
+fn mcp_list_servers(mcp: State<'_, Arc<mcp::McpStore>>) -> Result<Vec<mcp::McpServer>, String> {
     mcp.list()
 }
 
@@ -434,10 +428,7 @@ fn mcp_add_server(
 
 /// Remove an MCP server.
 #[tauri::command]
-fn mcp_remove_server(
-    mcp: State<'_, Arc<mcp::McpStore>>,
-    id: String,
-) -> Result<(), String> {
+fn mcp_remove_server(mcp: State<'_, Arc<mcp::McpStore>>, id: String) -> Result<(), String> {
     mcp.remove(&id)
 }
 
@@ -504,9 +495,7 @@ fn cost_receipts(
 
 /// Get the current budget.
 #[tauri::command]
-fn cost_get_budget(
-    cost: State<'_, Arc<cost::CostStore>>,
-) -> Result<cost::Budget, String> {
+fn cost_get_budget(cost: State<'_, Arc<cost::CostStore>>) -> Result<cost::Budget, String> {
     cost.get_budget()
 }
 
@@ -521,10 +510,7 @@ fn cost_set_budget(
 
 /// Spend in the last N days.
 #[tauri::command]
-fn cost_spend(
-    cost: State<'_, Arc<cost::CostStore>>,
-    days: u64,
-) -> Result<f64, String> {
+fn cost_spend(cost: State<'_, Arc<cost::CostStore>>, days: u64) -> Result<f64, String> {
     cost.spend_last_days(days)
 }
 
@@ -772,8 +758,8 @@ fn fable_create_session(
     time_budget_minutes: Option<u32>,
 ) -> Result<FableStatusView, String> {
     let dir = fable_dir();
-    let session =
-        rex_fable::FableSession::create(name, objective, time_budget_minutes).map_err(|e| e.to_string())?;
+    let session = rex_fable::FableSession::create(name, objective, time_budget_minutes)
+        .map_err(|e| e.to_string())?;
     session.save(&dir).map_err(|e| e.to_string())?;
     Ok(fable_view_of(&session))
 }
@@ -781,8 +767,7 @@ fn fable_create_session(
 /// Current status of a Fable session, including the live countdown.
 #[tauri::command]
 fn fable_session_status(name: String) -> Result<FableStatusView, String> {
-    let session =
-        rex_fable::FableSession::load(&fable_dir(), &name).map_err(|e| e.to_string())?;
+    let session = rex_fable::FableSession::load(&fable_dir(), &name).map_err(|e| e.to_string())?;
     Ok(fable_view_of(&session))
 }
 
@@ -791,9 +776,10 @@ fn fable_session_status(name: String) -> Result<FableStatusView, String> {
 #[tauri::command]
 fn fable_unlock_session(name: String, rationale: String) -> Result<FableStatusView, String> {
     let dir = fable_dir();
-    let mut session =
-        rex_fable::FableSession::load(&dir, &name).map_err(|e| e.to_string())?;
-    session.unlock_execution(rationale).map_err(|e| e.to_string())?;
+    let mut session = rex_fable::FableSession::load(&dir, &name).map_err(|e| e.to_string())?;
+    session
+        .unlock_execution(rationale)
+        .map_err(|e| e.to_string())?;
     session.save(&dir).map_err(|e| e.to_string())?;
     Ok(fable_view_of(&session))
 }
@@ -838,40 +824,41 @@ fn fable_mcp_probe(server_command: String) -> Result<FableMcpLink, String> {
     let mut reader = BufReader::new(stdout);
 
     let mut next_id = 0u64;
-    let mut request = |method: &str, params: serde_json::Value| -> Result<serde_json::Value, String> {
-        next_id += 1;
-        let msg = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": next_id,
-            "method": method,
-            "params": params,
-        });
-        writeln!(stdin, "{}", msg).map_err(|e| format!("write failed: {e}"))?;
-        stdin.flush().map_err(|e| format!("flush failed: {e}"))?;
-        // Read with a timeout so a hung server cannot hang the UI.
-        let mut line = String::new();
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(10) {
-            line.clear();
-            // Non-blocking check: try to read; BufRead::read_line blocks,
-            // so we rely on the overall spawn timeout via a helper thread
-            // in production. Here we read one line; a well-behaved MCP
-            // server answers initialize promptly.
-            match reader.read_line(&mut line) {
-                Ok(0) => break, // EOF
-                Ok(_) if !line.trim().is_empty() => break,
-                Ok(_) => continue,
-                Err(e) => return Err(format!("read failed: {e}")),
+    let mut request =
+        |method: &str, params: serde_json::Value| -> Result<serde_json::Value, String> {
+            next_id += 1;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": next_id,
+                "method": method,
+                "params": params,
+            });
+            writeln!(stdin, "{}", msg).map_err(|e| format!("write failed: {e}"))?;
+            stdin.flush().map_err(|e| format!("flush failed: {e}"))?;
+            // Read with a timeout so a hung server cannot hang the UI.
+            let mut line = String::new();
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(10) {
+                line.clear();
+                // Non-blocking check: try to read; BufRead::read_line blocks,
+                // so we rely on the overall spawn timeout via a helper thread
+                // in production. Here we read one line; a well-behaved MCP
+                // server answers initialize promptly.
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) if !line.trim().is_empty() => break,
+                    Ok(_) => continue,
+                    Err(e) => return Err(format!("read failed: {e}")),
+                }
+                if start.elapsed() >= Duration::from_secs(10) {
+                    break;
+                }
             }
-            if start.elapsed() >= Duration::from_secs(10) {
-                break;
+            if line.trim().is_empty() {
+                return Err("server did not answer within 10s".to_string());
             }
-        }
-        if line.trim().is_empty() {
-            return Err("server did not answer within 10s".to_string());
-        }
-        serde_json::from_str(&line).map_err(|e| format!("bad JSON from server: {e}"))
-    };
+            serde_json::from_str(&line).map_err(|e| format!("bad JSON from server: {e}"))
+        };
 
     let link = (|| -> Result<FableMcpLink, String> {
         let hello = request(
@@ -891,7 +878,11 @@ fn fable_mcp_probe(server_command: String) -> Result<FableMcpLink, String> {
             .and_then(|t| t.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                    .filter_map(|t| {
+                        t.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .collect()
             })
             .unwrap_or_default();

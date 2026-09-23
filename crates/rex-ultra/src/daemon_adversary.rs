@@ -61,7 +61,8 @@ pub fn scan(candidate_root: &Path) -> DaemonAdversaryReport {
     let mut scanned_files: u64 = 0;
     let mut scanned_bytes: u64 = 0;
     let mut truncated = false;
-    let canonical_root = fs::canonicalize(candidate_root).unwrap_or_else(|_| candidate_root.to_path_buf());
+    let canonical_root =
+        fs::canonicalize(candidate_root).unwrap_or_else(|_| candidate_root.to_path_buf());
     walk(
         candidate_root,
         &canonical_root,
@@ -73,15 +74,14 @@ pub fn scan(candidate_root: &Path) -> DaemonAdversaryReport {
     );
     // The tree hash binds this report to the scanned bytes. Symlinks are
     // invisible to the hash, which is exactly why they are defects above.
-    let tree_hash = crate::promotion::tree_hash(candidate_root)
-        .unwrap_or_else(|e| {
-            truncated = true;
-            defects.push(Defect {
-                title: "tree hash failed".into(),
-                detail: format!("the candidate tree could not be hashed: {e:?}"),
-            });
-            String::new()
+    let tree_hash = crate::promotion::tree_hash(candidate_root).unwrap_or_else(|e| {
+        truncated = true;
+        defects.push(Defect {
+            title: "tree hash failed".into(),
+            detail: format!("the candidate tree could not be hashed: {e:?}"),
         });
+        String::new()
+    });
     let mut report = DaemonAdversaryReport {
         defects,
         scanned_files,
@@ -89,7 +89,9 @@ pub fn scan(candidate_root: &Path) -> DaemonAdversaryReport {
         tree_hash,
         truncated,
     };
-    report.defects.sort_by(|a, b| a.title.cmp(&b.title).then(a.detail.cmp(&b.detail)));
+    report
+        .defects
+        .sort_by(|a, b| a.title.cmp(&b.title).then(a.detail.cmp(&b.detail)));
     report
 }
 
@@ -129,13 +131,26 @@ fn walk(
                 .map(|resolved| !resolved.starts_with(canonical_root))
                 .unwrap_or(true);
             defects.push(Defect {
-                title: if escapes { "symlink escapes workspace" } else { "symlink in workspace" }.into(),
+                title: if escapes {
+                    "symlink escapes workspace"
+                } else {
+                    "symlink in workspace"
+                }
+                .into(),
                 detail: format!("{} -> {target}", rel(root, &path)),
             });
             continue;
         }
         if kind.is_dir() {
-            walk(root, canonical_root, &path, defects, scanned_files, scanned_bytes, truncated);
+            walk(
+                root,
+                canonical_root,
+                &path,
+                defects,
+                scanned_files,
+                scanned_bytes,
+                truncated,
+            );
             continue;
         }
         if !kind.is_file() {
@@ -151,7 +166,9 @@ fn walk(
             return;
         }
         let relative = rel(root, &path);
-        let Ok(meta) = fs::metadata(&path) else { continue };
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
         if meta.len() == 0 {
             defects.push(Defect {
                 title: "empty file".into(),
@@ -219,7 +236,10 @@ mod tests {
         fs::write(d.path().join("app.js"), "// TODO: wire this up").unwrap();
         let report = scan(d.path());
         assert!(!report.clean());
-        assert!(report.defects.iter().any(|x| x.title == "placeholder content"));
+        assert!(report
+            .defects
+            .iter()
+            .any(|x| x.title == "placeholder content"));
     }
 
     #[test]
@@ -238,8 +258,14 @@ mod tests {
         std::os::unix::fs::symlink("real.txt", d.path().join("inside.txt")).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", d.path().join("escape.txt")).unwrap();
         let report = scan(d.path());
-        assert!(report.defects.iter().any(|x| x.title == "symlink in workspace"));
-        assert!(report.defects.iter().any(|x| x.title == "symlink escapes workspace"));
+        assert!(report
+            .defects
+            .iter()
+            .any(|x| x.title == "symlink in workspace"));
+        assert!(report
+            .defects
+            .iter()
+            .any(|x| x.title == "symlink escapes workspace"));
         assert!(!report.clean());
     }
 

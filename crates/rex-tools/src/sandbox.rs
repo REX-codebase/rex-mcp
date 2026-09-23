@@ -52,8 +52,7 @@ pub fn apply_in_child() -> Result<(), String> {
     // Map namespace-root back to the real uid/gid so workspace ownership
     // and permissions behave exactly as outside. setgroups must be denied
     // before the gid map can be written.
-    std::fs::write("/proc/self/setgroups", "deny")
-        .map_err(|e| format!("setgroups deny: {e}"))?;
+    std::fs::write("/proc/self/setgroups", "deny").map_err(|e| format!("setgroups deny: {e}"))?;
     std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))
         .map_err(|e| format!("uid_map: {e}"))?;
     std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))

@@ -9,8 +9,8 @@
 
 use crate::contract::{AcceptanceContract, Obligation, Proof};
 use crate::external_kernel::{
-    AdapterError, CandidateResponse, ExternalHostAdapter, HostCandidateRequest, HostEvidenceRequest,
-    HostKernelStatus, KernelState,
+    AdapterError, CandidateResponse, ExternalHostAdapter, HostCandidateRequest,
+    HostEvidenceRequest, HostKernelStatus, KernelState,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -178,9 +178,9 @@ impl UltraHostBridge {
         report: crate::daemon_adversary::DaemonAdversaryReport,
         receipts_hash: String,
     ) -> Result<UltraHostView, BridgeError> {
-        let mut adapter = self.load_existing(task_id)?.ok_or(BridgeError::Adapter(
-            AdapterError::EvidenceStageNotOpen,
-        ))?;
+        let mut adapter = self
+            .load_existing(task_id)?
+            .ok_or(BridgeError::Adapter(AdapterError::EvidenceStageNotOpen))?;
         adapter
             .record_daemon_adversary(candidate_id, report, receipts_hash)
             .map_err(BridgeError::Adapter)?;
@@ -198,9 +198,9 @@ impl UltraHostBridge {
         outcomes: std::collections::BTreeMap<String, bool>,
         receipts_hash: String,
     ) -> Result<UltraHostView, BridgeError> {
-        let mut adapter = self.load_existing(task_id)?.ok_or(BridgeError::Adapter(
-            AdapterError::EvidenceStageNotOpen,
-        ))?;
+        let mut adapter = self
+            .load_existing(task_id)?
+            .ok_or(BridgeError::Adapter(AdapterError::EvidenceStageNotOpen))?;
         adapter
             .record_daemon_verifier(candidate_id, outcomes, receipts_hash)
             .map_err(BridgeError::Adapter)?;
@@ -216,9 +216,9 @@ impl UltraHostBridge {
         candidate_id: &str,
         record: crate::external_kernel::DaemonVisualRecord,
     ) -> Result<UltraHostView, BridgeError> {
-        let mut adapter = self.load_existing(task_id)?.ok_or(BridgeError::Adapter(
-            AdapterError::EvidenceStageNotOpen,
-        ))?;
+        let mut adapter = self
+            .load_existing(task_id)?
+            .ok_or(BridgeError::Adapter(AdapterError::EvidenceStageNotOpen))?;
         adapter
             .record_daemon_visual(candidate_id, record)
             .map_err(BridgeError::Adapter)?;
@@ -228,9 +228,9 @@ impl UltraHostBridge {
 
     /// The current durable view; never creates or mutates state.
     pub fn current_view(&self, task_id: &str) -> Result<UltraHostView, BridgeError> {
-        let mut adapter = self.load_existing(task_id)?.ok_or(BridgeError::Adapter(
-            AdapterError::EvidenceStageNotOpen,
-        ))?;
+        let mut adapter = self
+            .load_existing(task_id)?
+            .ok_or(BridgeError::Adapter(AdapterError::EvidenceStageNotOpen))?;
         self.view(task_id, &mut adapter)
     }
 
@@ -346,18 +346,33 @@ mod tests {
             });
         }
         bridge
-            .record_daemon_adversary(task_id, candidate_id, report, canonical_hash(&clean).unwrap())
+            .record_daemon_adversary(
+                task_id,
+                candidate_id,
+                report,
+                canonical_hash(&clean).unwrap(),
+            )
             .unwrap()
     }
 
     /// The daemon's own verifier run over the plan-derived contract.
-    fn daemon_verify(bridge: &UltraHostBridge, task_id: &str, candidate_id: &str, proven: bool) -> UltraHostView {
+    fn daemon_verify(
+        bridge: &UltraHostBridge,
+        task_id: &str,
+        candidate_id: &str,
+        proven: bool,
+    ) -> UltraHostView {
         let outcomes = std::collections::BTreeMap::from([
             ("step-1".to_string(), proven),
             ("step-2".to_string(), proven),
         ]);
         bridge
-            .record_daemon_verifier(task_id, candidate_id, outcomes, canonical_hash(&proven).unwrap())
+            .record_daemon_verifier(
+                task_id,
+                candidate_id,
+                outcomes,
+                canonical_hash(&proven).unwrap(),
+            )
             .unwrap()
     }
 
@@ -390,9 +405,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let bridge = UltraHostBridge::open(directory.path()).unwrap();
         let facts = crate::skills::RepositoryFacts::default();
-        let plan =
-            crate::skills::compile_plan(&facts, &crate::skill_packs::first_class_registry())
-                .unwrap();
+        let plan = crate::skills::compile_plan(&facts, &crate::skill_packs::first_class_registry())
+            .unwrap();
         assert!(bridge.frozen_skill_plan("task-plan").unwrap().is_none());
         bridge.freeze_skill_plan("task-plan", &plan).unwrap();
         assert_eq!(

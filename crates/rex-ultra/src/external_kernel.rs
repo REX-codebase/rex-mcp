@@ -744,7 +744,9 @@ impl ExternalHostAdapter {
                 self.state.kernel = transition(
                     self.state.kernel.clone(),
                     KernelEvent::Fail {
-                        reason: "every candidate rejected by adversary, verifier or visual evidence".into(),
+                        reason:
+                            "every candidate rejected by adversary, verifier or visual evidence"
+                                .into(),
                     },
                 )
                 .map_err(AdapterError::Kernel)?;
@@ -995,7 +997,6 @@ mod tests {
         (adapter, requests)
     }
 
-
     fn clean_adversary_report() -> crate::daemon_adversary::DaemonAdversaryReport {
         crate::daemon_adversary::DaemonAdversaryReport {
             defects: Vec::new(),
@@ -1016,7 +1017,11 @@ mod tests {
             });
         }
         adapter
-            .record_daemon_adversary(candidate_id, report, canonical_hash(&"daemon-scan").unwrap())
+            .record_daemon_adversary(
+                candidate_id,
+                report,
+                canonical_hash(&"daemon-scan").unwrap(),
+            )
             .unwrap();
     }
 
@@ -1133,7 +1138,10 @@ mod tests {
     #[test]
     fn unproven_verifier_blocks_completion_until_every_candidate_fails() {
         let (mut adapter, _) = ready_adapter();
-        let candidates: Vec<String> = adapter.responses().map(|r| r.candidate_id.clone()).collect();
+        let candidates: Vec<String> = adapter
+            .responses()
+            .map(|r| r.candidate_id.clone())
+            .collect();
         for candidate in candidates {
             daemon_adversary(&mut adapter, &candidate, true);
             daemon_verify(&mut adapter, &candidate, false);
@@ -1308,7 +1316,10 @@ mod tests {
             KernelState::AwaitingEvidence
         ));
         adapter
-            .record_daemon_visual(&candidate, daemon_visual_record("thesis-a", 0xAAAA_5555_AAAA_5555, true))
+            .record_daemon_visual(
+                &candidate,
+                daemon_visual_record("thesis-a", 0xAAAA_5555_AAAA_5555, true),
+            )
             .unwrap();
         assert!(matches!(
             adapter.finalize().unwrap(),
@@ -1340,7 +1351,10 @@ mod tests {
         daemon_adversary(&mut adapter, &other, true);
         daemon_verify(&mut adapter, &other, true);
         adapter
-            .record_daemon_visual(&other, daemon_visual_record("thesis-b", 0x5555_AAAA_5555_AAAA, true))
+            .record_daemon_visual(
+                &other,
+                daemon_visual_record("thesis-b", 0x5555_AAAA_5555_AAAA, true),
+            )
             .unwrap();
         assert!(matches!(
             adapter.finalize().unwrap(),
@@ -1497,9 +1511,7 @@ mod tests {
             daemon_adversary(&mut adapter, candidate, true);
             daemon_verify(&mut adapter, candidate, true);
         }
-        adapter
-            .record_daemon_visual(&first, plain)
-            .unwrap();
+        adapter.record_daemon_visual(&first, plain).unwrap();
         assert!(matches!(
             adapter.finalize().unwrap(),
             KernelState::AwaitingEvidence
@@ -1517,7 +1529,10 @@ mod tests {
         let second = ids.next().unwrap();
         drop(ids);
         adapter
-            .record_daemon_visual(&first, daemon_visual_record("thesis-a", 0xFFFF_0000_FFFF_0000, true))
+            .record_daemon_visual(
+                &first,
+                daemon_visual_record("thesis-a", 0xFFFF_0000_FFFF_0000, true),
+            )
             .unwrap_err(); // no host declaration yet: nothing to bind to
         for (candidate, thesis) in [(&first, "thesis-a"), (&second, "thesis-b")] {
             let good = visual_report(thesis);
@@ -1540,11 +1555,17 @@ mod tests {
             daemon_verify(&mut adapter, candidate, true);
         }
         adapter
-            .record_daemon_visual(&first, daemon_visual_record("thesis-a", 0xFFFF_0000_FFFF_0000, true))
+            .record_daemon_visual(
+                &first,
+                daemon_visual_record("thesis-a", 0xFFFF_0000_FFFF_0000, true),
+            )
             .unwrap();
         // One bit apart: the second render is a copycat and cannot pass.
         adapter
-            .record_daemon_visual(&second, daemon_visual_record("thesis-b", 0xFFFF_0000_FFFF_0001, true))
+            .record_daemon_visual(
+                &second,
+                daemon_visual_record("thesis-b", 0xFFFF_0000_FFFF_0001, true),
+            )
             .unwrap();
         let record = adapter
             .candidate_evidence(&second)

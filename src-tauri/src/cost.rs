@@ -67,9 +67,7 @@ pub fn price_table() -> Vec<ModelPrice> {
 }
 
 pub fn estimate_cost(model_id: &str, prompt_tokens: u64, completion_tokens: u64) -> Option<f64> {
-    let price = price_table()
-        .into_iter()
-        .find(|p| p.model_id == model_id)?;
+    let price = price_table().into_iter().find(|p| p.model_id == model_id)?;
     Some(
         (prompt_tokens as f64 / 1_000_000.0) * price.input_per_1m
             + (completion_tokens as f64 / 1_000_000.0) * price.output_per_1m,

@@ -225,10 +225,7 @@ fn probe_server(server_command: &str) -> Result<Vec<(String, String)>, String> {
     use std::time::Duration;
 
     let mut parts = server_command.split_whitespace();
-    let bin = parts
-        .next()
-        .ok_or("server command is empty")?
-        .to_string();
+    let bin = parts.next().ok_or("server command is empty")?.to_string();
     let args: Vec<String> = parts.map(|s| s.to_string()).collect();
 
     let mut child = Command::new(&bin)

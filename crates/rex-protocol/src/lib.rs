@@ -885,8 +885,7 @@ mod tests {
         assert!(sub.evidence.is_empty());
         // Protocol 2.0 fails closed: capability-bearing calls MUST NOT
         // deserialize into a usable request without the capability.
-        let no_cap =
-            r#"{"task_id":"task-1","lease_epoch":1,"action_id":"a","narrative":"done"}"#;
+        let no_cap = r#"{"task_id":"task-1","lease_epoch":1,"action_id":"a","narrative":"done"}"#;
         assert!(serde_json::from_str::<SubmitRequest>(no_cap).is_err());
     }
 

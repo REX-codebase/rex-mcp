@@ -35,13 +35,22 @@ pub struct ArtifactBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactError {
-    TooLarge { bytes: u64, max: u64 },
+    TooLarge {
+        bytes: u64,
+        max: u64,
+    },
     /// Digest already bound to a different candidate or round: stale or
     /// reused evidence, never silently re-anchored.
-    ReusedDigest { sha256: String },
+    ReusedDigest {
+        sha256: String,
+    },
     /// Stored bytes no longer match their content address.
-    Tampered { sha256: String },
-    Missing { sha256: String },
+    Tampered {
+        sha256: String,
+    },
+    Missing {
+        sha256: String,
+    },
     Io(String),
 }
 
@@ -78,7 +87,10 @@ impl ArtifactStore {
         let bindings = root.join("evidence").join("bindings");
         fs::create_dir_all(&artifacts).map_err(ioe)?;
         fs::create_dir_all(&bindings).map_err(ioe)?;
-        Ok(Self { artifacts, bindings })
+        Ok(Self {
+            artifacts,
+            bindings,
+        })
     }
 
     /// Store bytes under their sha256 and bind them to (task, candidate,
@@ -209,7 +221,13 @@ mod tests {
     fn put_get_roundtrip_and_content_addressed() {
         let (_d, s) = store();
         let (b, fresh) = s
-            .put("task-1", "screenshot", b"png-bytes", Some("cand-1".into()), Some(1))
+            .put(
+                "task-1",
+                "screenshot",
+                b"png-bytes",
+                Some("cand-1".into()),
+                Some(1),
+            )
             .unwrap();
         assert!(fresh);
         assert_eq!(b.sha256, sha256_hex(b"png-bytes"));
@@ -220,15 +238,22 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o444);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
         }
     }
 
     #[test]
     fn identical_binding_is_idempotent() {
         let (_d, s) = store();
-        let (b1, f1) = s.put("task-1", "shot", b"x", Some("c".into()), Some(1)).unwrap();
-        let (b2, f2) = s.put("task-1", "shot", b"x", Some("c".into()), Some(1)).unwrap();
+        let (b1, f1) = s
+            .put("task-1", "shot", b"x", Some("c".into()), Some(1))
+            .unwrap();
+        let (b2, f2) = s
+            .put("task-1", "shot", b"x", Some("c".into()), Some(1))
+            .unwrap();
         assert!(f1 && !f2);
         assert_eq!(b1, b2);
         assert_eq!(s.bindings("task-1").len(), 1);
@@ -237,7 +262,8 @@ mod tests {
     #[test]
     fn digest_reused_for_other_candidate_or_round_is_rejected() {
         let (_d, s) = store();
-        s.put("task-1", "shot", b"x", Some("cand-1".into()), Some(1)).unwrap();
+        s.put("task-1", "shot", b"x", Some("cand-1".into()), Some(1))
+            .unwrap();
         // Same bytes, different candidate: reused evidence.
         assert!(matches!(
             s.put("task-1", "shot", b"x", Some("cand-2".into()), Some(1)),
@@ -254,8 +280,11 @@ mod tests {
     #[test]
     fn same_digest_is_reusable_across_distinct_tasks() {
         let (_d, s) = store();
-        s.put("task-1", "shot", b"x", Some("c".into()), Some(1)).unwrap();
-        let (_b, fresh) = s.put("task-2", "shot", b"x", Some("c".into()), Some(1)).unwrap();
+        s.put("task-1", "shot", b"x", Some("c".into()), Some(1))
+            .unwrap();
+        let (_b, fresh) = s
+            .put("task-2", "shot", b"x", Some("c".into()), Some(1))
+            .unwrap();
         assert!(fresh);
     }
 
