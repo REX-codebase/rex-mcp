@@ -46,11 +46,15 @@ pub fn load(workspace: &Path) -> Result<Option<Policy>, PolicyError> {
     };
     let v: Value = serde_json::from_str(&raw)
         .map_err(|e| PolicyError(format!("{} is not valid JSON: {e}", path.display())))?;
+    parse(&v)
+        .map(Some)
+        .map_err(|e| PolicyError(format!("{}: {e}", path.display())))
+}
+
+/// Parse a policy from its JSON form (shared by the exec gate and `rex replay`).
+pub fn parse(v: &Value) -> Result<Policy, PolicyError> {
     if v.get("schema").and_then(Value::as_str) != Some(SCHEMA) {
-        return Err(PolicyError(format!(
-            "{}: expected schema {SCHEMA:?}",
-            path.display()
-        )));
+        return Err(PolicyError(format!("expected schema {SCHEMA:?}")));
     }
     let get_bool = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
     let get_f64 = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| *x > 0.0);
@@ -62,11 +66,11 @@ pub fn load(workspace: &Path) -> Result<Option<Policy>, PolicyError> {
                 .collect()
         })
     });
-    Ok(Some(Policy {
+    Ok(Policy {
         require_bid: get_bool("require_bid"),
         max_cost_usd: get_f64("max_cost_usd"),
         allowed_providers,
-    }))
+    })
 }
 
 impl Policy {

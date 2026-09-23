@@ -11,6 +11,7 @@ mod ledger;
 mod policy;
 mod provenance;
 mod redteam;
+mod replay;
 mod tournament;
 
 use cert::{keygen, verify_receipt};
@@ -29,6 +30,7 @@ fn usage() -> &'static str {
      \x20 rex tournament --task TASK --providers a,b [options]\n\
      \x20 rex redteam --task TASK --yes [options]\n\
      \x20 rex policy --workspace DIR\n\
+     \x20 rex replay RECEIPT.json [--json]\n\
      \x20 rex runs [--json] [--limit N]\n\
      \x20 rex show RUN_ID [--json]\n\
      \x20 rex keygen [--force]\n\
@@ -311,6 +313,7 @@ fn main() -> ExitCode {
         Some("tournament") => parse_tournament(&args[1..]).and_then(run_tournament),
         Some("redteam") => parse_redteam(&args[1..]).and_then(run_redteam),
         Some("policy") => run_policy(&args[1..]),
+        Some("replay") => run_replay_args(&args[1..]),
         Some("runs") => run_runs(&args[1..]).map(|_| 0),
         Some("show") => run_show(&args[1..]),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
@@ -356,6 +359,28 @@ fn run_policy(args: &[String]) -> Result<i32, ExecError> {
         None => println!("no policy: {ws} declares no .rex/policy.json contract"),
     }
     Ok(0)
+}
+
+fn run_replay_args(args: &[String]) -> Result<i32, ExecError> {
+    let mut path: Option<String> = None;
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            "--help" | "-h" => return Err(ExecError::usage(usage())),
+            other if other.starts_with('-') => {
+                return Err(ExecError::usage(format!("unknown flag '{other}'")))
+            }
+            other => {
+                if path.is_some() {
+                    return Err(ExecError::usage("rex replay takes one receipt path"));
+                }
+                path = Some(other.to_string());
+            }
+        }
+    }
+    let path = path.ok_or_else(|| ExecError::usage("rex replay RECEIPT.json [--json]"))?;
+    replay::run_replay(&path, json)
 }
 
 fn run_runs(args: &[String]) -> Result<(), ExecError> {
