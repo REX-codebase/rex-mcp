@@ -24,6 +24,11 @@ jobs:
         id: setup-chrome
       - name: Expose Chrome on PATH for the test suite
         run: sudo ln -sf "${{ steps.setup-chrome.outputs.chrome-path }}" /usr/local/bin/google-chrome && google-chrome --version
+      # tauri::generate_context!() panics at compile time when frontendDist
+      # is missing; the frontend job builds the real dist in parallel, so
+      # the Rust job only needs the path to exist for clippy/test.
+      - name: Stub frontend dist for Tauri context macro
+        run: mkdir -p dist
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

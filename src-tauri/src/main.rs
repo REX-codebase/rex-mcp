@@ -29,6 +29,7 @@ use rex_ultra::orchestrator::{UltraOptions, UltraRunService, UltraSnapshot};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use tauri::Emitter;
 use tauri::State;
 
 type Service = ProviderService<FileSecretStore, UreqTransport>;
@@ -849,9 +850,6 @@ fn fable_mcp_probe(server_command: String) -> Result<FableMcpLink, String> {
                     Ok(_) if !line.trim().is_empty() => break,
                     Ok(_) => continue,
                     Err(e) => return Err(format!("read failed: {e}")),
-                }
-                if start.elapsed() >= Duration::from_secs(10) {
-                    break;
                 }
             }
             if line.trim().is_empty() {
