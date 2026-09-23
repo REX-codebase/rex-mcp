@@ -9,6 +9,7 @@ mod cert;
 mod deadman;
 mod exec;
 mod ledger;
+mod mcp_ext;
 mod policy;
 mod provenance;
 mod redteam;
@@ -37,6 +38,7 @@ fn usage() -> &'static str {
      \x20 rex checkin --file PATH\n\
      \x20 rex skill install DIR [--force] | list | show NAME | verify [NAME]\n\
      \x20             | remove NAME | pack DIR\n\
+     \x20 rex mcp list | tools [SERVER] | call SERVER TOOL [--args JSON]\n\
      \x20 rex serve [--port N]\n\
      \x20 rex runs [--json] [--limit N]\n\
      \x20 rex show RUN_ID [--json]\n\
@@ -335,6 +337,7 @@ fn main() -> ExitCode {
         Some("replay") => run_replay_args(&args[1..]),
         Some("checkin") => run_checkin(&args[1..]),
         Some("skill") => run_skill(&args[1..]),
+        Some("mcp") => run_mcp(&args[1..]),
         Some("serve") => run_serve_args(&args[1..]),
         Some("runs") => run_runs(&args[1..]).map(|_| 0),
         Some("show") => run_show(&args[1..]),
@@ -608,6 +611,157 @@ fn run_serve_args(args: &[String]) -> Result<i32, ExecError> {
         i += 1;
     }
     serve::run_serve(port)
+}
+
+/// External MCP servers: `rex mcp list | tools [SERVER] | call SERVER TOOL [--args JSON]`.
+/// Config: `.rex/mcp.json` in the workspace (or cwd), else `$REX_STATE_DIR/mcp.json`.
+fn run_mcp(args: &[String]) -> Result<i32, ExecError> {
+    let usage_msg =
+        "rex mcp list | tools [SERVER] [--json] | call SERVER TOOL [--args JSON] [--workspace DIR]";
+    let mut sub: Option<&str> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut workspace: Option<std::path::PathBuf> = None;
+    let mut call_args = serde_json::json!({});
+    let mut json_out = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .ok_or_else(|| ExecError::usage("--workspace expects a value"))?
+                        .into(),
+                );
+            }
+            "--args" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| ExecError::usage("--args expects a JSON object"))?;
+                call_args = serde_json::from_str(raw)
+                    .map_err(|e| ExecError::usage(format!("--args is not valid JSON: {e}")))?;
+                if !call_args.is_object() {
+                    return Err(ExecError::usage("--args must be a JSON object"));
+                }
+            }
+            "--help" | "-h" => return Err(ExecError::usage(usage_msg)),
+            "--json" => json_out = true,
+            other if other.starts_with('-') => {
+                return Err(ExecError::usage(format!("unknown flag '{other}'")));
+            }
+            other => {
+                if sub.is_none() {
+                    sub = Some(other);
+                } else {
+                    positional.push(other);
+                }
+            }
+        }
+        i += 1;
+    }
+    let sub = sub.ok_or_else(|| ExecError::usage(usage_msg))?;
+    let state = exec::state_dir();
+    let (cfg_path, servers) =
+        mcp_ext::load_config(workspace.as_deref(), &state).map_err(ExecError::internal)?;
+    let find = |name: &str| {
+        servers
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                ExecError::usage(format!("no MCP server {name:?} in {}", cfg_path.display()))
+            })
+    };
+    match sub {
+        "list" => {
+            if !positional.is_empty() {
+                return Err(ExecError::usage(usage_msg));
+            }
+            println!("MCP servers ({}):", cfg_path.display());
+            for s in &servers {
+                println!("  {}: {} {}", s.name, s.command, s.args.join(" "));
+            }
+            Ok(0)
+        }
+        "tools" => {
+            if positional.len() > 1 {
+                return Err(ExecError::usage(usage_msg));
+            }
+            let targets: Vec<mcp_ext::ExtServer> = match positional.first() {
+                Some(name) => vec![find(name)?],
+                None => servers.clone(),
+            };
+            if targets.is_empty() {
+                return Err(ExecError::internal(format!(
+                    "no servers configured in {}",
+                    cfg_path.display()
+                )));
+            }
+            let mut failed = false;
+            let mut all: Vec<mcp_ext::ExtTool> = Vec::new();
+            for srv in targets {
+                match mcp_ext::McpExtClient::spawn(&srv).and_then(|mut c| {
+                    let tools = c.list_tools()?;
+                    Ok((c.negotiated_version().to_string(), tools))
+                }) {
+                    Ok((version, tools)) => {
+                        if !json_out {
+                            println!(
+                                "{} (protocol {}): {} tool(s)",
+                                srv.name,
+                                version,
+                                tools.len()
+                            );
+                            for t in &tools {
+                                let desc = if t.description.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" — {}", t.description.lines().next().unwrap_or(""))
+                                };
+                                println!("  {}{}", t.name, desc);
+                            }
+                        }
+                        all.extend(tools);
+                    }
+                    Err(e) => {
+                        eprintln!("rex: mcp: {}: {e}", srv.name);
+                        failed = true;
+                    }
+                }
+            }
+            if json_out {
+                let arr: Vec<serde_json::Value> = all
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "server": t.server,
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr).unwrap());
+            }
+            Ok(if failed { 1 } else { 0 })
+        }
+        "call" => {
+            if positional.len() != 2 {
+                return Err(ExecError::usage(usage_msg));
+            }
+            let srv = find(positional[0])?;
+            let mut client = mcp_ext::McpExtClient::spawn(&srv).map_err(ExecError::internal)?;
+            let result = client
+                .call_tool(positional[1], call_args)
+                .map_err(ExecError::internal)?;
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            Ok(0)
+        }
+        other => Err(ExecError::usage(format!(
+            "unknown mcp subcommand '{other}': {usage_msg}"
+        ))),
+    }
 }
 
 fn run_runs(args: &[String]) -> Result<(), ExecError> {
