@@ -72,6 +72,14 @@ pub struct PreparedCall {
     pub policy_reason: String,
 }
 
+/// Original vs proposed content for a pending file write, for the diff UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub original: String,
+    pub modified: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CallState {
@@ -212,6 +220,65 @@ impl ToolRuntime {
             },
         );
         Ok(prepared)
+    }
+
+    /// A file diff for a pending call, for the approval UI.
+    /// Returns the original and proposed content so the UI can render a
+    /// Monaco diff. Only meaningful for CreateFile/EditFile; others return
+    /// None.
+    pub fn pending_diff(&self, call_id: &str) -> Result<Option<FileDiff>, ToolError> {
+        let pending = self.pending.lock().expect("pending lock poisoned");
+        let entry = pending
+            .get(call_id)
+            .ok_or_else(|| err(ErrorKind::NotFound, "unknown call id"))?;
+        match &entry.request {
+            ToolRequest::CreateFile {
+                path,
+                content,
+                overwrite,
+            } => {
+                // For a new file, original is empty. If overwrite is set and
+                // the file exists, show the existing content as original.
+                let original = if *overwrite {
+                    self.resolve_existing(path, false)
+                        .ok()
+                        .and_then(|p| fs::read_to_string(p).ok())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                Ok(Some(FileDiff {
+                    path: path.clone(),
+                    original,
+                    modified: content.clone(),
+                }))
+            }
+            ToolRequest::EditFile {
+                path,
+                expected,
+                replacement,
+                replace_all,
+            } => {
+                let target = self.resolve_existing(path, false)?;
+                let old = fs::read_to_string(&target).map_err(io_err)?;
+                if old.len() > MAX_FILE_BYTES as usize {
+                    return Err(err(ErrorKind::TooLarge, "file exceeds 2 MiB edit limit"));
+                }
+                // Apply the edit in memory (same logic as edit_file, without
+                // writing) to produce the proposed content.
+                let new = if *replace_all {
+                    old.replace(expected, replacement)
+                } else {
+                    old.replacen(expected, replacement, 1)
+                };
+                Ok(Some(FileDiff {
+                    path: path.clone(),
+                    original: old,
+                    modified: new,
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// This method must be called only from a trusted UI action, never from a model tool payload.
@@ -1491,5 +1558,61 @@ mod tests {
             r.error.unwrap().kind,
             ErrorKind::OutsideWorkspace | ErrorKind::SymlinkRefused | ErrorKind::NotFound
         ));
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    fn temp() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rex-diff-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pending_diff_for_edit_file() {
+        let root = temp();
+        std::fs::write(root.join("a.txt"), "hello world").unwrap();
+        let rt = ToolRuntime::new(root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::EditFile {
+                path: "a.txt".into(),
+                expected: "world".into(),
+                replacement: "rust".into(),
+                replace_all: false,
+            })
+            .unwrap();
+        let diff = rt.pending_diff(&p.call_id).unwrap().unwrap();
+        assert_eq!(diff.path, "a.txt");
+        assert_eq!(diff.original, "hello world");
+        assert_eq!(diff.modified, "hello rust");
+    }
+
+    #[test]
+    fn pending_diff_for_create_file() {
+        let root = temp();
+        let rt = ToolRuntime::new(root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::CreateFile {
+                path: "new.txt".into(),
+                content: "fresh".into(),
+                overwrite: false,
+            })
+            .unwrap();
+        let diff = rt.pending_diff(&p.call_id).unwrap().unwrap();
+        assert_eq!(diff.original, "");
+        assert_eq!(diff.modified, "fresh");
+    }
+
+    #[test]
+    fn pending_diff_none_for_read() {
+        let root = temp();
+        let rt = ToolRuntime::new(root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::ReadFile { path: "x".into() })
+            .unwrap();
+        assert!(rt.pending_diff(&p.call_id).unwrap().is_none());
     }
 }

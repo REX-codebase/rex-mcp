@@ -27,6 +27,7 @@ import { rexTaskBegin } from "./data/rexTasks";
 import { FableCountdown } from "./components/FableCountdown";
 import { loadFableSessionName, saveFableSessionName, fableCreateSession } from "./data/fable";
 import { TerminalView } from "./components/TerminalView";
+import { WorkspaceEditor } from "./components/WorkspaceEditor";
 import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
   agentCancel,
@@ -80,7 +81,7 @@ export default function App() {
     try { saveOperatorMode(mode); } catch { /* storage unavailable */ }
     setOperatorMode(mode);
   };
-  const [view, setView] = useState<"task" | "settings" | "terminal">("task");
+  const [view, setView] = useState<"task" | "settings" | "terminal" | "editor">("task");
   const [browserPhase, setBrowserPhase] = useState<"closed" | "active" | "collapsed">("closed");
   const [browserRun, setBrowserRun] = useState(0);
   const [ultra, setUltra] = useState(false);
@@ -667,6 +668,8 @@ export default function App() {
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
         {view === "terminal" ? (
           <TerminalView />
+        ) : view === "editor" ? (
+          <WorkspaceEditor />
         ) : view === "settings" ? (
           <SettingsView
             motion={motion}

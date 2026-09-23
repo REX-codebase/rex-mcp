@@ -247,6 +247,92 @@ fn tool_cancel(
     tools.cancel(&call_id)
 }
 
+/// Get the file diff for a pending tool call, for the approval UI.
+/// Returns null for non-file calls.
+#[tauri::command]
+fn tool_call_diff(
+    tools: State<'_, Arc<LocalTools>>,
+    call_id: String,
+) -> Result<Option<rex_tools::FileDiff>, String> {
+    tools
+        .pending_diff(&call_id)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Workspace editor: direct file read/write bound to the workspace.
+// ---------------------------------------------------------------------------
+
+/// Validate that `path` (relative or absolute) resolves under `workspace`.
+fn resolve_workspace_path(workspace: &str, path: &str) -> Result<PathBuf, String> {
+    let ws = PathBuf::from(workspace)
+        .canonicalize()
+        .map_err(|e| format!("workspace not found: {e}"))?;
+    let target = if PathBuf::from(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        ws.join(path)
+    };
+    // For existing files, canonicalize to resolve symlinks. For new files,
+    // canonicalize the parent.
+    let canonical = if target.exists() {
+        target.canonicalize().map_err(|e| format!("cannot resolve path: {e}"))?
+    } else {
+        let parent = target.parent().ok_or("invalid path")?;
+        let canon_parent = parent
+            .canonicalize()
+            .map_err(|e| format!("parent not found: {e}"))?;
+        canon_parent.join(target.file_name().ok_or("invalid path")?)
+    };
+    if !canonical.starts_with(&ws) {
+        return Err("path escapes the workspace".to_string());
+    }
+    Ok(canonical)
+}
+
+/// Read a workspace file for the inline editor.
+#[tauri::command]
+fn workspace_read_file(workspace: String, path: String) -> Result<String, String> {
+    let target = resolve_workspace_path(&workspace, &path)?;
+    std::fs::read_to_string(&target).map_err(|e| format!("cannot read file: {e}"))
+}
+
+/// Write a workspace file from the inline editor. The user is explicitly
+/// editing, so this does not go through the approval gate — the editor UI
+/// shows a dirty indicator and the write is the user's own action.
+#[tauri::command]
+fn workspace_write_file(
+    workspace: String,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    let target = resolve_workspace_path(&workspace, &path)?;
+    if content.len() > 2 * 1024 * 1024 {
+        return Err("file exceeds 2 MiB write limit".to_string());
+    }
+    std::fs::write(&target, content).map_err(|e| format!("cannot write file: {e}"))
+}
+
+/// List files in the workspace (non-recursive, for the editor picker).
+#[tauri::command]
+fn workspace_list_files(workspace: String) -> Result<Vec<String>, String> {
+    let ws = PathBuf::from(&workspace)
+        .canonicalize()
+        .map_err(|e| format!("workspace not found: {e}"))?;
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&ws).map_err(|e| format!("cannot list: {e}"))? {
+        let entry = entry.map_err(|e| format!("cannot read entry: {e}"))?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(&ws) {
+                files.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 #[tauri::command]
 fn preview_detect(
     preview: State<'_, Arc<NativePreview>>,
@@ -1141,6 +1227,10 @@ fn main() {
             tool_resolve_approval,
             tool_execute,
             tool_cancel,
+            tool_call_diff,
+            workspace_read_file,
+            workspace_write_file,
+            workspace_list_files,
             preview_detect,
             preview_start,
             preview_status,

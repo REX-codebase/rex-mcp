@@ -590,3 +590,15 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .terminal-view-body{height:480px;border:1px solid var(--color-line);border-radius:12px;overflow:hidden;background:#0d1117}
 .terminal-view-body .xterm{padding:8px;height:100%}
 .terminal-view--error{padding:16px;border:1px solid var(--color-line);border-radius:12px}
+
+/* Monaco diff viewer in approval flow. */
+.diff-viewer{margin:12px 0;border:1px solid var(--color-line);border-radius:12px;overflow:hidden}
+.diff-viewer-path{padding:8px 12px;font-size:11px;font-family:ui-monospace,monospace;color:var(--color-faint);border-bottom:1px solid var(--color-line);margin:0}
+
+/* Inline workspace editor. */
+.workspace-editor{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.workspace-editor-bar{display:flex;align-items:center;gap:10px}
+.workspace-editor-bar select{padding:8px 10px;border:1px solid var(--color-line);border-radius:8px;background:transparent;font-size:12px;color:var(--color-text);max-width:320px}
+.workspace-editor-error{font-size:12px;color:#c0392b}
+.workspace-editor-body{border:1px solid var(--color-line);border-radius:12px;overflow:hidden;min-height:480px}
+.workspace-editor-empty{padding:32px;text-align:center;color:var(--color-faint);font-size:13px}
