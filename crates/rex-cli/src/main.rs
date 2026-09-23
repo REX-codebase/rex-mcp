@@ -8,6 +8,7 @@ mod bid;
 mod cert;
 mod exec;
 mod ledger;
+mod policy;
 mod provenance;
 mod redteam;
 mod tournament;
@@ -27,6 +28,7 @@ fn usage() -> &'static str {
      \x20 rex exec [--task TASK | TASK...] [options]\n\
      \x20 rex tournament --task TASK --providers a,b [options]\n\
      \x20 rex redteam --task TASK --yes [options]\n\
+     \x20 rex policy --workspace DIR\n\
      \x20 rex runs [--json] [--limit N]\n\
      \x20 rex show RUN_ID [--json]\n\
      \x20 rex keygen [--force]\n\
@@ -308,6 +310,7 @@ fn main() -> ExitCode {
         Some("exec") => parse_exec(&args[1..]).and_then(run_exec),
         Some("tournament") => parse_tournament(&args[1..]).and_then(run_tournament),
         Some("redteam") => parse_redteam(&args[1..]).and_then(run_redteam),
+        Some("policy") => run_policy(&args[1..]),
         Some("runs") => run_runs(&args[1..]).map(|_| 0),
         Some("show") => run_show(&args[1..]),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
@@ -324,6 +327,35 @@ fn main() -> ExitCode {
             ExitCode::from(e.code as u8)
         }
     }
+}
+
+fn run_policy(args: &[String]) -> Result<i32, ExecError> {
+    let mut workspace: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| ExecError::usage("--workspace expects a value"))?,
+                );
+            }
+            "--help" | "-h" => return Err(ExecError::usage(usage())),
+            other => {
+                return Err(ExecError::usage(format!("unknown argument '{other}'")));
+            }
+        }
+        i += 1;
+    }
+    let ws = workspace.ok_or_else(|| ExecError::usage("rex policy --workspace DIR"))?;
+    let path = std::path::PathBuf::from(&ws);
+    match policy::load(&path).map_err(|e| ExecError::usage(format!("policy: {e}")))? {
+        Some(p) => println!("{}", serde_json::to_string_pretty(&p.to_json()).unwrap()),
+        None => println!("no policy: {ws} declares no .rex/policy.json contract"),
+    }
+    Ok(0)
 }
 
 fn run_runs(args: &[String]) -> Result<(), ExecError> {

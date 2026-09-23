@@ -189,6 +189,7 @@ fn receipt(
     snap: &AgentSnapshot,
     workspace: Option<&Path>,
     accepted_bid: Option<&crate::bid::Bid>,
+    policy: Option<&crate::policy::Policy>,
 ) -> Map<String, Value> {
     let status_str = serde_json::to_value(&snap.status)
         .ok()
@@ -233,6 +234,7 @@ fn receipt(
         "cost_basis": accepted_bid.map(|_| "worst-case: all tokens at the output price"),
         "bid_met": accepted_bid.map(|b| b.proof_gaps(&status_str, snap.completion_summary.as_deref()).is_empty()),
         "bid_gaps": accepted_bid.map(|b| b.proof_gaps(&status_str, snap.completion_summary.as_deref())),
+        "policy": policy.map(|p| p.to_json()),
     })
     .as_object()
     .cloned()
@@ -339,6 +341,39 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         )));
     }
 
+    // Proof contract: load `.rex/policy.json` from the source workspace
+    // before anything else, and fail closed on a malformed contract.
+    let source_workspace: Option<std::path::PathBuf> = match &opts.workspace {
+        Some(w) => {
+            let p = if w.is_absolute() {
+                w.clone()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| ExecError::internal(format!("cannot resolve cwd: {e}")))?
+                    .join(w)
+            };
+            Some(p)
+        }
+        None => None,
+    };
+    let policy: Option<crate::policy::Policy> = match &source_workspace {
+        Some(src) => {
+            crate::policy::load(src).map_err(|e| ExecError::usage(format!("policy: {e}")))?
+        }
+        None => None,
+    };
+    if let Some(p) = &policy {
+        // Provider allowlist can be checked before any budgets are built.
+        if let Some(allowed) = &p.allowed_providers {
+            if !allowed.iter().any(|a| a == &opts.provider) {
+                return Err(ExecError::usage(format!(
+                    "policy allows providers {allowed:?}; '{}' is not one of them",
+                    opts.provider
+                )));
+            }
+        }
+    }
+
     let mut budgets = Budgets::default();
     if let Some(s) = opts.max_steps {
         budgets.max_steps = s;
@@ -404,6 +439,14 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         None
     };
 
+    // The rest of the contract: bid requirement and cost cap, enforced
+    // against the accepted bid before the run starts.
+    if let Some(p) = &policy {
+        let ceiling = accepted_bid.as_ref().and_then(|b| b.max_cost_usd);
+        p.check(&opts.provider, accepted_bid.is_some(), ceiling)
+            .map_err(|e| ExecError::usage(format!("policy: {e}")))?;
+    }
+
     if opts.dry_run {
         let config = serde_json::json!({
             "schema": "rex.exec.dry_run/1",
@@ -416,6 +459,7 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
             "max_wall_ms": budgets.max_wall_ms,
             "auto_approve": opts.yes,
             "workspace": opts.workspace.as_ref().map(|w| w.display().to_string()),
+            "policy": policy.as_ref().map(|p| p.to_json()),
         });
         return Ok(ExecOutput {
             code: 0,
@@ -469,6 +513,7 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         &final_snap,
         staged_workspace.as_deref(),
         accepted_bid.as_ref(),
+        policy.as_ref(),
     );
 
     // Leapfrog bet 1: every receipt is signed. A failed signature must
