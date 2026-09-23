@@ -14,7 +14,7 @@
 //! route exists.
 
 use crate::autonomous::{
-    AgentSnapshot, AgentStatus, AutonomousRunService, Budgets, TerminalReason,
+    AgentSnapshot, AgentStatus, AutonomousRunService, Budgets, SessionMeta, TerminalReason,
 };
 use crate::http::Transport;
 use crate::secrets::SecretStore;
@@ -249,6 +249,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
                 Some(workspace),
                 Role::Worker,
                 req.plan_mode,
+                SessionMeta::default(),
             )
             .map_err(|e| {
                 // The run never started; release custody honestly.

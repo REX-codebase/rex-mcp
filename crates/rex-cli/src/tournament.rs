@@ -114,6 +114,8 @@ pub fn run_tournament(opts: TournamentOptions) -> Result<i32, ExecError> {
             deadman_mins: None,
             deadman_file: None,
             skills: vec![],
+            name: None,
+            continued_from: None,
             interactive: None,
             on_begin: None,
         };

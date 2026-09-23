@@ -284,10 +284,28 @@ struct TaskBrief {
     /// before any tool executes. Legacy briefs (no field) run un-gated.
     #[serde(default)]
     plan_mode: bool,
+    /// Human-given session label (`rex exec --name`). Purely cosmetic: it
+    /// never changes what the run may do. Legacy briefs carry none.
+    #[serde(default)]
+    name: Option<String>,
+    /// Run id this session continues (`rex resume`). Chains sessions
+    /// together; `None` means the session started fresh.
+    #[serde(default)]
+    continued_from: Option<String>,
 }
 
 fn legacy_prompt_marker() -> String {
     "legacy-unknown".to_string()
+}
+
+/// Human-facing session metadata recorded on the run brief. Everything is
+/// optional; `SessionMeta::default()` keeps the historical anonymous
+/// behavior. The name is a label only — it grants no capability and changes
+/// no behavior.
+#[derive(Debug, Clone, Default)]
+pub struct SessionMeta {
+    pub name: Option<String>,
+    pub continued_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -509,7 +527,14 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         requested_model: Option<&str>,
         budgets: Option<Budgets>,
     ) -> Result<AgentSnapshot, String> {
-        self.begin_in_workspace(task, provider, requested_model, budgets, None)
+        self.begin_in_workspace(
+            task,
+            provider,
+            requested_model,
+            budgets,
+            None,
+            SessionMeta::default(),
+        )
     }
 
     /// Start a run in a caller-provided workspace. Ultra uses this so the
@@ -522,6 +547,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         requested_model: Option<&str>,
         budgets: Option<Budgets>,
         workspace: Option<PathBuf>,
+        session: SessionMeta,
     ) -> Result<AgentSnapshot, String> {
         self.begin_in_workspace_with_role(
             task,
@@ -531,6 +557,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             workspace,
             Role::Worker,
             false,
+            session,
         )
     }
 
@@ -554,6 +581,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         workspace: Option<PathBuf>,
         role: Role,
         plan_mode: bool,
+        session: SessionMeta,
     ) -> Result<AgentSnapshot, String> {
         let task = task.trim();
         if task.is_empty() {
@@ -629,6 +657,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             role: Some(role.name().to_string()),
             allowed_tools,
             plan_mode,
+            name: session.name,
+            continued_from: session.continued_from,
         };
         write_brief(&state_dir, &brief)?;
         write_json(&state_dir.join("plan.json"), &Vec::<PlanItem>::new())?;
@@ -3544,6 +3574,8 @@ mod tests {
             role: None,
             allowed_tools: None,
             plan_mode: false,
+            name: None,
+            continued_from: None,
         };
         write_brief(&dir, &brief).unwrap();
         let mut changed = brief.clone();
@@ -3551,6 +3583,34 @@ mod tests {
         assert!(write_brief(&dir, &changed).is_err());
         let on_disk: TaskBrief = read_json(&dir.join("brief.json")).unwrap();
         assert_eq!(on_disk.task, "original ask");
+    }
+
+    #[test]
+    fn session_meta_is_recorded_on_the_brief() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![call_turn(vec![complete_call("{\"ok\":true}")])]),
+        ));
+        let snap = svc
+            .begin_in_workspace_with_role(
+                "do the thing",
+                "gemini",
+                None,
+                Some(budgets()),
+                None,
+                Role::Worker,
+                false,
+                SessionMeta {
+                    name: Some("alpha".into()),
+                    continued_from: Some("agent-0-aaa".into()),
+                },
+            )
+            .unwrap();
+        let on_disk: TaskBrief =
+            read_json(&svc.run_dir(&snap.id).join("state").join("brief.json")).unwrap();
+        assert_eq!(on_disk.name.as_deref(), Some("alpha"));
+        assert_eq!(on_disk.continued_from.as_deref(), Some("agent-0-aaa"));
     }
 
     #[test]
@@ -4104,6 +4164,7 @@ mod tests {
                 None,
                 Role::Adversary,
                 false,
+                SessionMeta::default(),
             )
             .unwrap();
         auto_approve(svc.clone(), snap.id.clone());
@@ -4276,6 +4337,7 @@ mod tests {
                 Some(ws.clone()),
                 Role::Worker,
                 true,
+                SessionMeta::default(),
             )
             .expect("plan-mode begin");
         (snap.id, ws)

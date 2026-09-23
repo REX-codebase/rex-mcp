@@ -117,6 +117,8 @@ fn exec_opts_for(
         deadman_mins: None,
         deadman_file: None,
         skills: vec![],
+        name: None,
+        continued_from: None,
         interactive: None,
         on_begin: None,
     }

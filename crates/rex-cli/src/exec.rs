@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use crate::cert::{load_or_generate, sign_receipt};
 use crate::ledger;
+use crate::{parse_u64, parse_usize, usage};
 
 const RECEIPT_SCHEMA: &str = "rex.exec.receipt/1";
 
@@ -96,6 +97,12 @@ pub struct ExecOptions {
     pub deadman_file: Option<PathBuf>,
     /// Skill packs to load into the run, by library name. Repeatable.
     pub skills: Vec<String>,
+    /// Human-given session label (`rex exec --name`). Shown by `rex runs`
+    /// and `rex show`; recorded on the brief and the receipt. Cosmetic only.
+    pub name: Option<String>,
+    /// Run id this session continues (`rex resume`). Recorded on the brief
+    /// and the receipt; the workspace is seeded from that run's final state.
+    pub continued_from: Option<String>,
     /// Interactive approval slot: when set, the drive loop parks on
     /// AwaitingApproval/AwaitingPlan until an external decision arrives,
     /// instead of erroring. Used by `rex serve`. Not a CLI flag.
@@ -227,6 +234,8 @@ fn receipt(
         "task": opts.task,
         "provider": snap.provider,
         "model": snap.model,
+        "name": opts.name,
+        "continued_from": opts.continued_from,
         "status": snap.status,
         "terminal_reason": terminal_reason_value(&snap.terminal_reason),
         "steps": snap.step,
@@ -589,6 +598,8 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
             "workspace": opts.workspace.as_ref().map(|w| w.display().to_string()),
             "policy": policy.as_ref().map(|p| p.to_json()),
             "deadman_mins": opts.deadman_mins,
+            "name": opts.name,
+            "continued_from": opts.continued_from,
         });
         return Ok(ExecOutput {
             code: 0,
@@ -629,11 +640,21 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
             opts.model.as_deref(),
             Some(budgets),
             staged_workspace.clone(),
+            rex_providers::autonomous::SessionMeta {
+                name: opts.name.clone(),
+                continued_from: opts.continued_from.clone(),
+            },
         )
         .map_err(ExecError::internal)?;
     let run_id = snap.id.clone();
     if !opts.json {
-        eprintln!("rex: run {run_id} started (provider {})", opts.provider);
+        match &opts.name {
+            Some(n) => eprintln!(
+                "rex: run {run_id} started (session '{n}', provider {})",
+                opts.provider
+            ),
+            None => eprintln!("rex: run {run_id} started (provider {})", opts.provider),
+        }
     }
     // `rex serve` registers the live run here.
     if let Some(hook) = &opts.on_begin {
@@ -730,6 +751,223 @@ pub fn run_exec(opts: ExecOptions) -> Result<i32, ExecError> {
     Ok(out.code)
 }
 
+/// Validate a `--name` session label: 1-64 chars of letters, digits, dash
+/// and underscore. Anything else makes `rex runs` unreadable and risks
+/// shell-hostile identifiers downstream.
+pub fn validate_session_name(name: &str) -> Result<String, ExecError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ExecError::usage("--name must not be empty"));
+    }
+    if name.chars().count() > 64 {
+        return Err(ExecError::usage("--name must be at most 64 characters"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ExecError::usage(
+            "--name may only contain letters, digits, '-' and '_'",
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Resolve a `rex resume` identifier to a ledger receipt: exact run id
+/// first, then unique id prefix (both via `ledger::find`), then session
+/// name — the newest run wins when a name is reused across sessions.
+fn resolve_session_run(state: &std::path::Path, ident: &str) -> Result<Value, ExecError> {
+    if let Some(v) = ledger::find(state, ident) {
+        return Ok(v);
+    }
+    let mut named: Vec<Value> = ledger::read_all(state)
+        .into_iter()
+        .filter(|v| {
+            ledger::kind_of(v) == "exec" && v.get("name").and_then(Value::as_str) == Some(ident)
+        })
+        .collect();
+    // The ledger is append-ordered, so the last match is the newest run.
+    named
+        .pop()
+        .ok_or_else(|| ExecError::usage(format!("no run '{ident}' found by id or session name")))
+}
+
+/// `rex resume RUN_ID|NAME [--task T] ...`: start a new run that continues a
+/// finished session. The new run's workspace is seeded from the previous
+/// run's final workspace state and the session name (unless overridden)
+/// carries over, so `rex runs` shows the chain. The previous run is never
+/// mutated: resume always begins a fresh run id with `continued_from` set.
+pub fn run_resume(args: &[String]) -> Result<i32, ExecError> {
+    let mut ident: Option<String> = None;
+    let mut task: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut provider: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut max_steps: Option<usize> = None;
+    let mut max_tool_calls: Option<usize> = None;
+    let mut max_tokens: Option<u64> = None;
+    let mut timeout_secs: Option<u64> = None;
+    let mut skills: Vec<String> = Vec::new();
+    let mut yes = false;
+    let mut json = false;
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let take_value = |flag: &str, i: &mut usize| -> Result<String, ExecError> {
+            *i += 1;
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| ExecError::usage(format!("{flag} expects a value")))
+        };
+        match a {
+            "--task" => task = Some(take_value("--task", &mut i)?),
+            "--name" => name = Some(validate_session_name(&take_value("--name", &mut i)?)?),
+            "--provider" => provider = Some(take_value("--provider", &mut i)?),
+            "--model" => model = Some(take_value("--model", &mut i)?),
+            "--max-steps" => {
+                max_steps = Some(parse_usize(
+                    &take_value("--max-steps", &mut i)?,
+                    "--max-steps",
+                )?)
+            }
+            "--max-tool-calls" => {
+                max_tool_calls = Some(parse_usize(
+                    &take_value("--max-tool-calls", &mut i)?,
+                    "--max-tool-calls",
+                )?)
+            }
+            "--max-tokens" => {
+                max_tokens = Some(parse_u64(
+                    &take_value("--max-tokens", &mut i)?,
+                    "--max-tokens",
+                )?)
+            }
+            "--timeout-secs" => {
+                timeout_secs = Some(parse_u64(
+                    &take_value("--timeout-secs", &mut i)?,
+                    "--timeout-secs",
+                )?)
+            }
+            "--skill" => skills.push(take_value("--skill", &mut i)?),
+            "--yes" => yes = true,
+            "--json" => json = true,
+            "--dry-run" => dry_run = true,
+            "--help" | "-h" => return Err(ExecError::usage(usage())),
+            other if other.starts_with('-') => {
+                return Err(ExecError::usage(format!("unknown flag '{other}'")));
+            }
+            other => {
+                if ident.is_some() {
+                    return Err(ExecError::usage(
+                        "usage: rex resume RUN_ID|NAME [--task T] [--name N] [--provider P] [--model M] [--yes] [--json] [--dry-run]",
+                    ));
+                }
+                ident = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let ident = ident.ok_or_else(|| {
+        ExecError::usage(
+            "usage: rex resume RUN_ID|NAME [--task T] [--name N] [--provider P] [--model M] [--yes] [--json] [--dry-run]",
+        )
+    })?;
+
+    let state = state_dir();
+    let prev = resolve_session_run(&state, &ident)?;
+    if ledger::kind_of(&prev) != "exec" {
+        return Err(ExecError::usage(format!(
+            "cannot resume '{ident}': only single exec runs resume, not tournaments"
+        )));
+    }
+    let prev_id = prev
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ExecError::internal("ledger entry has no run_id".to_string()))?
+        .to_string();
+    let prev_task = prev
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let prev_provider = prev
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("gemini")
+        .to_string();
+    let prev_model = prev
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let prev_name = prev.get("name").and_then(Value::as_str).map(str::to_string);
+    let prev_ws = prev
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    let seed = match &prev_ws {
+        Some(p) if p.is_dir() => p.clone(),
+        _ => {
+            return Err(ExecError::internal(format!(
+                "cannot resume run '{prev_id}': its workspace is gone (expected at {}); start fresh with rex exec",
+                prev_ws.map(|p| p.display().to_string()).unwrap_or_else(|| "<none recorded>".to_string())
+            )));
+        }
+    };
+
+    let session_name = name.or(prev_name);
+    // `begin` rejects tasks over 4000 chars; keep the wrapped task under
+    // 3900 by trimming the quoted previous task when necessary.
+    let mut quoted_prev = prev_task;
+    if quoted_prev.chars().count() > 3000 {
+        quoted_prev = format!("{}…", quoted_prev.chars().take(3000).collect::<String>());
+    }
+    let task_text = match (&session_name, &task) {
+        (Some(n), Some(f)) => format!(
+            "Continuing session '{n}' (previous run {prev_id}). The workspace already holds that run's final state; pick up from there.\n\nPrevious task: {quoted_prev}\n\nFollow-up: {f}"
+        ),
+        (Some(n), None) => format!(
+            "Continue session '{n}' from run {prev_id} where it left off. The workspace already holds that run's final state; review it and continue the work to completion.\n\nOriginal task: {quoted_prev}"
+        ),
+        (None, Some(f)) => format!(
+            "Continuing run {prev_id}. The workspace already holds that run's final state; pick up from there.\n\nPrevious task: {quoted_prev}\n\nFollow-up: {f}"
+        ),
+        (None, None) => format!(
+            "Continue run {prev_id} where it left off. The workspace already holds that run's final state; review it and continue the work to completion.\n\nOriginal task: {quoted_prev}"
+        ),
+    };
+
+    let short: String = prev_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    let opts = ExecOptions {
+        task: task_text,
+        provider: provider.unwrap_or(prev_provider),
+        model: model.or(prev_model),
+        workspace: Some(seed),
+        name: session_name,
+        continued_from: Some(prev_id.clone()),
+        // A resume gets its own staging directory: it must never clobber the
+        // shared `cli-workspace` staging area another run may still need.
+        run_tag: Some(format!("-resume-{short}")),
+        max_steps,
+        max_tool_calls,
+        max_tokens,
+        timeout_secs,
+        skills,
+        yes,
+        json,
+        dry_run,
+        ..Default::default()
+    };
+    if !json {
+        eprintln!("rex: resuming {prev_id} as a new run (workspace seeded from its final state)");
+    }
+    run_exec(opts)
+}
+
 fn status_line(snap: &AgentSnapshot) -> String {
     format!(
         "{:?} after {} steps, {} tool calls, {} tokens, {} ms",
@@ -740,6 +978,134 @@ fn status_line(snap: &AgentSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static RESUME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fake_state(tag: &str) -> std::path::PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("rex-resume-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn fake_receipt(id: &str, name: Option<&str>, ws: Option<&str>, tournament: bool) -> Value {
+        let mut m = serde_json::json!({
+            "schema": if tournament { "rex.tournament.receipt/1" } else { "rex.exec.receipt/1" },
+            "run_id": id,
+            "task": "do things",
+            "provider": "gemini",
+            "model": "gemini-test",
+            "status": "Completed",
+            "finished_at": "2026-09-23T00:00:00Z",
+        });
+        if let Some(n) = name {
+            m["name"] = Value::String(n.to_string());
+        }
+        if let Some(w) = ws {
+            m["workspace"] = Value::String(w.to_string());
+        }
+        m
+    }
+
+    fn with_state_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = RESUME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("REX_STATE_DIR");
+        std::env::set_var("REX_STATE_DIR", dir);
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var("REX_STATE_DIR", v),
+            None => std::env::remove_var("REX_STATE_DIR"),
+        }
+        out
+    }
+
+    #[test]
+    fn session_name_validation_accepts_and_rejects() {
+        assert_eq!(validate_session_name("alpha-1_x").unwrap(), "alpha-1_x");
+        assert_eq!(validate_session_name("  spaced  ").unwrap(), "spaced");
+        for bad in ["", "   ", "has space", "semi;colon", "slash/x", "dot.name"] {
+            let e = validate_session_name(bad).unwrap_err();
+            assert_eq!(e.code, 2, "expected usage error for '{bad}'");
+        }
+        let long = "a".repeat(65);
+        assert_eq!(validate_session_name(&long).unwrap_err().code, 2);
+        let ok = "a".repeat(64);
+        assert_eq!(validate_session_name(&ok).unwrap(), ok);
+    }
+
+    #[test]
+    fn resume_resolves_by_exact_id_and_unique_prefix() {
+        let state = fake_state("resolve");
+        ledger::append(
+            &state,
+            &fake_receipt("agent-1-aaa", Some("first"), None, false),
+        );
+        ledger::append(
+            &state,
+            &fake_receipt("agent-2-bbb", Some("second"), None, false),
+        );
+        let v = resolve_session_run(&state, "agent-1-aaa").unwrap();
+        assert_eq!(v["name"], serde_json::json!("first"));
+        let v = resolve_session_run(&state, "agent-2-").unwrap();
+        assert_eq!(v["name"], serde_json::json!("second"));
+        let e = resolve_session_run(&state, "nope").unwrap_err();
+        assert_eq!(e.code, 2);
+        assert!(e.message.contains("no run 'nope' found"));
+    }
+
+    #[test]
+    fn resume_prefers_newest_run_for_reused_name() {
+        let state = fake_state("reused");
+        ledger::append(
+            &state,
+            &fake_receipt("agent-1-old", Some("alpha"), None, false),
+        );
+        ledger::append(
+            &state,
+            &fake_receipt("agent-2-new", Some("alpha"), None, false),
+        );
+        let v = resolve_session_run(&state, "alpha").unwrap();
+        assert_eq!(
+            v["run_id"],
+            serde_json::json!("agent-2-new"),
+            "reused names must resolve to the newest run"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_tournament_receipts() {
+        let state = fake_state("tourn");
+        ledger::append(&state, &fake_receipt("tourn-1", None, None, true));
+        with_state_dir(&state, || {
+            let e = run_resume(&["tourn-1".to_string()]).unwrap_err();
+            assert_eq!(e.code, 2);
+            assert!(e.message.contains("cannot resume"), "got: {}", e.message);
+        });
+    }
+
+    #[test]
+    fn resume_errors_honestly_when_workspace_is_gone() {
+        let state = fake_state("gone");
+        ledger::append(
+            &state,
+            &fake_receipt(
+                "agent-9-gone",
+                Some("lost"),
+                Some("/nonexistent/rex-workspace-xyz"),
+                false,
+            ),
+        );
+        with_state_dir(&state, || {
+            let e = run_resume(&["lost".to_string()]).unwrap_err();
+            assert_eq!(e.code, 1);
+            assert!(
+                e.message.contains("workspace is gone"),
+                "got: {}",
+                e.message
+            );
+        });
+    }
 
     #[test]
     fn env_name_uppercases_and_underscores() {

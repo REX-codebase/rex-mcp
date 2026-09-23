@@ -20,7 +20,7 @@ use crate::phase4::{
 use crate::verify::{self, ObligationStatus, VerificationReport};
 use rex_prompt::roles::Role;
 use rex_prompt::{sha256_hex as prompt_sha256_hex, Assembler};
-use rex_providers::autonomous::{AgentSnapshot, AutonomousRunService, Budgets};
+use rex_providers::autonomous::{AgentSnapshot, AutonomousRunService, Budgets, SessionMeta};
 use rex_providers::http::Transport;
 use rex_providers::oneshot;
 use rex_providers::secrets::SecretStore;
@@ -619,6 +619,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
             Some(ctx.workspace.clone()),
             Role::Builder,
             false,
+            SessionMeta::default(),
         ) {
             Ok(snap) => snap,
             Err(e) => {
@@ -720,6 +721,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                     Some(ctx.workspace.clone()),
                     Role::Adversary,
                     false,
+                    SessionMeta::default(),
                 ) {
                     Ok(run) => {
                         ctx.handle

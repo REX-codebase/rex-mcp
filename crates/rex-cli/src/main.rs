@@ -18,18 +18,21 @@ mod skill;
 mod tournament;
 
 use cert::{keygen, verify_receipt};
-use exec::{run_exec, state_dir, ExecError, ExecOptions};
+use exec::{run_exec, run_resume, state_dir, validate_session_name, ExecError, ExecOptions};
 use redteam::{run_redteam, RedteamOptions};
 use std::process::ExitCode;
 use tournament::{run_tournament, TournamentOptions};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn usage() -> &'static str {
+pub(crate) fn usage() -> &'static str {
     "rex: headless REX harness CLI\n\
      \n\
      usage:\n\
      \x20 rex exec [--task TASK | TASK...] [options]\n\
+     \x20 rex resume RUN_ID|NAME [--task T] [--name N] [--provider P] [--model M]\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20[--max-steps N] [--max-tool-calls N] [--max-tokens N]\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20[--timeout-secs N] [--skill S] [--yes] [--json]\n\
      \x20 rex tournament --task TASK --providers a,b [options]\n\
      \x20 rex redteam --task TASK --yes [options]\n\
      \x20 rex policy --workspace DIR\n\
@@ -51,6 +54,8 @@ fn usage() -> &'static str {
      \x20                      (default: $REX_PROVIDER or anthropic)\n\
      \x20 --model ID           model id (default: $REX_MODEL or provider default)\n\
      \x20 --workspace DIR      directory to copy into the run sandbox\n\
+     \x20 --name NAME          session label: letters, digits, '-' and '_' (max 64)\n\
+     \x20                      shown by `rex runs` / `rex show`, usable by `rex resume`\n\
      \x20 --max-steps N        step budget\n\
      \x20 --max-tool-calls N   tool-call budget\n\
      \x20 --max-tokens N       token budget\n\
@@ -71,12 +76,12 @@ fn usage() -> &'static str {
      \x203 run ended without completing · 1 internal error\n"
 }
 
-fn parse_usize(raw: &str, flag: &str) -> Result<usize, ExecError> {
+pub(crate) fn parse_usize(raw: &str, flag: &str) -> Result<usize, ExecError> {
     raw.parse::<usize>()
         .map_err(|_| ExecError::usage(format!("{flag} expects a positive integer, got '{raw}'")))
 }
 
-fn parse_u64(raw: &str, flag: &str) -> Result<u64, ExecError> {
+pub(crate) fn parse_u64(raw: &str, flag: &str) -> Result<u64, ExecError> {
     raw.parse::<u64>()
         .map_err(|_| ExecError::usage(format!("{flag} expects a positive integer, got '{raw}'")))
 }
@@ -104,6 +109,9 @@ fn parse_exec(args: &[String]) -> Result<ExecOptions, ExecError> {
             "--model" => opts.model = Some(take_value("--model", &mut i)?),
             "--workspace" => {
                 opts.workspace = Some(take_value("--workspace", &mut i)?.into());
+            }
+            "--name" => {
+                opts.name = Some(validate_session_name(&take_value("--name", &mut i)?)?);
             }
             "--max-steps" => {
                 opts.max_steps = Some(parse_usize(
@@ -330,6 +338,7 @@ fn main() -> ExitCode {
             return ExitCode::from(0);
         }
         Some("exec") => parse_exec(&args[1..]).and_then(run_exec),
+        Some("resume") => run_resume(&args[1..]),
         Some("tournament") => parse_tournament(&args[1..]).and_then(run_tournament),
         Some("redteam") => parse_redteam(&args[1..]).and_then(run_redteam),
         Some("policy") => run_policy(&args[1..]),
@@ -814,6 +823,20 @@ fn run_runs(args: &[String]) -> Result<(), ExecError> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         let task_short: String = task.chars().take(60).collect();
+        let name = v
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let continued = v
+            .get("continued_from")
+            .and_then(serde_json::Value::as_str)
+            .map(|c| format!(" ↩{c}"))
+            .unwrap_or_default();
+        let label = if name.is_empty() {
+            task_short
+        } else {
+            format!("[{name}] {task_short}")
+        };
         let who = if ledger::kind_of(v) == "tournament" {
             let w = v
                 .get("winner")
@@ -827,7 +850,7 @@ fn run_runs(args: &[String]) -> Result<(), ExecError> {
                 .unwrap_or("?")
                 .to_string()
         };
-        println!("{id}  [{status}] {who}  {at}  {task_short}");
+        println!("{id}  [{status}]{continued} {who}  {at}  {label}");
     }
     Ok(())
 }
@@ -872,6 +895,12 @@ fn run_show(args: &[String]) -> Result<i32, ExecError> {
         get_u("elapsed_ms")
     );
     println!("finished   {}", get("finished_at"));
+    if let Some(n) = v.get("name").and_then(serde_json::Value::as_str) {
+        println!("session    {n}");
+    }
+    if let Some(c) = v.get("continued_from").and_then(serde_json::Value::as_str) {
+        println!("continues  {c}");
+    }
     if ledger::kind_of(&v) == "tournament" {
         if let Some(w) = v.get("winner") {
             println!(

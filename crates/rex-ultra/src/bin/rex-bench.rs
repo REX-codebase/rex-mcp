@@ -177,6 +177,7 @@ fn run_task(
                     args.model.as_deref(),
                     None,
                     Some(workspace.clone()),
+                    rex_providers::autonomous::SessionMeta::default(),
                 )
                 .expect("begin");
             let mut approvals = 0u32;
