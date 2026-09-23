@@ -1388,6 +1388,7 @@ fn main() {
     ));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(service)
         .manage(search_service)
         .manage(tools)
