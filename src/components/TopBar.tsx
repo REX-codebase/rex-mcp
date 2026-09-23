@@ -22,9 +22,14 @@ export function TopBar({ view, onView, ultra, onUltra, fast, onFast, live }: { v
           <span className="ultra-tier">{ultra ? "Verified runs" : "Preview"}</span>
         </button>
         {live ? (
-          <span className="preview-state flex shrink-0 items-center gap-2 text-[10px] font-medium tracking-wide text-faint sm:text-[11px]" title="A live backend is connected. Runs execute against the real provider.">
+          // Transport x provenance: `live` only means a backend transport
+          // (Tauri or the dev sidecar) answered the probe. It does NOT mean
+          // the current run is real — the sidecar can serve seeded demo
+          // tasks. Provenance is stated per run on its own receipt/header,
+          // never by this badge.
+          <span className="preview-state flex shrink-0 items-center gap-2 text-[10px] font-medium tracking-wide text-faint sm:text-[11px]" title="A backend transport is connected. Each run's receipt states the engine that produced it.">
             <span className="h-1.5 w-1.5 rounded-full bg-done" aria-hidden="true" />
-            <span className="hidden lg:inline">LIVE · REAL RUN</span><span className="lg:hidden">LIVE</span>
+            <span className="hidden lg:inline">BACKEND CONNECTED</span><span className="lg:hidden">BACKEND</span>
           </span>
         ) : (
           <span className="preview-state flex shrink-0 items-center gap-2 text-[10px] font-medium tracking-wide text-faint sm:text-[11px]" title="No backend is connected. All runs shown are sample data.">

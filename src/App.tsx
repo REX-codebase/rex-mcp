@@ -45,7 +45,10 @@ import {
 import { loadInstalledAgentOptions } from "./components/ModelStatus";
 import { OperatorModeChip, OperatorModeGate } from "./components/OperatorModeGate";
 import { loadOperatorMode, saveOperatorMode, type OperatorMode } from "./data/operatorMode";
+import { SetupChecklist } from "./components/SetupChecklist";
 import type { InstalledAgentId } from "./data/backend";
+
+const TOUR_KEY = "rex-tour-mode";
 
 export function shouldUseDirectUltra(
   operatorMode: OperatorMode | null,
@@ -81,6 +84,16 @@ export default function App() {
   const [task, setTask] = useState("");
   const [session, setSession] = useState<Session | null>(null);
   const [liveCapable, setLiveCapable] = useState(false);
+  const [backendProbed, setBackendProbed] = useState(false);
+  const [tourMode, setTourMode] = useState(() => {
+    try {
+      return window.localStorage.getItem(TOUR_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [checklistHot, setChecklistHot] = useState(false);
+  const checklistTimer = useRef<number | null>(null);
   const [liveRun, setLiveRun] = useState<AgentSnapshot | null>(null);
   const [custody, setCustody] = useState<{ grantId: string; phase: string; operator: string } | null>(null);
   const [rexTaskId, setRexTaskId] = useState<string | null>(null);
@@ -96,9 +109,37 @@ export default function App() {
   const [nativePreviewDir, setNativePreviewDir] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
-    liveRunAvailable().then((ok) => { if (active) setLiveCapable(ok); }).catch(() => undefined);
+    liveRunAvailable()
+      .then((ok) => {
+        if (active) {
+          setLiveCapable(ok);
+          setBackendProbed(true);
+        }
+      })
+      .catch(() => {
+        if (active) setBackendProbed(true);
+      });
     return () => { active = false; };
   }, []);
+  // Re-probe on demand (the setup checklist's "check again" button): the
+  // user may have started the sidecar after the first probe.
+  const reprobeBackend = () => {
+    liveRunAvailable()
+      .then((ok) => {
+        setLiveCapable(ok);
+        setBackendProbed(true);
+      })
+      .catch(() => undefined);
+  };
+  const chooseTourMode = (on: boolean) => {
+    setTourMode(on);
+    try {
+      if (on) window.localStorage.setItem(TOUR_KEY, "1");
+      else window.localStorage.removeItem(TOUR_KEY);
+    } catch {
+      /* storage unavailable; tour mode just won't persist */
+    }
+  };
   // Deep link: #run=<id> reattaches to an existing agent loop run (e.g.
   // after a reload). Read-only viewers and the original driver share the
   // same snapshot stream.
@@ -218,6 +259,15 @@ export default function App() {
     cancel.current?.();
     const label = task.trim();
     if (!label) return;
+    if (!liveCapable && !tourMode) {
+      // No backend and no explicit tour: never silently animate a fake run.
+      // Pulse the setup checklist instead — it is already rendered above.
+      setChecklistHot(true);
+      if (checklistTimer.current) window.clearTimeout(checklistTimer.current);
+      checklistTimer.current = window.setTimeout(() => setChecklistHot(false), 1600);
+      beginSettle();
+      return;
+    }
     let installedBackend: InstalledAgentId | null = null;
     try {
       const selected = JSON.parse(window.localStorage.getItem("rex-model-selection") || "null") as { provider?: string; id?: string } | null;
@@ -531,6 +581,15 @@ export default function App() {
           />
         ) : (
           <>
+            {backendProbed && !liveCapable && (
+              <SetupChecklist
+                hot={checklistHot}
+                tour={tourMode}
+                onTour={chooseTourMode}
+                onOpenSettings={() => setView("settings")}
+                onRecheck={reprobeBackend}
+              />
+            )}
             {hero !== "gone" && (
               <div className={`hero-wrap ${hero === "settling" ? "settling" : ""}`}>
                 <div>

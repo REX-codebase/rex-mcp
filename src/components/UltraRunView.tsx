@@ -42,7 +42,7 @@ export function UltraRunView({
         <span className="eyebrow">Ultra</span>
         <strong>{PHASE_LABEL[run.phase] ?? run.phase}</strong>
         <small>
-          worker {run.provider}/{run.model || "resolving"} · judge {run.judge_model || "worker"} · adversary {run.adversary_model || "worker"}
+          Engines · worker {run.provider}/{run.model || "resolving"} · judge {run.judge_model || "worker"} · adversary {run.adversary_model || "worker"}
           {run.repair > 0 ? ` · repair ${run.repair}/${run.max_repairs}` : ""}
         </small>
       </header>

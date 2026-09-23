@@ -5,7 +5,7 @@ function fmt(ms: number) {
   return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
 }
 
-function TurnBlock({ turn, receipt, expanded }: { turn: Turn; receipt: string; expanded: boolean }) {
+function TurnBlock({ turn, receipt, engine, expanded }: { turn: Turn; receipt: string; engine: string; expanded: boolean }) {
   const [open, setOpen] = useState(expanded);
   const finished = turn.state === "done" || turn.state === "blocked";
   const passed = turn.steps.filter((s) => s.ok).length;
@@ -62,7 +62,7 @@ function TurnBlock({ turn, receipt, expanded }: { turn: Turn; receipt: string; e
           </div>
           <div>
             <dt>Engine</dt>
-            <dd>Preview engine</dd>
+            <dd>{engine}</dd>
           </div>
           <div>
             <dt>Started</dt>
@@ -125,7 +125,7 @@ export function SessionView({ session, busy, onFollowUp, onNewTask, focusCompose
         </button>
       </div>
       {session.turns.map((turn, i) => (
-        <TurnBlock key={turn.id} turn={turn} receipt={session.receipt} expanded={i === latestIndex} />
+        <TurnBlock key={turn.id} turn={turn} receipt={session.receipt} engine={session.engine} expanded={i === latestIndex} />
       ))}
       <FollowUpComposer busy={busy} onFollowUp={onFollowUp} focusWhenReady={focusComposer} />
       <p className="mt-3 text-[11px] leading-relaxed text-faint">

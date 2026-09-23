@@ -159,6 +159,11 @@ export function AgentRunView({
           Custody {custody.phase.replace(/_/g, " ")} · operator {custody.operator} · grant {custody.grantId.slice(0, 18)}
         </p>
       )}
+      {/* Provenance: which engine produced this run. Stated on the run itself,
+          never inferred from the transport badge in the top bar. */}
+      <p className="engine-line">
+        Engine · model <b>{run.provider}/{run.model || "resolving…"}</b>
+      </p>
 
       <div className="agent-budgets" aria-label="Budgets">
         <span>Step {run.step}/{run.max_steps}</span>

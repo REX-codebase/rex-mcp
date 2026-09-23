@@ -85,6 +85,9 @@ export function InstalledAgentRunView({
           </button>
         )}
       </div>
+      {/* Provenance: the task executes inside the vendor CLI's own process;
+          REX supervises, streams events, and gates promotion. */}
+      <p className="engine-line">Engine · vendor CLI <b>{run.backend}</b>{run.model ? ` · ${run.model}` : ""}</p>
 
       <ul className="agent-events" aria-label="Run events">
         {run.events.length === 0 && <li className="agent-event agent-event-info">Starting the vendor CLI…</li>}

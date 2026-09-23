@@ -180,6 +180,18 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .sample-chip{position:absolute;top:10px;left:10px;z-index:3;border:1px solid color-mix(in srgb,var(--color-blocked) 45%,var(--color-line));border-radius:5px;background:color-mix(in srgb,var(--color-canvas) 82%,transparent);padding:4px 7px;font-family:var(--font-mono);font-size:8px;letter-spacing:.14em;color:var(--color-blocked)}
 .handover-banner{position:relative;z-index:4;display:flex;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid color-mix(in srgb,var(--color-blocked) 35%,var(--color-line));background:color-mix(in srgb,var(--color-lift) 94%,transparent);padding:8px 12px;font-size:11px;color:var(--color-muted)}
 .handover-banner button{min-height:26px;border:1px solid var(--color-line);border-radius:6px;background:transparent;padding:0 9px;font-size:10px;font-weight:500;color:var(--color-text)}
+.setup-panel{margin:18px 0 6px;border:1px solid var(--color-line);border-radius:14px;background:color-mix(in srgb,var(--color-lift) 88%,transparent);padding:18px 20px 16px;transition:border-color 200ms ease,box-shadow 200ms ease}
+.setup-panel.attn{border-color:color-mix(in srgb,var(--color-blocked) 60%,var(--color-line));box-shadow:0 0 0 3px color-mix(in srgb,var(--color-blocked) 14%,transparent)}
+.setup-steps{margin:14px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:12px}
+.setup-steps li{display:flex;gap:11px;align-items:flex-start;font-size:13px;line-height:1.6;color:var(--color-muted)}
+.setup-steps .step-n{flex:none;width:20px;height:20px;margin-top:1px;border:1px solid var(--color-line);border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--color-faint)}
+.setup-steps code{display:inline-block;margin:4px 4px 0 0;font-family:var(--font-mono);font-size:11.5px;color:var(--color-text);background:color-mix(in srgb,var(--color-canvas) 65%,transparent);border:1px solid var(--color-line);border-radius:6px;padding:3px 8px}
+.setup-actions{margin-top:14px;display:flex;flex-wrap:wrap;gap:8px}
+.setup-btn{min-height:34px;border:1px solid var(--color-line);border-radius:8px;background:transparent;padding:0 13px;font-size:12.5px;font-weight:500;color:var(--color-text);cursor:pointer}
+.setup-btn.primary{background:var(--color-accent);border-color:transparent;color:var(--color-ink);font-weight:600}
+.setup-tour{margin-top:14px;padding-top:12px;border-top:1px solid var(--color-line);font-size:11.5px;color:var(--color-faint)}
+.setup-link{background:none;border:0;padding:0;color:var(--color-muted);text-decoration:underline;text-underline-offset:2px;cursor:pointer;font-size:inherit}
+.setup-link:hover{color:var(--color-text)}
 .sim-page{display:flex;min-height:340px;flex-direction:column;background:#efe9dc;padding:48px 26px 26px;color:#211d16}
 .sim-brand{display:flex;align-items:baseline;gap:8px;font-family:var(--font-mono);font-size:10px;letter-spacing:.08em;color:#8a8062}
 .sim-brand span{color:#b3a887}
@@ -506,6 +518,8 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 
 /* Custody and REX task supervision */
 .custody-line{margin:6px 0 0;font-size:11px;color:var(--color-faint);letter-spacing:.02em}
+.engine-line{margin:6px 0 0;font-size:11px;color:var(--color-faint);letter-spacing:.02em}
+.engine-line b{color:var(--color-muted);font-weight:600}
 .rex-task-body{margin:10px 0 0}
 .rex-task-text{margin:0;font-size:13px;color:var(--color-text)}
 .rex-task-id{margin:4px 0 0;font-size:11px;color:var(--color-faint)}

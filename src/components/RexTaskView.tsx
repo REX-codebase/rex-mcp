@@ -166,6 +166,9 @@ export function RexTaskView({ taskId, onClose }: { taskId: string; onClose: () =
         <div className="rex-task-body">
           <p className="rex-task-text">{status.task}</p>
           <p className="rex-task-id">task {status.task_id} · operator {status.operator_is_agent ? "agent" : "human"}</p>
+          {/* Provenance: in agent mode the intelligence lives in the external
+              host, not in this UI — the host name is the engine of record. */}
+          <p className="engine-line">Engine · external host <b>{status.host.replace(/_/g, " ")}</b></p>
           {status.open_action && !terminal && (
             <p className="rex-task-action">Open action: {status.open_action.instructions}</p>
           )}
