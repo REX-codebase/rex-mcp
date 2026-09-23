@@ -1,0 +1,57 @@
+name: Release
+
+# Cut a release by pushing a tag like v0.1.0. The tag MUST match the
+# `version` field in src-tauri/tauri.conf.json (and package.json /
+# src-tauri/Cargo.toml) or the bundle version will be wrong.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis msi
+          - os: macos-14
+            bundles: dmg
+          - os: ubuntu-22.04
+            bundles: appimage deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # tauri-action runs the frontend build via beforeBuildCommand, builds
+      # the app, bundles the per-OS installers, and attaches everything to
+      # a draft GitHub Release. No signing keys are configured, so:
+      #  - macOS dmg is UNSIGNED (Gatekeeper will warn; right-click > Open)
+      #  - Windows installers are unsigned (SmartScreen will warn)
+      #  - no updater artifacts (.sig / latest.json) are produced
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('manual-{0}', github.run_id) }}
+          releaseName: "REX Harness ${{ github.ref_type == 'tag' && github.ref_name || github.run_id }}"
+          releaseBody: "Unsigned preview build. See INSTALL.md for install notes (macOS Gatekeeper workaround included)."
+          releaseDraft: true
+          prerelease: false
+          args: --bundles ${{ matrix.bundles }}
