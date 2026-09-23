@@ -57,8 +57,15 @@ Parity items: IDE extensions, GitHub App.
       status-bar live status, checkpoint + rewind from the editor.
       Exit criterion met: run a task, approve a plan, rewind a checkpoint
       without leaving VS Code.
-- [ ] GitHub App + Checks: proof-replay summaries posted on PRs,
-      "verified by REX" check runs with bundle links
+- [x] GitHub proof summaries + checks: the `rex-run` action now runs
+      `rex replay --json` after every run and posts a proof-replay summary
+      (status, budgets, cost ceiling/estimate, bid terms, per-check
+      verdicts) as a "verified by REX" check run (conclusion follows the
+      verdict) with a bundle link to the workflow run's receipt artifact,
+      and as a PR comment (created once, updated on re-runs via the
+      `<!-- rex-proof-summary -->` marker). Delivered through the Action +
+      `gh api`, which is the whole behavior the App would have; a
+      standalone App registration is not needed for it.
 - [ ] JetBrains extension (after VS Code proves the protocol)
 
 Exit criteria: a developer can run a REX task, approve a plan, and rewind a
