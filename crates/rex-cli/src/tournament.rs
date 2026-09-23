@@ -114,6 +114,8 @@ pub fn run_tournament(opts: TournamentOptions) -> Result<i32, ExecError> {
             deadman_mins: None,
             deadman_file: None,
             skills: vec![],
+            interactive: None,
+            on_begin: None,
         };
         match execute(exec_opts) {
             Ok(out) => {

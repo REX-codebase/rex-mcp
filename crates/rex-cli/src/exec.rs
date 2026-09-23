@@ -17,6 +17,7 @@ use rex_providers::{
 };
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cert::{load_or_generate, sign_receipt};
@@ -27,7 +28,7 @@ const RECEIPT_SCHEMA: &str = "rex.exec.receipt/1";
 /// Secret store that prefers `REX_<PROVIDER>_API_KEY` env vars (CI convention)
 /// and falls back to the file store the desktop app uses. Writes always go
 /// to the file store; the CLI never persists anything into the environment.
-struct EnvSecretStore<S: SecretStore> {
+pub(crate) struct EnvSecretStore<S: SecretStore> {
     inner: S,
 }
 
@@ -95,6 +96,12 @@ pub struct ExecOptions {
     pub deadman_file: Option<PathBuf>,
     /// Skill packs to load into the run, by library name. Repeatable.
     pub skills: Vec<String>,
+    /// Interactive approval slot: when set, the drive loop parks on
+    /// AwaitingApproval/AwaitingPlan until an external decision arrives,
+    /// instead of erroring. Used by `rex serve`. Not a CLI flag.
+    pub(crate) interactive: Option<Arc<Mutex<Option<bool>>>>,
+    /// Hook called once the run begins. Used by `rex serve`. Not a CLI flag.
+    pub(crate) on_begin: Option<BeginHook>,
 }
 
 #[derive(Debug)]
@@ -252,7 +259,20 @@ fn receipt(
     .expect("receipt literal is an object")
 }
 
-type Agent = AutonomousRunService<EnvSecretStore<FileSecretStore>, UreqTransport>;
+pub(crate) type Agent = AutonomousRunService<EnvSecretStore<FileSecretStore>, UreqTransport>;
+
+/// Hook invoked right after a run begins, with a live handle to the agent
+/// and the run id. `rex serve` uses it to register the run for live
+/// status and approval; the plain CLI never sets it.
+#[derive(Clone)]
+#[allow(clippy::type_complexity)]
+pub struct BeginHook(pub Arc<dyn Fn(Arc<Agent>, &str) + Send + Sync>);
+
+impl std::fmt::Debug for BeginHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BeginHook")
+    }
+}
 
 fn build_agent() -> Result<(Agent, PathBuf), ExecError> {
     let state = state_dir();
@@ -306,6 +326,19 @@ fn drive(
                     agent
                         .decide(run_id, true)
                         .map_err(|e| ExecError::internal(format!("approval failed: {e}")))?;
+                } else if let Some(slot) = &opts.interactive {
+                    // `rex serve`: park until the operator decides via the API.
+                    await_interactive(
+                        agent,
+                        slot,
+                        run_id,
+                        AgentStatus::AwaitingApproval,
+                        |a, r, d| {
+                            a.decide(r, d)
+                                .map(|_| ())
+                                .map_err(|e| ExecError::internal(format!("approval failed: {e}")))
+                        },
+                    )?;
                 } else {
                     eprintln!("rex: run is waiting for approval:");
                     eprintln!("  tool:   {}", call.tool);
@@ -324,6 +357,18 @@ fn drive(
                     agent
                         .decide_plan(run_id, true)
                         .map_err(|e| ExecError::internal(format!("plan approval failed: {e}")))?;
+                } else if let Some(slot) = &opts.interactive {
+                    await_interactive(
+                        agent,
+                        slot,
+                        run_id,
+                        AgentStatus::AwaitingPlan,
+                        |a, r, d| {
+                            a.decide_plan(r, d).map(|_| ()).map_err(|e| {
+                                ExecError::internal(format!("plan approval failed: {e}"))
+                            })
+                        },
+                    )?;
                 } else {
                     return Err(ExecError::usage(
                         "plan approval required: re-run with --yes to auto-approve (CI mode)",
@@ -345,6 +390,31 @@ fn panic_missing_approval() -> ! {
     // A loud failure beats a silent wrong approval.
     eprintln!("rex: internal error: approval gate with no pending call");
     std::process::exit(1);
+}
+
+/// Park the drive loop until an external decision arrives on `slot`
+/// (`rex serve` approval flow). Also bails out if the run leaves the
+/// awaiting state on its own (e.g. cancelled via the API).
+fn await_interactive(
+    agent: &Agent,
+    slot: &Arc<Mutex<Option<bool>>>,
+    run_id: &str,
+    waiting_for: AgentStatus,
+    decide: impl Fn(&Agent, &str, bool) -> Result<(), ExecError>,
+) -> Result<(), ExecError> {
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Some(d) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            return decide(agent, run_id, d);
+        }
+        let still_waiting = agent
+            .snapshot(run_id)
+            .map(|s| s.status == waiting_for)
+            .unwrap_or(false);
+        if !still_waiting {
+            return Ok(());
+        }
+    }
 }
 
 pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
@@ -520,6 +590,7 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
     }
 
     let (agent, runs_root) = build_agent()?;
+    let agent = Arc::new(agent);
 
     // Stage the workspace copy under the runs root (the service requires it).
     let staged_workspace: Option<PathBuf> = match &opts.workspace {
@@ -555,6 +626,10 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
     let run_id = snap.id.clone();
     if !opts.json {
         eprintln!("rex: run {run_id} started (provider {})", opts.provider);
+    }
+    // `rex serve` registers the live run here.
+    if let Some(hook) = &opts.on_begin {
+        (hook.0)(Arc::clone(&agent), &run_id);
     }
 
     // Dead-man custody: arm the switch before the first drive poll.

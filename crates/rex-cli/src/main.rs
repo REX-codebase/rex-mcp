@@ -13,6 +13,7 @@ mod policy;
 mod provenance;
 mod redteam;
 mod replay;
+mod serve;
 mod skill;
 mod tournament;
 
@@ -36,6 +37,7 @@ fn usage() -> &'static str {
      \x20 rex checkin --file PATH\n\
      \x20 rex skill install DIR [--force] | list | show NAME | verify [NAME]\n\
      \x20             | remove NAME | pack DIR\n\
+     \x20 rex serve [--port N]\n\
      \x20 rex runs [--json] [--limit N]\n\
      \x20 rex show RUN_ID [--json]\n\
      \x20 rex keygen [--force]\n\
@@ -333,6 +335,7 @@ fn main() -> ExitCode {
         Some("replay") => run_replay_args(&args[1..]),
         Some("checkin") => run_checkin(&args[1..]),
         Some("skill") => run_skill(&args[1..]),
+        Some("serve") => run_serve_args(&args[1..]),
         Some("runs") => run_runs(&args[1..]).map(|_| 0),
         Some("show") => run_show(&args[1..]),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
@@ -580,6 +583,28 @@ fn run_skill(args: &[String]) -> Result<i32, ExecError> {
         }
         other => Err(ExecError::usage(format!("unknown skill command '{other}'"))),
     }
+}
+
+fn run_serve_args(args: &[String]) -> Result<i32, ExecError> {
+    let mut port: u16 = 0;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| ExecError::usage("--port expects a value"))?;
+                port = v
+                    .parse::<u16>()
+                    .map_err(|_| ExecError::usage("--port expects a port number"))?;
+            }
+            "--help" | "-h" => return Err(ExecError::usage(usage())),
+            other => return Err(ExecError::usage(format!("unknown argument '{other}'"))),
+        }
+        i += 1;
+    }
+    serve::run_serve(port)
 }
 
 fn run_runs(args: &[String]) -> Result<(), ExecError> {
