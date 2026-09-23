@@ -16,7 +16,13 @@
 //!   GET  /v1/runs/:id         -> live snapshot, or the finished receipt
 //!   POST /v1/runs/:id/approve {approve: bool} -> {}
 //!   POST /v1/runs/:id/cancel  -> {}
+//!   POST /v1/runs/:id/checkpoint      -> {checkpoint: N, created_at}
+//!   GET  /v1/runs/:id/checkpoints     -> {checkpoints: [...]}
+//!   POST /v1/runs/:id/rewind  {checkpoint: N} -> {ok: true}
 //!
+//! Checkpoints snapshot the run's staged workspace copy (runs never touch
+//! the operator's original workspace), and rewind restores it. File-level
+//! only; the agent's logical state (step count, plan) is not rewound.
 //! Runs are interactive by default: tool and plan approvals park until
 //! POST /approve resolves them. Pass `auto_approve: true` for CI-style
 //! runs. A minimal std-only HTTP/1.1 implementation — no new dependencies.
@@ -34,6 +40,8 @@ struct LiveRun {
     slot: Arc<Mutex<Option<bool>>>,
     task: String,
     started_at: String,
+    /// The staged workspace copy the agent is mutating, if any.
+    workspace: Option<std::path::PathBuf>,
 }
 
 struct Registry {
@@ -224,20 +232,21 @@ fn handle(req: Request, stream: &mut TcpStream, reg: &Arc<Mutex<Registry>>) {
                 yes: auto,
                 json: true, // keep run output machine-shaped on stdout
                 interactive: if auto { None } else { Some(slot2) },
-                on_begin: Some(BeginHook(Arc::new(move |agent, run_id| {
+                on_begin: Some(BeginHook(Arc::new(move |agent, info| {
                     {
                         let mut reg = reg2.lock().unwrap_or_else(|p| p.into_inner());
                         reg.live.insert(
-                            run_id.to_string(),
+                            info.run_id.clone(),
                             LiveRun {
                                 agent: Arc::clone(&agent),
                                 slot: Arc::clone(&slot),
                                 task: task3.clone(),
                                 started_at: started_at2.clone(),
+                                workspace: info.workspace.clone(),
                             },
                         );
                     }
-                    let _ = tx2.send(Ok(run_id.to_string()));
+                    let _ = tx2.send(Ok(info.run_id.clone()));
                 }))),
                 ..ExecOptions::default()
             };
@@ -316,7 +325,161 @@ fn handle(req: Request, stream: &mut TcpStream, reg: &Arc<Mutex<Registry>>) {
                 None => err(stream, 404, "Not Found", "unknown or finished run id"),
             }
         }
+        ("POST", ["", "v1", "runs", id, "checkpoint"]) => {
+            // Snapshot the run's staged workspace. The operator's original
+            // workspace is never touched by runs (they work in staged
+            // copies), so a checkpoint rewinds the run's working copy.
+            match with_live_workspace(reg, id) {
+                Err((code, reason, msg)) => err(stream, code, reason, msg),
+                Ok(ws) => {
+                    let root = checkpoints_root(id);
+                    let idx = next_checkpoint_index(&root);
+                    let dst = root.join(idx.to_string());
+                    match copy_dir_recursive(&ws, &dst) {
+                        Err(e) => err(stream, 500, "Internal Server Error", e),
+                        Ok(()) => {
+                            let meta = serde_json::json!({
+                                "checkpoint": idx,
+                                "created_at": chrono::Utc::now().to_rfc3339(),
+                            });
+                            let _ = std::fs::write(
+                                dst.join("meta.json"),
+                                serde_json::to_string_pretty(&meta).unwrap_or_default(),
+                            );
+                            ok(stream, &meta)
+                        }
+                    }
+                }
+            }
+        }
+        ("GET", ["", "v1", "runs", id, "checkpoints"]) => {
+            let root = checkpoints_root(id);
+            let mut out = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let created_at = std::fs::read_to_string(entry.path().join("meta.json"))
+                        .ok()
+                        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                        .and_then(|v| {
+                            v.get("created_at")
+                                .and_then(Value::as_str)
+                                .map(|s| s.to_string())
+                        });
+                    out.push(serde_json::json!({"checkpoint": name, "created_at": created_at}));
+                }
+            }
+            ok(stream, &serde_json::json!({"checkpoints": out}))
+        }
+        ("POST", ["", "v1", "runs", id, "rewind"]) => {
+            let n = serde_json::from_slice::<Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("checkpoint").and_then(Value::as_u64));
+            let n = match n {
+                Some(n) => n,
+                None => {
+                    err(stream, 400, "Bad Request", "body needs {\"checkpoint\": N}");
+                    return;
+                }
+            };
+            match with_live_workspace(reg, id) {
+                Err((code, reason, msg)) => err(stream, code, reason, msg),
+                Ok(ws) => {
+                    let src = checkpoints_root(id).join(n.to_string());
+                    if !src.is_dir() {
+                        err(stream, 404, "Not Found", "unknown checkpoint");
+                        return;
+                    }
+                    // Restore = clear the staged copy, then copy the
+                    // checkpoint back. meta.json is bookkeeping, not
+                    // workspace content.
+                    let tmp = ws.with_extension("rewind-tmp");
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    let restored = (|| -> Result<(), String> {
+                        copy_dir_recursive(&src, &tmp)?;
+                        std::fs::remove_dir_all(&ws)
+                            .map_err(|e| format!("cannot clear workspace: {e}"))?;
+                        std::fs::rename(&tmp, &ws)
+                            .map_err(|e| format!("cannot restore workspace: {e}"))?;
+                        let _ = std::fs::remove_file(ws.join("meta.json"));
+                        Ok(())
+                    })();
+                    match restored {
+                        Err(e) => err(stream, 500, "Internal Server Error", e),
+                        Ok(()) => {
+                            eprintln!("rex: run {id} rewound to checkpoint {n}");
+                            ok(stream, &serde_json::json!({"ok": true, "checkpoint": n}))
+                        }
+                    }
+                }
+            }
+        }
         _ => err(stream, 404, "Not Found", "unknown endpoint"),
+    }
+}
+
+/// Recursive directory copy (symlinks are skipped: checkpoints are
+/// file-level snapshots, and following links could escape the workspace).
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+    let entries =
+        std::fs::read_dir(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read entry: {e}"))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("cannot stat entry: {e}"))?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ft.is_file() {
+            std::fs::copy(&from, &to)
+                .map_err(|e| format!("cannot copy {}: {e}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn checkpoints_root(run_id: &str) -> std::path::PathBuf {
+    crate::exec::state_dir()
+        .join("runs")
+        .join("checkpoints")
+        .join(run_id)
+}
+
+/// Next checkpoint index for a run (count of existing checkpoints).
+fn next_checkpoint_index(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .filter_map(|e| e.file_name().to_string_lossy().parse::<usize>().ok())
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+fn with_live_workspace(
+    reg: &Arc<Mutex<Registry>>,
+    id: &str,
+) -> Result<std::path::PathBuf, (u16, &'static str, String)> {
+    let reg = reg.lock().unwrap_or_else(|p| p.into_inner());
+    match reg.live.get(id) {
+        Some(live) => match &live.workspace {
+            Some(ws) => Ok(ws.clone()),
+            None => Err((409, "Conflict", "run has no staged workspace".to_string())),
+        },
+        None => Err((404, "Not Found", "unknown or finished run id".to_string())),
     }
 }
 
@@ -380,5 +543,37 @@ mod tests {
         });
         let (mut stream, _) = listener.accept().unwrap();
         assert!(read_request(&mut stream).is_err());
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_restores_files() {
+        let base = std::env::temp_dir().join(format!("rex-ckpt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::write(ws.join("a.txt"), "v1").unwrap();
+        std::fs::write(ws.join("sub").join("b.txt"), "keep").unwrap();
+
+        // Take checkpoint 0, mutate, rewind by hand (same primitives the
+        // endpoint uses), and confirm the original bytes come back.
+        let root = base.join("ckpts");
+        let idx = next_checkpoint_index(&root);
+        assert_eq!(idx, 0);
+        let dst = root.join(idx.to_string());
+        copy_dir_recursive(&ws, &dst).unwrap();
+        assert_eq!(next_checkpoint_index(&root), 1);
+
+        std::fs::write(ws.join("a.txt"), "v2").unwrap();
+        std::fs::write(ws.join("new.txt"), "oops").unwrap();
+        std::fs::remove_dir_all(&ws).unwrap();
+        copy_dir_recursive(&dst, &ws).unwrap();
+
+        assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "v1");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("sub").join("b.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!ws.join("new.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

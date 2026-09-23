@@ -12,6 +12,11 @@ from the daemon's first stdout line, and talks to it over HTTP.
 - **REX: Cancel active run** — cancels through the daemon.
 - **REX: Show run receipt** — opens the live snapshot or finished receipt
   as JSON.
+- **REX: Checkpoint run workspace** — snapshots the run's staged working
+  copy on the daemon.
+- **REX: Rewind run to checkpoint…** — picks a checkpoint and restores the
+  run's working copy to it. File-level only: the agent keeps its current
+  step and plan.
 
 The status bar shows the active run's status, step count, tool calls and
 tokens.
@@ -30,5 +35,4 @@ npm install
 npm run compile
 ```
 
-Package with `vsce` to install locally. Checkpoint rewind from the editor
-is next: it needs a checkpoint endpoint on `rex serve` first.
+Package with `vsce` to install locally.

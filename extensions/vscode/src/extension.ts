@@ -263,6 +263,68 @@ export function activate(context: vscode.ExtensionContext) {
       }
     })
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('rex.checkpoint', async () => {
+      if (!activeRunId) {
+        vscode.window.showInformationMessage('REX: no active run.');
+        return;
+      }
+      try {
+        const res = await api('POST', `/v1/runs/${activeRunId}/checkpoint`);
+        vscode.window.showInformationMessage(
+          `REX: checkpoint ${res.checkpoint} saved.`
+        );
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`REX: ${e.message}`);
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('rex.rewind', async () => {
+      if (!activeRunId) {
+        vscode.window.showInformationMessage('REX: no active run.');
+        return;
+      }
+      try {
+        const list = await api('GET', `/v1/runs/${activeRunId}/checkpoints`);
+        const cps = (list.checkpoints as any[]) || [];
+        if (cps.length === 0) {
+          vscode.window.showInformationMessage('REX: no checkpoints yet.');
+          return;
+        }
+        const pick = await vscode.window.showQuickPick(
+          cps.map((c) => ({
+            label: `Checkpoint ${c.checkpoint}`,
+            description: c.created_at || '',
+            checkpoint: c.checkpoint,
+          })),
+          { placeHolder: 'Rewind the run workspace to…' }
+        );
+        if (!pick) {
+          return;
+        }
+        const confirm = await vscode.window.showWarningMessage(
+          `Rewind the run's working copy to checkpoint ${pick.checkpoint}? The agent keeps its current step and plan.`,
+          { modal: true },
+          'Rewind'
+        );
+        if (confirm !== 'Rewind') {
+          return;
+        }
+        await api('POST', `/v1/runs/${activeRunId}/rewind`, {
+          checkpoint: Number(pick.checkpoint),
+        });
+        vscode.window.showInformationMessage(
+          `REX: rewound to checkpoint ${pick.checkpoint}.`
+        );
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`REX: ${e.message}`);
+      }
+    })
+  );
+
 }
 
 export function deactivate() {

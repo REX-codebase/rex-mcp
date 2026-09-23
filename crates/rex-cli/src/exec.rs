@@ -262,11 +262,19 @@ fn receipt(
 pub(crate) type Agent = AutonomousRunService<EnvSecretStore<FileSecretStore>, UreqTransport>;
 
 /// Hook invoked right after a run begins, with a live handle to the agent
-/// and the run id. `rex serve` uses it to register the run for live
-/// status and approval; the plain CLI never sets it.
+/// and the run's begin info. `rex serve` uses it to register the run for
+/// live status and approval; the plain CLI never sets it.
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
-pub struct BeginHook(pub Arc<dyn Fn(Arc<Agent>, &str) + Send + Sync>);
+pub struct BeginHook(pub Arc<dyn Fn(Arc<Agent>, &BeginInfo) + Send + Sync>);
+
+/// What `rex serve` needs to know about a freshly begun run.
+#[derive(Debug, Clone)]
+pub struct BeginInfo {
+    pub run_id: String,
+    /// The staged workspace copy the agent is mutating, if any.
+    pub workspace: Option<PathBuf>,
+}
 
 impl std::fmt::Debug for BeginHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -629,7 +637,11 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
     }
     // `rex serve` registers the live run here.
     if let Some(hook) = &opts.on_begin {
-        (hook.0)(Arc::clone(&agent), &run_id);
+        let info = BeginInfo {
+            run_id: run_id.clone(),
+            workspace: staged_workspace.clone(),
+        };
+        (hook.0)(Arc::clone(&agent), &info);
     }
 
     // Dead-man custody: arm the switch before the first drive poll.
