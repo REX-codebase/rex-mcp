@@ -21,7 +21,9 @@
 //! permissions, sandbox, tests, or human approval rules.
 
 pub mod error;
+pub mod ledger;
 pub mod session;
 
 pub use error::FableError;
+pub use ledger::{EpistemicItem, EpistemicLedger, EpistemicStatus, Invariant};
 pub use session::{FablePhase, FableSession};

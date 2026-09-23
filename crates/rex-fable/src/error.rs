@@ -20,6 +20,18 @@ pub enum FableError {
     Io(String),
     /// A stored session could not be parsed.
     Corrupt(String),
+    /// A ledger claim was empty.
+    EmptyClaim,
+    /// A PROVEN item was logged without evidence.
+    EvidenceRequired { claim: String },
+    /// A HYPOTHESIS/UNKNOWN item was logged with evidence.
+    EvidenceForbidden { status: String },
+    /// An invariant was recorded without a falsifiable check.
+    InvariantNeedsCheck,
+    /// `unlock_execution` was attempted without meeting the prerequisites.
+    UnlockDenied { unmet: Vec<String> },
+    /// `unlock_execution` was attempted outside PROVE.
+    UnlockWrongPhase { phase: String },
 }
 
 impl fmt::Display for FableError {
@@ -40,6 +52,26 @@ impl fmt::Display for FableError {
             }
             FableError::Io(e) => write!(f, "fable persistence failed: {e}"),
             FableError::Corrupt(e) => write!(f, "stored fable session is corrupt: {e}"),
+            FableError::EmptyClaim => write!(f, "ledger claim must not be empty"),
+            FableError::EvidenceRequired { claim } => write!(
+                f,
+                "PROVEN claim {claim:?} needs evidence: file, command output, receipt, or source"
+            ),
+            FableError::EvidenceForbidden { status } => write!(
+                f,
+                "{status} items must not carry evidence; log a PROVEN item instead"
+            ),
+            FableError::InvariantNeedsCheck => write!(
+                f,
+                "invariant needs a falsifiable check: how could it be proven wrong?"
+            ),
+            FableError::UnlockDenied { unmet } => {
+                write!(f, "unlock denied: {}", unmet.join("; "))
+            }
+            FableError::UnlockWrongPhase { phase } => write!(
+                f,
+                "unlock_execution is only valid in PROVE, not {phase}"
+            ),
         }
     }
 }

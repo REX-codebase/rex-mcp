@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::FableError;
+use crate::ledger::EpistemicLedger;
 
 /// The four Fable gates plus terminal states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +70,9 @@ pub struct FableSession {
     /// Set when the session leaves PROVE via `unlock_execution`.
     #[serde(default)]
     unlocked: bool,
+    /// The epistemic ledger: claims and invariants backing the unlock gate.
+    #[serde(default)]
+    ledger: EpistemicLedger,
 }
 
 fn now_ms() -> u64 {
@@ -109,6 +113,7 @@ impl FableSession {
             created_at_ms: now,
             updated_at_ms: now,
             unlocked: false,
+            ledger: EpistemicLedger::new(),
         })
     }
 
@@ -126,6 +131,38 @@ impl FableSession {
 
     pub fn unlocked(&self) -> bool {
         self.unlocked
+    }
+
+    /// The session's epistemic ledger.
+    pub fn ledger(&self) -> &EpistemicLedger {
+        &self.ledger
+    }
+
+    /// Mutable access to the ledger (log items, record invariants).
+    pub fn ledger_mut(&mut self) -> &mut EpistemicLedger {
+        &mut self.ledger
+    }
+
+    /// The PROVE → ATTACK gate. Succeeds only in PROVE, with a non-empty
+    /// evidence-based rationale, and the ledger prerequisites met (2 PROVEN
+    /// items + 1 invariant). The authority-timer check arrives with the
+    /// timer module; until then the gate is ledger-only and says so.
+    pub fn unlock_execution(&mut self, rationale: impl Into<String>) -> Result<(), FableError> {
+        if self.phase != FablePhase::Prove {
+            return Err(FableError::UnlockWrongPhase {
+                phase: self.phase.to_string(),
+            });
+        }
+        let rationale = rationale.into();
+        if rationale.trim().is_empty() {
+            return Err(FableError::EmptyClaim);
+        }
+        let unmet = self.ledger.unmet_prerequisites();
+        if !unmet.is_empty() {
+            return Err(FableError::UnlockDenied { unmet });
+        }
+        self.mark_unlocked();
+        Ok(())
     }
 
     /// Move one step forward. PROVE → ATTACK is not reachable here on
@@ -160,8 +197,6 @@ impl FableSession {
 
     /// Transition used by `unlock_execution` once its prerequisites pass.
     /// `pub(crate)` so only the gate itself can move Prove → Attack.
-    /// (Used by the unlock module arriving in the next commit.)
-    #[allow(dead_code)]
     pub(crate) fn mark_unlocked(&mut self) {
         self.unlocked = true;
         self.phase = FablePhase::Attack;
@@ -270,5 +305,75 @@ mod tests {
         let loaded = FableSession::load(dir.path(), "roundtrip").unwrap();
         assert_eq!(loaded.phase(), FablePhase::Prove);
         assert_eq!(loaded.objective(), "o");
+    }
+
+    fn proven_ledger() -> crate::ledger::EpistemicLedger {
+        use crate::ledger::EpistemicStatus;
+        let mut l = crate::ledger::EpistemicLedger::new();
+        l.log_item(
+            EpistemicStatus::Proven,
+            "cli exit codes unchanged",
+            Some("smoke.sh".to_string()),
+        )
+        .unwrap();
+        l.log_item(
+            EpistemicStatus::Proven,
+            "no new network calls",
+            Some("strace".to_string()),
+        )
+        .unwrap();
+        l.record_invariant("public CLI compatible", "run smoke.sh")
+            .unwrap();
+        l
+    }
+
+    #[test]
+    fn unlock_denied_without_prerequisites() {
+        let mut s = FableSession::create("n", "o").unwrap();
+        s.advance_phase().unwrap(); // THINK -> PROVE
+        let err = s.unlock_execution("looks good").unwrap_err();
+        assert!(matches!(err, FableError::UnlockDenied { .. }));
+        assert_eq!(s.phase(), FablePhase::Prove);
+        assert!(!s.unlocked());
+    }
+
+    #[test]
+    fn unlock_succeeds_with_prerequisites_and_rationale() {
+        let mut s = FableSession::create("n", "o").unwrap();
+        s.advance_phase().unwrap();
+        *s.ledger_mut() = proven_ledger();
+        s.unlock_execution("two proven claims plus INV-01; timer check pending")
+            .unwrap();
+        assert_eq!(s.phase(), FablePhase::Attack);
+        assert!(s.unlocked());
+    }
+
+    #[test]
+    fn unlock_rejected_outside_prove() {
+        let mut s = FableSession::create("n", "o").unwrap();
+        let err = s.unlock_execution("rationale").unwrap_err();
+        assert!(matches!(err, FableError::UnlockWrongPhase { .. }));
+    }
+
+    #[test]
+    fn unlock_rejects_empty_rationale() {
+        let mut s = FableSession::create("n", "o").unwrap();
+        s.advance_phase().unwrap();
+        *s.ledger_mut() = proven_ledger();
+        assert!(matches!(
+            s.unlock_execution("   ").unwrap_err(),
+            FableError::EmptyClaim
+        ));
+    }
+
+    #[test]
+    fn ledger_survives_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FableSession::create("ledgertest", "o").unwrap();
+        *s.ledger_mut() = proven_ledger();
+        s.save(dir.path()).unwrap();
+        let loaded = FableSession::load(dir.path(), "ledgertest").unwrap();
+        assert!(loaded.ledger().prerequisites_met());
+        assert_eq!(loaded.ledger().invariants().len(), 1);
     }
 }
