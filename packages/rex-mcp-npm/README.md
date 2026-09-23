@@ -11,6 +11,10 @@ private. After the release checklist passes, the intended MCP command is:
 npx --yes @rex-codebase/rex-mcp@latest
 ```
 
+> **v0.1.0 ships the Linux x64 binary only.** macOS and Windows binaries land
+> in a follow-up release built from the desktop release pipeline. On other
+> platforms the launcher exits with a clear "unsupported platform" message.
+
 MCP host configuration:
 
 ```json
