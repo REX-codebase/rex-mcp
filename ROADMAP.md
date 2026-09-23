@@ -80,10 +80,17 @@ after Phase 2/3 parity.)
 1. Machine-verifiable signed run certificates — DONE (b24ce024):
    Ed25519 per-machine keys, `rex keygen` / `rex verify`, every receipt
    signed. Local ledger (`rex runs` / `rex show`) added in 15e528da.
-2. Repo-specific adversarial immune system
+2. Repo-specific adversarial immune system — DONE (4f538ca3):
+   `rex redteam --task T --yes` runs a builder then an adversarial critic
+   that attacks the result; the signed redteam receipt binds both receipts
+   plus a mechanical verdict (sound/broken/inconclusive). Exit 0 only if
+   the result survived the attack.
 3. Cross-provider tournaments with deterministic promotion — DONE (380d58e9):
    `rex tournament --task T --providers a,b`, signed bracket receipts.
-4. Epistemic provenance at diff-hunk level
+4. Epistemic provenance at diff-hunk level — DONE (1f99f2d2 + 2d80ca2d):
+   audit receipts now carry real unified diffs (Myers, hunk headers);
+   every exec receipt has a `provenance` map attributing each hunk to
+   the event/tool call that wrote it.
 5. Proof replay as the primary review primitive
 6. Time-locked disconnected operation (dead-man custody, verified rollback)
 7. Plans that bid binding cost/proof-coverage commitments before execution —
