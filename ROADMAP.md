@@ -93,7 +93,16 @@ sandbox profiles, cross-machine resume, review surface, MCP client + skills.
       workspace state, records `continued_from`, and carries the name over;
       `rex runs` / `rex show` display names and the session chain.
       Honest boundary: resume is same-machine only (see cross-machine item).
-- [ ] Compaction and clear (context reset within a session)
+- [x] Compaction and clear (context reset within a session): `rex compact
+      NAME` collapses a session's `continued_from` run chain into one
+      mechanical summary at `$REX_STATE_DIR/sessions/<name>.json` (run ids,
+      tasks, results, token spend, newest first, plus oldest-first one-line
+      history); the next `rex resume NAME` injects the 8 most recent history
+      lines into the continuation task so the new run gets distilled context.
+      `rex clear NAME` drops the compacted context (idempotent). Honest
+      boundary: the ledger is never rewritten — compaction is an index over
+      immutable history, and the summary is mechanical (tasks/results from
+      receipts), not a model-written semantic digest.
 - [ ] OS-level sandbox profiles, network-off defaults
 - [ ] Cross-machine and cross-directory session resume
 - [ ] Managed code-review surface with proof replay
