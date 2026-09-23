@@ -585,7 +585,11 @@ impl ToolRuntime {
             previous.len() as u64,
             content.len() as u64,
         );
-        r.diff = Some(simple_diff(&previous, content, &relative(&self.root, &target)));
+        r.diff = Some(simple_diff(
+            &previous,
+            content,
+            &relative(&self.root, &target),
+        ));
         Ok(exec(
             Some(format!(
                 "wrote {} bytes to {}",
@@ -1479,8 +1483,16 @@ fn simple_diff(old: &str, new: &str, label: &str) -> String {
         let (al, bl) = (a_line[start], b_line[start]);
         let (ac, bc) = (a_line[end] - al, b_line[end] - bl);
         // Unified convention: empty range starts at the line before.
-        let (as_, ac_) = if ac == 0 { (al.saturating_sub(1), 0) } else { (al + 1, ac) };
-        let (bs_, bc_) = if bc == 0 { (bl.saturating_sub(1), 0) } else { (bl + 1, bc) };
+        let (as_, ac_) = if ac == 0 {
+            (al.saturating_sub(1), 0)
+        } else {
+            (al + 1, ac)
+        };
+        let (bs_, bc_) = if bc == 0 {
+            (bl.saturating_sub(1), 0)
+        } else {
+            (bl + 1, bc)
+        };
         out.push_str(&format!("@@ -{as_},{ac_} +{bs_},{bc_} @@\n"));
         for (k, op) in ops[start..end].iter().enumerate() {
             let line = match op {
