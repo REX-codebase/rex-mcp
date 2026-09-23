@@ -1683,6 +1683,32 @@ mod tests {
         assert!(n >= 2);
         assert!(!s.contains("abcdefghijklmnopqrstuvwxyz"));
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_writes_land_inside_workspace() {
+        // Checkpoint/rewind covers shell-made changes because every tool
+        // (shell included) is confined to the workspace root: the default
+        // cwd "." resolves inside it, and anything outside is refused.
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = run_approved(&rt, &["touch", "made-by-shell"]);
+        assert!(r.ok, "touch failed: {:?}", r.error);
+        assert!(
+            root.join("made-by-shell").exists(),
+            "shell side effect escaped the workspace root"
+        );
+        let p = rt
+            .prepare(ToolRequest::RunCommand {
+                argv: vec!["true".into()],
+                cwd: Some("/tmp".into()),
+                timeout_ms: Some(10_000),
+            })
+            .unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        let r2 = rt.execute(&p.call_id);
+        assert_eq!(r2.error.unwrap().kind, ErrorKind::OutsideWorkspace);
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[cfg(unix)]
     #[test]
     fn trusted_scoring_runs_allowlisted_bare_names_only() {

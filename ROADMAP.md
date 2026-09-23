@@ -79,7 +79,13 @@ checkpoint without leaving VS Code.
 Parity items: rewind incl. shell changes, subagent dashboard, session UX,
 sandbox profiles, cross-machine resume, review surface, MCP client + skills.
 
-- [ ] Checkpoint/rewind covers shell-made changes, not just editor writes
+- [x] Checkpoint/rewind covers shell-made changes, not just editor writes:
+      verified — every tool (shell included) is confined to the staged
+      workspace root (`resolve_existing` rejects outside paths, absolute
+      paths refused, symlinks rejected), so workspace snapshots capture
+      all tool side effects. New test: `shell_writes_land_inside_workspace`.
+      Honest boundary: only the staged copy is rewound; the operator's
+      original workspace is never touched.
 - [ ] Background/subagent dashboard with restrained default parallelism
 - [ ] Compaction, clear, named sessions, resumable context UX
 - [ ] OS-level sandbox profiles, network-off defaults
