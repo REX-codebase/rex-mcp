@@ -110,6 +110,7 @@ fn exec_opts_for(
         json: true, // never print the legs; the redteam receipt is the output
         yes: true,  // --yes is required by run_redteam
         dry_run: false,
+        detach: false,
         bid: false,
         accept_bid: false,
         budget_usd: None,

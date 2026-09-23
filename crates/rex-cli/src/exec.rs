@@ -81,6 +81,11 @@ pub struct ExecOptions {
     pub json: bool,
     pub yes: bool,
     pub dry_run: bool,
+    /// Run in the background: the parent spawns a detached child, prints
+    /// the run id once the child registers, and exits immediately. The
+    /// child writes an active-run marker so `rex ps` can see it. CLI flag
+    /// only; `rex serve` never sets it.
+    pub detach: bool,
     /// Print the binding bid and stop unless `accept_bid` is also given.
     pub bid: bool,
     pub accept_bid: bool,
@@ -313,8 +318,15 @@ fn drive(
     run_id: &str,
     deadman: &mut Option<crate::deadman::Deadman>,
 ) -> Result<AgentSnapshot, ExecError> {
+    // Heartbeat for `rex ps`: throttled so the dashboard sees a live run
+    // without a file write on every 500ms poll.
+    let mut last_beat = std::time::Instant::now();
     loop {
         std::thread::sleep(Duration::from_millis(500));
+        if last_beat.elapsed() >= crate::ps::HEARTBEAT_EVERY {
+            crate::ps::refresh_heartbeat(&state_dir(), run_id);
+            last_beat = std::time::Instant::now();
+        }
         if let Some(dm) = deadman {
             let rid = run_id.to_string();
             let tripped = dm
@@ -684,7 +696,40 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         }
     }
 
-    let final_snap = drive(&agent, &opts, &run_id, &mut deadman)?;
+    // Active-run marker for `rex ps`: written once the run exists, removed
+    // when the final receipt is recorded. Best-effort — a marker failure
+    // must never fail the run. Detached children are recognized by the
+    // env the detached parent set; every other run is a foreground run.
+    let detach_info = crate::ps::DetachInfo::from_env();
+    crate::ps::write_marker(
+        &state_for_dm,
+        &crate::ps::ActiveRun {
+            run_id: run_id.clone(),
+            task: opts.task.clone(),
+            provider: opts.provider.clone(),
+            model: opts.model.clone(),
+            name: opts.name.clone(),
+            started_at: crate::ps::now_rfc3339(),
+            heartbeat_at: crate::ps::now_rfc3339(),
+            detached: detach_info.detached,
+            pid: std::process::id(),
+            log: detach_info.log,
+            deadman: deadman.as_ref().map(|d| d.to_json()),
+            nonce: detach_info.nonce,
+            stale: false,
+        },
+    );
+
+    let final_snap = match drive(&agent, &opts, &run_id, &mut deadman) {
+        Ok(s) => s,
+        Err(e) => {
+            // The run died mid-flight: drop the marker so `rex ps` does
+            // not show a ghost forever. (If removal races a crash, the
+            // 120s heartbeat staleness still catches it.)
+            crate::ps::remove_marker(&state_for_dm, &run_id);
+            return Err(e);
+        }
+    };
     let completed = final_snap.status == AgentStatus::Completed;
     let mut receipt_map = receipt(
         &opts,
@@ -706,6 +751,8 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
     let out = Value::Object(receipt_map);
     let code = if completed { 0 } else { 3 };
     ledger::append(&state, &out);
+    // The run is recorded: it leaves the dashboard.
+    crate::ps::remove_marker(&state, &run_id);
 
     if opts.json {
         println!("{}", serde_json::to_string(&out).unwrap());
@@ -737,6 +784,9 @@ pub struct ExecOutput {
 }
 
 pub fn run_exec(opts: ExecOptions) -> Result<i32, ExecError> {
+    if opts.detach {
+        return run_detached(opts);
+    }
     let dry = opts.dry_run;
     let bid_only = opts.bid && !opts.accept_bid;
     let out = execute(opts)?;
@@ -751,6 +801,127 @@ pub fn run_exec(opts: ExecOptions) -> Result<i32, ExecError> {
     Ok(out.code)
 }
 
+/// Restrained default parallelism: a detached launch is refused when the
+/// number of live (fresh-heartbeat) runs already reaches `max_parallel_runs`.
+/// Stale markers never count — a dead process must not block new work.
+pub fn check_parallel_cap(state_dir: &Path) -> Result<(), ExecError> {
+    let cfg = crate::config::load(state_dir);
+    let live = crate::ps::live_runs(state_dir);
+    if live.len() >= cfg.max_parallel_runs {
+        return Err(ExecError::usage(format!(
+            "parallel run cap reached: {} live run(s), max_parallel_runs={} — wait for one to finish (watch with `rex ps`), or raise the cap deliberately with `rex config set max_parallel_runs N`",
+            live.len(),
+            cfg.max_parallel_runs
+        )));
+    }
+    Ok(())
+}
+
+/// argv for the detached child: this binary, same flags, minus `--detach`
+/// (the child runs in the foreground of its own process; the flag is a
+/// parent-side instruction, not a run property).
+fn detach_child_args_from(argv: &[String]) -> Vec<String> {
+    argv.iter()
+        .filter(|a| a.as_str() != "--detach")
+        .cloned()
+        .collect()
+}
+
+fn detach_child_args() -> Vec<String> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    detach_child_args_from(&argv)
+}
+
+/// `rex exec --detach` (and `rex resume --detach`): check the parallelism
+/// cap, then spawn this binary again as an orphaned child with stdout and
+/// stderr redirected to a log file. The child writes its active-run marker
+/// right after `begin`; the parent polls for that marker (bounded — a
+/// child that fails fast never writes one) and then exits, leaving the
+/// child running.
+pub fn run_detached(opts: ExecOptions) -> Result<i32, ExecError> {
+    if opts.task.trim().is_empty() {
+        return Err(ExecError::usage("no task given: rex exec --task \"...\""));
+    }
+    let state = state_dir();
+    check_parallel_cap(&state)?;
+    let exe = std::env::current_exe()
+        .map_err(|e| ExecError::internal(format!("cannot locate rex binary: {e}")))?;
+    let logs = state.join("logs");
+    std::fs::create_dir_all(&logs)
+        .map_err(|e| ExecError::internal(format!("cannot create logs dir: {e}")))?;
+    let nonce = crate::ps::new_nonce();
+    let log_path = logs.join(format!("detached-{nonce}.log"));
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| ExecError::internal(format!("cannot create log file: {e}")))?;
+    let log_err = log_file
+        .try_clone()
+        .map_err(|e| ExecError::internal(format!("cannot clone log handle: {e}")))?;
+    let mut child = std::process::Command::new(&exe)
+        .args(detach_child_args())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_err))
+        .env("REX_DETACH_NONCE", &nonce)
+        .env("REX_DETACH_LOG", &log_path)
+        .spawn()
+        .map_err(|e| ExecError::internal(format!("cannot spawn detached run: {e}")))?;
+    let pid = child.id();
+    // Bounded wait for the child's marker. `REX_DETACH_WAIT_SECS`
+    // overrides the default for tests.
+    let wait_secs: u64 = std::env::var("REX_DETACH_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait_secs);
+    loop {
+        if let Some(m) = crate::ps::find_by_nonce(&state, &nonce) {
+            if opts.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "detached": true,
+                        "run_id": m.run_id,
+                        "name": m.name,
+                        "pid": pid,
+                        "log": log_path.display().to_string(),
+                    }))
+                    .unwrap()
+                );
+            } else {
+                match &m.name {
+                    Some(n) => println!(
+                        "run {} started in background (session '{n}', pid {pid})",
+                        m.run_id
+                    ),
+                    None => println!("run {} started in background (pid {pid})", m.run_id),
+                }
+                eprintln!("rex: log: {} — watch with `rex ps`", log_path.display());
+            }
+            return Ok(0);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The child exited before registering: surface the log
+                // instead of hanging until the deadline.
+                eprintln!(
+                    "rex: detached child exited ({status}) before the run started; see {}",
+                    log_path.display()
+                );
+                return Ok(if status.success() { 0 } else { 1 });
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("rex: warning: cannot poll detached child: {e}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "rex: detached child (pid {pid}) is still starting; log at {} — check `rex ps` for the run id",
+                log_path.display()
+            );
+            return Ok(0);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
 /// Validate a `--name` session label: 1-64 chars of letters, digits, dash
 /// and underscore. Anything else makes `rex runs` unreadable and risks
 /// shell-hostile identifiers downstream.
@@ -865,6 +1036,7 @@ pub fn run_resume(args: &[String]) -> Result<i32, ExecError> {
     let mut yes = false;
     let mut json = false;
     let mut dry_run = false;
+    let mut detach = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -907,6 +1079,7 @@ pub fn run_resume(args: &[String]) -> Result<i32, ExecError> {
             "--yes" => yes = true,
             "--json" => json = true,
             "--dry-run" => dry_run = true,
+            "--detach" => detach = true,
             "--help" | "-h" => return Err(ExecError::usage(usage())),
             other if other.starts_with('-') => {
                 return Err(ExecError::usage(format!("unknown flag '{other}'")));
@@ -1009,6 +1182,7 @@ pub fn run_resume(args: &[String]) -> Result<i32, ExecError> {
         yes,
         json,
         dry_run,
+        detach,
         ..Default::default()
     };
     if !json {
@@ -1247,6 +1421,95 @@ mod tests {
             !text.contains("- run-0:"),
             "oldest lines must be dropped, got: {text}"
         );
+    }
+
+    fn fake_active_run(id: &str, heartbeat_at: &str) -> crate::ps::ActiveRun {
+        crate::ps::ActiveRun {
+            run_id: id.to_string(),
+            task: "do things".to_string(),
+            provider: "anthropic".to_string(),
+            model: None,
+            name: None,
+            started_at: crate::ps::now_rfc3339(),
+            heartbeat_at: heartbeat_at.to_string(),
+            detached: true,
+            pid: 9999,
+            log: None,
+            deadman: None,
+            nonce: None,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn parallel_cap_refuses_at_limit_and_names_the_fix() {
+        let state = fake_state("cap");
+        let now = crate::ps::now_rfc3339();
+        crate::ps::write_marker(&state, &fake_active_run("run-1", &now));
+        crate::ps::write_marker(&state, &fake_active_run("run-2", &now));
+        // Default cap is 2 (restrained): 2 live runs refuse a third.
+        let e = check_parallel_cap(&state).unwrap_err();
+        assert_eq!(e.code, 2);
+        assert!(
+            e.message.contains("max_parallel_runs"),
+            "got: {}",
+            e.message
+        );
+        assert!(e.message.contains("rex config set"), "got: {}", e.message);
+        // Raising the cap deliberately lets the next launch through.
+        crate::config::save(
+            &state,
+            &crate::config::Config {
+                max_parallel_runs: 3,
+            },
+        )
+        .unwrap();
+        assert!(check_parallel_cap(&state).is_ok());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn parallel_cap_ignores_stale_markers() {
+        let state = fake_state("cap-stale");
+        // Two dead processes' markers must not block new work.
+        crate::ps::write_marker(&state, &fake_active_run("old-1", "2020-01-01T00:00:00Z"));
+        crate::ps::write_marker(&state, &fake_active_run("old-2", "2020-01-01T00:00:00Z"));
+        assert!(check_parallel_cap(&state).is_ok());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn detach_child_args_strips_detach_flag() {
+        let argv = vec![
+            "exec".to_string(),
+            "--task".to_string(),
+            "hello".to_string(),
+            "--detach".to_string(),
+            "--yes".to_string(),
+        ];
+        assert_eq!(
+            detach_child_args_from(&argv),
+            vec![
+                "exec".to_string(),
+                "--task".to_string(),
+                "hello".to_string(),
+                "--yes".to_string(),
+            ]
+        );
+        // No --detach present: argv passes through unchanged.
+        let argv = vec!["exec".to_string(), "--json".to_string()];
+        assert_eq!(detach_child_args_from(&argv), argv);
+    }
+
+    #[test]
+    fn run_detached_refuses_without_task() {
+        let opts = ExecOptions {
+            detach: true,
+            ..Default::default()
+        };
+        let e = run_detached(opts).unwrap_err();
+        assert_eq!(e.code, 2);
+        assert!(e.message.contains("no task given"), "got: {}", e.message);
     }
 
     #[test]

@@ -107,6 +107,7 @@ pub fn run_tournament(opts: TournamentOptions) -> Result<i32, ExecError> {
             json: true, // never print per-contestant; the bracket is the output
             yes: opts.yes,
             dry_run: false,
+            detach: false,
             bid: false,
             accept_bid: false,
             budget_usd: None,

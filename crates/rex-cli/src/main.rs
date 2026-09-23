@@ -6,11 +6,13 @@
 
 mod bid;
 mod cert;
+mod config;
 mod deadman;
 mod exec;
 mod ledger;
 mod policy;
 mod provenance;
+mod ps;
 mod redteam;
 mod replay;
 mod serve;
@@ -48,6 +50,8 @@ pub(crate) fn usage() -> &'static str {
      \x20 rex mcp list | tools [SERVER] | call SERVER TOOL [--args JSON]\n\
      \x20 rex serve [--port N]\n\
      \x20 rex runs [--json] [--limit N]\n\
+     \x20 rex ps [--all] [--json] [--prune] [--limit N]\n\
+     \x20 rex config [get KEY | set KEY VALUE]\n\
      \x20 rex show RUN_ID [--json]\n\
      \x20 rex keygen [--force]\n\
      \x20 rex verify RECEIPT.json [--public-key BASE64]\n\
@@ -68,6 +72,8 @@ pub(crate) fn usage() -> &'static str {
      \x20 --json               print exactly one JSON receipt on stdout\n\
      \x20 --yes                auto-approve tool calls and plans (CI mode)\n\
      \x20 --dry-run            validate args and print config without running\n\
+     \x20 --detach             run in the background: prints the run id,\n\
+     \x20                      watch it with `rex ps` (see `rex config`)\n\
      \x20 --bid                print the binding bid and stop (needs --accept-bid)\n\
      \x20 --accept-bid         run under the printed bid (requires --bid)\n\
      \x20 --budget-usd X        dollar cap, converted worst-case to a token budget\n\
@@ -145,6 +151,7 @@ fn parse_exec(args: &[String]) -> Result<ExecOptions, ExecError> {
             "--json" => opts.json = true,
             "--yes" => opts.yes = true,
             "--dry-run" => opts.dry_run = true,
+            "--detach" => opts.detach = true,
             "--bid" => opts.bid = true,
             "--accept-bid" => opts.accept_bid = true,
             "--budget-usd" => {
@@ -355,6 +362,8 @@ fn main() -> ExitCode {
         Some("mcp") => run_mcp(&args[1..]),
         Some("serve") => run_serve_args(&args[1..]),
         Some("runs") => run_runs(&args[1..]).map(|_| 0),
+        Some("ps") => crate::ps::run_ps(&args[1..]),
+        Some("config") => crate::config::run_config(&args[1..]),
         Some("show") => run_show(&args[1..]),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
         Some("verify") => run_verify(&args[1..]),
