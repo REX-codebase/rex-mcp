@@ -124,14 +124,14 @@ async function backend() {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${SIDEBAR_SAFE()}${path}`, {
+  const response = await fetch(`${sidecarBase()}${path}`, {
     ...init,
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
   });
   if (!response.ok) throw new Error(`sidecar HTTP ${response.status}`);
   return (await response.json()) as T;
 }
-function SIDEBAR_SAFE() {
+function sidecarBase() {
   return SIDECAR;
 }
 

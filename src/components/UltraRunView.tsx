@@ -5,7 +5,7 @@ const PHASE_LABEL: Record<string, string> = {
   contracting: "Compiling the acceptance contract",
   building: "Builder working",
   verifying: "Re-executing every proof fresh",
-  adversary: "Adversary attacking the result",
+  adversary: "Adversary review",
   judging: "Clean-room judge scoring obligations",
   repairing: "Repairing gate failures",
   promoted: "Promoted - every gate agreed",
@@ -64,6 +64,11 @@ export function UltraRunView({
       )}
       {run.adversary && (run.adversary.defects.length > 0 || run.adversary.inconclusive) && (
         <div className="ultra-adversary" role="status">
+          <p className="ultra-adversary-note">
+            {run.adversary.adversary_model && run.adversary.adversary_model !== "static"
+              ? `Model red-team review by ${run.adversary.adversary_model}.`
+              : "Static scan — deterministic checks, no model involved."}
+          </p>
           {run.adversary.inconclusive && <p>Adversary pass was inconclusive.</p>}
           {run.adversary.defects.map((d, i) => (
             <p key={i}>Adversary: {d.title} - {d.detail}</p>
