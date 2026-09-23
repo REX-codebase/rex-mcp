@@ -105,14 +105,14 @@ fn to_rgb(color: png::ColorType, depth: png::BitDepth, raw: &[u8]) -> Result<Vec
             return Err("indexed png is rejected; encode truecolor screenshots".into())
         }
     };
-    if raw.len() % channels != 0 {
+    if !raw.len().is_multiple_of(channels) {
         return Err("png payload is not a whole number of pixels".into());
     }
     let mut rgb = Vec::with_capacity(raw.len() / channels * 3);
     match color {
         ColorType::Rgb => rgb.extend_from_slice(raw),
         ColorType::Rgba => {
-            for px in raw.chunks_exact(4) {
+            for px in raw.as_chunks::<4>().0 {
                 rgb.extend_from_slice(&px[..3]);
             }
         }
@@ -122,7 +122,7 @@ fn to_rgb(color: png::ColorType, depth: png::BitDepth, raw: &[u8]) -> Result<Vec
             }
         }
         ColorType::GrayscaleAlpha => {
-            for px in raw.chunks_exact(2) {
+            for px in raw.as_chunks::<2>().0 {
                 rgb.extend_from_slice(&[px[0], px[0], px[0]]);
             }
         }
@@ -140,7 +140,7 @@ fn metrics_from_rgb(rgb: &[u8], width: u32, height: u32, artifact_hash: &str) ->
     // 8x8 block sums for the average hash.
     let mut block_sum = [0u64; 64];
     let mut block_count = [0u64; 64];
-    for (i, px) in rgb.chunks_exact(3).enumerate() {
+    for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
         let (r, g, b) = (px[0] as u32, px[1] as u32, px[2] as u32);
         if colors.len() < 1_000_000 {
             colors.insert((r << 16) | (g << 8) | b);
@@ -158,7 +158,7 @@ fn metrics_from_rgb(rgb: &[u8], width: u32, height: u32, artifact_hash: &str) ->
         block_count[block] += 1;
     }
     let n = pixels as u64;
-    let mean_luma = if n > 0 { (luma_sum / n) as u32 } else { 0 };
+    let mean_luma = (luma_sum.checked_div(n).unwrap_or(0)) as u32;
     // population variance = E[x^2] - E[x]^2, kept in integers
     let luma_variance = if n > 0 {
         let n128 = n as u128;
@@ -171,11 +171,7 @@ fn metrics_from_rgb(rgb: &[u8], width: u32, height: u32, artifact_hash: &str) ->
     let mut block_means = [0u64; 64];
     let mut total: u64 = 0;
     for b in 0..64 {
-        block_means[b] = if block_count[b] > 0 {
-            block_sum[b] / block_count[b]
-        } else {
-            0
-        };
+        block_means[b] = block_sum[b].checked_div(block_count[b]).unwrap_or(0);
         total += block_means[b];
     }
     let overall = total / 64;

@@ -917,7 +917,7 @@ impl PromotionStore {
             // blocks below.
             let mut executable = AcceptanceContract {
                 task: contract.task.clone(),
-                work_kind: contract.work_kind.clone(),
+                work_kind: contract.work_kind,
                 obligations: Vec::new(),
                 forbidden_regressions: contract.forbidden_regressions.clone(),
             };

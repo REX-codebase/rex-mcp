@@ -1889,7 +1889,6 @@ impl HarnessDaemon {
     }
 
     /// Mint a fresh operational capability and rotate the stored hash.
-
     /// A verified resume (the rotated host handle) also renews a lapsed
     /// lease: docs/rex-mcp-ultra.md promises that an expired lease plus the
     /// current handle resumes the task. Without this, a host working longer

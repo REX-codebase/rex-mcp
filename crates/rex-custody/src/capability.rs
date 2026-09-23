@@ -179,7 +179,7 @@ pub fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     let inner_digest = inner.finalize();
     let mut outer = Sha256::new();
     outer.update(&opad);
-    outer.update(&inner_digest);
+    outer.update(inner_digest);
     outer
         .finalize()
         .iter()

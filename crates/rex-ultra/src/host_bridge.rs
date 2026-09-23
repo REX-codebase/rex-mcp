@@ -7,7 +7,7 @@
 //! provider, no managed inference, no silent fallback - a missing host stays
 //! `HostRequired`.
 
-use crate::contract::{AcceptanceContract, Obligation, Proof};
+use crate::contract::AcceptanceContract;
 use crate::external_kernel::{
     AdapterError, CandidateResponse, ExternalHostAdapter, HostCandidateRequest,
     HostEvidenceRequest, HostKernelStatus, KernelState,

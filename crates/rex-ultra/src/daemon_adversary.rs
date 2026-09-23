@@ -176,15 +176,15 @@ fn walk(
             });
             continue;
         }
-        if meta.len() > MAX_FILE_BYTES || *scanned_bytes + meta.len() > MAX_SCAN_BYTES {
-            if meta.len() > MAX_FILE_BYTES || *scanned_bytes >= MAX_SCAN_BYTES {
-                *truncated = true;
-                defects.push(Defect {
-                    title: "scan truncated".into(),
-                    detail: format!("byte bound reached at {relative}"),
-                });
-                return;
-            }
+        if (meta.len() > MAX_FILE_BYTES || *scanned_bytes + meta.len() > MAX_SCAN_BYTES)
+            && (meta.len() > MAX_FILE_BYTES || *scanned_bytes >= MAX_SCAN_BYTES)
+        {
+            *truncated = true;
+            defects.push(Defect {
+                title: "scan truncated".into(),
+                detail: format!("byte bound reached at {relative}"),
+            });
+            return;
         }
         let Ok(bytes) = fs::read(&path) else { continue };
         *scanned_bytes += bytes.len() as u64;

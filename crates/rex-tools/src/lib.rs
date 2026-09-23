@@ -1799,7 +1799,7 @@ mod git_tests {
 
         // Commit it.
         let out = rt.git_commit(&root, "test commit").unwrap();
-        assert!(out.contains("test commit") || out.len() > 0);
+        assert!(out.contains("test commit") || !out.is_empty());
 
         // Status is clean now.
         let files = rt.git_status(&root).unwrap();
