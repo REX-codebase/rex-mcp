@@ -73,16 +73,28 @@ answer, verified against the battle-plan parity checklist.
 ## Phase 4 — Leapfrog (the 10 bets)
 
 Only after parity. These are what make REX a different category, not a copy.
+(Status 2026-09-23: bets 1, 3, and 7 were pulled forward into the headless
+CLI during Phase 1 work and are live in `rex`; the rest remain sequenced
+after Phase 2/3 parity.)
 
-1. Machine-verifiable signed run certificates
+1. Machine-verifiable signed run certificates — DONE (b24ce024):
+   Ed25519 per-machine keys, `rex keygen` / `rex verify`, every receipt
+   signed. Local ledger (`rex runs` / `rex show`) added in 15e528da.
 2. Repo-specific adversarial immune system
-3. Cross-provider tournaments with deterministic promotion
+3. Cross-provider tournaments with deterministic promotion — DONE (380d58e9):
+   `rex tournament --task T --providers a,b`, signed bracket receipts.
 4. Epistemic provenance at diff-hunk level
 5. Proof replay as the primary review primitive
 6. Time-locked disconnected operation (dead-man custody, verified rollback)
-7. Plans that bid binding cost/proof-coverage commitments before execution
+7. Plans that bid binding cost/proof-coverage commitments before execution —
+   DONE (d62a443e, e34f6f51): `rex exec --bid` prints the binding bid
+   (budgets + worst-case dollar ceiling), `--accept-bid` executes under it,
+   `--budget-usd` converts a dollar cap into a token budget; the receipt
+   carries the bid, `cost_usd_estimate`, and `bid_met`/`bid_gaps`.
 8. Skills marketplace ranked by verified efficacy
-9. Air-gapped offline verification
+9. Air-gapped offline verification — PARTIAL: `rex verify` already runs fully
+   offline (certificates verify from the receipt alone); the packaged
+   air-gap story is still to do.
 10. Cross-repo proof contracts
 
 Exit criteria per bet: a demo where the capability is *exercised*, not
