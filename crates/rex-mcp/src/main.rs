@@ -1,4 +1,4 @@
-use rex_daemon::{DaemonPolicy, HarnessDaemon};
+use rex_daemon::{DaemonPolicy, HarnessDaemon, LeaseKeeper, LeaseKeeperConfig};
 use rex_mcp::McpServer;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -9,6 +9,7 @@ fn main() {
         std::process::exit(1);
     }
 }
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = std::env::var_os("REX_STATE_DIR")
         .map(PathBuf::from)
@@ -20,6 +21,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut policy = DaemonPolicy::conservative(workspace);
     policy.approve_task_mutations = approved;
     let daemon = HarnessDaemon::open(state, policy)?;
+    let enabled = std::env::var("REX_LEASE_KEEPER").as_deref() != Ok("0");
+    let _lease_keeper: Option<LeaseKeeper> = if enabled {
+        Some(daemon.spawn_lease_keeper(LeaseKeeperConfig::default())?)
+    } else {
+        None
+    };
     let mut server = McpServer::new(daemon);
     server.serve(
         BufReader::new(std::io::stdin().lock()),
@@ -27,6 +34,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     Ok(())
 }
+
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)

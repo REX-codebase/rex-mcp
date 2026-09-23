@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod lease_keeper;
+pub use lease_keeper::{LeaseKeeper, LeaseKeeperConfig, LeaseRenewalReport, RenewedLease};
+
 const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
 const MAX_PLAN_STEPS: usize = 100;
 
@@ -683,7 +686,8 @@ impl HarnessDaemon {
     }
 
     pub fn status(&self, req: TaskRefRequest) -> Result<StatusResponse, ProtocolError> {
-        let t = self.load(&req.task_id)?;
+        let mut t = self.load(&req.task_id)?;
+        self.sync_lease_from_custody(&mut t)?;
         let lease = lease_view(&t);
         let used_wall = elapsed(&t);
         let operation = status_operation(&t);
@@ -1850,7 +1854,7 @@ impl HarnessDaemon {
     }
 
     fn live(&self, id: &str, epoch: u64, capability: &str) -> Result<DurableTask, ProtocolError> {
-        let t = self.load(id)?;
+        let mut t = self.load(id)?;
         // Authorization first: a presented capability whose hash does not
         // match is denied before any state or lease detail is revealed.
         // Pre-2.0 records carry an empty hash and fail closed.
@@ -1865,6 +1869,9 @@ impl HarnessDaemon {
         if epoch != t.lease_epoch {
             return Err(perr(ErrorCode::StaleLease, "lease epoch is stale", id));
         }
+        // The keeper may have renewed the lease in custody since this
+        // record was written; judge expiry on the live view.
+        self.sync_lease_from_custody(&mut t)?;
         if now_ms() >= t.lease_expires_ms {
             return Err(perr(ErrorCode::StaleLease, "lease expired", id));
         }
@@ -1877,12 +1884,21 @@ impl HarnessDaemon {
     }
 
     fn heartbeat(&self, t: &mut DurableTask) -> Result<(), ProtocolError> {
-        let lease = self
-            .custody
-            .lock()
-            .map_err(|_| internal("custody registry poisoned"))?
-            .heartbeat(&t.token, t.heartbeat_seq, now_ms())
-            .map_err(custody_err)?;
+        // The sequence comes from the custody grant, not from the task
+        // record: the lease keeper may have heartbeated since the last
+        // agent call, and a cached sequence would then read as a replay.
+        let beat = {
+            let mut reg = self
+                .custody
+                .lock()
+                .map_err(|_| internal("custody registry poisoned"))?;
+            let seq = match reg.grant(&t.grant_id) {
+                Some(g) => g.lease.next_seq,
+                None => t.heartbeat_seq,
+            };
+            reg.heartbeat(&t.token, seq, now_ms())
+        };
+        let lease = beat.map_err(custody_err)?;
         t.heartbeat_seq = lease.next_seq;
         t.lease_expires_ms = lease.expires_ms;
         Ok(())
@@ -1895,6 +1911,9 @@ impl HarnessDaemon {
     /// than one lease window between calls - exactly the long Ultra loop -
     /// bricked its own task with no recovery path.
     fn renew_lease_on_resume(&self, t: &mut DurableTask) -> Result<bool, ProtocolError> {
+        // The keeper may have renewed this lease already; only a lapsed
+        // lease needs the renewal work below.
+        self.sync_lease_from_custody(t)?;
         if now_ms() < t.lease_expires_ms {
             return Ok(false);
         }
