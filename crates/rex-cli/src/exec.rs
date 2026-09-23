@@ -225,6 +225,7 @@ fn receipt(
         "prompt_version": snap.prompt_version,
         "prompt_hash": snap.prompt_hash,
         "workspace": workspace.map(|w| w.display().to_string()),
+        "provenance": crate::provenance::build(&snap.events),
         "finished_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "bid": accepted_bid.map(|b| b.to_json()),
         "cost_usd_ceiling": cost_usd_ceiling,

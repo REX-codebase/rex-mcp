@@ -8,6 +8,7 @@ mod bid;
 mod cert;
 mod exec;
 mod ledger;
+mod provenance;
 mod redteam;
 mod tournament;
 
