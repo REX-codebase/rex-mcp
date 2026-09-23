@@ -66,7 +66,10 @@ Parity items: IDE extensions, GitHub App.
       `<!-- rex-proof-summary -->` marker). Delivered through the Action +
       `gh api`, which is the whole behavior the App would have; a
       standalone App registration is not needed for it.
-- [ ] JetBrains extension (after VS Code proves the protocol)
+- [x] JetBrains extension (`extensions/jetbrains`): Kotlin plugin over the
+      same local `rex serve` HTTP API — Run Task, Cancel, Checkpoint,
+      Rewind, Show Receipt; plan/tool approvals as IDE notifications.
+      Compiled clean via `gradle buildPlugin` in CI.
 
 Exit criteria: a developer can run a REX task, approve a plan, and rewind a
 checkpoint without leaving VS Code.
