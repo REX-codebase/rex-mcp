@@ -6,6 +6,7 @@
 
 mod bid;
 mod cert;
+mod deadman;
 mod exec;
 mod ledger;
 mod policy;
@@ -31,6 +32,7 @@ fn usage() -> &'static str {
      \x20 rex redteam --task TASK --yes [options]\n\
      \x20 rex policy --workspace DIR\n\
      \x20 rex replay RECEIPT.json [--json]\n\
+     \x20 rex checkin --file PATH\n\
      \x20 rex runs [--json] [--limit N]\n\
      \x20 rex show RUN_ID [--json]\n\
      \x20 rex keygen [--force]\n\
@@ -131,6 +133,15 @@ fn parse_exec(args: &[String]) -> Result<ExecOptions, ExecError> {
                     &take_value("--budget-usd", &mut i)?,
                     "--budget-usd",
                 )?);
+            }
+            "--deadman-mins" => {
+                opts.deadman_mins = Some(parse_u64(
+                    &take_value("--deadman-mins", &mut i)?,
+                    "--deadman-mins",
+                )?);
+            }
+            "--deadman-file" => {
+                opts.deadman_file = Some(take_value("--deadman-file", &mut i)?.into());
             }
             "--help" | "-h" => return Err(ExecError::usage(usage())),
             other if other.starts_with('-') => {
@@ -314,6 +325,7 @@ fn main() -> ExitCode {
         Some("redteam") => parse_redteam(&args[1..]).and_then(run_redteam),
         Some("policy") => run_policy(&args[1..]),
         Some("replay") => run_replay_args(&args[1..]),
+        Some("checkin") => run_checkin(&args[1..]),
         Some("runs") => run_runs(&args[1..]).map(|_| 0),
         Some("show") => run_show(&args[1..]),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
@@ -381,6 +393,31 @@ fn run_replay_args(args: &[String]) -> Result<i32, ExecError> {
     }
     let path = path.ok_or_else(|| ExecError::usage("rex replay RECEIPT.json [--json]"))?;
     replay::run_replay(&path, json)
+}
+
+fn run_checkin(args: &[String]) -> Result<i32, ExecError> {
+    let mut file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => {
+                i += 1;
+                file = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| ExecError::usage("--file expects a value"))?,
+                );
+            }
+            "--help" | "-h" => return Err(ExecError::usage(usage())),
+            other => return Err(ExecError::usage(format!("unknown argument '{other}'"))),
+        }
+        i += 1;
+    }
+    let file = file.ok_or_else(|| ExecError::usage("rex checkin --file PATH"))?;
+    let path = std::path::PathBuf::from(&file);
+    deadman::checkin(&path).map_err(ExecError::internal)?;
+    println!("checked in at {file}");
+    Ok(0)
 }
 
 fn run_runs(args: &[String]) -> Result<(), ExecError> {

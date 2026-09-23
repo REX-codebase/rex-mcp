@@ -88,6 +88,11 @@ pub struct ExecOptions {
     /// contestants): each tag gets its own staged workspace directory.
     /// Not a CLI flag.
     pub run_tag: Option<String>,
+    /// Dead-man custody: check in at least this often (minutes) or the
+    /// run is cancelled. A liveness signal, not a runtime budget.
+    pub deadman_mins: Option<u64>,
+    /// Override the dead-man check-in file location.
+    pub deadman_file: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -190,6 +195,7 @@ fn receipt(
     workspace: Option<&Path>,
     accepted_bid: Option<&crate::bid::Bid>,
     policy: Option<&crate::policy::Policy>,
+    deadman: Option<Value>,
 ) -> Map<String, Value> {
     let status_str = serde_json::to_value(&snap.status)
         .ok()
@@ -235,6 +241,7 @@ fn receipt(
         "bid_met": accepted_bid.map(|b| b.proof_gaps(&status_str, snap.completion_summary.as_deref()).is_empty()),
         "bid_gaps": accepted_bid.map(|b| b.proof_gaps(&status_str, snap.completion_summary.as_deref())),
         "policy": policy.map(|p| p.to_json()),
+        "deadman": deadman,
     })
     .as_object()
     .cloned()
@@ -259,9 +266,23 @@ fn build_agent() -> Result<(Agent, PathBuf), ExecError> {
     ))
 }
 
-fn drive(agent: &Agent, opts: &ExecOptions, run_id: &str) -> Result<AgentSnapshot, ExecError> {
+fn drive(
+    agent: &Agent,
+    opts: &ExecOptions,
+    run_id: &str,
+    deadman: &mut Option<crate::deadman::Deadman>,
+) -> Result<AgentSnapshot, ExecError> {
     loop {
         std::thread::sleep(Duration::from_millis(500));
+        if let Some(dm) = deadman {
+            let rid = run_id.to_string();
+            let tripped = dm
+                .poll(&|| agent.cancel(&rid).map(|_| ()).map_err(|e| e.to_string()))
+                .map_err(ExecError::internal)?;
+            if tripped && !opts.json {
+                eprintln!("rex: dead-man tripped: no operator check-in — run cancelled");
+            }
+        }
         let snap = agent
             .snapshot(run_id)
             .ok_or_else(|| ExecError::internal("run vanished from the registry"))?;
@@ -374,6 +395,12 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         }
     }
 
+    if let Some(mins) = opts.deadman_mins {
+        if mins == 0 {
+            return Err(ExecError::usage("--deadman-mins must be at least 1"));
+        }
+    }
+
     let mut budgets = Budgets::default();
     if let Some(s) = opts.max_steps {
         budgets.max_steps = s;
@@ -460,6 +487,7 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
             "auto_approve": opts.yes,
             "workspace": opts.workspace.as_ref().map(|w| w.display().to_string()),
             "policy": policy.as_ref().map(|p| p.to_json()),
+            "deadman_mins": opts.deadman_mins,
         });
         return Ok(ExecOutput {
             code: 0,
@@ -506,7 +534,26 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         eprintln!("rex: run {run_id} started (provider {})", opts.provider);
     }
 
-    let final_snap = drive(&agent, &opts, &run_id)?;
+    // Dead-man custody: arm the switch before the first drive poll.
+    let state_for_dm = state_dir();
+    let mut deadman = match opts.deadman_mins {
+        Some(mins) => Some(
+            crate::deadman::Deadman::arm(&state_for_dm, &run_id, mins, opts.deadman_file.clone())
+                .map_err(ExecError::internal)?,
+        ),
+        None => None,
+    };
+    if let Some(dm) = &deadman {
+        if !opts.json {
+            eprintln!(
+                "rex: dead-man armed: check in at {} at least every {} min",
+                dm.file().display(),
+                opts.deadman_mins.unwrap_or(0),
+            );
+        }
+    }
+
+    let final_snap = drive(&agent, &opts, &run_id, &mut deadman)?;
     let completed = final_snap.status == AgentStatus::Completed;
     let mut receipt_map = receipt(
         &opts,
@@ -514,6 +561,7 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         staged_workspace.as_deref(),
         accepted_bid.as_ref(),
         policy.as_ref(),
+        deadman.as_ref().map(|d| d.to_json()),
     );
 
     // Leapfrog bet 1: every receipt is signed. A failed signature must
