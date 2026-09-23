@@ -3,7 +3,7 @@ import { ModelStatus } from "./ModelStatus";
 import { EXAMPLE_TASKS, type RunState } from "../data/mock";
 import type { ExecutionPath } from "../data/executionPath";
 
-export function Composer({ task, setTask, state, onRun, planMode, setPlanMode, executionPath }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void; planMode: boolean; setPlanMode: (v: boolean) => void; executionPath: ExecutionPath }) {
+export function Composer({ task, setTask, state, onRun, planMode, setPlanMode, fableGate, setFableGate, executionPath }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void; planMode: boolean; setPlanMode: (v: boolean) => void; fableGate: boolean; setFableGate: (v: boolean) => void; executionPath: ExecutionPath }) {
   const busy = state === "working" || state === "verifying";
   const canRun = task.trim().length > 0 && !busy;
   const areaRef = useRef<HTMLTextAreaElement>(null);
@@ -46,6 +46,10 @@ export function Composer({ task, setTask, state, onRun, planMode, setPlanMode, e
             <label className="plan-toggle" title="Plan mode: REX proposes a plan and waits for your approval before any tool runs.">
               <input type="checkbox" checked={planMode} disabled={busy} onChange={(e) => setPlanMode(e.target.checked)} aria-label="Plan mode" />
               <span>Plan mode</span>
+            </label>
+            <label className="plan-toggle" title="Fable gate: opens a THINK→PROVE→ATTACK→WRITE session with a mechanical deliberation timer and evidence-gated unlock. The countdown shows above the run.">
+              <input type="checkbox" checked={fableGate} disabled={busy} onChange={(e) => setFableGate(e.target.checked)} aria-label="Fable gate" />
+              <span>Fable gate</span>
             </label>
             <span className="hidden text-[11px] text-faint md:inline">Ctrl + Enter</span>
             <button type="button" onClick={onRun} disabled={!canRun} title={!task.trim() ? "Describe a task first" : busy ? "A run is in progress" : "Start the run"} className="run-button" aria-label={busy ? "Run in progress" : "Run task"}>

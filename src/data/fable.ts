@@ -42,6 +42,37 @@ export async function fableUnlockSession(
   return invoke<FableStatus>("fable_unlock_session", { name, rationale });
 }
 
+export interface FableMcpLink {
+  available: boolean;
+  server_command: string;
+  tools: string[];
+  has_fable_session_tool: boolean;
+  error: string | null;
+}
+
+export async function fableMcpProbe(serverCommand: string): Promise<FableMcpLink> {
+  return invoke<FableMcpLink>("fable_mcp_probe", { serverCommand });
+}
+
+const MCP_COMMAND_KEY = "rex-fable-mcp-command";
+
+export function loadFableMcpCommand(): string {
+  try {
+    return window.localStorage.getItem(MCP_COMMAND_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function saveFableMcpCommand(cmd: string): void {
+  try {
+    if (cmd) window.localStorage.setItem(MCP_COMMAND_KEY, cmd);
+    else window.localStorage.removeItem(MCP_COMMAND_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
 const SESSION_KEY = "rex-fable-session";
 
 export function loadFableSessionName(): string | null {

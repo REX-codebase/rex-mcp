@@ -576,3 +576,8 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .fable-countdown-text b{font-variant-numeric:tabular-nums}
 .fable-countdown--open{border-color:var(--color-accent)}
 .fable-countdown--error{border-color:var(--color-danger,#b3261e)}
+
+/* Fable MCP link settings. */
+.settings-input{flex:1;min-width:200px;padding:8px 10px;border:1px solid var(--color-line);border-radius:8px;background:transparent;font-size:12px;color:var(--color-text);font-family:ui-monospace,monospace}
+.settings-input::placeholder{color:var(--color-faint)}
+.settings-input:focus{outline:none;border-color:var(--color-accent)}

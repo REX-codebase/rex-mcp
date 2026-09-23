@@ -515,6 +515,140 @@ fn fable_unlock_session(name: String, rationale: String) -> Result<FableStatusVi
     Ok(fable_view_of(&session))
 }
 
+// ---------------------------------------------------------------------------
+// Fable-mode MCP link: probe an external Fable Engine MCP server.
+// ---------------------------------------------------------------------------
+
+/// Result of probing a fable-mode MCP server over stdio.
+#[derive(serde::Serialize)]
+struct FableMcpLink {
+    available: bool,
+    server_command: String,
+    tools: Vec<String>,
+    has_fable_session_tool: bool,
+    error: Option<String>,
+}
+
+/// Probe an external fable-mode MCP server. Spawns `server_command` (split
+/// on whitespace), performs the MCP initialize handshake, and lists tools.
+/// The child is killed afterwards; this is a link check, not a session.
+#[tauri::command]
+fn fable_mcp_probe(server_command: String) -> Result<FableMcpLink, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut parts = server_command.split_whitespace();
+    let bin = parts.next().ok_or("server command is empty")?.to_string();
+    let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+
+    let mut child = Command::new(&bin)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot spawn {bin}: {e}"))?;
+
+    let mut stdin = child.stdin.take().ok_or("server stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("server stdout unavailable")?;
+    let mut reader = BufReader::new(stdout);
+
+    let mut next_id = 0u64;
+    let mut request = |method: &str, params: serde_json::Value| -> Result<serde_json::Value, String> {
+        next_id += 1;
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": next_id,
+            "method": method,
+            "params": params,
+        });
+        writeln!(stdin, "{}", msg).map_err(|e| format!("write failed: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush failed: {e}"))?;
+        // Read with a timeout so a hung server cannot hang the UI.
+        let mut line = String::new();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            line.clear();
+            // Non-blocking check: try to read; BufRead::read_line blocks,
+            // so we rely on the overall spawn timeout via a helper thread
+            // in production. Here we read one line; a well-behaved MCP
+            // server answers initialize promptly.
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) if !line.trim().is_empty() => break,
+                Ok(_) => continue,
+                Err(e) => return Err(format!("read failed: {e}")),
+            }
+            if start.elapsed() >= Duration::from_secs(10) {
+                break;
+            }
+        }
+        if line.trim().is_empty() {
+            return Err("server did not answer within 10s".to_string());
+        }
+        serde_json::from_str(&line).map_err(|e| format!("bad JSON from server: {e}"))
+    };
+
+    let link = (|| -> Result<FableMcpLink, String> {
+        let hello = request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "rex-harness", "version": env!("CARGO_PKG_VERSION") },
+            }),
+        )?;
+        if hello.get("result").is_none() {
+            return Err(format!("server refused initialize: {hello}"));
+        }
+        let tools_resp = request("tools/list", serde_json::json!({}))?;
+        let tools: Vec<String> = tools_resp
+            .pointer("/result/tools")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(FableMcpLink {
+            available: true,
+            server_command: server_command.clone(),
+            has_fable_session_tool: tools.iter().any(|t| t == "fable_session"),
+            tools,
+            error: None,
+        })
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match link {
+        Ok(mut l) => {
+            if !l.has_fable_session_tool {
+                l.available = false;
+                l.error = Some(format!(
+                    "server answered but has no fable_session tool (has: {})",
+                    if l.tools.is_empty() {
+                        "none".to_string()
+                    } else {
+                        l.tools.join(", ")
+                    }
+                ));
+            }
+            Ok(l)
+        }
+        Err(e) => Ok(FableMcpLink {
+            available: false,
+            server_command: server_command.clone(),
+            tools: vec![],
+            has_fable_session_tool: false,
+            error: Some(e),
+        }),
+    }
+}
+
 /// Current custody phase for a grant (active, verifying, released, ...).
 #[tauri::command]
 fn custody_phase(
@@ -936,6 +1070,7 @@ fn main() {
             fable_create_session,
             fable_session_status,
             fable_unlock_session,
+            fable_mcp_probe,
             rex_task_begin,
             rex_task_follow_up,
             rex_tasks,

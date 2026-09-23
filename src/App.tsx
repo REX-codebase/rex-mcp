@@ -25,7 +25,7 @@ import { liveRunAvailable } from "./data/liveRun";
 import { custodyBegin, custodyDecidePlan, custodyStop } from "./data/custodyRun";
 import { rexTaskBegin } from "./data/rexTasks";
 import { FableCountdown } from "./components/FableCountdown";
-import { loadFableSessionName } from "./data/fable";
+import { loadFableSessionName, saveFableSessionName, fableCreateSession } from "./data/fable";
 import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
   agentCancel,
@@ -93,8 +93,30 @@ export default function App() {
   const [task, setTask] = useState("");
   const [session, setSession] = useState<Session | null>(null);
   // Active Fable gate session, if the user started one. The countdown is
-  // visible here; the toggle that creates sessions arrives separately.
-  const [fableSession] = useState<string | null>(() => loadFableSessionName());
+  // visible here; the Composer toggle creates sessions.
+  const [fableSession, setFableSession] = useState<string | null>(() => loadFableSessionName());
+  // Fable gate toggle: when on, runs create a native fable session first.
+  const [fableGate, setFableGate] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem("rex-fable-gate") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleFableGate = (v: boolean) => {
+    try {
+      window.localStorage.setItem("rex-fable-gate", v ? "1" : "0");
+    } catch {
+      /* storage unavailable */
+    }
+    setFableGate(v);
+    if (!v) {
+      // Turning the gate off clears the active session from the UI.
+      // The session persists on disk; the countdown simply stops showing.
+      saveFableSessionName(null);
+      setFableSession(null);
+    }
+  };
   const [liveCapable, setLiveCapable] = useState(false);
   const [backendProbed, setBackendProbed] = useState(false);
   const [tourMode, setTourMode] = useState(() => {
@@ -284,7 +306,7 @@ export default function App() {
     tourMode,
   });
 
-  const onRun = () => {
+  const onRun = async () => {
     cancel.current?.();
     const label = task.trim();
     if (!label) return;
@@ -317,6 +339,25 @@ export default function App() {
       }
       beginSettle();
       return;
+    }
+    // Fable gate: when enabled, open a native fable session for this task
+    // before the run starts. The session's authority timer and unlock rule
+    // are enforced in Rust; the countdown appears above the run. If the
+    // gate fails to open, the run does not start ungated.
+    if (fableGate && liveCapable) {
+      const sessionName = `fable-${Date.now().toString(36)}`;
+      try {
+        await fableCreateSession(sessionName, label);
+        saveFableSessionName(sessionName);
+        setFableSession(sessionName);
+      } catch (e) {
+        console.error("Fable gate failed to open:", e);
+        setChecklistHot(true);
+        if (checklistTimer.current) window.clearTimeout(checklistTimer.current);
+        checklistTimer.current = window.setTimeout(() => setChecklistHot(false), 1600);
+        beginSettle();
+        return;
+      }
     }
     if (path.kind === "installed") {
       // Settings integration: the vendor CLI runs the task on an isolated
@@ -661,6 +702,8 @@ export default function App() {
                       onRun={onRun}
                       planMode={planMode}
                       setPlanMode={setPlanMode}
+                      fableGate={fableGate}
+                      setFableGate={toggleFableGate}
                       executionPath={executionPath}
                     />
                   </div>
