@@ -46,6 +46,14 @@ impl<S: SecretStore> SecretStore for EnvSecretStore<S> {
                 return Ok(Some(v));
             }
         }
+        // Generic fallback so CI can bind the secret via `env:` without
+        // interpolating it into shell text (avoids quoting/injection bugs).
+        if let Ok(v) = std::env::var("REX_API_KEY") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Ok(Some(v));
+            }
+        }
         self.inner.get_key(provider)
     }
 

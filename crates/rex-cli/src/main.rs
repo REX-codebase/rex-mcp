@@ -47,8 +47,9 @@ fn usage() -> &'static str {
      \x20 --budget-usd X        dollar cap, converted worst-case to a token budget\n\
      \x20                      (requires --model with a known price)\n\
      \n\
-     credentials: $REX_<PROVIDER>_API_KEY wins; otherwise the file credential\n\
-     store under $REX_STATE_DIR (default ~/.rex/harness) is used.\n\
+     credentials: $REX_<PROVIDER>_API_KEY wins, then $REX_API_KEY;\n\
+     otherwise the file credential store under $REX_STATE_DIR\n\
+     (default ~/.rex/harness) is used.\n\
      \n\
      exit codes: 0 completed · 2 usage/config/approval needed ·\n\
      \x203 run ended without completing · 1 internal error\n"

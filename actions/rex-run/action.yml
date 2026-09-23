@@ -76,10 +76,11 @@ runs:
       shell: bash
       env:
         REX_STATE_DIR: ${{ runner.temp }}/rex-state
+        # Bound via env: so the secret never touches shell text (no quoting or
+        # injection issues). The CLI also accepts REX_<PROVIDER>_API_KEY.
+        REX_API_KEY: ${{ inputs.api-key }}
       run: |
         set -euo pipefail
-        upper_provider=$(echo "${{ inputs.provider }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-        export "REX_${upper_provider}_API_KEY=${{ inputs.api-key }}"
         args=(exec --yes --json --provider "${{ inputs.provider }}" --task "${{ inputs.task }}")
         [ -n "${{ inputs.model }}" ] && args+=(--model "${{ inputs.model }}")
         args+=(--workspace "${{ inputs.workspace }}")
@@ -94,6 +95,13 @@ runs:
         } >> "$GITHUB_OUTPUT"
         # Fail the job unless the run actually completed.
         [ "$(jq -r .status "$RUNNER_TEMP/rex-receipt.json")" = "completed" ]
+
+    - name: Verify receipt signature
+      shell: bash
+      env:
+        REX_STATE_DIR: ${{ runner.temp }}/rex-state
+      run: |
+        "$GITHUB_WORKSPACE/rex-harness/target/release/rex" verify "$RUNNER_TEMP/rex-receipt.json"
 
     - name: Upload receipt
       uses: actions/upload-artifact@v4
