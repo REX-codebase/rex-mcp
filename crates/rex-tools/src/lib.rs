@@ -1026,7 +1026,7 @@ impl ToolRuntime {
         let staged = self.git_run(&ws, &["diff", "--cached", "--", path])?;
         if !staged.is_empty() {
             if !out.is_empty() {
-                out.push_str("\n");
+                out.push('\n');
             }
             out.push_str(&staged);
         }
