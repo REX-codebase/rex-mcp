@@ -40,7 +40,10 @@ pub struct RedteamOptions {
 }
 
 fn summary_of(r: &Value) -> &str {
-    r.get("completion_summary")
+    // Real exec receipts store the summary under "result"; older fixtures
+    // used "completion_summary". Read the real key first.
+    r.get("result")
+        .or_else(|| r.get("completion_summary"))
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("(no summary produced)")
@@ -278,7 +281,12 @@ mod tests {
 
     #[test]
     fn critic_task_contains_evidence() {
-        let b = serde_json::json!({"status": "completed", "completion_summary": "built it"});
+        // Regression: real exec receipts store the summary under "result",
+        // not "completion_summary" (which summary_of used to read).
+        let b = serde_json::json!({"status": "completed", "result": "built it"});
+        assert_eq!(summary_of(&b), "built it");
+        let legacy = serde_json::json!({"status": "completed", "completion_summary": "old"});
+        assert_eq!(summary_of(&legacy), "old");
         let t = critic_task("make tea", &b);
         assert!(t.contains("make tea"));
         assert!(t.contains("built it"));
