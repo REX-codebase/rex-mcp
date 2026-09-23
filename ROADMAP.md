@@ -45,6 +45,12 @@ completes in CI with a parseable receipt and a non-zero exit on failure.
 
 Parity items: IDE extensions, GitHub App.
 
+- [x] Local harness daemon protocol: `rex serve` binds 127.0.0.1 and exposes
+      POST /v1/runs, GET /v1/runs, GET /v1/runs/:id (live snapshot with
+      pending approval / awaiting plan), POST /v1/runs/:id/approve,
+      POST /v1/runs/:id/cancel. Runs are interactive by default: tool and
+      plan approvals park until the operator decides. First stdout line is
+      `{"port": N}` for extension discovery.
 - [ ] VS Code extension: talk to the local harness daemon, inline plan
       approval, checkpoint rewind from the editor
 - [ ] GitHub App + Checks: proof-replay summaries posted on PRs,
