@@ -32,6 +32,8 @@ pub enum FableError {
     UnlockDenied { unmet: Vec<String> },
     /// `unlock_execution` was attempted outside PROVE.
     UnlockWrongPhase { phase: String },
+    /// The time budget was below the minimum.
+    BadTimeBudget { minutes: u32, minimum: u32 },
 }
 
 impl fmt::Display for FableError {
@@ -71,6 +73,10 @@ impl fmt::Display for FableError {
             FableError::UnlockWrongPhase { phase } => write!(
                 f,
                 "unlock_execution is only valid in PROVE, not {phase}"
+            ),
+            FableError::BadTimeBudget { minutes, minimum } => write!(
+                f,
+                "time budget {minutes}m is below the {minimum}m minimum: a shorter timer is theater, not deliberation"
             ),
         }
     }

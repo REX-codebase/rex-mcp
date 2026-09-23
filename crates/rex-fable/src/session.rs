@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::FableError;
 use crate::ledger::EpistemicLedger;
+use crate::timer::{AuthorityTimer, DEFAULT_BUDGET_MINUTES};
 
 /// The four Fable gates plus terminal states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +74,11 @@ pub struct FableSession {
     /// The epistemic ledger: claims and invariants backing the unlock gate.
     #[serde(default)]
     ledger: EpistemicLedger,
+    /// The mechanical authority timer: unlock cannot precede deliberation.
+    /// Sessions persisted before the timer existed get a fresh default
+    /// budget starting now — the gate never silently opens for old data.
+    #[serde(default = "default_timer")]
+    timer: AuthorityTimer,
 }
 
 fn now_ms() -> u64 {
@@ -90,12 +96,20 @@ fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+fn default_timer() -> AuthorityTimer {
+    AuthorityTimer::new(DEFAULT_BUDGET_MINUTES).expect("default budget is valid")
+}
+
 impl FableSession {
     /// Create a session in THINK. The name must be filesystem-safe because it
-    /// becomes the persistence filename.
+    /// becomes the persistence filename. `time_budget_minutes` sets the
+    /// mechanical deliberation budget (default 60, minimum 2); the authority
+    /// timer starts now and `unlock_execution` cannot succeed before it
+    /// elapses.
     pub fn create(
         name: impl Into<String>,
         objective: impl Into<String>,
+        time_budget_minutes: Option<u32>,
     ) -> Result<Self, FableError> {
         let name = name.into();
         let objective = objective.into();
@@ -105,6 +119,7 @@ impl FableSession {
         if objective.trim().is_empty() {
             return Err(FableError::EmptyObjective);
         }
+        let timer = AuthorityTimer::new(time_budget_minutes.unwrap_or(DEFAULT_BUDGET_MINUTES))?;
         let now = now_ms();
         Ok(FableSession {
             name,
@@ -114,6 +129,7 @@ impl FableSession {
             updated_at_ms: now,
             unlocked: false,
             ledger: EpistemicLedger::new(),
+            timer,
         })
     }
 
@@ -143,10 +159,21 @@ impl FableSession {
         &mut self.ledger
     }
 
+    /// The mechanical authority timer.
+    pub fn timer(&self) -> &AuthorityTimer {
+        &self.timer
+    }
+
+    /// Test hook: replace the timer (e.g. with an already-elapsed one).
+    #[cfg(test)]
+    pub fn set_timer_for_test(&mut self, timer: AuthorityTimer) {
+        self.timer = timer;
+    }
+
     /// The PROVE → ATTACK gate. Succeeds only in PROVE, with a non-empty
-    /// evidence-based rationale, and the ledger prerequisites met (2 PROVEN
-    /// items + 1 invariant). The authority-timer check arrives with the
-    /// timer module; until then the gate is ledger-only and says so.
+    /// evidence-based rationale, the ledger prerequisites met (2 PROVEN
+    /// items + 1 invariant), and the authority timer elapsed. Denials name
+    /// exactly what is unmet.
     pub fn unlock_execution(&mut self, rationale: impl Into<String>) -> Result<(), FableError> {
         if self.phase != FablePhase::Prove {
             return Err(FableError::UnlockWrongPhase {
@@ -157,7 +184,13 @@ impl FableSession {
         if rationale.trim().is_empty() {
             return Err(FableError::EmptyClaim);
         }
-        let unmet = self.ledger.unmet_prerequisites();
+        let mut unmet = self.ledger.unmet_prerequisites();
+        if !self.timer.elapsed() {
+            unmet.push(format!(
+                "authority timer: {} of deliberation remaining",
+                self.timer.remaining_human()
+            ));
+        }
         if !unmet.is_empty() {
             return Err(FableError::UnlockDenied { unmet });
         }
@@ -236,34 +269,34 @@ mod tests {
 
     #[test]
     fn create_starts_in_think() {
-        let s = FableSession::create("fix-auth", "Fix the auth bypass").unwrap();
+        let s = FableSession::create("fix-auth", "Fix the auth bypass", None).unwrap();
         assert_eq!(s.phase(), FablePhase::Think);
         assert!(!s.unlocked());
     }
 
     #[test]
     fn bad_names_rejected() {
-        assert!(FableSession::create("", "x").is_err());
-        assert!(FableSession::create("../evil", "x").is_err());
-        assert!(FableSession::create("has space", "x").is_err());
-        assert!(FableSession::create("ok-name_1", "x").is_ok());
+        assert!(FableSession::create("", "x", None).is_err());
+        assert!(FableSession::create("../evil", "x", None).is_err());
+        assert!(FableSession::create("has space", "x", None).is_err());
+        assert!(FableSession::create("ok-name_1", "x", None).is_ok());
     }
 
     #[test]
     fn empty_objective_rejected() {
-        assert!(FableSession::create("n", "   ").is_err());
+        assert!(FableSession::create("n", "   ", None).is_err());
     }
 
     #[test]
     fn think_advances_to_prove() {
-        let mut s = FableSession::create("n", "o").unwrap();
+        let mut s = FableSession::create("n", "o", None).unwrap();
         s.advance_phase().unwrap();
         assert_eq!(s.phase(), FablePhase::Prove);
     }
 
     #[test]
     fn prove_does_not_advance_without_unlock() {
-        let mut s = FableSession::create("n", "o").unwrap();
+        let mut s = FableSession::create("n", "o", None).unwrap();
         s.advance_phase().unwrap();
         let err = s.advance_phase().unwrap_err();
         assert!(matches!(err, FableError::IllegalTransition { .. }));
@@ -272,7 +305,7 @@ mod tests {
 
     #[test]
     fn attack_write_complete_chain() {
-        let mut s = FableSession::create("n", "o").unwrap();
+        let mut s = FableSession::create("n", "o", None).unwrap();
         s.advance_phase().unwrap(); // THINK -> PROVE
         s.mark_unlocked(); // (unlock_execution in a later commit)
         assert_eq!(s.phase(), FablePhase::Attack);
@@ -286,7 +319,7 @@ mod tests {
 
     #[test]
     fn terminal_sessions_reject_transitions() {
-        let mut s = FableSession::create("n", "o").unwrap();
+        let mut s = FableSession::create("n", "o", None).unwrap();
         s.abandon().unwrap();
         assert_eq!(s.phase(), FablePhase::Abandoned);
         assert!(matches!(
@@ -299,7 +332,7 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = FableSession::create("roundtrip", "o").unwrap();
+        let mut s = FableSession::create("roundtrip", "o", None).unwrap();
         s.advance_phase().unwrap();
         s.save(dir.path()).unwrap();
         let loaded = FableSession::load(dir.path(), "roundtrip").unwrap();
@@ -329,7 +362,7 @@ mod tests {
 
     #[test]
     fn unlock_denied_without_prerequisites() {
-        let mut s = FableSession::create("n", "o").unwrap();
+        let mut s = FableSession::create("n", "o", None).unwrap();
         s.advance_phase().unwrap(); // THINK -> PROVE
         let err = s.unlock_execution("looks good").unwrap_err();
         assert!(matches!(err, FableError::UnlockDenied { .. }));
@@ -339,25 +372,51 @@ mod tests {
 
     #[test]
     fn unlock_succeeds_with_prerequisites_and_rationale() {
-        let mut s = FableSession::create("n", "o").unwrap();
+        let mut s = FableSession::create("n", "o", None).unwrap();
         s.advance_phase().unwrap();
         *s.ledger_mut() = proven_ledger();
-        s.unlock_execution("two proven claims plus INV-01; timer check pending")
+        // Elapse the authority timer: even perfect evidence waits.
+        let elapsed = crate::timer::AuthorityTimer::new_at(2, 0).unwrap();
+        s.set_timer_for_test(elapsed);
+        s.unlock_execution("two proven claims plus INV-01; timer elapsed")
             .unwrap();
         assert_eq!(s.phase(), FablePhase::Attack);
         assert!(s.unlocked());
     }
 
     #[test]
+    fn unlock_denied_while_timer_runs_despite_evidence() {
+        let mut s = FableSession::create("n", "o", None).unwrap();
+        s.advance_phase().unwrap();
+        *s.ledger_mut() = proven_ledger();
+        // Fresh 60-minute timer: evidence is ready, deliberation is not.
+        let err = s.unlock_execution("evidence ready").unwrap_err();
+        match err {
+            FableError::UnlockDenied { unmet } => {
+                assert!(unmet.iter().any(|u| u.contains("authority timer")));
+            }
+            _ => panic!("expected UnlockDenied, got {err:?}"),
+        }
+        assert_eq!(s.phase(), FablePhase::Prove);
+    }
+
+    #[test]
+    fn create_rejects_theater_budgets() {
+        assert!(FableSession::create("n", "o", Some(1)).is_err());
+        assert!(FableSession::create("n", "o", Some(2)).is_ok());
+        assert!(FableSession::create("n", "o", None).is_ok());
+    }
+
+    #[test]
     fn unlock_rejected_outside_prove() {
-        let mut s = FableSession::create("n", "o").unwrap();
+        let mut s = FableSession::create("n", "o", None).unwrap();
         let err = s.unlock_execution("rationale").unwrap_err();
         assert!(matches!(err, FableError::UnlockWrongPhase { .. }));
     }
 
     #[test]
     fn unlock_rejects_empty_rationale() {
-        let mut s = FableSession::create("n", "o").unwrap();
+        let mut s = FableSession::create("n", "o", None).unwrap();
         s.advance_phase().unwrap();
         *s.ledger_mut() = proven_ledger();
         assert!(matches!(
@@ -369,7 +428,7 @@ mod tests {
     #[test]
     fn ledger_survives_save_load() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = FableSession::create("ledgertest", "o").unwrap();
+        let mut s = FableSession::create("ledgertest", "o", None).unwrap();
         *s.ledger_mut() = proven_ledger();
         s.save(dir.path()).unwrap();
         let loaded = FableSession::load(dir.path(), "ledgertest").unwrap();

@@ -442,6 +442,79 @@ fn custody_decide_plan(
     custody_runs.decide_plan(&run_id, approved)
 }
 
+// ---------------------------------------------------------------------------
+// Fable gate: native THINK → PROVE → ATTACK → WRITE sessions.
+// ---------------------------------------------------------------------------
+
+fn fable_dir() -> std::path::PathBuf {
+    config_dir().join("fable-sessions")
+}
+
+/// Serializable view of a Fable session for the UI countdown.
+#[derive(serde::Serialize)]
+struct FableStatusView {
+    name: String,
+    objective: String,
+    phase: String,
+    unlocked: bool,
+    timer_remaining_ms: u64,
+    timer_remaining_human: String,
+    timer_elapsed: bool,
+    proven_count: usize,
+    invariant_count: usize,
+    unlock_ready: bool,
+}
+
+fn fable_view_of(s: &rex_fable::FableSession) -> FableStatusView {
+    let timer = s.timer();
+    FableStatusView {
+        name: s.name().to_string(),
+        objective: s.objective().to_string(),
+        phase: s.phase().to_string(),
+        unlocked: s.unlocked(),
+        timer_remaining_ms: timer.remaining_ms(),
+        timer_remaining_human: timer.remaining_human(),
+        timer_elapsed: timer.elapsed(),
+        proven_count: s.ledger().proven_count(),
+        invariant_count: s.ledger().invariants().len(),
+        unlock_ready: s.ledger().prerequisites_met() && timer.elapsed(),
+    }
+}
+
+/// Create a Fable session in THINK. The authority timer starts immediately.
+#[tauri::command]
+fn fable_create_session(
+    name: String,
+    objective: String,
+    time_budget_minutes: Option<u32>,
+) -> Result<FableStatusView, String> {
+    let dir = fable_dir();
+    let session =
+        rex_fable::FableSession::create(name, objective, time_budget_minutes).map_err(|e| e.to_string())?;
+    session.save(&dir).map_err(|e| e.to_string())?;
+    Ok(fable_view_of(&session))
+}
+
+/// Current status of a Fable session, including the live countdown.
+#[tauri::command]
+fn fable_session_status(name: String) -> Result<FableStatusView, String> {
+    let session =
+        rex_fable::FableSession::load(&fable_dir(), &name).map_err(|e| e.to_string())?;
+    Ok(fable_view_of(&session))
+}
+
+/// Attempt the PROVE → ATTACK unlock. Fails honestly when prerequisites or
+/// the authority timer are unmet.
+#[tauri::command]
+fn fable_unlock_session(name: String, rationale: String) -> Result<FableStatusView, String> {
+    let dir = fable_dir();
+    let mut session =
+        rex_fable::FableSession::load(&dir, &name).map_err(|e| e.to_string())?;
+    session.unlock_execution(rationale).map_err(|e| e.to_string())?;
+    session.save(&dir).map_err(|e| e.to_string())?;
+    Ok(fable_view_of(&session))
+}
+
 /// Current custody phase for a grant (active, verifying, released, ...).
 #[tauri::command]
 fn custody_phase(
@@ -860,6 +933,9 @@ fn main() {
             custody_phase,
             custody_stop,
             custody_decide_plan,
+            fable_create_session,
+            fable_session_status,
+            fable_unlock_session,
             rex_task_begin,
             rex_task_follow_up,
             rex_tasks,

@@ -24,6 +24,8 @@ import { ultraBegin, ultraSnapshot, ultraDecide, ultraCancel, type UltraSnapshot
 import { liveRunAvailable } from "./data/liveRun";
 import { custodyBegin, custodyDecidePlan, custodyStop } from "./data/custodyRun";
 import { rexTaskBegin } from "./data/rexTasks";
+import { FableCountdown } from "./components/FableCountdown";
+import { loadFableSessionName } from "./data/fable";
 import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
   agentCancel,
@@ -90,6 +92,9 @@ export default function App() {
   const fastTimer = useRef<number | null>(null);
   const [task, setTask] = useState("");
   const [session, setSession] = useState<Session | null>(null);
+  // Active Fable gate session, if the user started one. The countdown is
+  // visible here; the toggle that creates sessions arrives separately.
+  const [fableSession] = useState<string | null>(() => loadFableSessionName());
   const [liveCapable, setLiveCapable] = useState(false);
   const [backendProbed, setBackendProbed] = useState(false);
   const [tourMode, setTourMode] = useState(() => {
@@ -614,6 +619,7 @@ export default function App() {
       <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Verification tier engaged" : "Verification tier offline"}</b><small>{ultra ? "Contract, adversary and clean-room judge active" : "No extra capabilities are active"}</small></div>
       <div className="mx-auto w-full max-w-[820px] px-5 pt-3 sm:px-8">
         <OperatorModeChip mode={operatorMode} onSwitch={chooseOperatorMode} />
+        {fableSession && <FableCountdown sessionName={fableSession} />}
       </div>
       <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "TEMPO PROFILE ARMED" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small><i aria-hidden="true" /></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">

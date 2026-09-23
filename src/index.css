@@ -568,3 +568,11 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .rex-task-list button{width:100%;display:flex;justify-content:space-between;gap:10px;align-items:baseline;text-align:left;padding:8px 10px;border:1px solid var(--color-line);border-radius:8px;background:transparent;cursor:pointer;font-size:12px;color:var(--color-text)}
 .rex-task-list button:hover{border-color:var(--color-faint)}
 .rex-task-list-meta{font-size:11px;color:var(--color-faint);white-space:nowrap}
+
+/* Fable gate countdown: visible deliberation lock above the run. */
+.fable-countdown{margin:10px 0 0;padding:10px 12px;border:1px solid var(--color-line);border-radius:10px;display:flex;flex-direction:column;gap:4px;background:var(--color-panel)}
+.fable-countdown .eyebrow{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--color-faint)}
+.fable-countdown-text{font-size:12px;color:var(--color-text)}
+.fable-countdown-text b{font-variant-numeric:tabular-nums}
+.fable-countdown--open{border-color:var(--color-accent)}
+.fable-countdown--error{border-color:var(--color-danger,#b3261e)}
