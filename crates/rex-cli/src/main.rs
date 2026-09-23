@@ -4,6 +4,7 @@
 //! `rex verify` (signed run certificates). The desktop app keeps the
 //! interactive surface; this binary is the machine surface.
 
+mod bid;
 mod cert;
 mod exec;
 mod ledger;
@@ -41,6 +42,10 @@ fn usage() -> &'static str {
      \x20 --json               print exactly one JSON receipt on stdout\n\
      \x20 --yes                auto-approve tool calls and plans (CI mode)\n\
      \x20 --dry-run            validate args and print config without running\n\
+     \x20 --bid                print the binding bid and stop (needs --accept-bid)\n\
+     \x20 --accept-bid         run under the printed bid (requires --bid)\n\
+     \x20 --budget-usd X        dollar cap, converted worst-case to a token budget\n\
+     \x20                      (requires --model with a known price)\n\
      \n\
      credentials: $REX_<PROVIDER>_API_KEY wins; otherwise the file credential\n\
      store under $REX_STATE_DIR (default ~/.rex/harness) is used.\n\
@@ -57,6 +62,11 @@ fn parse_usize(raw: &str, flag: &str) -> Result<usize, ExecError> {
 fn parse_u64(raw: &str, flag: &str) -> Result<u64, ExecError> {
     raw.parse::<u64>()
         .map_err(|_| ExecError::usage(format!("{flag} expects a positive integer, got '{raw}'")))
+}
+
+fn parse_f64(raw: &str, flag: &str) -> Result<f64, ExecError> {
+    raw.parse::<f64>()
+        .map_err(|_| ExecError::usage(format!("{flag} expects a number, got '{raw}'")))
 }
 
 fn parse_exec(args: &[String]) -> Result<ExecOptions, ExecError> {
@@ -105,6 +115,14 @@ fn parse_exec(args: &[String]) -> Result<ExecOptions, ExecError> {
             "--json" => opts.json = true,
             "--yes" => opts.yes = true,
             "--dry-run" => opts.dry_run = true,
+            "--bid" => opts.bid = true,
+            "--accept-bid" => opts.accept_bid = true,
+            "--budget-usd" => {
+                opts.budget_usd = Some(parse_f64(
+                    &take_value("--budget-usd", &mut i)?,
+                    "--budget-usd",
+                )?);
+            }
             "--help" | "-h" => return Err(ExecError::usage(usage())),
             other if other.starts_with('-') => {
                 return Err(ExecError::usage(format!("unknown flag '{other}'")));
@@ -115,6 +133,9 @@ fn parse_exec(args: &[String]) -> Result<ExecOptions, ExecError> {
     }
     if opts.task.is_empty() && !positional.is_empty() {
         opts.task = positional.join(" ");
+    }
+    if opts.accept_bid && !opts.bid {
+        return Err(ExecError::usage("--accept-bid requires --bid"));
     }
     Ok(opts)
 }

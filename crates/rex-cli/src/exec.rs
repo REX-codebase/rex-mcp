@@ -71,6 +71,11 @@ pub struct ExecOptions {
     pub json: bool,
     pub yes: bool,
     pub dry_run: bool,
+    /// Print the binding bid and stop unless `accept_bid` is also given.
+    pub bid: bool,
+    pub accept_bid: bool,
+    /// Dollar cap: converted worst-case into a token budget. Needs --model.
+    pub budget_usd: Option<f64>,
     /// Internal disambiguator for parallel-family runs (e.g. tournament
     /// contestants): each tag gets its own staged workspace directory.
     /// Not a CLI flag.
@@ -175,7 +180,17 @@ fn receipt(
     opts: &ExecOptions,
     snap: &AgentSnapshot,
     workspace: Option<&Path>,
+    accepted_bid: Option<&crate::bid::Bid>,
 ) -> Map<String, Value> {
+    let (cost_usd_ceiling, cost_usd_estimate) = match accepted_bid {
+        Some(b) => (
+            b.max_cost_usd,
+            b.model
+                .as_deref()
+                .and_then(|m| crate::bid::worst_case_cost(snap.tokens_used, &opts.provider, m)),
+        ),
+        None => (None, None),
+    };
     serde_json::json!({
         "schema": RECEIPT_SCHEMA,
         "run_id": snap.id,
@@ -198,6 +213,10 @@ fn receipt(
         "prompt_hash": snap.prompt_hash,
         "workspace": workspace.map(|w| w.display().to_string()),
         "finished_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "bid": accepted_bid.map(|b| b.to_json()),
+        "cost_usd_ceiling": cost_usd_ceiling,
+        "cost_usd_estimate": cost_usd_estimate,
+        "cost_basis": accepted_bid.map(|_| "worst-case: all tokens at the output price"),
     })
     .as_object()
     .cloned()
@@ -318,6 +337,57 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
         budgets.max_wall_ms = secs.saturating_mul(1000);
     }
 
+    // A dollar budget binds the token budget: the cap buys tokens at the
+    // expensive (output) price, so the spend can never exceed it.
+    if let Some(usd) = opts.budget_usd {
+        if usd <= 0.0 {
+            return Err(ExecError::usage("--budget-usd must be positive"));
+        }
+        let model = opts.model.as_deref().ok_or_else(|| {
+            ExecError::usage("--budget-usd needs --model with a known price (see rex exec --bid)")
+        })?;
+        let tokens =
+            crate::bid::tokens_for_budget(usd, &opts.provider, model).ok_or_else(|| {
+                ExecError::usage(format!(
+                    "--budget-usd: no price for model '{model}' (see rex exec --bid)"
+                ))
+            })?;
+        if opts.max_tokens.is_some_and(|t| t != tokens) {
+            eprintln!("rex: --budget-usd ${usd} overrides --max-tokens with {tokens} tokens");
+        }
+        budgets.max_tokens = tokens;
+    }
+
+    // The bid gate: print the binding bid and stop unless it is accepted.
+    // Works offline — no key, no provider contact needed for a bid.
+    let accepted_bid: Option<crate::bid::Bid> = if opts.bid {
+        let bid = crate::bid::build_bid(
+            &opts.provider,
+            opts.model.as_deref(),
+            budgets.max_steps,
+            budgets.max_tool_calls,
+            budgets.max_tokens,
+            budgets.max_wall_ms,
+        );
+        if !opts.accept_bid {
+            let out = serde_json::json!({
+                "schema": "rex.exec.bid/1",
+                "task": opts.task,
+                "provider": opts.provider,
+                "accepted": false,
+                "bid": bid.to_json(),
+            });
+            return Ok(ExecOutput {
+                code: 2,
+                receipt: out,
+                workspace: None,
+            });
+        }
+        Some(bid)
+    } else {
+        None
+    };
+
     if opts.dry_run {
         let config = serde_json::json!({
             "schema": "rex.exec.dry_run/1",
@@ -378,7 +448,12 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
 
     let final_snap = drive(&agent, &opts, &run_id)?;
     let completed = final_snap.status == AgentStatus::Completed;
-    let mut receipt_map = receipt(&opts, &final_snap, staged_workspace.as_deref());
+    let mut receipt_map = receipt(
+        &opts,
+        &final_snap,
+        staged_workspace.as_deref(),
+        accepted_bid.as_ref(),
+    );
 
     // Leapfrog bet 1: every receipt is signed. A failed signature must
     // never block the run's own output, so it degrades to a warning.
@@ -422,10 +497,15 @@ pub struct ExecOutput {
 
 pub fn run_exec(opts: ExecOptions) -> Result<i32, ExecError> {
     let dry = opts.dry_run;
+    let bid_only = opts.bid && !opts.accept_bid;
     let out = execute(opts)?;
     // Dry runs always show their config: that is the whole point of them.
-    if dry {
+    // A bare --bid prints the binding bid the same way.
+    if dry || bid_only {
         println!("{}", serde_json::to_string_pretty(&out.receipt).unwrap());
+    }
+    if bid_only {
+        eprintln!("rex: bid printed; re-run with --accept-bid to execute under it.");
     }
     Ok(out.code)
 }
