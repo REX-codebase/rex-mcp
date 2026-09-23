@@ -92,9 +92,10 @@ after Phase 2/3 parity.)
    `--budget-usd` converts a dollar cap into a token budget; the receipt
    carries the bid, `cost_usd_estimate`, and `bid_met`/`bid_gaps`.
 8. Skills marketplace ranked by verified efficacy
-9. Air-gapped offline verification — PARTIAL: `rex verify` already runs fully
-   offline (certificates verify from the receipt alone); the packaged
-   air-gap story is still to do.
+9. Air-gapped offline verification — DONE (6b34f680):
+   `tools/verify-airgap/verify_receipt.py` verifies a receipt's Ed25519
+   certificate with stdlib-only Python 3.8+, no REX install, no network.
+   Cross-checked against OpenSSL signatures and Rust-signed fixtures.
 10. Cross-repo proof contracts
 
 Exit criteria per bet: a demo where the capability is *exercised*, not
