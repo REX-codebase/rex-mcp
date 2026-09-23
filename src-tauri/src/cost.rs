@@ -4,6 +4,7 @@
 //! so the UI labels them as estimates. The store records a receipt per run
 //! and tracks spend against user-set budgets.
 
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -84,21 +85,12 @@ pub struct CostReceipt {
     pub at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Budget {
     /// Daily limit in USD. None = no limit.
     pub daily_usd: Option<f64>,
     /// Monthly limit in USD. None = no limit.
     pub monthly_usd: Option<f64>,
-}
-
-impl Default for Budget {
-    fn default() -> Self {
-        Budget {
-            daily_usd: None,
-            monthly_usd: None,
-        }
-    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -172,7 +164,7 @@ impl CostStore {
     pub fn receipts(&self, limit: usize) -> Result<Vec<CostReceipt>, String> {
         let data = self.inner.lock().map_err(|e| e.to_string())?;
         let mut out = data.receipts.clone();
-        out.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        out.sort_by_key(|a| Reverse(a.at_ms));
         out.truncate(limit);
         Ok(out)
     }

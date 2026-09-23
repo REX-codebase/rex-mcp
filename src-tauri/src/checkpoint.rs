@@ -6,6 +6,7 @@
 //! back over the workspace — but first it auto-snapshots the current state,
 //! so a restore is never destructive.
 
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -142,7 +143,7 @@ impl CheckpointStore {
             .filter(|c| c.workspace == ws_str)
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        out.sort_by_key(|a| Reverse(a.created_at_ms));
         Ok(out)
     }
 
@@ -190,7 +191,7 @@ impl CheckpointStore {
         }
         // Remove now-empty dirs (deepest first).
         let mut dirs: Vec<PathBuf> = walkdir(&ws)?.into_iter().filter(|p| p.is_dir()).collect();
-        dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        dirs.sort_by_key(|a| Reverse(a.components().count()));
         for d in dirs {
             if d == ws {
                 continue;
@@ -239,11 +240,6 @@ fn walkdir(dir: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(out)
-}
-
-fn uuid_short() -> String {
-    // Deprecated: IDs now use an atomic counter for uniqueness.
-    format!("{:x}", std::process::id())
 }
 
 #[cfg(test)]

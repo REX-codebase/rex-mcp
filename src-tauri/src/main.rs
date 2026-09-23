@@ -509,6 +509,16 @@ fn cost_set_budget(
     cost.set_budget(budget)
 }
 
+/// Check whether a prospective cost would exceed the set budgets.
+/// Returns a warning message, or None when within budget.
+#[tauri::command]
+fn cost_check_budget(
+    cost: State<'_, Arc<cost::CostStore>>,
+    additional_usd: f64,
+) -> Result<Option<String>, String> {
+    cost.check_budget(additional_usd)
+}
+
 /// Spend in the last N days.
 #[tauri::command]
 fn cost_spend(cost: State<'_, Arc<cost::CostStore>>, days: u64) -> Result<f64, String> {
@@ -1442,6 +1452,7 @@ fn main() {
             cost_receipts,
             cost_get_budget,
             cost_set_budget,
+            cost_check_budget,
             cost_spend,
             preview_detect,
             preview_start,
