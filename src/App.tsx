@@ -47,15 +47,22 @@ import { OperatorModeChip, OperatorModeGate } from "./components/OperatorModeGat
 import { loadOperatorMode, saveOperatorMode, type OperatorMode } from "./data/operatorMode";
 import { SetupChecklist } from "./components/SetupChecklist";
 import type { InstalledAgentId } from "./data/backend";
+import { resolveExecutionPath, type ExecutionPath } from "./data/executionPath";
 
 const TOUR_KEY = "rex-tour-mode";
 
-export function shouldUseDirectUltra(
-  operatorMode: OperatorMode | null,
-  liveCapable: boolean,
-  ultra: boolean,
-): boolean {
-  return liveCapable && ultra && operatorMode === "human";
+// Reads the installed-agent selection from settings. When an installed agent
+// is selected it becomes the explicit execution path (see executionPath.ts);
+// otherwise the custody loop is the default. Read at render for the path
+// label and re-read inside onRun so the click always sees the latest choice.
+export function readInstalledAgentSelection(): { id: InstalledAgentId; label: string } | null {
+  try {
+    const selected = JSON.parse(window.localStorage.getItem("rex-model-selection") || "null") as { provider?: string; id?: string; label?: string } | null;
+    if (selected?.provider?.startsWith("installed:") && selected.id) {
+      return { id: selected.id as InstalledAgentId, label: selected.label ?? selected.id };
+    }
+  } catch { /* no selection */ }
+  return null;
 }
 
 // The hero starter composer exists only while there is no session. The moment
@@ -259,11 +266,35 @@ export default function App() {
   const nativeProject = nativePreviewDir ?? new URLSearchParams(window.location.search).get("native-preview");
   const previewTask = /(?:html|react|next\.?js|vite|astro|svelte|website|ui|interface|dashboard|landing page|app)/i.test(task);
 
+  // One default execution path: the custody loop. Every alternative is an
+  // explicit opt-in resolved here, so the Composer label and onRun below can
+  // never disagree about what the Run button will do.
+  const installedSelection = readInstalledAgentSelection();
+  const executionPath: ExecutionPath = resolveExecutionPath({
+    operatorMode,
+    ultra,
+    installedAgentId: installedSelection?.id ?? null,
+    installedAgentLabel: installedSelection?.label ?? null,
+    liveCapable,
+    tourMode,
+  });
+
   const onRun = () => {
     cancel.current?.();
     const label = task.trim();
     if (!label) return;
-    if (!liveCapable && !tourMode) {
+    // Re-resolve at click time: the settings selection may have changed
+    // since the last render.
+    const selection = readInstalledAgentSelection();
+    const path = resolveExecutionPath({
+      operatorMode,
+      ultra,
+      installedAgentId: selection?.id ?? null,
+      installedAgentLabel: selection?.label ?? null,
+      liveCapable,
+      tourMode,
+    });
+    if (path.kind === "unavailable") {
       // No backend and no explicit tour: never silently animate a fake run.
       // Pulse the setup checklist instead — it is already rendered above.
       setChecklistHot(true);
@@ -272,17 +303,22 @@ export default function App() {
       beginSettle();
       return;
     }
-    let installedBackend: InstalledAgentId | null = null;
-    try {
-      const selected = JSON.parse(window.localStorage.getItem("rex-model-selection") || "null") as { provider?: string; id?: string } | null;
-      if (selected?.provider?.startsWith("installed:") && selected.id) {
-        installedBackend = selected.id as InstalledAgentId;
+    if (path.kind === "tour") {
+      const s = newSession(label);
+      cancel.current = startMockTurn(s, label, "task", setSession, reduced);
+      if (ultra) {
+        setBrowserRun((v) => v + 1);
+        setBrowserPhase("active");
       }
-    } catch { /* no selection */ }
-    if (installedBackend) {
-      // Real installed-agent path: the vendor CLI runs the task on an
-      // isolated workspace while REX streams its events, applies the
-      // completion gate, and holds any source changes for reviewed promotion.
+      beginSettle();
+      return;
+    }
+    if (path.kind === "installed") {
+      // Settings integration: the vendor CLI runs the task on an isolated
+      // workspace while REX streams its events, applies the completion gate,
+      // and holds any source changes for reviewed promotion.
+      const installedBackend = selection?.id ?? installedSelection?.id;
+      if (!installedBackend) return;
       const options = loadInstalledAgentOptions();
       setInstalledRun(null);
       setInstalledStarting(true);
@@ -315,8 +351,10 @@ export default function App() {
         .finally(() => setInstalledStarting(false));
       return;
     }
-    if (shouldUseDirectUltra(operatorMode, liveCapable, ultra)) {
-      // Ultra path: contract -> build -> verify -> adversary -> judge.
+    if (path.kind === "ultra") {
+      // Explicit verified-pipeline mode: contract -> build -> verify ->
+      // adversary -> judge. A separate backend, chosen deliberately via the
+      // Ultra toggle — not a silent branch.
       setUltraRun(null);
       setLiveRun(null);
       setLiveStarting(true);
@@ -354,54 +392,53 @@ export default function App() {
         .finally(() => setLiveStarting(false));
       return;
     }
-    if (liveCapable) {
-      // Real path: the autonomous Rust loop plans, acts through trusted
-      // approvals, verifies its own work against gates, and stops truthfully.
-      // The operator mode picked at the gate decides who is accountable:
-      // human mode runs under a custody grant recording operator:human;
-      // agent mode opens a durable REX task an external host drives through
-      // rex-mcp, and this UI supervises with the permanent human Stop.
+    if (path.kind === "delegate") {
+      // Explicit "delegate to external host": opens a durable REX task an
+      // external host drives through rex-mcp; this UI supervises with the
+      // permanent human Stop.
       setLiveRun(null);
       setCustody(null);
       setLiveStarting(true);
       beginSettle();
-      if (operatorMode === "agent") {
-        rexTaskBegin(label, ultra)
-          .then((res) => {
-            const id = res?.task_id;
-            if (id) {
-              setRexTaskId(id);
-            } else {
-              throw new Error("rex-mcp returned no task id");
-            }
+      rexTaskBegin(label, ultra)
+        .then((res) => {
+          const id = res?.task_id;
+          if (id) {
+            setRexTaskId(id);
+          } else {
+            throw new Error("rex-mcp returned no task id");
+          }
+        })
+        .catch((e) =>
+          setLiveRun({
+            id: "run-failed",
+            task: label,
+            status: "failed",
+            terminal_reason: { kind: "provider_error", detail: String(e) },
+            provider: "gemini",
+            model: "",
+            plan: [],
+            step: 0,
+            max_steps: 0,
+            tool_calls: 0,
+            max_tool_calls: 0,
+            tokens_used: 0,
+            max_tokens: 0,
+            elapsed_ms: 0,
+            max_wall_ms: 0,
+            pending_approval: null,
+            events: [],
+            preview: null,
+            completion_summary: null,
+            error: String(e),
           })
-          .catch((e) =>
-            setLiveRun({
-              id: "run-failed",
-              task: label,
-              status: "failed",
-              terminal_reason: { kind: "provider_error", detail: String(e) },
-              provider: "gemini",
-              model: "",
-              plan: [],
-              step: 0,
-              max_steps: 0,
-              tool_calls: 0,
-              max_tool_calls: 0,
-              tokens_used: 0,
-              max_tokens: 0,
-              elapsed_ms: 0,
-              max_wall_ms: 0,
-              pending_approval: null,
-              events: [],
-              preview: null,
-              completion_summary: null,
-              error: String(e),
-            })
-          )
-          .finally(() => setLiveStarting(false));
-        return;
-      }
+        )
+        .finally(() => setLiveStarting(false));
+      return;
+    }
+    // Default: the custody autonomous loop plans, acts through trusted
+    // approvals, verifies its own work against gates, and stops truthfully.
+    {
       // Capture the plan-mode choice for this run, then reset the checkbox so
       // the next run starts in the default execution mode unless the user
       // opts in again.
@@ -438,15 +475,7 @@ export default function App() {
           })
         )
         .finally(() => setLiveStarting(false));
-      return;
     }
-    const s = newSession(label);
-    cancel.current = startMockTurn(s, label, "task", setSession, reduced);
-    if (ultra) {
-      setBrowserRun((v) => v + 1);
-      setBrowserPhase("active");
-    }
-    beginSettle();
   };
 
   const onLiveDecision = (approved: boolean) => {
@@ -626,6 +655,7 @@ export default function App() {
                       onRun={onRun}
                       planMode={planMode}
                       setPlanMode={setPlanMode}
+                      executionPath={executionPath}
                     />
                   </div>
                 </div>

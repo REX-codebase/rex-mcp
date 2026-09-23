@@ -1,8 +1,9 @@
 import { useRef } from "react";
 import { ModelStatus } from "./ModelStatus";
 import { EXAMPLE_TASKS, type RunState } from "../data/mock";
+import type { ExecutionPath } from "../data/executionPath";
 
-export function Composer({ task, setTask, state, onRun, planMode, setPlanMode }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void; planMode: boolean; setPlanMode: (v: boolean) => void }) {
+export function Composer({ task, setTask, state, onRun, planMode, setPlanMode, executionPath }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void; planMode: boolean; setPlanMode: (v: boolean) => void; executionPath: ExecutionPath }) {
   const busy = state === "working" || state === "verifying";
   const canRun = task.trim().length > 0 && !busy;
   const areaRef = useRef<HTMLTextAreaElement>(null);
@@ -38,6 +39,10 @@ export function Composer({ task, setTask, state, onRun, planMode, setPlanMode }:
             </span>
           </div>
           <div className="flex items-center gap-3">
+            <span className="execution-path" title={executionPath.detail}>
+              <span className={`execution-path-dot execution-path-dot--${executionPath.kind}`} aria-hidden="true" />
+              {executionPath.label}
+            </span>
             <label className="plan-toggle" title="Plan mode: REX proposes a plan and waits for your approval before any tool runs.">
               <input type="checkbox" checked={planMode} disabled={busy} onChange={(e) => setPlanMode(e.target.checked)} aria-label="Plan mode" />
               <span>Plan mode</span>

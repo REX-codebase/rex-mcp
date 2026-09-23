@@ -416,6 +416,14 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .plan-toggle{display:inline-flex;align-items:center;gap:7px;font-size:11px;color:var(--color-muted);cursor:pointer;user-select:none}
 .plan-toggle input{accent-color:#6aa8ff;width:13px;height:13px;cursor:pointer}
 .plan-toggle input:disabled{cursor:default}
+.execution-path{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--color-muted);white-space:nowrap;cursor:help}
+.execution-path-dot{width:7px;height:7px;border-radius:9999px;background:#6aa8ff;flex:none}
+.execution-path-dot--custody{background:#6aa8ff}
+.execution-path-dot--ultra{background:#b48cff}
+.execution-path-dot--installed{background:#7fd08c}
+.execution-path-dot--delegate{background:#e0b36a}
+.execution-path-dot--tour{background:#9aa3b2}
+.execution-path-dot--unavailable{background:#e06a6a}
 .agent-plan {
   list-style: none;
   margin: 12px 0;
