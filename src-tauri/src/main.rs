@@ -7,6 +7,7 @@
 mod terminal;
 mod checkpoint;
 mod mcp;
+mod cost;
 
 use rex_installed_agents::{
     discover as discover_installed_agents, run as run_installed_agent, InstalledAgentId,
@@ -468,6 +469,63 @@ fn mcp_probe_server(
     id: String,
 ) -> Result<mcp::McpServer, String> {
     mcp.probe(&id)
+}
+
+// ---------------------------------------------------------------------------
+// Cost: price tables, per-run receipts, budgets.
+// ---------------------------------------------------------------------------
+
+/// Get the static price table (estimates).
+#[tauri::command]
+fn cost_price_table() -> Vec<cost::ModelPrice> {
+    cost::price_table()
+}
+
+/// Record a run's token usage; returns the cost receipt.
+#[tauri::command]
+fn cost_record(
+    cost: State<'_, Arc<cost::CostStore>>,
+    run_id: String,
+    model_id: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Result<cost::CostReceipt, String> {
+    cost.record(&run_id, &model_id, prompt_tokens, completion_tokens)
+}
+
+/// Get recent cost receipts, newest first.
+#[tauri::command]
+fn cost_receipts(
+    cost: State<'_, Arc<cost::CostStore>>,
+    limit: u64,
+) -> Result<Vec<cost::CostReceipt>, String> {
+    cost.receipts(limit as usize)
+}
+
+/// Get the current budget.
+#[tauri::command]
+fn cost_get_budget(
+    cost: State<'_, Arc<cost::CostStore>>,
+) -> Result<cost::Budget, String> {
+    cost.get_budget()
+}
+
+/// Set the budget.
+#[tauri::command]
+fn cost_set_budget(
+    cost: State<'_, Arc<cost::CostStore>>,
+    budget: cost::Budget,
+) -> Result<(), String> {
+    cost.set_budget(budget)
+}
+
+/// Spend in the last N days.
+#[tauri::command]
+fn cost_spend(
+    cost: State<'_, Arc<cost::CostStore>>,
+    days: u64,
+) -> Result<f64, String> {
+    cost.spend_last_days(days)
 }
 
 #[tauri::command]
@@ -1346,6 +1404,9 @@ fn main() {
         .manage(Arc::new(
             mcp::McpStore::new(&config_dir()).expect("mcp store"),
         ))
+        .manage(Arc::new(
+            cost::CostStore::new(&config_dir()).expect("cost store"),
+        ))
         .invoke_handler(tauri::generate_handler![
             installed_agent_summaries,
             installed_agent_run,
@@ -1386,6 +1447,12 @@ fn main() {
             mcp_set_server_enabled,
             mcp_set_tool_enabled,
             mcp_probe_server,
+            cost_price_table,
+            cost_record,
+            cost_receipts,
+            cost_get_budget,
+            cost_set_budget,
+            cost_spend,
             preview_detect,
             preview_start,
             preview_status,

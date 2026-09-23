@@ -652,3 +652,25 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .mcp-tools label{display:flex;gap:8px;align-items:baseline;font-size:12px}
 .mcp-tools b{font-family:ui-monospace,monospace;font-size:12px}
 .mcp-tools span{color:var(--color-faint);font-size:11px}
+
+/* Cost panel. */
+.cost-error{font-size:12px;color:#c0392b}
+.cost-h3{font-size:13px;font-weight:600;margin:16px 0 8px}
+.cost-spend{display:flex;gap:24px}
+.cost-spend div{display:flex;flex-direction:column;gap:2px}
+.cost-spend b{font-size:20px}
+.cost-spend span{font-size:11px;color:var(--color-faint)}
+.cost-spend span.over{color:#c0392b;font-weight:600}
+.cost-budget{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+.cost-budget label{display:flex;flex-direction:column;gap:4px;font-size:12px}
+.cost-budget input{padding:8px 10px;border:1px solid var(--color-line);border-radius:8px;background:transparent;font-size:12px;color:var(--color-text);width:140px}
+.cost-empty{color:var(--color-faint);font-size:13px}
+.cost-receipts{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.cost-receipts li{display:flex;gap:12px;align-items:baseline;font-size:12px;padding:8px 12px;border:1px solid var(--color-line);border-radius:8px}
+.cost-receipts b{font-family:ui-monospace,monospace}
+.cost-receipts span{color:var(--color-faint)}
+.cost-receipts small{margin-left:auto;color:var(--color-faint);font-size:11px}
+.cost-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+.cost-table th,.cost-table td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--color-line)}
+.cost-table th{font-weight:600;color:var(--color-faint)}
+.cost-table code{font-family:ui-monospace,monospace;font-size:11px}
