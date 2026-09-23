@@ -19,6 +19,7 @@
 
 use crate::cert::{load_or_generate, sign_receipt};
 use crate::exec::{execute, state_dir, ExecError, ExecOptions};
+use crate::ledger;
 use serde_json::Value;
 use std::cmp::Ordering;
 
@@ -137,12 +138,18 @@ pub fn run_tournament(opts: TournamentOptions) -> Result<i32, ExecError> {
     let winner = &contestants[winner_idx];
     let winner_completed = status_of(winner) == "completed";
 
+    let bracket_id = format!(
+        "tournament-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
     let receipt = serde_json::json!({
         "schema": SCHEMA,
+        "run_id": bracket_id,
         "task": opts.task,
         "providers": opts.providers,
         "rule": RULE,
         "contestants": contestants,
+        "finished_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "winner": {
             "provider": provider_of(winner),
             "run_id": winner.get("run_id"),
@@ -159,6 +166,7 @@ pub fn run_tournament(opts: TournamentOptions) -> Result<i32, ExecError> {
         Err(e) => eprintln!("rex: warning: tournament receipt is unsigned: {e}"),
     }
     let out = Value::Object(map);
+    ledger::append(&state_dir(), &out);
 
     if opts.json {
         println!("{}", serde_json::to_string(&out).unwrap());

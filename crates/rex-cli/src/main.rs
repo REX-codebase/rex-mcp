@@ -6,6 +6,7 @@
 
 mod cert;
 mod exec;
+mod ledger;
 mod tournament;
 
 use cert::{keygen, verify_receipt};
@@ -21,6 +22,8 @@ fn usage() -> &'static str {
      usage:\n\
      \x20 rex exec [--task TASK | TASK...] [options]\n\
      \x20 rex tournament --task TASK --providers a,b [options]\n\
+     \x20 rex runs [--json] [--limit N]\n\
+     \x20 rex show RUN_ID [--json]\n\
      \x20 rex keygen [--force]\n\
      \x20 rex verify RECEIPT.json [--public-key BASE64]\n\
      \x20 rex --version\n\
@@ -206,6 +209,8 @@ fn main() -> ExitCode {
         }
         Some("exec") => parse_exec(&args[1..]).and_then(run_exec),
         Some("tournament") => parse_tournament(&args[1..]).and_then(run_tournament),
+        Some("runs") => run_runs(&args[1..]).map(|_| 0),
+        Some("show") => run_show(&args[1..]),
         Some("keygen") => run_keygen(&args[1..]).map(|_| 0),
         Some("verify") => run_verify(&args[1..]),
         Some(other) => Err(ExecError::usage(format!(
@@ -220,6 +225,145 @@ fn main() -> ExitCode {
             ExitCode::from(e.code as u8)
         }
     }
+}
+
+fn run_runs(args: &[String]) -> Result<(), ExecError> {
+    let mut json = false;
+    let mut limit: usize = 20;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ExecError::usage("usage: rex runs [--json] [--limit N]"))?;
+            }
+            other => {
+                return Err(ExecError::usage(format!(
+                    "unknown flag '{other}': usage: rex runs [--json] [--limit N]"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let mut entries = ledger::read_all(&state_dir());
+    entries.reverse(); // newest first
+    let entries: Vec<_> = entries.into_iter().take(limit).collect();
+    if json {
+        println!("{}", serde_json::to_string(&entries).unwrap());
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("no runs recorded yet.");
+        return Ok(());
+    }
+    for v in &entries {
+        let id = v
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let status = v
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let at = v
+            .get("finished_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let task = v
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let task_short: String = task.chars().take(60).collect();
+        let who = if ledger::kind_of(v) == "tournament" {
+            let w = v
+                .get("winner")
+                .and_then(|w| w.get("provider"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            format!("tournament→{w}")
+        } else {
+            v.get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+                .to_string()
+        };
+        println!("{id}  [{status}] {who}  {at}  {task_short}");
+    }
+    Ok(())
+}
+
+fn run_show(args: &[String]) -> Result<i32, ExecError> {
+    let mut id: Option<&str> = None;
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return Err(ExecError::usage(format!("unknown flag '{other}'")));
+            }
+            other => {
+                if id.is_some() {
+                    return Err(ExecError::usage("usage: rex show RUN_ID [--json]"));
+                }
+                id = Some(other);
+            }
+        }
+    }
+    let id = id.ok_or_else(|| ExecError::usage("usage: rex show RUN_ID [--json]"))?;
+    let v = ledger::find(&state_dir(), id).ok_or_else(|| {
+        ExecError::usage(format!("no run '{id}' in the ledger (or ambiguous prefix)"))
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        return Ok(0);
+    }
+    let get = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+    let get_u = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    println!("run        {}", get("run_id"));
+    println!("kind       {}", ledger::kind_of(&v));
+    println!("task       {}", get("task"));
+    println!("provider   {} / {}", get("provider"), get("model"));
+    println!("status     {} ({})", get("status"), get("terminal_reason"));
+    println!(
+        "usage      {} steps, {} tool calls, {} tokens, {} ms",
+        get_u("steps"),
+        get_u("tool_calls"),
+        get_u("tokens_used"),
+        get_u("elapsed_ms")
+    );
+    println!("finished   {}", get("finished_at"));
+    if ledger::kind_of(&v) == "tournament" {
+        if let Some(w) = v.get("winner") {
+            println!(
+                "winner     {} — {}",
+                w.get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                w.get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            );
+        }
+    } else {
+        if let Some(r) = v.get("result").and_then(serde_json::Value::as_str) {
+            println!("result     {r}");
+        }
+        if let Some(e) = v.get("error").and_then(serde_json::Value::as_str) {
+            println!("error      {e}");
+        }
+        if let Some(ws) = v.get("workspace").and_then(serde_json::Value::as_str) {
+            println!("workspace  {ws}");
+        }
+    }
+    match verify_receipt(v, None) {
+        Ok(r) => println!("certificate valid — signed by {}", r.public_key),
+        Err(e) => println!("certificate INVALID: {e}"),
+    }
+    Ok(0)
 }
 
 fn run_keygen(args: &[String]) -> Result<(), ExecError> {

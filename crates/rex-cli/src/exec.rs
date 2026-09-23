@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cert::{load_or_generate, sign_receipt};
+use crate::ledger;
 
 const RECEIPT_SCHEMA: &str = "rex.exec.receipt/1";
 
@@ -196,6 +197,7 @@ fn receipt(
         "prompt_version": snap.prompt_version,
         "prompt_hash": snap.prompt_hash,
         "workspace": workspace.map(|w| w.display().to_string()),
+        "finished_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     })
     .as_object()
     .cloned()
@@ -387,6 +389,7 @@ pub fn execute(mut opts: ExecOptions) -> Result<ExecOutput, ExecError> {
     }
     let out = Value::Object(receipt_map);
     let code = if completed { 0 } else { 3 };
+    ledger::append(&state, &out);
 
     if opts.json {
         println!("{}", serde_json::to_string(&out).unwrap());
