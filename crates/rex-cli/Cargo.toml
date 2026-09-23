@@ -1,0 +1,16 @@
+[package]
+name = "rex-cli"
+version = "0.1.0"
+edition = "2021"
+description = "REX headless CLI: scriptable agent runs for CI and automation"
+
+[[bin]]
+name = "rex"
+path = "src/main.rs"
+
+[dependencies]
+rex-providers = { path = "../rex-providers" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
