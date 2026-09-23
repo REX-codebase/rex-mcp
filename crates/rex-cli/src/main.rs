@@ -502,15 +502,18 @@ fn run_skill(args: &[String]) -> Result<i32, ExecError> {
             let dir = skill::library_dir(&state).join(name);
             let lock =
                 skill::verify_installed(&dir).map_err(|e| ExecError::internal(e.to_string()))?;
-            let m = skill::read_manifest(&dir).map_err(|e| ExecError::internal(e.to_string()))?;
+            // The install deliberately does not preserve skill.json (it is
+            // not part of the hashed payload), so display metadata comes
+            // from the verified lockfile, which the install wrote from the
+            // manifest it had just hash-verified.
             println!("{} v{}", lock.name, lock.version);
-            if !m.author.is_empty() {
-                println!("author: {}", m.author);
+            if !lock.author.is_empty() {
+                println!("author: {}", lock.author);
             }
-            if !m.description.is_empty() {
-                println!("description: {}", m.description);
+            if !lock.description.is_empty() {
+                println!("description: {}", lock.description);
             }
-            println!("entry: {}", m.entry);
+            println!("entry: {}", lock.entry);
             println!("files:");
             for (rel, hash) in &lock.files {
                 println!("  {rel}  {hash}");

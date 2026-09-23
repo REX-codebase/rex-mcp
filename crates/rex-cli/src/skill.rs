@@ -43,6 +43,10 @@ pub struct SkillLock {
     pub schema: String,
     pub name: String,
     pub version: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub description: String,
     pub entry: String,
     pub installed_at: String,
     pub files: BTreeMap<String, String>,
@@ -170,6 +174,8 @@ pub fn install(state_dir: &Path, src: &Path, force: bool) -> Result<PathBuf, Str
         schema: SCHEMA.to_string(),
         name: m.name.clone(),
         version: m.version.clone(),
+        author: m.author.clone(),
+        description: m.description.clone(),
         entry: m.entry.clone(),
         installed_at: chrono::Utc::now().to_rfc3339(),
         files: m.files.clone(),
@@ -425,5 +431,25 @@ mod tests {
         assert_eq!(m.files.len(), 2);
         assert!(verify_source(&src, &m).is_ok());
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn install_lock_carries_display_metadata() {
+        // `rex skill show` reads from the verified lockfile because the
+        // install deliberately does not preserve skill.json.
+        let src = sample_src("meta");
+        write_manifest(&src, &hashes(&src));
+        let state = std::env::temp_dir().join("rex-skill-state-meta");
+        let _ = std::fs::remove_dir_all(&state);
+        let dest = install(&state, &src, false).unwrap();
+        assert!(!dest.join(MANIFEST_FILE).exists());
+        let lock = verify_installed(&dest).unwrap();
+        assert_eq!(lock.name, "sample-skill");
+        assert_eq!(lock.version, "0.1.0");
+        assert_eq!(lock.author, "rex");
+        assert_eq!(lock.description, "a test skill");
+        assert_eq!(lock.entry, "SKILL.md");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
