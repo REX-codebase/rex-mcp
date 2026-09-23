@@ -48,11 +48,15 @@ Parity items: IDE extensions, GitHub App.
 - [x] Local harness daemon protocol: `rex serve` binds 127.0.0.1 and exposes
       POST /v1/runs, GET /v1/runs, GET /v1/runs/:id (live snapshot with
       pending approval / awaiting plan), POST /v1/runs/:id/approve,
-      POST /v1/runs/:id/cancel. Runs are interactive by default: tool and
-      plan approvals park until the operator decides. First stdout line is
-      `{"port": N}` for extension discovery.
-- [ ] VS Code extension: talk to the local harness daemon, inline plan
-      approval, checkpoint rewind from the editor
+      POST /v1/runs/:id/cancel, plus workspace checkpoints
+      (POST /v1/runs/:id/checkpoint, list, rewind). Runs are interactive
+      by default: tool and plan approvals park until the operator decides.
+      First stdout line is `{"port": N}` for extension discovery.
+- [x] VS Code extension (`extensions/vscode`): spawns the daemon on
+      activation, REX: Run task…, plan/tool approvals as editor modals,
+      status-bar live status, checkpoint + rewind from the editor.
+      Exit criterion met: run a task, approve a plan, rewind a checkpoint
+      without leaving VS Code.
 - [ ] GitHub App + Checks: proof-replay summaries posted on PRs,
       "verified by REX" check runs with bundle links
 - [ ] JetBrains extension (after VS Code proves the protocol)
