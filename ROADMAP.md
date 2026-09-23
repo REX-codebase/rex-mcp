@@ -86,7 +86,15 @@ sandbox profiles, cross-machine resume, review surface, MCP client + skills.
       all tool side effects. New test: `shell_writes_land_inside_workspace`.
       Honest boundary: only the staged copy is rewound; the operator's
       original workspace is never touched.
-- [ ] Background/subagent dashboard with restrained default parallelism
+- [x] Background/subagent dashboard with restrained default parallelism:
+      `rex ps` lists live runs (active-run markers with 30s heartbeats,
+      stale after 120s, prunable), `--all`/`--json`/`--prune` supported;
+      `rex exec --detach` / `rex resume --detach` spawn orphaned children
+      logging to `$REX_STATE_DIR/logs/`; `max_parallel_runs` (default 2)
+      in `$REX_STATE_DIR/config.json` gates detached launches, adjustable
+      via `rex config set`. Dead-man column shows armed + check-in age.
+      Honest boundary: the append-only ledger can't show in-flight runs,
+      so liveness comes from markers, not ledger entries.
 - [x] Named sessions and resumable context UX: `rex exec --name NAME` records
       a session label on the brief and receipt; `rex resume RUN_ID|NAME`
       [--task T] starts a fresh run seeded from the previous run's final
