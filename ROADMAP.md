@@ -21,20 +21,22 @@ Shipped across 14 audit commits + 7 CI-fix commits. CI green.
 - Cost visibility (price tables, per-run receipts, budgets)
 - One-command quickstart + Tauri updater config
 
-## Phase 1 — Headless & CI (IN PROGRESS)
+## Phase 1 — Headless & CI (DONE)
 
 Parity item: `rex exec --json`. Makes REX scriptable: CI jobs, cron,
 GitHub Actions, eval harnesses. No GUI, no TTY required.
 
-- [ ] `rex` CLI crate: `rex exec --json` drives the autonomous run loop
+- [x] `rex` CLI crate: `rex exec --json` drives the autonomous run loop
       headlessly, auto-resolves approvals only with explicit `--yes`,
       prints one JSON receipt on stdout (logs on stderr), honest exit codes
-- [ ] Env-based credentials for CI (`REX_<PROVIDER>_API_KEY` overrides file store)
-- [ ] `rex --version`, `REX_STATE_DIR` / `REX_WORKSPACE` honored like `rex-mcp`
-- [ ] GitHub Action (`rex-run`): checks out repo, runs `rex exec --json`,
+- [x] Env-based credentials for CI (`REX_<PROVIDER>_API_KEY` overrides file store)
+- [x] `rex --version`, `REX_STATE_DIR` / `REX_WORKSPACE` honored like `rex-mcp`
+- [x] GitHub Action (`rex-run`): checks out repo, runs `rex exec --json`,
       uploads receipt + proof bundle as artifacts, fails the job on
       non-completed terminal states
-- [ ] quickstart.sh installs the CLI alongside the desktop app
+- [x] quickstart.sh installs the CLI alongside the desktop app
+- [x] Signed run certificates (leapfrog bet 1, pulled forward): every
+      receipt carries an Ed25519 certificate; `rex verify` checks it offline
 
 Exit criteria: `rex exec --task "write hello.py and prove it runs" --yes --json`
 completes in CI with a parseable receipt and a non-zero exit on failure.
