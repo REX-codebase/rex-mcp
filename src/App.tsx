@@ -29,6 +29,7 @@ import { loadFableSessionName, saveFableSessionName, fableCreateSession } from "
 import { TerminalView } from "./components/TerminalView";
 import { WorkspaceEditor } from "./components/WorkspaceEditor";
 import { GitPanel } from "./components/GitPanel";
+import { CheckpointPanel } from "./components/CheckpointPanel";
 import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
   agentCancel,
@@ -672,7 +673,10 @@ export default function App() {
         ) : view === "editor" ? (
           <WorkspaceEditor />
         ) : view === "git" ? (
-          <GitPanel />
+          <>
+            <GitPanel />
+            <CheckpointPanel />
+          </>
         ) : view === "settings" ? (
           <SettingsView
             motion={motion}

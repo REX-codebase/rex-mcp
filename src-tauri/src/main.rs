@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod terminal;
+mod checkpoint;
 
 use rex_installed_agents::{
     discover as discover_installed_agents, run as run_installed_agent, InstalledAgentId,
@@ -371,6 +372,40 @@ fn git_commit(
     tools
         .git_commit(PathBuf::from(workspace).as_path(), &message)
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoints: workspace snapshots for one-click restore.
+// ---------------------------------------------------------------------------
+
+/// Create a checkpoint of the workspace.
+#[tauri::command]
+fn checkpoint_create(
+    checkpoints: State<'_, Arc<checkpoint::CheckpointStore>>,
+    workspace: String,
+    label: String,
+) -> Result<checkpoint::Checkpoint, String> {
+    checkpoints.create(PathBuf::from(workspace).as_path(), &label)
+}
+
+/// List checkpoints for the workspace, newest first.
+#[tauri::command]
+fn checkpoint_list(
+    checkpoints: State<'_, Arc<checkpoint::CheckpointStore>>,
+    workspace: String,
+) -> Result<Vec<checkpoint::Checkpoint>, String> {
+    checkpoints.list(PathBuf::from(workspace).as_path())
+}
+
+/// Restore a checkpoint. Auto-snapshots the current state first and returns
+/// the backup checkpoint, so the restore is reversible.
+#[tauri::command]
+fn checkpoint_restore(
+    checkpoints: State<'_, Arc<checkpoint::CheckpointStore>>,
+    workspace: String,
+    id: String,
+) -> Result<checkpoint::Checkpoint, String> {
+    checkpoints.restore(PathBuf::from(workspace).as_path(), &id)
 }
 
 #[tauri::command]
@@ -1243,6 +1278,9 @@ fn main() {
         .manage(custody_runs)
         .manage(installed_runs)
         .manage(terminal::SharedTerminals::default())
+        .manage(Arc::new(
+            checkpoint::CheckpointStore::new(&config_dir()).expect("checkpoint store"),
+        ))
         .invoke_handler(tauri::generate_handler![
             installed_agent_summaries,
             installed_agent_run,
@@ -1274,6 +1312,9 @@ fn main() {
             git_status,
             git_diff,
             git_commit,
+            checkpoint_create,
+            checkpoint_list,
+            checkpoint_restore,
             preview_detect,
             preview_start,
             preview_status,
