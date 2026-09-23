@@ -87,7 +87,13 @@ sandbox profiles, cross-machine resume, review surface, MCP client + skills.
       Honest boundary: only the staged copy is rewound; the operator's
       original workspace is never touched.
 - [ ] Background/subagent dashboard with restrained default parallelism
-- [ ] Compaction, clear, named sessions, resumable context UX
+- [x] Named sessions and resumable context UX: `rex exec --name NAME` records
+      a session label on the brief and receipt; `rex resume RUN_ID|NAME`
+      [--task T] starts a fresh run seeded from the previous run's final
+      workspace state, records `continued_from`, and carries the name over;
+      `rex runs` / `rex show` display names and the session chain.
+      Honest boundary: resume is same-machine only (see cross-machine item).
+- [ ] Compaction and clear (context reset within a session)
 - [ ] OS-level sandbox profiles, network-off defaults
 - [ ] Cross-machine and cross-directory session resume
 - [ ] Managed code-review surface with proof replay
