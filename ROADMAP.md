@@ -105,7 +105,10 @@ after Phase 2/3 parity.)
    (budgets + worst-case dollar ceiling), `--accept-bid` executes under it,
    `--budget-usd` converts a dollar cap into a token budget; the receipt
    carries the bid, `cost_usd_estimate`, and `bid_met`/`bid_gaps`.
-8. Skills marketplace ranked by verified efficacy
+8. Skills marketplace — DONE (e059e489): `rex skill pack/install/verify/
+   remove/list/show` — hash-verified skill packs with install lockfiles;
+   `rex exec --skill NAME` loads skills into the run (fail-closed on
+   tamper) and the receipt records name/version/entry-sha256. ranked by verified efficacy
 9. Air-gapped offline verification — DONE (6b34f680):
    `tools/verify-airgap/verify_receipt.py` verifies a receipt's Ed25519
    certificate with stdlib-only Python 3.8+, no REX install, no network.
