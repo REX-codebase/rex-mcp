@@ -15,6 +15,7 @@ export type AgentStatus =
   | "planning"
   | "running"
   | "awaiting_approval"
+  | "awaiting_plan"
   | "verifying"
   | "completed"
   | "blocked"
@@ -44,6 +45,8 @@ export type AgentEvent =
   | { state: "tool_finished"; result: ToolResult }
   | { state: "approval_required"; call: PreparedCall }
   | { state: "approval_resolved"; call_id: string; approved: boolean }
+  | { state: "plan_approval_required"; items: PlanItem[] }
+  | { state: "plan_approval_resolved"; approved: boolean }
   | { state: "gate_result"; attempt: number; passed: boolean; failures: string[] }
   | { state: "retry"; attempt: number; reason: string }
   | { state: "info"; message: string };
@@ -88,11 +91,12 @@ export interface AgentSnapshot {
   error: string | null;
 }
 
-export type AgentPhase = "working" | "approval" | "verifying" | "completed" | "stopped";
+export type AgentPhase = "working" | "approval" | "plan" | "verifying" | "completed" | "stopped";
 
 export function phaseOf(snap: AgentSnapshot | null): AgentPhase {
   if (!snap) return "working";
   if (snap.status === "awaiting_approval") return "approval";
+  if (snap.status === "awaiting_plan") return "plan";
   if (snap.status === "verifying") return "verifying";
   if (snap.status === "completed") return "completed";
   if (

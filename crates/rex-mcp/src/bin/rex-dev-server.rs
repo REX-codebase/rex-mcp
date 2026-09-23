@@ -541,6 +541,12 @@ fn route(
                 .get("model")
                 .and_then(|m| m.as_str())
                 .map(|s| s.to_string());
+            // Plan mode: the run proposes a plan and waits for trusted
+            // approval before any tool executes.
+            let plan_mode = parsed
+                .get("plan_mode")
+                .and_then(|p| p.as_bool())
+                .unwrap_or(false);
             // The operator identity is the caller's declaration, recorded
             // for audit; custody decisions never trust the string.
             let operator = match parsed.get("operator").and_then(|o| o.as_str()) {
@@ -585,6 +591,7 @@ fn route(
                         provider.to_string(),
                         model,
                         ws,
+                        plan_mode,
                     );
                     match custody_runs.begin_managed_task(req) {
                         Ok(run) => json_response(
@@ -620,6 +627,21 @@ fn route(
                     &serde_json::to_string(&serde_json::json!({"ok": true, "reason": reason}))
                         .unwrap(),
                 ),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("POST", ["api", "agent", "custody", "runs", id, "plan-decision"]) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let approved = parsed
+                .get("approved")
+                .and_then(|a| a.as_bool())
+                .unwrap_or(false);
+            match custody_runs.decide_plan(id, approved) {
+                Ok(snap) => json_response(200, &serde_json::to_string(&snap).unwrap()),
                 Err(detail) => json_response(
                     200,
                     &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),

@@ -46,10 +46,26 @@ function selectedModel(): { provider: string; model?: string } {
   return { provider, model };
 }
 
-export const custodyBegin = (task: string) => {
+export const custodyBegin = (task: string, planMode = false) => {
   const { provider, model } = selectedModel();
-  return call<CustodiedRunView>("custody_begin", "/api/agent/custody/runs", { task, provider, model });
+  // Tauri reads camelCase args, the sidecar snake_case; each transport
+  // ignores the other's spelling.
+  return call<CustodiedRunView>("custody_begin", "/api/agent/custody/runs", {
+    task,
+    provider,
+    model,
+    planMode,
+    plan_mode: planMode,
+  });
 };
+
+/// Trusted plan decision for a plan-gated run: approve to continue into
+/// the loop, reject to end the run as denied before any tool executes.
+export const custodyDecidePlan = (runId: string, approved: boolean) =>
+  call<AgentSnapshot>("custody_decide_plan", `/api/agent/custody/runs/${runId}/plan-decision`, {
+    runId,
+    approved,
+  });
 
 // The permanent human Stop: terminal fence in custody first, then the run
 // loop is cancelled. Tauri reads camelCase args, the sidecar snake_case;

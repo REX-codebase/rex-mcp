@@ -131,6 +131,9 @@ pub enum AgentStatus {
     Planning,
     Running,
     AwaitingApproval,
+    /// Plan mode: the model produced a plan and the run is parked until the
+    /// trusted UI approves or rejects it. No tool has run yet.
+    AwaitingPlan,
     Verifying,
     Completed,
     Blocked,
@@ -196,6 +199,13 @@ pub enum AgentEvent {
     },
     ApprovalResolved {
         call_id: String,
+        approved: bool,
+    },
+    /// Plan mode: the proposed plan is waiting on the trusted UI.
+    PlanApprovalRequired {
+        items: Vec<PlanItem>,
+    },
+    PlanApprovalResolved {
         approved: bool,
     },
     GateResult {
@@ -270,6 +280,10 @@ struct TaskBrief {
     /// legacy brief); `Some` = only these tool names may execute.
     #[serde(default)]
     allowed_tools: Option<Vec<String>>,
+    /// Plan mode: the run must produce a plan and wait for trusted approval
+    /// before any tool executes. Legacy briefs (no field) run un-gated.
+    #[serde(default)]
+    plan_mode: bool,
 }
 
 fn legacy_prompt_marker() -> String {
@@ -325,6 +339,17 @@ struct Checkpoint {
     prompt_version: String,
     #[serde(default = "legacy_prompt_marker")]
     prompt_hash: String,
+    /// Plan mode: set durably the moment the plan is approved, so a resumed
+    /// run never re-enters the plan gate. Legacy checkpoints default to
+    /// false, which re-runs the gate (fail closed: approval is never
+    /// assumed).
+    #[serde(default)]
+    plan_approved: bool,
+    /// The run's workspace, as resolved at begin time. Resume restores it
+    /// from here (re-validated under the runs root); legacy checkpoints
+    /// without it fall back to `<run_dir>/workspace`.
+    #[serde(default)]
+    workspace: Option<PathBuf>,
 }
 
 struct RunShared {
@@ -505,12 +530,21 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             budgets,
             workspace,
             Role::Worker,
+            false,
         )
     }
 
     /// Start a run under an explicit REX role. The role selects the
     /// assembled system prompt and the least-authority tool scope: an
     /// adversary run, for example, can read but never write.
+    ///
+    /// `plan_mode` parks the run at a plan-approval gate before any tool runs.
+    /// The flag stays a plain parameter (rather than a builder) because this
+    /// constructor mirrors the brief shape and every caller passes it
+    /// explicitly. Scope: only the custody human path opts in; Ultra and the
+    /// installed-agent paths pass `false` (their loops have their own
+    /// gating).
+    #[allow(clippy::too_many_arguments)]
     pub fn begin_in_workspace_with_role(
         &self,
         task: &str,
@@ -519,6 +553,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         budgets: Option<Budgets>,
         workspace: Option<PathBuf>,
         role: Role,
+        plan_mode: bool,
     ) -> Result<AgentSnapshot, String> {
         let task = task.trim();
         if task.is_empty() {
@@ -593,6 +628,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             prompt_hash,
             role: Some(role.name().to_string()),
             allowed_tools,
+            plan_mode,
         };
         write_brief(&state_dir, &brief)?;
         write_json(&state_dir.join("plan.json"), &Vec::<PlanItem>::new())?;
@@ -630,8 +666,12 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             model: requested_model.unwrap_or_default().trim().to_string(),
             prompt_version: brief.prompt_version.clone(),
             prompt_hash: brief.prompt_hash.clone(),
+            workspace: Some(workspace.clone()),
             ..Checkpoint::default()
         };
+        // The run is resumable from the moment it begins: a restart before
+        // the first turn still finds a checkpoint.
+        write_json(&state_dir.join("checkpoint.json"), &checkpoint)?;
         let loop_ctx = LoopCtx {
             system_prompt,
             brief,
@@ -672,6 +712,25 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 &mut state,
                 AgentEvent::ApprovalResolved { call_id, approved },
             );
+        }
+        handle.cond.notify_all();
+        Ok(self.snapshot_of(run_id, handle))
+    }
+
+    /// Trusted UI decision on a proposed plan. Only this path can release a
+    /// plan-gated run from `AwaitingPlan`; the model has no route to it.
+    /// Approval continues the run into the normal loop; denial ends it as
+    /// `Denied` without any tool having executed.
+    pub fn decide_plan(&self, run_id: &str, approved: bool) -> Result<AgentSnapshot, String> {
+        let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+        let handle = runs.get(run_id).ok_or("unknown run")?;
+        {
+            let mut state = handle.shared.lock().map_err(|_| "run state poisoned")?;
+            if state.status != AgentStatus::AwaitingPlan {
+                return Err("run is not waiting for a plan decision".into());
+            }
+            state.decision = Some(approved);
+            push_locked(&mut state, AgentEvent::PlanApprovalResolved { approved });
         }
         handle.cond.notify_all();
         Ok(self.snapshot_of(run_id, handle))
@@ -727,7 +786,24 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         // the run log says so.
         let migrated_legacy = check_resume_identity(&checkpoint, &current_version, &current_hash)?;
         let plan: Vec<PlanItem> = read_json(&state_dir.join("plan.json")).unwrap_or_default();
-        let workspace = run_dir.join("workspace");
+        // The workspace is restored from the checkpoint when present
+        // (explicit-workspace runs, e.g. custody); legacy checkpoints fall
+        // back to the default `<run_dir>/workspace` layout. A stored path is
+        // re-validated under the runs root: a tampered checkpoint must not
+        // redirect the resumed run elsewhere.
+        let runs_root_canon = self.runs_root.canonicalize().map_err(|e| e.to_string())?;
+        let workspace = match checkpoint.workspace.clone() {
+            Some(stored) => {
+                let canon = stored
+                    .canonicalize()
+                    .map_err(|_| "checkpointed workspace is missing".to_string())?;
+                if !canon.starts_with(&runs_root_canon) {
+                    return Err("checkpointed workspace escaped the runs root".into());
+                }
+                canon
+            }
+            None => run_dir.join("workspace"),
+        };
         if !workspace.is_dir() {
             return Err("checkpointed workspace is missing".into());
         }
@@ -1030,6 +1106,45 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
     };
     let mut cp = ctx.checkpoint.clone();
     let budgets = ctx.brief.budgets;
+
+    // ---- plan mode: propose the plan, wait for trusted approval ---------
+    // No tool executes before approval. Denial ends the run as Denied with
+    // the plan preserved in the snapshot for inspection. A resumed run whose
+    // checkpoint already records approval skips the gate; anything else
+    // re-parks (approval is never assumed).
+    if ctx.brief.plan_mode && !cp.plan_approved {
+        match plan_gate(
+            &ctx,
+            &tools,
+            &mut ledger,
+            protocol,
+            &base_url,
+            &key,
+            &model,
+            started,
+            &mut cp,
+        ) {
+            PlanGate::Approved => {}
+            PlanGate::Denied => {
+                // Test-only: a simulated death while parked must not write
+                // a terminal state.
+                #[cfg(test)]
+                if silent_halt(&ctx, &cp) {
+                    return;
+                }
+                finish(&ctx, &mut ledger, TerminalReason::Denied, started, &cp);
+                return;
+            }
+            PlanGate::Failed(reason) => {
+                #[cfg(test)]
+                if silent_halt(&ctx, &cp) {
+                    return;
+                }
+                finish(&ctx, &mut ledger, reason, started, &cp);
+                return;
+            }
+        }
+    }
 
     loop {
         // ---- hard stops, checked at every turn boundary ------------------
@@ -2449,6 +2564,322 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
     }
 }
 
+/// Plan mode: the instruction appended to the plan turn. The request itself
+/// declares ONLY `update_plan`, so the model structurally cannot reach any
+/// other tool before the human approves the plan.
+const PLAN_ONLY_INSTRUCTION: &str = "PLAN MODE. This turn you may ONLY call update_plan. \
+    Produce a concrete 2-8 step plan for the task: one in_progress step, the rest pending. \
+    The plan IS the tool call - do not describe it in prose instead of calling the tool. \
+    No other tools exist in this turn.";
+
+enum PlanGate {
+    Approved,
+    Denied,
+    Failed(TerminalReason),
+}
+
+/// The plan-only tool declarations, derived from the same contract as the
+/// full toolset so the schema can never drift from it.
+fn plan_only_declarations() -> Vec<Value> {
+    gemini_tool_definitions()[0]["functionDeclarations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.get("name").and_then(|n| n.as_str()) == Some("update_plan"))
+        .collect()
+}
+
+/// A provider request identical in shape to `build_request` but declaring
+/// only `update_plan`: the model cannot call what is not offered.
+fn build_plan_request(
+    protocol: ProviderProtocol,
+    model: &str,
+    system: &str,
+    state_msg: &str,
+) -> String {
+    let decls = plan_only_declarations();
+    match protocol {
+        ProviderProtocol::Gemini => {
+            let contents = vec![json!({"role":"user","parts":[{"text": state_msg}]})];
+            json!({"contents": contents, "tools": [{"functionDeclarations": decls}],
+                "systemInstruction": {"parts":[{"text": system}]},
+                "toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},
+                "generationConfig":{"temperature":0.2,"maxOutputTokens":4096}})
+            .to_string()
+        }
+        ProviderProtocol::Anthropic => {
+            let tools: Vec<Value> = decls
+                .into_iter()
+                .map(|d| {
+                    json!({"name": d["name"], "description": d["description"],
+                        "input_schema": lowercase_schema(d["parameters"].clone())})
+                })
+                .collect();
+            json!({"model":model,"max_tokens":4096,"temperature":0.2,
+                "system":system,
+                "messages":[{"role":"user","content":state_msg}],"tools":tools})
+            .to_string()
+        }
+        ProviderProtocol::OpenAiCompatible => {
+            let tools: Vec<Value> = decls
+                .into_iter()
+                .map(|d| {
+                    json!({"type":"function","function":{
+                        "name":d["name"],"description":d["description"],
+                        "parameters":lowercase_schema(d["parameters"].clone())}})
+                })
+                .collect();
+            json!({"model":model,
+                "messages":[{"role":"system","content":system},{"role":"user","content":state_msg}],
+                "tools":tools,"tool_choice":"auto","temperature":0.2,"max_tokens":4096})
+            .to_string()
+        }
+    }
+}
+
+/// Plan gate: one model turn with only `update_plan` declared, then park in
+/// `AwaitingPlan` until the trusted UI approves. No tool executes before
+/// approval - the plan turn's tool-call accounting is restored afterwards
+/// because proposing the plan is pre-work, not execution.
+// Runs the single pre-execution plan turn and parks the run at
+// AgentStatus::AwaitingPlan until the user approves or denies the plan.
+// The parameters are the loop's ambient context; bundling them would hide
+// what the gate actually depends on at its single call site.
+#[allow(clippy::too_many_arguments)]
+fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
+    ctx: &LoopCtx<S, T>,
+    tools: &ToolRuntime,
+    ledger: &mut Option<Ledger>,
+    protocol: ProviderProtocol,
+    base_url: &str,
+    key: &str,
+    model: &str,
+    started: Instant,
+    cp: &mut Checkpoint,
+) -> PlanGate {
+    if let Ok(mut s) = ctx.handle.shared.lock() {
+        s.status = AgentStatus::Planning;
+    }
+    let system = format!("{}\n\n{PLAN_ONLY_INSTRUCTION}", ctx.system_prompt);
+    let state_msg = format!(
+        "Task: {}\n\nPropose the execution plan now via update_plan. Nothing has run yet; \
+         the human approves the plan before any tool executes.",
+        ctx.brief.task
+    );
+    // Two attempts: a model that will not produce a plan fails the gate
+    // honestly instead of stalling the run forever.
+    for attempt in 1..=2u32 {
+        if ctx.handle.cancel.load(Ordering::SeqCst) {
+            return PlanGate::Failed(TerminalReason::Cancelled);
+        }
+        let body = build_plan_request(protocol, model, &system, &state_msg);
+        let _ = fs::write(
+            ctx.state_dir
+                .join("evidence")
+                .join(format!("plan-turn-{attempt}-request.json")),
+            &body,
+        );
+        let response = match generate_with_retry(
+            ctx.service.transport(),
+            protocol,
+            base_url,
+            key,
+            model,
+            &body,
+            &ctx.handle,
+        ) {
+            Ok(r) => r,
+            Err(detail) => return PlanGate::Failed(TerminalReason::ProviderError { detail }),
+        };
+        let _ = fs::write(
+            ctx.state_dir
+                .join("evidence")
+                .join(format!("plan-turn-{attempt}-response.json")),
+            &response,
+        );
+        let (usage_total, response_text) =
+            (usage_tokens(protocol, &response), response.len() as u64);
+        cp.tokens_used += usage_total.unwrap_or((body.len() as u64 + response_text) / 4);
+        if let Some(l) = ledger.as_mut() {
+            l.append(
+                "plan_turn",
+                json!({"attempt": attempt, "usage_tokens": usage_total}),
+            );
+        }
+        let decoded = match decode_provider_calls(protocol, &response) {
+            Ok(v) => v,
+            Err(e) => {
+                return PlanGate::Failed(TerminalReason::ProviderError {
+                    detail: format!("undecodable plan turn: {e}"),
+                })
+            }
+        };
+        for text in &decoded.texts {
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::ModelText { text: text.clone() },
+            );
+        }
+        // Fail closed: the plan turn offers only update_plan, but the
+        // generic decoder turns any tool-shaped part into an executable
+        // AgentCall::Tool. Verify every decoded call here, before
+        // execute_turn can run anything: only update_plan (and BadCall,
+        // which executes nothing) may pass. Anything else aborts the gate
+        // before a single tool runs.
+        let mut disallowed: Vec<String> = Vec::new();
+        for (call, _) in &decoded.calls {
+            let name = match call {
+                AgentCall::UpdatePlan { .. } => None,
+                AgentCall::BadCall { .. } => None,
+                AgentCall::Tool { request, .. } => Some(format!(
+                    "tool:{}",
+                    match request {
+                        ToolRequest::ReadFile { .. } => "read_file",
+                        ToolRequest::CreateFile { .. } => "create_file",
+                        ToolRequest::EditFile { .. } => "edit_file",
+                        ToolRequest::SearchFiles { .. } => "search_files",
+                        ToolRequest::RunCommand { .. } => "run_command",
+                    }
+                )),
+                AgentCall::WebSearch { .. } => Some("web_search".to_string()),
+                AgentCall::CompleteTask { .. } => Some("complete_task".to_string()),
+            };
+            if let Some(name) = name {
+                disallowed.push(name);
+            }
+        }
+        if !disallowed.is_empty() {
+            if let Some(l) = ledger.as_mut() {
+                l.append(
+                    "plan_gate",
+                    json!({"ok": false, "disallowed_calls": disallowed}),
+                );
+            }
+            return PlanGate::Failed(TerminalReason::Blocked {
+                detail: format!(
+                    "plan turn emitted disallowed call(s) before approval: {}",
+                    disallowed.join(", ")
+                ),
+            });
+        }
+        // The plan turn is pre-work: its tool-call accounting is restored.
+        let tool_calls_before = cp.tool_calls;
+        let out = execute_turn(
+            ctx,
+            tools,
+            ledger,
+            protocol,
+            decoded.calls,
+            decoded.thought_signature,
+            cp,
+            started,
+        );
+        cp.tool_calls = tool_calls_before;
+        if let Some(fatal) = out.fatal {
+            return PlanGate::Failed(fatal);
+        }
+        let plan = current_plan(&ctx.handle);
+        if !plan.is_empty() {
+            if let Some(l) = ledger.as_mut() {
+                l.append("plan_proposed", json!({"items": plan}));
+            }
+            // Parked runs are resumable: persist before blocking on the
+            // decision, so process death while awaiting approval still
+            // resumes at the gate instead of losing the run.
+            let _ = write_json(&ctx.state_dir.join("checkpoint.json"), &*cp);
+            return match wait_for_plan_decision(ctx, &plan) {
+                Decision::Approved => {
+                    // Durable before entering the loop: a resumed run must
+                    // never re-enter the gate and must never assume approval.
+                    cp.plan_approved = true;
+                    let _ = write_json(&ctx.state_dir.join("checkpoint.json"), &*cp);
+                    PlanGate::Approved
+                }
+                Decision::Denied => PlanGate::Denied,
+                Decision::Timeout => PlanGate::Failed(TerminalReason::ApprovalTimeout),
+                Decision::Cancelled => PlanGate::Failed(TerminalReason::Cancelled),
+            };
+        }
+        RunHandle::push_event(
+            &ctx.handle.shared,
+            AgentEvent::Info {
+                message: format!("plan turn {attempt} produced no plan; asking once more"),
+            },
+        );
+    }
+    PlanGate::Failed(TerminalReason::ModelStalled)
+}
+
+/// Test-only process-death simulation: persist the checkpoint and report
+/// that the run halted silently, without writing a terminal state. Mirrors
+/// the main loop's silent-cancel path so `halt_without_terminal` works no
+/// matter where the run was parked.
+#[cfg(test)]
+fn silent_halt<S: SecretStore + 'static, T: Transport + 'static>(
+    ctx: &LoopCtx<S, T>,
+    cp: &Checkpoint,
+) -> bool {
+    if ctx.handle.silent_cancel.load(Ordering::SeqCst) {
+        let _ = write_json(&ctx.state_dir.join("checkpoint.json"), cp);
+        return true;
+    }
+    false
+}
+
+/// Park the loop thread until the trusted UI approves or rejects the plan.
+/// Mirrors `wait_for_decision`; the model cannot reach this transition.
+fn wait_for_plan_decision<S: SecretStore + 'static, T: Transport + 'static>(
+    ctx: &LoopCtx<S, T>,
+    plan: &[PlanItem],
+) -> Decision {
+    {
+        let mut s = match ctx.handle.shared.lock() {
+            Ok(s) => s,
+            Err(_) => return Decision::Cancelled,
+        };
+        s.status = AgentStatus::AwaitingPlan;
+        s.pending_approval = None;
+        s.decision = None;
+        push_locked(
+            &mut s,
+            AgentEvent::PlanApprovalRequired {
+                items: plan.to_vec(),
+            },
+        );
+    }
+    let deadline = Instant::now() + Duration::from_millis(APPROVAL_WAIT_MS);
+    let mut guard = match ctx.handle.shared.lock() {
+        Ok(g) => g,
+        Err(_) => return Decision::Cancelled,
+    };
+    loop {
+        if ctx.handle.cancel.load(Ordering::SeqCst) {
+            guard.status = AgentStatus::Planning;
+            return Decision::Cancelled;
+        }
+        if let Some(approved) = guard.decision.take() {
+            guard.status = AgentStatus::Running;
+            return if approved {
+                Decision::Approved
+            } else {
+                Decision::Denied
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            guard.status = AgentStatus::Planning;
+            return Decision::Timeout;
+        }
+        let (g, _timeout) = ctx
+            .handle
+            .cond
+            .wait_timeout(guard, remaining.min(Duration::from_secs(5)))
+            .expect("run state poisoned");
+        guard = g;
+    }
+}
+
 /// Concrete completion gates. A completion claim is verified, never trusted:
 /// the plan must be fully done, real work must exist, and a UI deliverable
 /// must survive desktop + mobile preview verification with no console or
@@ -2934,6 +3365,7 @@ mod tests {
             prompt_hash: legacy_prompt_marker(),
             role: None,
             allowed_tools: None,
+            plan_mode: false,
         };
         write_brief(&dir, &brief).unwrap();
         let mut changed = brief.clone();
@@ -3418,6 +3850,7 @@ mod tests {
                 Some(budgets()),
                 None,
                 Role::Adversary,
+                false,
             )
             .unwrap();
         auto_approve(svc.clone(), snap.id.clone());
@@ -3557,5 +3990,370 @@ mod tests {
             .begin("task", "private-undocumented-wire", None)
             .is_err());
         assert!(svc.begin("   ", "gemini", None).is_err());
+    }
+
+    // ---- plan mode --------------------------------------------------------
+
+    #[test]
+    fn plan_only_declarations_offer_exactly_update_plan() {
+        let decls = plan_only_declarations();
+        assert_eq!(decls.len(), 1, "the plan turn must offer exactly one tool");
+        assert_eq!(
+            decls[0].get("name").and_then(|n| n.as_str()),
+            Some("update_plan")
+        );
+    }
+
+    fn begin_plan_mode(
+        svc: &Arc<Svc>,
+        root: &Path,
+        ws_name: &str,
+        task: &str,
+    ) -> (String, PathBuf) {
+        // The workspace must live under the runs root, which the service
+        // only creates lazily; make it exist before begin canonicalizes.
+        fs::create_dir_all(root.join("runs")).unwrap();
+        let ws = root.join("runs").join(ws_name);
+        let snap = svc
+            .begin_in_workspace_with_role(
+                task,
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws.clone()),
+                Role::Worker,
+                true,
+            )
+            .expect("plan-mode begin");
+        (snap.id, ws)
+    }
+
+    fn wait_plan_park(svc: &Arc<Svc>, id: &str) -> AgentSnapshot {
+        wait_status(svc, id, AgentStatus::AwaitingPlan)
+    }
+
+    fn wait_status(svc: &Arc<Svc>, id: &str, want: AgentStatus) -> AgentSnapshot {
+        let start = Instant::now();
+        loop {
+            let s = svc.snapshot(id).expect("snapshot");
+            if s.status == want {
+                return s;
+            }
+            assert!(
+                start.elapsed().as_secs() < 30,
+                "never reached {want:?}: {:?}",
+                s.status
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn plan_mode_parks_for_approval_and_denial_mutates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![call_turn(vec![plan_call(vec![
+                ("1", "write the page", "pending"),
+                ("2", "verify it", "pending"),
+            ])])]),
+        ));
+        let (id, ws) = begin_plan_mode(&svc, tmp.path(), "plan-deny-ws", "plan then stop");
+        let parked = wait_plan_park(&svc, &id);
+        assert_eq!(
+            parked.plan.len(),
+            2,
+            "the proposed plan is visible for review"
+        );
+        assert_eq!(
+            parked.tool_calls, 0,
+            "the planning turn is pre-work, not execution"
+        );
+        assert!(
+            parked
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PlanApprovalRequired { .. })),
+            "the UI is told a plan decision is required"
+        );
+        // Denial ends the run before any tool executes.
+        let denied_snap = svc.decide_plan(&id, false).expect("decide plan");
+        assert!(
+            denied_snap
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PlanApprovalResolved { approved: false })),
+            "the denial is recorded as an event"
+        );
+        let done = wait_terminal(&svc, &id, 15_000);
+        assert!(matches!(done.terminal_reason, Some(TerminalReason::Denied)));
+        assert_eq!(done.status, AgentStatus::Denied);
+        assert!(
+            !ws.join("index.html").exists(),
+            "a denied plan mutates nothing"
+        );
+        // The gate is single-shot: a second decision fails closed.
+        assert!(svc.decide_plan(&id, false).is_err());
+    }
+
+    #[test]
+    fn plan_mode_approval_continues_into_execution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                // Consumed by the gate, pre-approval: the plan proposal.
+                call_turn(vec![plan_call(vec![("1", "write the notes", "pending")])]),
+                // Post-approval execution. A plain text file keeps the
+                // preview-verification gate out of the picture: it needs a
+                // `rex-static-preview` binary the test environment has no
+                // business providing, and this test is about plan approval.
+                call_turn(vec![create_call("notes.txt", "Fresh leaves.")]),
+                call_turn(vec![
+                    plan_call(vec![("1", "write the notes", "done")]),
+                    complete_call("notes written"),
+                ]),
+            ]),
+        ));
+        let (id, ws) = begin_plan_mode(&svc, tmp.path(), "plan-approve-ws", "plan then run");
+        auto_approve(svc.clone(), id.clone());
+        wait_plan_park(&svc, &id);
+        svc.decide_plan(&id, true).expect("approve plan");
+        let done = wait_terminal(&svc, &id, 120_000);
+        if !matches!(done.terminal_reason, Some(TerminalReason::Completed)) {
+            for e in &done.events {
+                eprintln!("EVENT: {}", serde_json::to_string(e).unwrap_or_default());
+            }
+        }
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "got {:?}",
+            done.terminal_reason
+        );
+        assert!(
+            ws.join("notes.txt").exists(),
+            "the approved run does the work"
+        );
+    }
+
+    #[test]
+    fn plan_mode_rogue_tool_call_in_plan_turn_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![call_turn(vec![
+                plan_call(vec![("1", "write file", "pending")]),
+                create_call("rogue.txt", "no"),
+            ])]),
+        ));
+        let (id, ws) = begin_plan_mode(&svc, tmp.path(), "plan-rogue-ws", "rogue plan");
+        let done = wait_terminal(&svc, &id, 30_000);
+        match &done.terminal_reason {
+            Some(TerminalReason::Blocked { detail }) => {
+                assert!(
+                    detail.contains("create_file"),
+                    "truthful detail names the disallowed call, got: {detail}"
+                );
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert_eq!(done.status, AgentStatus::Blocked);
+        assert!(
+            !ws.join("rogue.txt").exists(),
+            "the rogue call never executed"
+        );
+    }
+
+    #[test]
+    fn plan_mode_cancel_while_awaiting_plan_ends_cancelled_with_no_tool_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![plan_call(vec![("1", "write file", "pending")])]),
+                call_turn(vec![create_call("never.txt", "must not exist")]),
+            ]),
+        ));
+        let (id, ws) = begin_plan_mode(&svc, tmp.path(), "plan-cancel-ws", "cancel me");
+        wait_plan_park(&svc, &id);
+        svc.cancel(&id).expect("cancel while awaiting plan");
+        let done = wait_terminal(&svc, &id, 30_000);
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Cancelled)),
+            "got {:?}",
+            done.terminal_reason
+        );
+        assert!(
+            !ws.join("never.txt").exists(),
+            "no tool ran after cancellation at the plan gate"
+        );
+        assert!(
+            !done
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PlanApprovalResolved { .. })),
+            "cancellation records no plan decision"
+        );
+        svc.teardown(&id).unwrap();
+    }
+
+    #[test]
+    fn plan_decision_outside_plan_mode_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(tmp.path(), Script::new(vec![text_turn("idle")])));
+        let snap = svc.begin("plain run", "gemini", Some(budgets())).unwrap();
+        assert!(svc.decide_plan(&snap.id, true).is_err());
+        assert!(svc.decide_plan(&snap.id, false).is_err());
+        assert!(svc.decide_plan("no-such-run", true).is_err());
+        svc.cancel(&snap.id).unwrap();
+    }
+
+    #[test]
+    fn plan_mode_approval_is_checkpointed_and_resume_skips_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let run_id;
+        let ws;
+        {
+            // Phase 1 runs the plan gate, does one approved tool call, then
+            // parks at a second tool approval that is deliberately never
+            // granted: the halt below always lands on a parked run, never in
+            // a race with the stall detector.
+            let svc = Arc::new(service(
+                &root,
+                Script::new(vec![
+                    call_turn(vec![plan_call(vec![("1", "write the notes", "pending")])]),
+                    call_turn(vec![create_call("notes.txt", "Fresh leaves.")]),
+                    call_turn(vec![create_call("blocker.txt", "never approved")]),
+                ]),
+            ));
+            let (id, w) = begin_plan_mode(&svc, &root, "plan-resume-ws", "plan then resume");
+            run_id = id;
+            ws = w;
+            wait_plan_park(&svc, &run_id);
+            svc.decide_plan(&run_id, true).expect("approve plan");
+            // Approve only the first tool call; the second parks forever.
+            wait_status(&svc, &run_id, AgentStatus::AwaitingApproval);
+            svc.decide(&run_id, true).expect("approve notes.txt");
+            // notes.txt existing proves the first approval resolved; the
+            // next AwaitingApproval is therefore the blocker park.
+            let start = Instant::now();
+            loop {
+                let snap = svc.snapshot(&run_id).expect("snapshot");
+                if ws.join("notes.txt").exists() && snap.status == AgentStatus::AwaitingApproval {
+                    break;
+                }
+                assert!(
+                    start.elapsed().as_secs() < 30,
+                    "run never parked at the blocker approval"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                svc.snapshot(&run_id).expect("snapshot").status,
+                AgentStatus::AwaitingApproval,
+                "the blocker park is stable: the run is not drifting toward a terminal state"
+            );
+            // Kill the process mid-run: no terminal state is written.
+            svc.halt_without_terminal(&run_id);
+            std::thread::sleep(Duration::from_millis(100));
+            // The approval marker is durable on disk before execution began.
+            let cp: serde_json::Value = read_json(
+                &root
+                    .join("runs")
+                    .join(&run_id)
+                    .join("state")
+                    .join("checkpoint.json"),
+            )
+            .expect("checkpoint persisted");
+            assert_eq!(
+                cp.get("plan_approved"),
+                Some(&serde_json::Value::Bool(true)),
+                "approval is checkpointed, got: {cp}"
+            );
+        }
+        // A new service over the same runs root resumes from disk.
+        let svc2 = Arc::new(service(
+            &root,
+            Script::new(vec![
+                call_turn(vec![create_call("notes2.txt", "after resume")]),
+                call_turn(vec![
+                    plan_call(vec![("1", "write the notes", "done")]),
+                    complete_call("notes written"),
+                ]),
+            ]),
+        ));
+        let resumed = svc2.resume(&run_id).expect("resume approved run");
+        assert!(resumed.step >= 1, "resumed at the checkpointed step");
+        auto_approve(svc2.clone(), run_id.clone());
+        let done = wait_terminal(&svc2, &run_id, 120_000);
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "got {:?}",
+            done.terminal_reason
+        );
+        assert!(
+            !done
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PlanApprovalRequired { .. })),
+            "the resumed run never re-entered the plan gate"
+        );
+        svc2.teardown(&run_id).unwrap();
+    }
+
+    #[test]
+    fn plan_mode_unapproved_run_reparks_on_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let run_id;
+        {
+            let svc = Arc::new(service(
+                &root,
+                Script::new(vec![call_turn(vec![plan_call(vec![(
+                    "1",
+                    "write the notes",
+                    "pending",
+                )])])]),
+            ));
+            let (id, _ws) = begin_plan_mode(&svc, &root, "plan-repark-ws", "park then resume");
+            run_id = id;
+            // Park at the gate, approve nothing, then die.
+            wait_plan_park(&svc, &run_id);
+            svc.halt_without_terminal(&run_id);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Resume: the gate must run again, never be skipped.
+        let svc2 = Arc::new(service(
+            &root,
+            Script::new(vec![
+                call_turn(vec![plan_call(vec![("1", "write the notes", "pending")])]),
+                call_turn(vec![create_call("notes.txt", "Fresh leaves.")]),
+                call_turn(vec![
+                    plan_call(vec![("1", "write the notes", "done")]),
+                    complete_call("notes written"),
+                ]),
+            ]),
+        ));
+        svc2.resume(&run_id).expect("resume parked run");
+        wait_plan_park(&svc2, &run_id);
+        let parked = svc2.snapshot(&run_id).expect("snapshot");
+        assert!(
+            parked
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::PlanApprovalRequired { .. })),
+            "the resumed run re-parked for plan approval instead of bypassing it"
+        );
+        auto_approve(svc2.clone(), run_id.clone());
+        svc2.decide_plan(&run_id, true).expect("approve plan");
+        let done = wait_terminal(&svc2, &run_id, 120_000);
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "got {:?}",
+            done.terminal_reason
+        );
+        svc2.teardown(&run_id).unwrap();
     }
 }

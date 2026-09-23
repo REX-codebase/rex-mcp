@@ -618,6 +618,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
             Some(ultra_budgets()),
             Some(ctx.workspace.clone()),
             Role::Builder,
+            false,
         ) {
             Ok(snap) => snap,
             Err(e) => {
@@ -718,6 +719,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                     Some(ultra_budgets()),
                     Some(ctx.workspace.clone()),
                     Role::Adversary,
+                    false,
                 ) {
                     Ok(run) => {
                         ctx.handle

@@ -47,6 +47,9 @@ pub struct ManagedTaskRequest {
     pub budgets: CustodyBudgets,
     pub lease_terms: LeaseTerms,
     pub contract: CompletionContract,
+    /// Plan mode: the run proposes a plan and waits for trusted approval
+    /// before any tool executes.
+    pub plan_mode: bool,
 }
 
 /// Flat view the shell returns when a custodied run starts or is polled:
@@ -73,6 +76,7 @@ pub fn ui_managed_request(
     provider: String,
     model: Option<String>,
     workspace: PathBuf,
+    plan_mode: bool,
 ) -> ManagedTaskRequest {
     let capabilities = CapabilitySet {
         workspace_root: workspace.clone(),
@@ -115,6 +119,7 @@ pub fn ui_managed_request(
             ],
             max_claim_attempts: 1,
         },
+        plan_mode,
     }
 }
 
@@ -243,6 +248,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
                 Some(budgets),
                 Some(workspace),
                 Role::Worker,
+                req.plan_mode,
             )
             .map_err(|e| {
                 // The run never started; release custody honestly.
@@ -284,6 +290,12 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
             .map_err(|e| format!("stop refused: {e}"))?;
         let _ = self.runs.cancel(run_id);
         Ok(reason)
+    }
+
+    /// Trusted UI decision on a plan-gated run's proposed plan. Delegates to
+    /// the shared run service; custody never sees the plan contents.
+    pub fn decide_plan(&self, run_id: &str, approved: bool) -> Result<AgentSnapshot, String> {
+        self.runs.decide_plan(run_id, approved)
     }
 
     fn spawn_monitor(&self, grant_id: String, token: CapabilityToken, run_id: String) {
@@ -538,6 +550,7 @@ mod tests {
             budgets,
             lease_terms: LeaseTerms::default(),
             contract,
+            plan_mode: false,
         }
     }
 
@@ -770,6 +783,7 @@ mod tests {
             "gemini".into(),
             None,
             ws.clone(),
+            false,
         );
         assert!(!req.capabilities.can_delegate, "custody never delegates");
         assert_eq!(req.capabilities.workspace_root, ws);

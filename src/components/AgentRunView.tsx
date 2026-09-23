@@ -49,6 +49,10 @@ function EventLine({ event }: { event: AgentEvent }) {
       return <li className="agent-event agent-event-wait">Approval requested · {event.call.tool.replace(/_/g, " ")}</li>;
     case "approval_resolved":
       return <li className="agent-event agent-event-wait">{event.approved ? "Approved once" : "Denied"}</li>;
+    case "plan_approval_required":
+      return <li className="agent-event agent-event-wait">Plan proposed · {event.items.length} step{event.items.length === 1 ? "" : "s"} awaiting your approval</li>;
+    case "plan_approval_resolved":
+      return <li className="agent-event agent-event-wait">{event.approved ? "Plan approved · executing" : "Plan rejected · run stopped before any tool ran"}</li>;
     case "gate_result":
       return (
         <li className={`agent-event ${event.passed ? "agent-event-ok" : "agent-event-err"}`}>
@@ -69,6 +73,8 @@ export function AgentRunView({
   onDecide,
   onCancel,
   custody,
+  onPlanDecision,
+  planDeciding,
 }: {
   run: AgentSnapshot;
   deciding: boolean;
@@ -76,6 +82,8 @@ export function AgentRunView({
   onDecide: (approved: boolean) => void;
   onCancel: () => void;
   custody?: { grantId: string; phase: string; operator: string } | null;
+  onPlanDecision?: (approved: boolean) => void;
+  planDeciding?: boolean;
 }) {
   const phase = phaseOf(run);
   const [shot, setShot] = useState<string | null>(null);
@@ -142,13 +150,15 @@ export function AgentRunView({
             ? terminalLabel(terminal)
             : phase === "approval"
               ? "Waiting on your approval"
-              : phase === "verifying"
-                ? "Verifying the work…"
-                : run.model
-                  ? `${run.model} · step ${run.step}/${run.max_steps}`
-                  : "Contacting the live model catalog…"}
+              : phase === "plan"
+                ? "Plan proposed · waiting on your approval"
+                : phase === "verifying"
+                  ? "Verifying the work…"
+                  : run.model
+                    ? `${run.model} · step ${run.step}/${run.max_steps}`
+                    : "Contacting the live model catalog…"}
         </span>
-        {(working || phase === "approval") && (
+        {(working || phase === "approval" || phase === "plan") && (
           <button type="button" className="agent-cancel" onClick={onCancel} disabled={cancelling}>
             {cancelling ? "Cancelling…" : "Cancel"}
           </button>
@@ -190,6 +200,23 @@ export function AgentRunView({
 
       {run.pending_approval && phase === "approval" && (
         <ToolApproval call={run.pending_approval} busy={deciding} onDecision={onDecide} />
+      )}
+
+      {phase === "plan" && onPlanDecision && (
+        <section className="plan-approval" role="alertdialog" aria-labelledby="plan-approval-title" aria-describedby="plan-approval-detail">
+          <div className="tool-approval-head">
+            <span className="approval-shield" aria-hidden="true">✓</span>
+            <div>
+              <p className="eyebrow">Plan approval</p>
+              <h3 id="plan-approval-title">REX proposed a plan · nothing has run yet</h3>
+            </div>
+          </div>
+          <p id="plan-approval-detail" className="approval-note">Review the steps above. Approve to let REX execute them, or reject to stop the run before any tool runs.</p>
+          <div className="approval-actions">
+            <button type="button" disabled={planDeciding} onClick={() => onPlanDecision(false)} className="approval-deny">Reject plan</button>
+            <button type="button" disabled={planDeciding} onClick={() => onPlanDecision(true)} className="approval-allow">{planDeciding ? "Sending…" : "Approve plan"}</button>
+          </div>
+        </section>
       )}
 
       <ul className="agent-events" aria-label="Run events">

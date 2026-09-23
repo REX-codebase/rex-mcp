@@ -385,6 +385,10 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .tool-approval{margin:20px 0;border:1px solid color-mix(in srgb,#f0a43b 42%,var(--color-line));border-radius:18px;background:color-mix(in srgb,#f0a43b 7%,var(--color-surface));padding:20px;box-shadow:0 18px 45px rgba(0,0,0,.12)}
 .tool-approval-head{display:flex;align-items:flex-start;gap:13px}.approval-shield{display:grid;height:34px;width:34px;place-items:center;border-radius:11px;background:#f0a43b;color:#15120d;font-weight:800}.tool-approval h3{margin-top:3px;font-size:17px;font-weight:650;color:var(--color-text)}.tool-summary{margin-top:17px;border-radius:12px;background:color-mix(in srgb,var(--color-bg) 82%,transparent);padding:13px 14px;font:12px/1.65 "JetBrains Mono",monospace;color:var(--color-text);overflow-wrap:anywhere}.tool-approval dl{display:grid;gap:9px;margin-top:14px}.tool-approval dl div{display:grid;grid-template-columns:92px 1fr;gap:12px;font-size:12px}.tool-approval dt{color:var(--color-faint)}.tool-approval dd{color:var(--color-muted)}.approval-note{margin-top:15px;font-size:11px;color:var(--color-faint)}.approval-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:17px}.approval-actions button{border-radius:10px;padding:9px 14px;font-size:12px;font-weight:650}.approval-deny{border:1px solid var(--color-line);color:var(--color-muted)}.approval-allow{background:#f0a43b;color:#15120d}.tool-receipt{margin:14px 0;border:1px solid var(--color-line);border-radius:15px;background:var(--color-surface);padding:15px}.receipt-title{display:flex;gap:10px;align-items:center}.receipt-title>span{display:grid;width:26px;height:26px;place-items:center;border-radius:9px;background:color-mix(in srgb,#50c878 17%,transparent);color:#50c878}.receipt-title div{display:flex;flex-direction:column}.receipt-title b{font-size:13px;color:var(--color-text)}.receipt-title small{font-size:10px;color:var(--color-faint)}.receipt-diff,.receipt-output{margin-top:12px;max-height:220px;overflow:auto;border-radius:10px;background:var(--color-bg);padding:12px;font:11px/1.65 "JetBrains Mono",monospace;color:var(--color-muted);white-space:pre-wrap}.tool-receipt footer{display:flex;flex-wrap:wrap;gap:12px;margin-top:11px;font:10px "JetBrains Mono",monospace;color:var(--color-faint)}
 @media(max-width:520px){.tool-approval{padding:16px}.tool-approval dl div{grid-template-columns:1fr;gap:2px}.approval-actions button{flex:1}}
+.plan-approval{margin:20px 0;border:1px solid color-mix(in srgb,#6aa8ff 42%,var(--color-line));border-radius:18px;background:color-mix(in srgb,#6aa8ff 7%,var(--color-surface));padding:20px;box-shadow:0 18px 45px rgba(0,0,0,.12)}
+.plan-approval .approval-shield{background:#6aa8ff;color:#0d1526}
+.plan-approval .approval-allow{background:#6aa8ff;color:#0d1526}
+@media(max-width:520px){.plan-approval{padding:16px}}
 
 /* Autonomous agent loop */
 .agent-budgets {
@@ -409,6 +413,9 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 }
 .agent-cancel:hover { border-color: rgba(0, 0, 0, 0.32); }
 .agent-cancel:disabled { opacity: 0.5; cursor: default; }
+.plan-toggle{display:inline-flex;align-items:center;gap:7px;font-size:11px;color:var(--color-muted);cursor:pointer;user-select:none}
+.plan-toggle input{accent-color:#6aa8ff;width:13px;height:13px;cursor:pointer}
+.plan-toggle input:disabled{cursor:default}
 .agent-plan {
   list-style: none;
   margin: 12px 0;

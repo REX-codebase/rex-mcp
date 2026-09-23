@@ -22,7 +22,7 @@ import { AgentRunView } from "./components/AgentRunView";
 import { UltraRunView } from "./components/UltraRunView";
 import { ultraBegin, ultraSnapshot, ultraDecide, ultraCancel, type UltraSnapshot } from "./data/ultraRun";
 import { liveRunAvailable } from "./data/liveRun";
-import { custodyBegin, custodyStop } from "./data/custodyRun";
+import { custodyBegin, custodyDecidePlan, custodyStop } from "./data/custodyRun";
 import { rexTaskBegin } from "./data/rexTasks";
 import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
@@ -100,6 +100,10 @@ export default function App() {
   const [liveStarting, setLiveStarting] = useState(false);
   const [liveDeciding, setLiveDeciding] = useState(false);
   const [liveCancelling, setLiveCancelling] = useState(false);
+  // Plan mode: the run proposes a plan and parks in awaiting_plan until the
+  // user approves it. Reset on each new run start.
+  const [planMode, setPlanMode] = useState(false);
+  const [planDeciding, setPlanDeciding] = useState(false);
   const livePoll = useRef<number | null>(null);
   const [installedRun, setInstalledRun] = useState<InstalledRunSnapshot | null>(null);
   const [installedStarting, setInstalledStarting] = useState(false);
@@ -398,7 +402,12 @@ export default function App() {
           .finally(() => setLiveStarting(false));
         return;
       }
-      custodyBegin(label)
+      // Capture the plan-mode choice for this run, then reset the checkbox so
+      // the next run starts in the default execution mode unless the user
+      // opts in again.
+      const mode = planMode;
+      setPlanMode(false);
+      custodyBegin(label, mode)
         .then((view) => {
           setCustody({ grantId: view.grant_id, phase: view.phase, operator: view.operator });
           setLiveRun(view.snapshot);
@@ -456,6 +465,19 @@ export default function App() {
       .then((snap) => setLiveRun(snap))
       .catch((e) => setLiveRun((prev) => (prev ? { ...prev, error: String(e) } : prev)))
       .finally(() => setLiveDeciding(false));
+  };
+
+  // Plan decision for a plan-gated custody run: approval resumes the run
+  // into the normal loop; rejection ends it as denied. The decision travels
+  // through the custody channel, which shares the same run registry, so the
+  // gate's trusted-UI checks still apply.
+  const onPlanDecision = (approved: boolean) => {
+    if (!liveRun || planDeciding) return;
+    setPlanDeciding(true);
+    custodyDecidePlan(liveRun.id, approved)
+      .then((snap) => setLiveRun(snap))
+      .catch((e) => setLiveRun((prev) => (prev ? { ...prev, error: String(e) } : prev)))
+      .finally(() => setPlanDeciding(false));
   };
 
   const onLiveCancel = () => {
@@ -602,6 +624,8 @@ export default function App() {
                       setTask={setTask}
                       state={state}
                       onRun={onRun}
+                      planMode={planMode}
+                      setPlanMode={setPlanMode}
                     />
                   </div>
                 </div>
@@ -645,6 +669,8 @@ export default function App() {
                 onDecide={onLiveDecision}
                 onCancel={onLiveCancel}
                 custody={custody}
+                onPlanDecision={onPlanDecision}
+                planDeciding={planDeciding}
               />
             )}
             {rexTaskId && (

@@ -400,12 +400,17 @@ fn now_ms_u128() -> u128 {
 /// the Human/Agent gate is recorded in the grant, the run's budgets are
 /// clamped to the grant, and completion must pass the grant's evidence
 /// gates. The capability token never leaves the backend.
+///
+/// When `plan_mode` is set, the run first produces a plan via a single
+/// plan-only model turn and parks in `awaiting_plan` until the UI approves
+/// it through `custody_decide_plan`. No tool executes before approval.
 #[tauri::command]
 fn custody_begin(
     custody_runs: State<'_, Arc<CustodyRuns>>,
     task: String,
     provider: Option<String>,
     model: Option<String>,
+    plan_mode: Option<bool>,
 ) -> Result<rex_providers::CustodiedRunView, String> {
     let task_id = format!("task-ui-{:x}", now_ms_u128());
     // The custodied workspace sits under the agent runs root: the run
@@ -419,9 +424,22 @@ fn custody_begin(
         provider.unwrap_or_else(|| "gemini".into()),
         model,
         workspace,
+        plan_mode.unwrap_or(false),
     );
     let run = custody_runs.begin_managed_task(req)?;
     Ok(custody_runs.view_of(&run))
+}
+
+/// Trusted UI decision on a plan-gated run's proposed plan. Approval
+/// continues the run into the normal loop; denial ends it as denied with
+/// no tool having executed.
+#[tauri::command]
+fn custody_decide_plan(
+    custody_runs: State<'_, Arc<CustodyRuns>>,
+    run_id: String,
+    approved: bool,
+) -> Result<rex_providers::AgentSnapshot, String> {
+    custody_runs.decide_plan(&run_id, approved)
 }
 
 /// Current custody phase for a grant (active, verifying, released, ...).
@@ -841,6 +859,7 @@ fn main() {
             custody_begin,
             custody_phase,
             custody_stop,
+            custody_decide_plan,
             rex_task_begin,
             rex_task_follow_up,
             rex_tasks,

@@ -2,7 +2,7 @@ import { useRef } from "react";
 import { ModelStatus } from "./ModelStatus";
 import { EXAMPLE_TASKS, type RunState } from "../data/mock";
 
-export function Composer({ task, setTask, state, onRun }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void }) {
+export function Composer({ task, setTask, state, onRun, planMode, setPlanMode }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void; planMode: boolean; setPlanMode: (v: boolean) => void }) {
   const busy = state === "working" || state === "verifying";
   const canRun = task.trim().length > 0 && !busy;
   const areaRef = useRef<HTMLTextAreaElement>(null);
@@ -38,6 +38,10 @@ export function Composer({ task, setTask, state, onRun }: { task: string; setTas
             </span>
           </div>
           <div className="flex items-center gap-3">
+            <label className="plan-toggle" title="Plan mode: REX proposes a plan and waits for your approval before any tool runs.">
+              <input type="checkbox" checked={planMode} disabled={busy} onChange={(e) => setPlanMode(e.target.checked)} aria-label="Plan mode" />
+              <span>Plan mode</span>
+            </label>
             <span className="hidden text-[11px] text-faint md:inline">Ctrl + Enter</span>
             <button type="button" onClick={onRun} disabled={!canRun} title={!task.trim() ? "Describe a task first" : busy ? "A run is in progress" : "Start the run"} className="run-button" aria-label={busy ? "Run in progress" : "Run task"}>
               <span>{busy ? "Running" : "Run"}</span>
