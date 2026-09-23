@@ -26,6 +26,7 @@ import { custodyBegin, custodyDecidePlan, custodyStop } from "./data/custodyRun"
 import { rexTaskBegin } from "./data/rexTasks";
 import { FableCountdown } from "./components/FableCountdown";
 import { loadFableSessionName, saveFableSessionName, fableCreateSession } from "./data/fable";
+import { TerminalView } from "./components/TerminalView";
 import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
   agentCancel,
@@ -79,7 +80,7 @@ export default function App() {
     try { saveOperatorMode(mode); } catch { /* storage unavailable */ }
     setOperatorMode(mode);
   };
-  const [view, setView] = useState<"task" | "settings">("task");
+  const [view, setView] = useState<"task" | "settings" | "terminal">("task");
   const [browserPhase, setBrowserPhase] = useState<"closed" | "active" | "collapsed">("closed");
   const [browserRun, setBrowserRun] = useState(0);
   const [ultra, setUltra] = useState(false);
@@ -664,7 +665,9 @@ export default function App() {
       </div>
       <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "TEMPO PROFILE ARMED" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small><i aria-hidden="true" /></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
-        {view === "settings" ? (
+        {view === "terminal" ? (
+          <TerminalView />
+        ) : view === "settings" ? (
           <SettingsView
             motion={motion}
             setMotion={setMotion}

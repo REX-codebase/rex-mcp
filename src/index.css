@@ -581,3 +581,12 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .settings-input{flex:1;min-width:200px;padding:8px 10px;border:1px solid var(--color-line);border-radius:8px;background:transparent;font-size:12px;color:var(--color-text);font-family:ui-monospace,monospace}
 .settings-input::placeholder{color:var(--color-faint)}
 .settings-input:focus{outline:none;border-color:var(--color-accent)}
+
+/* Interactive terminal view. */
+.terminal-view{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.terminal-view-bar{display:flex;align-items:center;gap:10px}
+.terminal-view-id{font-size:11px;color:var(--color-faint);font-family:ui-monospace,monospace}
+.terminal-view-exited{font-size:11px;color:var(--color-accent)}
+.terminal-view-body{height:480px;border:1px solid var(--color-line);border-radius:12px;overflow:hidden;background:#0d1117}
+.terminal-view-body .xterm{padding:8px;height:100%}
+.terminal-view--error{padding:16px;border:1px solid var(--color-line);border-radius:12px}

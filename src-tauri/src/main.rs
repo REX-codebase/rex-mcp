@@ -4,6 +4,8 @@
 // only - key material never crosses the bridge.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod terminal;
+
 use rex_installed_agents::{
     discover as discover_installed_agents, run as run_installed_agent, InstalledAgentId,
     InstalledAgentRun, InstalledAgentSummary, RunManager as InstalledAgentManager, RunOptions,
@@ -649,6 +651,98 @@ fn fable_mcp_probe(server_command: String) -> Result<FableMcpLink, String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Interactive terminal: PTY sessions bound to the workspace.
+// ---------------------------------------------------------------------------
+
+/// Spawn a terminal in `workspace` (must sit under the agent runs root).
+/// Returns the terminal ID. Output arrives as `terminal-output-{id}` events.
+#[tauri::command]
+fn terminal_spawn(
+    app: tauri::AppHandle,
+    terminals: State<'_, terminal::SharedTerminals>,
+    workspace: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> Result<String, String> {
+    let runs_root = config_dir().join("agent-runs");
+    let id = terminals.spawn(
+        PathBuf::from(workspace),
+        &runs_root,
+        cols.unwrap_or(80),
+        rows.unwrap_or(24),
+    )?;
+
+    // Drain the PTY in a background thread; forward bytes as events.
+    // The event name embeds the terminal ID so the UI routes correctly.
+    let event_name = format!("terminal-output-{id}");
+    let terminals_clone = terminals.inner().clone();
+    let id_clone = id.clone();
+    std::thread::spawn(move || {
+        let mut reader = match terminals_clone.clone_reader(&id_clone) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF: child exited
+                Ok(n) => {
+                    // Lossy conversion is fine for terminal output; the
+                    // alternative is dropping undecodable bytes entirely.
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = app.emit(&event_name, text);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = app.emit(&format!("terminal-exit-{id_clone}"), ());
+    });
+
+    Ok(id)
+}
+
+/// Write bytes (UTF-8) to the terminal's stdin.
+#[tauri::command]
+fn terminal_write(
+    terminals: State<'_, terminal::SharedTerminals>,
+    id: String,
+    data: String,
+) -> Result<(), String> {
+    terminals.write(&id, data.as_bytes())
+}
+
+/// Resize the PTY.
+#[tauri::command]
+fn terminal_resize(
+    terminals: State<'_, terminal::SharedTerminals>,
+    id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    terminals.resize(&id, cols, rows)
+}
+
+/// Kill the terminal and its child.
+#[tauri::command]
+fn terminal_kill(
+    terminals: State<'_, terminal::SharedTerminals>,
+    id: String,
+) -> Result<(), String> {
+    terminals.kill(&id)
+}
+
+/// The default workspace for new terminals: the agent runs root.
+/// The UI passes this to `terminal_spawn`; the backend re-validates it.
+#[tauri::command]
+fn terminal_default_workspace() -> Result<String, String> {
+    let root = config_dir().join("agent-runs");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    root.to_str()
+        .map(|s| s.to_string())
+        .ok_or("workspace path is not UTF-8".to_string())
+}
+
 /// Current custody phase for a grant (active, verifying, released, ...).
 #[tauri::command]
 fn custody_phase(
@@ -1022,6 +1116,7 @@ fn main() {
         .manage(ultra)
         .manage(custody_runs)
         .manage(installed_runs)
+        .manage(terminal::SharedTerminals::default())
         .invoke_handler(tauri::generate_handler![
             installed_agent_summaries,
             installed_agent_run,
@@ -1071,6 +1166,11 @@ fn main() {
             fable_session_status,
             fable_unlock_session,
             fable_mcp_probe,
+            terminal_spawn,
+            terminal_write,
+            terminal_resize,
+            terminal_kill,
+            terminal_default_workspace,
             rex_task_begin,
             rex_task_follow_up,
             rex_tasks,
