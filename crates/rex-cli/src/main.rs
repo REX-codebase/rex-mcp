@@ -9,7 +9,6 @@ mod cert;
 mod deadman;
 mod exec;
 mod ledger;
-mod mcp_ext;
 mod policy;
 mod provenance;
 mod redteam;
@@ -663,7 +662,7 @@ fn run_mcp(args: &[String]) -> Result<i32, ExecError> {
     let sub = sub.ok_or_else(|| ExecError::usage(usage_msg))?;
     let state = exec::state_dir();
     let (cfg_path, servers) =
-        mcp_ext::load_config(workspace.as_deref(), &state).map_err(ExecError::internal)?;
+        rex_mcp_ext::load_config(workspace.as_deref(), &state).map_err(ExecError::internal)?;
     let find = |name: &str| {
         servers
             .iter()
@@ -688,7 +687,7 @@ fn run_mcp(args: &[String]) -> Result<i32, ExecError> {
             if positional.len() > 1 {
                 return Err(ExecError::usage(usage_msg));
             }
-            let targets: Vec<mcp_ext::ExtServer> = match positional.first() {
+            let targets: Vec<rex_mcp_ext::ExtServer> = match positional.first() {
                 Some(name) => vec![find(name)?],
                 None => servers.clone(),
             };
@@ -699,9 +698,9 @@ fn run_mcp(args: &[String]) -> Result<i32, ExecError> {
                 )));
             }
             let mut failed = false;
-            let mut all: Vec<mcp_ext::ExtTool> = Vec::new();
+            let mut all: Vec<rex_mcp_ext::ExtTool> = Vec::new();
             for srv in targets {
-                match mcp_ext::McpExtClient::spawn(&srv).and_then(|mut c| {
+                match rex_mcp_ext::McpExtClient::spawn(&srv).and_then(|mut c| {
                     let tools = c.list_tools()?;
                     Ok((c.negotiated_version().to_string(), tools))
                 }) {
@@ -751,7 +750,7 @@ fn run_mcp(args: &[String]) -> Result<i32, ExecError> {
                 return Err(ExecError::usage(usage_msg));
             }
             let srv = find(positional[0])?;
-            let mut client = mcp_ext::McpExtClient::spawn(&srv).map_err(ExecError::internal)?;
+            let mut client = rex_mcp_ext::McpExtClient::spawn(&srv).map_err(ExecError::internal)?;
             let result = client
                 .call_tool(positional[1], call_args)
                 .map_err(ExecError::internal)?;

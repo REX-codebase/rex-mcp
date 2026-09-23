@@ -6,6 +6,7 @@ description = "REX Harness provider core: live model catalogs, credentials, and 
 license = "Proprietary"
 
 [dependencies]
+rex-mcp-ext = { path = "../rex-mcp-ext" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rex-custody = { path = "../rex-custody" }

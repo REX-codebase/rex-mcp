@@ -8,6 +8,7 @@ pub mod sandbox;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -18,6 +19,43 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// MCP tool output is capped so a chatty server cannot flood the model
+/// context; the truncation marker tells the model the output was cut.
+const MAX_MCP_OUTPUT: usize = 64 * 1024;
+
+/// Extract human-readable text from an MCP `tools/call` result: join
+/// `type: "text"` content parts; fall back to the compact JSON.
+fn mcp_text(result: &Value) -> String {
+    let parts = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    if item.get("type").and_then(Value::as_str) == Some("text") {
+                        item.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if parts.is_empty() {
+        serde_json::to_string(result).unwrap_or_default()
+    } else {
+        parts
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    format!("{}…\n[output truncated at {max} bytes]", &text[..max])
+}
 const MAX_WRITE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
@@ -59,6 +97,11 @@ pub enum ToolRequest {
         argv: Vec<String>,
         cwd: Option<String>,
         timeout_ms: Option<u64>,
+    },
+    McpCall {
+        server: String,
+        name: String,
+        arguments: Value,
     },
 }
 
@@ -161,6 +204,14 @@ pub struct ToolRuntime {
     root: Arc<PathBuf>,
     pending: Arc<Mutex<HashMap<String, Pending>>>,
     order: Arc<Mutex<VecDeque<String>>>,
+    mcp: Option<Arc<dyn McpCaller>>,
+}
+
+/// How a run reaches third-party MCP servers. Implemented by the run host
+/// (rex-providers), which owns the live stdio sessions; rex-tools only
+/// knows this interface so the tool sandbox stays decoupled from MCP.
+pub trait McpCaller: Send + Sync {
+    fn call(&self, server: &str, tool: &str, arguments: &Value) -> Result<Value, String>;
 }
 
 #[derive(Clone)]
@@ -184,7 +235,15 @@ impl ToolRuntime {
             root: Arc::new(root),
             pending: Default::default(),
             order: Default::default(),
+            mcp: None,
         })
+    }
+
+    /// Attach the run's live MCP sessions. Without this, `mcp_call` requests
+    /// prepare fine but fail at execution with a clear error.
+    pub fn with_mcp_caller(mut self, caller: Arc<dyn McpCaller>) -> Self {
+        self.mcp = Some(caller);
+        self
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -508,7 +567,45 @@ impl ToolRuntime {
                 cwd,
                 timeout_ms,
             } => self.run_command(argv, cwd.as_deref(), timeout_ms.unwrap_or(30_000)),
+            ToolRequest::McpCall {
+                server,
+                name,
+                arguments,
+            } => self.mcp_call(server, name, arguments),
         }
+    }
+
+    /// Call a third-party MCP tool through the run's attached caller.
+    /// The server's text content is returned as model-visible output;
+    /// an MCP-level error (`isError`) becomes a tool error so the model
+    /// sees the failure instead of a silent success.
+    fn mcp_call(&self, server: &str, name: &str, arguments: &Value) -> Result<ExecData, ToolError> {
+        let caller = self.mcp.as_ref().ok_or_else(|| {
+            err(
+                ErrorKind::InvalidRequest,
+                "no MCP servers connected for this run",
+            )
+        })?;
+        let result = caller.call(server, name, arguments).map_err(|detail| {
+            err(
+                ErrorKind::ProcessFailed,
+                &format!("MCP {server}.{name}: {detail}"),
+            )
+        })?;
+        let text = mcp_text(&result);
+        if result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(err(
+                ErrorKind::ProcessFailed,
+                &format!("MCP {server}.{name} reported an error: {text}"),
+            ));
+        }
+        let mut r = receipt(&self.root, None, text.len() as u64, 0);
+        r.target = Some(format!("mcp:{server}.{name}"));
+        Ok(exec(Some(truncate(&text, MAX_MCP_OUTPUT)), r))
     }
 
     fn read_file(&self, path: &str) -> Result<ExecData, ToolError> {
@@ -1170,6 +1267,7 @@ fn tool_name(r: &ToolRequest) -> &'static str {
         ToolRequest::EditFile { .. } => "edit_file",
         ToolRequest::SearchFiles { .. } => "search_files",
         ToolRequest::RunCommand { .. } => "run_command",
+        ToolRequest::McpCall { .. } => "mcp_call",
     }
 }
 fn summarize(r: &ToolRequest) -> String {
@@ -1187,6 +1285,7 @@ fn summarize(r: &ToolRequest) -> String {
         ToolRequest::RunCommand { argv, cwd, .. } => {
             format!("Run {:?} in {}", argv, cwd.as_deref().unwrap_or("."))
         }
+        ToolRequest::McpCall { server, name, .. } => format!("MCP {server}.{name}"),
     }
 }
 /// Trusted scoring policy for benchmark verification. This list is ONLY
@@ -1238,6 +1337,10 @@ fn classify(r: &ToolRequest) -> (RiskClass, &'static str) {
             RiskClass::Execute,
             "runs a bounded process and requires user approval",
         ),
+        ToolRequest::McpCall { .. } => (
+            RiskClass::Execute,
+            "calls a third-party MCP server and requires user approval",
+        ),
     }
 }
 fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
@@ -1254,6 +1357,14 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         }
         ToolRequest::RunCommand { argv, .. } if argv.is_empty() || argv[0].trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "command argv is empty"))
+        }
+        ToolRequest::McpCall { server, name, .. }
+            if server.trim().is_empty() || name.trim().is_empty() =>
+        {
+            Err(err(
+                ErrorKind::InvalidRequest,
+                "mcp_call needs a server and a tool name",
+            ))
         }
         _ => Ok(()),
     }
@@ -1589,6 +1700,7 @@ fn redact(input: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     fn temp() -> PathBuf {
         let p = std::env::temp_dir().join(new_call_id());
         fs::create_dir_all(&p).unwrap();
@@ -1625,6 +1737,105 @@ mod tests {
         assert!(rt.execute(&p.call_id).ok);
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "hi");
     }
+    #[test]
+    fn mcp_call_needs_approval_and_round_trips_through_caller() {
+        struct Fake;
+        impl McpCaller for Fake {
+            fn call(&self, server: &str, name: &str, arguments: &Value) -> Result<Value, String> {
+                assert_eq!(server, "fake");
+                assert_eq!(name, "echo");
+                Ok(json!({
+                    "content": [{"type": "text", "text": format!("echo:{}", arguments["text"].as_str().unwrap_or(""))}]
+                }))
+            }
+        }
+        let rt = ToolRuntime::new(temp())
+            .unwrap()
+            .with_mcp_caller(Arc::new(Fake));
+        let p = rt
+            .prepare(ToolRequest::McpCall {
+                server: "fake".into(),
+                name: "echo".into(),
+                arguments: json!({"text": "hello"}),
+            })
+            .unwrap();
+        assert!(p.approval_required);
+        assert_eq!(p.risk, RiskClass::Execute);
+        // Approval gate still applies: executing before approval fails.
+        assert_eq!(
+            rt.execute(&p.call_id).error.unwrap().kind,
+            ErrorKind::ApprovalRequired
+        );
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        let r = rt.execute(&p.call_id);
+        assert!(r.ok, "mcp_call failed: {:?}", r.error);
+        assert_eq!(r.output.as_deref(), Some("echo:hello"));
+        assert_eq!(r.tool, "mcp_call");
+    }
+
+    #[test]
+    fn mcp_call_without_caller_fails_honestly() {
+        let rt = ToolRuntime::new(temp()).unwrap();
+        let p = rt
+            .prepare(ToolRequest::McpCall {
+                server: "fake".into(),
+                name: "echo".into(),
+                arguments: json!({}),
+            })
+            .unwrap();
+        assert!(p.approval_required);
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        let r = rt.execute(&p.call_id);
+        assert!(!r.ok);
+        assert!(r.error.unwrap().detail.contains("no MCP servers connected"));
+    }
+
+    #[test]
+    fn mcp_call_server_error_is_not_a_silent_success() {
+        struct Failing;
+        impl McpCaller for Failing {
+            fn call(&self, _s: &str, _n: &str, _a: &Value) -> Result<Value, String> {
+                Ok(json!({
+                    "content": [{"type": "text", "text": "boom"}],
+                    "isError": true
+                }))
+            }
+        }
+        let rt = ToolRuntime::new(temp())
+            .unwrap()
+            .with_mcp_caller(Arc::new(Failing));
+        let p = rt
+            .prepare(ToolRequest::McpCall {
+                server: "s".into(),
+                name: "t".into(),
+                arguments: json!({}),
+            })
+            .unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        let r = rt.execute(&p.call_id);
+        assert!(!r.ok);
+        assert!(r.error.unwrap().detail.contains("boom"));
+    }
+
+    #[test]
+    fn mcp_call_rejects_empty_server_or_tool() {
+        let rt = ToolRuntime::new(temp()).unwrap();
+        assert!(rt
+            .prepare(ToolRequest::McpCall {
+                server: "".into(),
+                name: "t".into(),
+                arguments: json!({}),
+            })
+            .is_err());
+        assert!(rt
+            .prepare(ToolRequest::McpCall {
+                server: "s".into(),
+                name: "  ".into(),
+                arguments: json!({}),
+            })
+            .is_err());
+    }
+
     #[test]
     fn denial_is_final() {
         let rt = ToolRuntime::new(temp()).unwrap();

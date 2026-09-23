@@ -9,6 +9,7 @@ name = "rex"
 path = "src/main.rs"
 
 [dependencies]
+rex-mcp-ext = { path = "../rex-mcp-ext" }
 rex-providers = { path = "../rex-providers" }
 serde = { workspace = true }
 serde_json = { workspace = true }

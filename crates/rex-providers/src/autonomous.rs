@@ -672,6 +672,10 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         // The run is resumable from the moment it begins: a restart before
         // the first turn still finds a checkpoint.
         write_json(&state_dir.join("checkpoint.json"), &checkpoint)?;
+        // External MCP servers connect once per run; the catalog is
+        // appended to the prompt so the model can discover `mcp_call`.
+        let mcp = setup_mcp(&workspace);
+        let system_prompt = format!("{}{}", system_prompt, mcp.catalog);
         let loop_ctx = LoopCtx {
             system_prompt,
             brief,
@@ -681,6 +685,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             state_dir,
             workspace,
             checkpoint,
+            mcp_tools: mcp.tools,
+            mcp_caller: mcp.caller,
         };
         std::thread::spawn(move || drive(loop_ctx));
         Ok(self.snapshot_of(&id, &handle))
@@ -852,6 +858,10 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 },
             );
         }
+        // External MCP servers connect once per run; the catalog is
+        // appended to the prompt so the model can discover `mcp_call`.
+        let mcp = setup_mcp(&workspace);
+        let system_prompt = format!("{}{}", system_prompt, mcp.catalog);
         let loop_ctx = LoopCtx {
             system_prompt,
             brief,
@@ -861,6 +871,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             state_dir,
             workspace,
             checkpoint,
+            mcp_tools: mcp.tools,
+            mcp_caller: mcp.caller,
         };
         std::thread::spawn(move || drive(loop_ctx));
         Ok(self.snapshot_of(run_id, &handle))
@@ -944,6 +956,99 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
+use rex_mcp_ext::{ExtTool, McpExtClient};
+
+/// Live external MCP sessions for one run. Sessions spawn at run start so
+/// the model can call them through `mcp_call`; a broken server is skipped
+/// with a stderr warning instead of failing the whole run.
+struct McpPool {
+    clients: Mutex<HashMap<String, McpExtClient>>,
+}
+
+impl rex_tools::McpCaller for McpPool {
+    fn call(&self, server: &str, name: &str, arguments: &Value) -> Result<Value, String> {
+        let mut clients = self
+            .clients
+            .lock()
+            .map_err(|_| "mcp pool lock poisoned".to_string())?;
+        let client = clients
+            .get_mut(server)
+            .ok_or_else(|| format!("unknown MCP server {server:?}"))?;
+        client.call_tool(name, arguments.clone())
+    }
+}
+
+struct McpSetup {
+    caller: Option<Arc<McpPool>>,
+    tools: Vec<ExtTool>,
+    catalog: String,
+}
+
+/// Connect the run's external MCP servers, if any are configured. The model
+/// learns the catalog from the system prompt and calls tools through the
+/// single `mcp_call` agent tool (approval-gated like any Execute risk).
+fn setup_mcp(workspace: &Path) -> McpSetup {
+    let empty = McpSetup {
+        caller: None,
+        tools: Vec::new(),
+        catalog: String::new(),
+    };
+    // No config at all is normal: external tools are simply absent. A
+    // config file that exists but fails to parse is worth a warning.
+    let state_dir = rex_mcp_ext::state_dir();
+    let (_cfg_path, servers) = match rex_mcp_ext::load_config(Some(workspace), &state_dir) {
+        Ok(found) => found,
+        Err(e) => {
+            if workspace.join(".rex").join("mcp.json").exists()
+                || state_dir.join("mcp.json").exists()
+            {
+                eprintln!("rex: MCP config invalid ({e}); external tools disabled");
+            }
+            return empty;
+        }
+    };
+    let mut clients = HashMap::new();
+    let mut tools = Vec::new();
+    for server in servers {
+        match McpExtClient::spawn(&server) {
+            Ok(mut client) => match client.list_tools() {
+                Ok(ts) => {
+                    tools.extend(ts);
+                    clients.insert(server.name.clone(), client);
+                }
+                Err(e) => eprintln!(
+                    "rex: MCP server {:?} failed tools/list ({e}); skipping",
+                    server.name
+                ),
+            },
+            Err(e) => eprintln!(
+                "rex: MCP server {:?} failed to start ({e}); skipping",
+                server.name
+            ),
+        }
+    }
+    if clients.is_empty() {
+        return empty;
+    }
+    let mut catalog = String::from(
+        "\n\nExternal MCP tools (third-party servers; every call needs approval):\n\
+         Call them with the `mcp_call` tool, passing `server`, `name`, and `arguments`.\n",
+    );
+    for t in &tools {
+        catalog.push_str(&format!(
+            "- server {:?}: tool {:?} — {}\n",
+            t.server, t.name, t.description
+        ));
+    }
+    McpSetup {
+        caller: Some(Arc::new(McpPool {
+            clients: Mutex::new(clients),
+        })),
+        tools,
+        catalog,
+    }
+}
+
 struct LoopCtx<S: SecretStore + 'static, T: Transport + 'static> {
     brief: TaskBrief,
     system_prompt: String,
@@ -953,6 +1058,8 @@ struct LoopCtx<S: SecretStore + 'static, T: Transport + 'static> {
     state_dir: PathBuf,
     workspace: PathBuf,
     checkpoint: Checkpoint,
+    mcp_tools: Vec<ExtTool>,
+    mcp_caller: Option<Arc<McpPool>>,
 }
 
 struct Ledger {
@@ -997,7 +1104,10 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
     let started = Instant::now();
     let mut ledger = Ledger::open(&ctx.state_dir);
     let tools = match ToolRuntime::new(&ctx.workspace) {
-        Ok(t) => t,
+        Ok(t) => match &ctx.mcp_caller {
+            Some(caller) => t.with_mcp_caller(caller.clone()),
+            None => t,
+        },
         Err(e) => {
             finish(
                 &ctx,
@@ -1221,6 +1331,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             &ctx.system_prompt,
             &state_msg,
             cp.last_pair.as_ref(),
+            &ctx.mcp_tools,
         );
         let turn_no = cp.step + 1;
         let _ = fs::write(
@@ -1550,6 +1661,7 @@ fn build_request(
     system: &str,
     state_msg: &str,
     prev: Option<&TurnPair>,
+    mcp_tools: &[ExtTool],
 ) -> String {
     match protocol {
         ProviderProtocol::Gemini => {
@@ -1562,7 +1674,7 @@ fn build_request(
                     contents.push(json!({"role":"user","parts": pair.response_parts}));
                 }
             }
-            json!({"contents": contents, "tools": gemini_tool_definitions(),
+            json!({"contents": contents, "tools": gemini_tool_definitions_with(mcp_tools),
                 "systemInstruction": {"parts":[{"text": system}]},
                 "toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},
                 "generationConfig":{"temperature":0.2,"maxOutputTokens":8192}})
@@ -1581,7 +1693,7 @@ fn build_request(
             messages.push(json!({"role":"user","content":state_msg}));
             json!({"model":model,"max_tokens":8192,"temperature":0.2,
                 "system":system,
-                "messages":messages,"tools":anthropic_tool_definitions()})
+                "messages":messages,"tools":anthropic_tool_definitions_with(mcp_tools)})
             .to_string()
         }
         ProviderProtocol::OpenAiCompatible => {
@@ -1593,7 +1705,7 @@ fn build_request(
                 messages.extend(pair.response_parts.clone());
             }
             messages.push(json!({"role":"user","content":state_msg}));
-            json!({"model":model,"messages":messages,"tools":openai_tool_definitions(),
+            json!({"model":model,"messages":messages,"tools":openai_tool_definitions_with(mcp_tools),
                 "tool_choice":"auto","temperature":0.2,"max_tokens":8192})
             .to_string()
         }
@@ -1631,6 +1743,64 @@ fn openai_tool_definitions() -> Value {
     Value::Array(declarations.into_iter().map(|d| json!({"type":"function","function":{
         "name":d["name"],"description":d["description"],"parameters":lowercase_schema(d["parameters"].clone())
     }})).collect())
+}
+
+/// The single agent tool that reaches external MCP servers. Declared in the
+/// Gemini function-declaration shape; the protocol converters below adapt it.
+fn mcp_call_declaration() -> Value {
+    json!({
+        "name": "mcp_call",
+        "description": "Call a tool on a connected external MCP server (see the prompt catalog for servers and tools). Requires trusted approval.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "server": {"type": "STRING", "description": "MCP server name from the catalog"},
+                "name": {"type": "STRING", "description": "Tool name on that server"},
+                "arguments": {"type": "OBJECT", "description": "Tool arguments object"}
+            },
+            "required": ["server", "name"]
+        }
+    })
+}
+
+fn gemini_tool_definitions_with(mcp_tools: &[ExtTool]) -> Value {
+    let mut defs = gemini_tool_definitions();
+    if !mcp_tools.is_empty() {
+        if let Some(decls) = defs[0]["functionDeclarations"].as_array_mut() {
+            decls.push(mcp_call_declaration());
+        }
+    }
+    defs
+}
+
+fn anthropic_tool_definitions_with(mcp_tools: &[ExtTool]) -> Value {
+    let mut defs = anthropic_tool_definitions();
+    if !mcp_tools.is_empty() {
+        if let Some(arr) = defs.as_array_mut() {
+            let d = mcp_call_declaration();
+            arr.push(json!({
+                "name": d["name"],
+                "description": d["description"],
+                "input_schema": lowercase_schema(d["parameters"].clone())
+            }));
+        }
+    }
+    defs
+}
+
+fn openai_tool_definitions_with(mcp_tools: &[ExtTool]) -> Value {
+    let mut defs = openai_tool_definitions();
+    if !mcp_tools.is_empty() {
+        if let Some(arr) = defs.as_array_mut() {
+            let d = mcp_call_declaration();
+            arr.push(json!({"type": "function", "function": {
+                "name": d["name"],
+                "description": d["description"],
+                "parameters": lowercase_schema(d["parameters"].clone())
+            }}));
+        }
+    }
+    defs
 }
 
 fn lowercase_schema(mut value: Value) -> Value {
@@ -2503,6 +2673,7 @@ fn tool_name_of(request: &ToolRequest) -> &'static str {
         ToolRequest::EditFile { .. } => "edit_file",
         ToolRequest::SearchFiles { .. } => "search_files",
         ToolRequest::RunCommand { .. } => "run_command",
+        ToolRequest::McpCall { .. } => "mcp_call",
     }
 }
 
@@ -2740,6 +2911,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                         ToolRequest::EditFile { .. } => "edit_file",
                         ToolRequest::SearchFiles { .. } => "search_files",
                         ToolRequest::RunCommand { .. } => "run_command",
+                        ToolRequest::McpCall { .. } => "mcp_call",
                     }
                 )),
                 AgentCall::WebSearch { .. } => Some("web_search".to_string()),
@@ -3285,6 +3457,7 @@ mod tests {
             "sys",
             "state",
             Some(&pair),
+            &[],
         );
         assert!(request.contains("tool_result"));
         assert!(request.contains("toolu_2"));
@@ -3322,6 +3495,7 @@ mod tests {
             "sys",
             "state",
             Some(&pair),
+            &[],
         );
         assert!(request.contains("tool_call_id"));
         assert!(request.contains("call_42"));
@@ -3336,14 +3510,18 @@ mod tests {
             "sys",
             "state",
             None,
+            &[],
         );
+
         let openai = build_request(
             ProviderProtocol::OpenAiCompatible,
             "gpt-test",
             "sys",
             "state",
             None,
+            &[],
         );
+
         assert!(!anthropic.contains("api-key"));
         assert!(!openai.contains("Bearer"));
         assert!(anthropic.contains("claude-test"));
@@ -3747,7 +3925,9 @@ mod tests {
             &system,
             "state",
             None,
+            &[],
         );
+
         let value: Value = serde_json::from_str(&request).unwrap();
         let text = value["systemInstruction"]["parts"][0]["text"]
             .as_str()
@@ -3757,7 +3937,14 @@ mod tests {
         assert!(text.contains("TOOLS ENABLED FOR THIS CALL"));
         assert!(text.contains("COMPLETION GATE"));
         // same semantics reach the other protocols' system fields
-        let anthropic = build_request(ProviderProtocol::Anthropic, "m", &system, "state", None);
+        let anthropic = build_request(
+            ProviderProtocol::Anthropic,
+            "m",
+            &system,
+            "state",
+            None,
+            &[],
+        );
         assert!(anthropic.contains("REX CONSTITUTION"));
         let openai = build_request(
             ProviderProtocol::OpenAiCompatible,
@@ -3765,7 +3952,9 @@ mod tests {
             &system,
             "state",
             None,
+            &[],
         );
+
         assert!(openai.contains("REX CONSTITUTION"));
     }
 
@@ -3784,6 +3973,70 @@ mod tests {
             .map(|s| s.name.clone())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(declared, contracted);
+    }
+
+    fn fake_ext_tool() -> ExtTool {
+        ExtTool {
+            server: "fake".into(),
+            name: "echo".into(),
+            description: "Echo the input text back.".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn mcp_call_decodes_from_provider_tool_use() {
+        let (call, _) = decode_named_call(
+            "mcp_call",
+            "call-1".into(),
+            serde_json::json!({"server": "fake", "name": "echo", "arguments": {"text": "hi"}}),
+            serde_json::json!({}),
+        );
+        match call {
+            AgentCall::Tool { id, request } => {
+                assert_eq!(id, "call-1");
+                match request {
+                    ToolRequest::McpCall {
+                        server,
+                        name,
+                        arguments,
+                    } => {
+                        assert_eq!(server, "fake");
+                        assert_eq!(name, "echo");
+                        assert_eq!(arguments["text"], "hi");
+                    }
+                    other => panic!("wrong variant: {other:?}"),
+                }
+            }
+            _ => panic!("unexpected call variant"),
+        }
+    }
+
+    #[test]
+    fn build_request_declares_mcp_call_when_tools_connected() {
+        let tools = vec![fake_ext_tool()];
+        for protocol in [
+            ProviderProtocol::Gemini,
+            ProviderProtocol::Anthropic,
+            ProviderProtocol::OpenAiCompatible,
+        ] {
+            let body = build_request(protocol, "m", "sys", "state", None, &tools);
+            assert!(
+                body.contains("\"mcp_call\""),
+                "protocol {protocol:?} must declare mcp_call"
+            );
+        }
+        for protocol in [
+            ProviderProtocol::Gemini,
+            ProviderProtocol::Anthropic,
+            ProviderProtocol::OpenAiCompatible,
+        ] {
+            let body = build_request(protocol, "m", "sys", "state", None, &[]);
+            assert!(
+                !body.contains("mcp_call"),
+                "protocol {protocol:?} must not declare mcp_call without servers"
+            );
+        }
     }
 
     #[test]

@@ -115,6 +115,9 @@ impl CapabilitySet {
             ToolRequest::RunCommand { cwd, .. } => {
                 ("run_command", cwd.as_deref().into_iter().collect())
             }
+            // External MCP calls carry no workspace paths; they are gated
+            // by the Execute class (approval) like run_command.
+            ToolRequest::McpCall { .. } => ("mcp_call", vec![]),
         };
         if !self.allowed_tools.contains(tool) {
             return Err(CapabilityDenial::ToolNotGranted { tool: tool.into() });

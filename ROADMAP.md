@@ -92,12 +92,15 @@ sandbox profiles, cross-machine resume, review surface, MCP client + skills.
 - [ ] Cross-machine and cross-directory session resume
 - [ ] Managed code-review surface with proof replay
 - [x] MCP **client**: `rex mcp list | tools [SERVER] [--json] | call SERVER TOOL`
-      against external MCP servers over stdio (`mcp_ext.rs`), configured in
-      `.rex/mcp.json` (workspace) or `$REX_STATE_DIR/mcp.json`. Handshake,
-      version-mismatch warning, per-server spawn with 30s RPC timeouts,
-      honest failures. Tested against a fake MCP server (3 integration
-      tests). Next: expose external tools inside `rex exec` runs under the
-      approval gate.
+      against external MCP servers over stdio (new `rex-mcp-ext` crate),
+      configured in `.rex/mcp.json` (workspace) or `$REX_STATE_DIR/mcp.json`.
+      Handshake, version-mismatch warning, per-server spawn with 30s RPC
+      timeouts, honest failures. Runs also connect configured servers at
+      start: the model sees an `mcp_call` tool (Execute risk, approval-gated,
+      custody-scoped) plus a prompt catalog, so external tools work inside
+      `rex exec` like Codex/Claude Code MCP. Tested against a fake MCP
+      server (3 CLI integration tests), plus run-level decode/declaration
+      tests and 4 `rex-tools` unit tests for the caller path.
 
 Exit criteria: every Claude Code / Codex table-stakes feature has a REX
 answer, verified against the battle-plan parity checklist.
