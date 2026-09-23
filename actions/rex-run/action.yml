@@ -1,0 +1,103 @@
+name: 'REX run'
+description: 'Run a REX harness agent task headlessly. Fails the job unless the run completes.'
+
+inputs:
+  task:
+    description: 'Task description for the agent'
+    required: true
+  provider:
+    description: 'Model provider id (gemini, anthropic, openai, xai, deepseek, kimi, kimi-coding, qwen, glm, local)'
+    required: false
+    default: 'anthropic'
+  model:
+    description: 'Model id (default: provider default)'
+    required: false
+    default: ''
+  api-key:
+    description: 'Provider API key (use a secret)'
+    required: true
+  workspace:
+    description: 'Directory to give the agent a copy of (default: the checked-out repo)'
+    required: false
+    default: '.'
+  max-steps:
+    description: 'Step budget'
+    required: false
+    default: '40'
+  max-tool-calls:
+    description: 'Tool-call budget'
+    required: false
+    default: '200'
+  timeout-secs:
+    description: 'Wall-clock budget in seconds'
+    required: false
+    default: '1200'
+  rex-ref:
+    description: 'REX harness ref to build the CLI from'
+    required: false
+    default: 'main'
+
+outputs:
+  receipt:
+    description: 'Path to the JSON run receipt'
+    value: ${{ steps.run.outputs.receipt }}
+  run-id:
+    description: 'REX run id'
+    value: ${{ steps.run.outputs.run-id }}
+  status:
+    description: 'Terminal agent status (completed when the step succeeds)'
+    value: ${{ steps.run.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rex-harness -> target
+
+    - name: Check out REX harness
+      uses: actions/checkout@v4
+      with:
+        repository: REX-codebase/rex-harness
+        ref: ${{ inputs.rex-ref }}
+        path: rex-harness
+
+    - name: Build rex CLI
+      shell: bash
+      working-directory: rex-harness
+      run: cargo build --release -p rex-cli
+
+    - name: Run task
+      id: run
+      shell: bash
+      env:
+        REX_STATE_DIR: ${{ runner.temp }}/rex-state
+      run: |
+        set -euo pipefail
+        upper_provider=$(echo "${{ inputs.provider }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+        export "REX_${upper_provider}_API_KEY=${{ inputs.api-key }}"
+        args=(exec --yes --json --provider "${{ inputs.provider }}" --task "${{ inputs.task }}")
+        [ -n "${{ inputs.model }}" ] && args+=(--model "${{ inputs.model }}")
+        args+=(--workspace "${{ inputs.workspace }}")
+        args+=(--max-steps "${{ inputs.max-steps }}")
+        args+=(--max-tool-calls "${{ inputs.max-tool-calls }}")
+        args+=(--timeout-secs "${{ inputs.timeout-secs }}")
+        "$GITHUB_WORKSPACE/rex-harness/target/release/rex" "${args[@]}" | tee "$RUNNER_TEMP/rex-receipt.json"
+        {
+          echo "receipt=$RUNNER_TEMP/rex-receipt.json"
+          echo "run-id=$(jq -r .run_id "$RUNNER_TEMP/rex-receipt.json")"
+          echo "status=$(jq -r .status "$RUNNER_TEMP/rex-receipt.json")"
+        } >> "$GITHUB_OUTPUT"
+        # Fail the job unless the run actually completed.
+        [ "$(jq -r .status "$RUNNER_TEMP/rex-receipt.json")" = "completed" ]
+
+    - name: Upload receipt
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: rex-receipt
+        path: ${{ runner.temp }}/rex-receipt.json
