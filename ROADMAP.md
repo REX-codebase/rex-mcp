@@ -91,7 +91,10 @@ after Phase 2/3 parity.)
    audit receipts now carry real unified diffs (Myers, hunk headers);
    every exec receipt has a `provenance` map attributing each hunk to
    the event/tool call that wrote it.
-5. Proof replay as the primary review primitive
+5. Proof replay as the primary review primitive — DONE (ac62b803):
+   `rex replay RECEIPT.json` re-derives every mechanical claim check by
+   check: signature, bid terms, bid ceiling (recomputed from the price
+   table), policy, provenance shape, ledger membership. Exit 0/3.
 6. Time-locked disconnected operation (dead-man custody, verified rollback)
 7. Plans that bid binding cost/proof-coverage commitments before execution —
    DONE (d62a443e, e34f6f51): `rex exec --bid` prints the binding bid
