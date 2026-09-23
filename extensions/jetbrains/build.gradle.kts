@@ -19,6 +19,8 @@ dependencies {
         // Community edition is enough: the plugin is a thin client over the
         // local `rex serve` HTTP API, no IDE-internal machinery needed.
         create("IC", "2024.1")
+        // Required for the `instrumentCode` task.
+        instrumentationTools()
     }
 }
 
