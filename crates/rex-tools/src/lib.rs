@@ -4,6 +4,7 @@
 //! request is prepared against a canonical workspace, classified, and bound to
 //! an unguessable pending call. Risky calls require a separate user decision.
 
+pub mod fuzzy;
 pub mod sandbox;
 
 use regex::Regex;
@@ -205,6 +206,11 @@ pub struct ToolRuntime {
     pending: Arc<Mutex<HashMap<String, Pending>>>,
     order: Arc<Mutex<VecDeque<String>>>,
     mcp: Option<Arc<dyn McpCaller>>,
+    /// Content fingerprint of each file as this runtime last read or wrote
+    /// it. A write to a file whose bytes changed since then (another
+    /// process, the user, a concurrent run) is refused as stale, so a model
+    /// never overwrites edits it has not seen.
+    seen: Arc<Mutex<HashMap<PathBuf, u64>>>,
 }
 
 /// How a run reaches third-party MCP servers. Implemented by the run host
@@ -236,6 +242,7 @@ impl ToolRuntime {
             pending: Default::default(),
             order: Default::default(),
             mcp: None,
+            seen: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -244,6 +251,45 @@ impl ToolRuntime {
     pub fn with_mcp_caller(mut self, caller: Arc<dyn McpCaller>) -> Self {
         self.mcp = Some(caller);
         self
+    }
+
+    fn fingerprint(bytes: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    }
+
+    /// Record the current on-disk bytes of `target` as seen by the model.
+    fn note_seen(&self, target: &Path) {
+        if let Ok(bytes) = fs::read(target) {
+            self.seen
+                .lock()
+                .expect("seen lock poisoned")
+                .insert(target.to_path_buf(), Self::fingerprint(&bytes));
+        }
+    }
+
+    /// Refuse a write when the file changed on disk since this runtime last
+    /// read or wrote it. Files never read are allowed: an edit's expected
+    /// text is itself a check, and creating new files needs no read.
+    fn check_not_stale(&self, target: &Path) -> Result<(), ToolError> {
+        let known = self
+            .seen
+            .lock()
+            .expect("seen lock poisoned")
+            .get(target)
+            .copied();
+        if let Some(fp) = known {
+            let now = fs::read(target).map(|b| Self::fingerprint(&b)).ok();
+            if now != Some(fp) {
+                return Err(err(
+                    ErrorKind::Conflict,
+                    "file changed on disk since it was last read; read it again before writing",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -333,11 +379,9 @@ impl ToolRuntime {
                 }
                 // Apply the edit in memory (same logic as edit_file, without
                 // writing) to produce the proposed content.
-                let new = if *replace_all {
-                    old.replace(expected, replacement)
-                } else {
-                    old.replacen(expected, replacement, 1)
-                };
+                // Same planner as execution, so the approved diff is exactly
+                // what would be written if the file is unchanged.
+                let new = plan_edit_checked(&old, expected, replacement, *replace_all)?.new_content;
                 Ok(Some(FileDiff {
                     path: path.clone(),
                     original: old,
@@ -630,6 +674,7 @@ impl ToolRuntime {
                 "binary or non-UTF-8 files are not supported",
             )
         })?;
+        self.note_seen(&target);
         Ok(exec(
             Some(text),
             receipt(&self.root, Some(&target), meta.len(), 0),
@@ -661,6 +706,7 @@ impl ToolRuntime {
             if meta.len() > MAX_FILE_BYTES {
                 return Err(err(ErrorKind::TooLarge, "existing file exceeds diff limit"));
             }
+            self.check_not_stale(&target)?;
             fs::read_to_string(&target).map_err(io_err)?
         } else {
             String::new()
@@ -676,6 +722,8 @@ impl ToolRuntime {
         file.write_all(content.as_bytes())
             .and_then(|_| file.sync_all())
             .map_err(io_err)?;
+        drop(file);
+        self.note_seen(&target);
         let mut r = receipt(
             &self.root,
             Some(&target),
@@ -715,28 +763,14 @@ impl ToolRuntime {
         if old.len() > MAX_FILE_BYTES as usize {
             return Err(err(ErrorKind::TooLarge, "file exceeds 2 MiB edit limit"));
         }
-        let count = old.matches(expected).count();
-        if count == 0 {
-            return Err(err(
-                ErrorKind::Conflict,
-                "expected text was not found; file may have changed",
-            ));
-        }
-        if count > 1 && !replace_all {
-            return Err(err(
-                ErrorKind::Conflict,
-                "expected text is not unique; set replace_all explicitly",
-            ));
-        }
-        let new = if replace_all {
-            old.replace(expected, replacement)
-        } else {
-            old.replacen(expected, replacement, 1)
-        };
+        self.check_not_stale(&target)?;
+        let plan = plan_edit_checked(&old, expected, replacement, replace_all)?;
+        let new = plan.new_content;
         if new.len() > MAX_WRITE_BYTES {
             return Err(err(ErrorKind::TooLarge, "edited file exceeds 2 MiB limit"));
         }
         fs::write(&target, new.as_bytes()).map_err(io_err)?;
+        self.note_seen(&target);
         let mut r = receipt(
             &self.root,
             Some(&target),
@@ -745,11 +779,20 @@ impl ToolRuntime {
         );
         r.diff = Some(simple_diff(&old, &new, &relative(&self.root, &target)));
         Ok(exec(
-            Some(format!(
-                "replaced {} occurrence(s) in {}",
-                if replace_all { count } else { 1 },
-                relative(&self.root, &target)
-            )),
+            Some(if plan.strategy == "exact" {
+                format!(
+                    "replaced {} occurrence(s) in {}",
+                    plan.replaced,
+                    relative(&self.root, &target)
+                )
+            } else {
+                format!(
+                    "replaced {} occurrence(s) in {} (matched via {}; indentation taken from the file)",
+                    plan.replaced,
+                    relative(&self.root, &target),
+                    plan.strategy
+                )
+            }),
             r,
         ))
     }
@@ -1872,6 +1915,129 @@ mod tests {
             ErrorKind::Conflict
         );
     }
+    fn run_edit(rt: &ToolRuntime, path: &str, expected: &str, replacement: &str) -> ToolResult {
+        let p = rt
+            .prepare(ToolRequest::EditFile {
+                path: path.into(),
+                expected: expected.into(),
+                replacement: replacement.into(),
+                replace_all: false,
+            })
+            .unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        rt.execute(&p.call_id)
+    }
+    #[test]
+    fn fuzzy_edit_reports_strategy_and_keeps_indent() {
+        let root = temp();
+        fs::write(root.join("m.rs"), "fn f() {\n    let a = 1;\n}\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        // The model dropped the block's indentation.
+        let r = run_edit(
+            &rt,
+            "m.rs",
+            "fn f() {\nlet a = 1;\n}\n",
+            "fn f() {\nlet a = 2;\nlet b = 3;\n}\n",
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert!(r.output.unwrap().contains("matched via line_trimmed"));
+        assert_eq!(
+            fs::read_to_string(root.join("m.rs")).unwrap(),
+            "fn f() {\n    let a = 2;\n    let b = 3;\n}\n"
+        );
+    }
+    #[test]
+    fn approved_diff_equals_written_bytes_for_fuzzy_edit() {
+        let root = temp();
+        fs::write(root.join("d.txt"), "  alpha\n  beta\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::EditFile {
+                path: "d.txt".into(),
+                expected: "beta".into(),
+                replacement: "gamma".into(),
+                replace_all: false,
+            })
+            .unwrap();
+        let diff = rt.pending_diff(&p.call_id).unwrap().unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        assert_eq!(
+            fs::read_to_string(root.join("d.txt")).unwrap(),
+            diff.modified
+        );
+    }
+    #[test]
+    fn write_after_external_change_is_refused_as_stale() {
+        let root = temp();
+        fs::write(root.join("s.txt"), "one\ntwo\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "s.txt".into(),
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        // Someone else edits the file after the model read it.
+        fs::write(root.join("s.txt"), "one\ntwo\nthree\n").unwrap();
+        let r = run_edit(&rt, "s.txt", "two", "TWO");
+        let e = r.error.unwrap();
+        assert_eq!(e.kind, ErrorKind::Conflict);
+        assert!(e.detail.contains("changed on disk"));
+        // Re-reading clears the stale state.
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "s.txt".into(),
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        assert!(run_edit(&rt, "s.txt", "two", "TWO").ok);
+        // A second edit right after our own write is not stale.
+        assert!(run_edit(&rt, "s.txt", "three", "3").ok);
+        assert_eq!(
+            fs::read_to_string(root.join("s.txt")).unwrap(),
+            "one\nTWO\n3\n"
+        );
+    }
+    #[test]
+    fn overwrite_after_external_change_is_refused_as_stale() {
+        let root = temp();
+        fs::write(root.join("o.txt"), "v1").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "o.txt".into(),
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        fs::write(root.join("o.txt"), "v2 by user").unwrap();
+        let p = rt
+            .prepare(ToolRequest::CreateFile {
+                path: "o.txt".into(),
+                content: "v3".into(),
+                overwrite: true,
+            })
+            .unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        assert_eq!(
+            rt.execute(&p.call_id).error.unwrap().kind,
+            ErrorKind::Conflict
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("o.txt")).unwrap(),
+            "v2 by user"
+        );
+    }
+    #[test]
+    fn not_found_edit_tells_model_where_to_look() {
+        let root = temp();
+        fs::write(root.join("h.rs"), "fn alpha() {}\nfn compute(x: u8) {}\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = run_edit(&rt, "h.rs", "fn compute(x: u16) {}", "fn c() {}");
+        let e = r.error.unwrap();
+        assert_eq!(e.kind, ErrorKind::Conflict);
+        assert!(e.detail.contains("line 2"), "{}", e.detail);
+    }
     #[test]
     fn shell_is_hard_denied() {
         let rt = ToolRuntime::new(temp()).unwrap();
@@ -2271,4 +2437,30 @@ mod git_tests {
         }
         assert_eq!(rebuilt.join("\n") + "\n", new, "diff:\n{d}");
     }
+}
+
+/// Plan an edit with the tolerant matcher and map failures to model-facing
+/// tool errors that say what to do next.
+fn plan_edit_checked(
+    old: &str,
+    expected: &str,
+    replacement: &str,
+    replace_all: bool,
+) -> Result<fuzzy::EditPlan, ToolError> {
+    fuzzy::plan_edit(old, expected, replacement, replace_all).map_err(|e| match e {
+        fuzzy::PlanError::NotFound { hint } => err(
+            ErrorKind::Conflict,
+            &format!("expected text was not found; {hint}"),
+        ),
+        fuzzy::PlanError::Ambiguous {
+            strategy,
+            count,
+            lines,
+        } => err(
+            ErrorKind::Conflict,
+            &format!(
+                "expected text is not unique: {count} matches ({strategy}) starting at lines {lines:?}; include more surrounding lines, or set replace_all explicitly"
+            ),
+        ),
+    })
 }
