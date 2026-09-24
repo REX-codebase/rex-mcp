@@ -411,7 +411,8 @@ struct TurnPair {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Checkpoint {
     /// Full text of this run's clipped command outputs, for read_output.
-    /// In memory only: a resumed run starts empty.
+    /// Not in checkpoint.json: mirrored to `state/outputs` and reloaded
+    /// there on resume (see `output_store`).
     #[serde(skip)]
     outputs: crate::output_store::OutputStore,
     step: usize,
@@ -1838,6 +1839,8 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         }
     };
     let mut cp = ctx.checkpoint.clone();
+    // clipped outputs kept by an earlier drive of this run (resume)
+    cp.outputs = crate::output_store::OutputStore::attached(ctx.state_dir.join("outputs"));
     let budgets = ctx.brief.budgets;
 
     // ---- plan mode: propose the plan, wait for trusted approval ---------
@@ -8697,6 +8700,92 @@ mod tests {
         );
         assert!(done.events.iter().any(|e| matches!(e, AgentEvent::Info { message } if message.contains("resumed from checkpoint"))));
         svc2.teardown(&run_id).unwrap();
+    }
+
+    #[test]
+    fn resume_keeps_clipped_outputs_for_read_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let ws = root.join("runs").join("resume-out-ws");
+        fs::create_dir_all(&ws).unwrap();
+        let log: Vec<String> = (1..=3000)
+            .map(|i| {
+                if i == 1500 {
+                    "test deep::resume FAILED".to_string()
+                } else {
+                    format!("line {i} ok")
+                }
+            })
+            .collect();
+        fs::write(ws.join("log.txt"), log.join("\n")).unwrap();
+        let run_id;
+        {
+            let svc = Arc::new(service(
+                &root,
+                Script::new(vec![
+                    call_turn(vec![json!({"functionCall":{"name":"run_command","args":{
+                        "argv":["cat","log.txt"]}}})]),
+                    call_turn(vec![create_call("never.txt", "never")]),
+                ]),
+            ));
+            let snap = svc
+                .begin_in_workspace_with_options(
+                    "find the failure",
+                    "gemini",
+                    None,
+                    Some(budgets()),
+                    Some(ws.clone()),
+                    Role::Worker,
+                    RunOptions::default(),
+                    SessionMeta::default(),
+                )
+                .unwrap();
+            run_id = snap.id.clone();
+            // approve the command only; the write then parks
+            let start = Instant::now();
+            loop {
+                let s = svc.snapshot(&run_id).unwrap();
+                if s.status == AgentStatus::AwaitingApproval {
+                    let _ = svc.decide(&run_id, true);
+                    break;
+                }
+                assert!(start.elapsed().as_secs() < 30, "never parked");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let start = Instant::now();
+            loop {
+                let s = svc.snapshot(&run_id).unwrap();
+                if s.step >= 1 && s.status == AgentStatus::AwaitingApproval {
+                    break;
+                }
+                assert!(start.elapsed().as_secs() < 30, "never parked twice");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            svc.halt_without_terminal(&run_id);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let state = root.join("runs").join(&run_id).join("state");
+        assert!(state.join("outputs").join("index.json").exists());
+        let svc2 = Arc::new(service(
+            &root,
+            Script::new(vec![
+                call_turn(vec![
+                    json!({"functionCall":{"name":"read_output","args":{"call_id":"__LAST_TOOL_ID__","query":"failed"}}}),
+                ]),
+                text_turn("done"),
+                text_turn("done"),
+                text_turn("done"),
+            ]),
+        ));
+        svc2.resume(&run_id).unwrap();
+        auto_approve(svc2.clone(), run_id.clone());
+        let _ = wait_terminal(&svc2, &run_id, 30_000);
+        let posts = svc2.service.transport().seen();
+        let found = posts
+            .iter()
+            .find(|p| p.contains("1501: test deep::resume FAILED"))
+            .unwrap_or_else(|| panic!("{:?}", posts.get(1)));
+        assert!(found.contains(r#"\"matches\":1"#), "{found}");
     }
 
     #[test]

@@ -3,11 +3,16 @@
 //! A `run_command` result reaches the model as head + tail within a few
 //! thousand characters, so the middle of a long test or build log is lost.
 //! The loop keeps the full text of the last few clipped outputs here, in
-//! memory and for one run only, and the `read_output` tool pages or
-//! searches it. Nothing is written into the workspace.
+//! memory for one run, and the `read_output` tool pages or searches it.
+//! When the store is attached to the run's state folder, each kept output
+//! is also written there (`state/outputs/<call id>.txt` plus an ordered
+//! `index.json`), so a resumed run can still read them. Nothing is written
+//! into the workspace.
 
 use serde_json::json;
 use std::collections::VecDeque;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Clipped outputs kept per run; the oldest is dropped first.
 pub(crate) const MAX_SAVED_OUTPUTS: usize = 8;
@@ -26,12 +31,75 @@ const REPLY_CHARS: usize = 16_000;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OutputStore {
     items: VecDeque<(String, String)>,
+    /// State folder the outputs are mirrored to, when attached.
+    dir: Option<PathBuf>,
+}
+
+/// Call ids used as file names: rex-tools ids are `tool-<digits>`, so
+/// only ASCII letters, digits and `-` are accepted.
+fn safe_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 impl OutputStore {
+    /// A store mirrored to `dir`, loaded with whatever an earlier drive of
+    /// the same run kept there (ids in `index.json` order, unsafe ids and
+    /// missing files skipped, the usual caps applied).
+    pub(crate) fn attached(dir: PathBuf) -> Self {
+        let mut store = OutputStore::default();
+        let ids: Vec<String> = fs::read_to_string(dir.join("index.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        for id in ids.iter().filter(|id| safe_id(id)) {
+            if let Ok(text) = fs::read_to_string(dir.join(format!("{id}.txt"))) {
+                store.save(id, &text);
+            }
+        }
+        store.dir = Some(dir);
+        store
+    }
+
+    /// Write the kept outputs to the attached folder and remove files of
+    /// outputs no longer kept. Errors are ignored: the copy on disk only
+    /// helps a resume, the in-memory store stays correct.
+    fn mirror(&self, dir: &Path) {
+        if fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let ids: Vec<&str> = self.items.iter().map(|(id, _)| id.as_str()).collect();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if let Some(id) = name.strip_suffix(".txt") {
+                    if !ids.contains(&id) {
+                        let _ = fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+        let _ = fs::write(
+            dir.join("index.json"),
+            serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into()),
+        );
+    }
+
     /// Keep `text` under `call_id`, replacing an older copy and dropping
     /// the oldest entry past the cap. Returns the line count.
     pub(crate) fn save(&mut self, call_id: &str, text: &str) -> usize {
+        let lines = self.keep(call_id, text);
+        if let Some(dir) = self.dir.clone() {
+            if safe_id(call_id) {
+                let kept = &self.items.back().expect("just kept").1;
+                let _ = fs::create_dir_all(&dir);
+                let _ = fs::write(dir.join(format!("{call_id}.txt")), kept);
+            }
+            self.mirror(&dir);
+        }
+        lines
+    }
+
+    fn keep(&mut self, call_id: &str, text: &str) -> usize {
         self.items.retain(|(id, _)| id != call_id);
         let mut end = text.len().min(MAX_SAVED_BYTES);
         while !text.is_char_boundary(end) {
@@ -217,5 +285,67 @@ mod tests {
         s.save("wide", &wide);
         let kept = s.get("wide").unwrap();
         assert!(kept.len() <= MAX_SAVED_BYTES && kept.len() >= MAX_SAVED_BYTES - 1);
+    }
+
+    #[test]
+    fn attached_store_mirrors_to_disk_and_reloads() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rex-outputs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = tmp.join("outputs");
+        let mut a = OutputStore::attached(dir.clone());
+        assert_eq!(a.items.len(), 0);
+        for i in 0..MAX_SAVED_OUTPUTS + 2 {
+            a.save(&format!("tool-{i}"), &format!("line a{i}\nline b{i}"));
+        }
+        // re-saving an id moves it to the newest place
+        a.save("tool-3", "line a3\nnew b3");
+        // an unsafe id stays in memory only
+        a.save("../evil", "x");
+        let index: Vec<String> =
+            serde_json::from_str(&fs::read_to_string(dir.join("index.json")).unwrap()).unwrap();
+        let want: Vec<String> = (4..MAX_SAVED_OUTPUTS + 2)
+            .map(|i| format!("tool-{i}"))
+            .chain(["tool-3".to_string(), "../evil".to_string()])
+            .collect();
+        assert_eq!(index, want);
+        let mut files: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), MAX_SAVED_OUTPUTS, "{files:?}"); // 7 txt + index
+        assert!(!files.contains(&"tool-0.txt".to_string()));
+        assert!(!tmp.join("evil.txt").exists());
+        // a new store over the same folder sees the same outputs; the
+        // unsafe id in the index is not read even if such a file exists
+        fs::write(tmp.join("evil.txt"), "x").unwrap();
+        let b = OutputStore::attached(dir.clone());
+        let ids: Vec<&str> = b.items.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, want[..want.len() - 1].to_vec());
+        let (ok, reply) = b.render("tool-3", 0, Some("new"));
+        assert!(ok);
+        assert!(reply.contains("2: new b3"), "{reply}");
+        // a broken index or a missing file is skipped, not fatal
+        fs::remove_file(dir.join("tool-5.txt")).unwrap();
+        let c = OutputStore::attached(dir.clone());
+        assert!(c.get("tool-5").is_none());
+        assert!(c.get("tool-6").is_some());
+        fs::write(dir.join("index.json"), "not json").unwrap();
+        assert_eq!(OutputStore::attached(dir).items.len(), 0);
+        // an unattached store writes nothing
+        let mut d = OutputStore::default();
+        d.save("tool-1", "x");
+        assert!(d.dir.is_none());
+        assert!(safe_id("tool-12"));
+        for bad in ["", "a/b", "a.b", "..", &"x".repeat(65)] {
+            assert!(!safe_id(bad), "{bad}");
+        }
+        assert!(safe_id(&"x".repeat(64)));
     }
 }

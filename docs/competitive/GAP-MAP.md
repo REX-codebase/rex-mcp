@@ -902,6 +902,29 @@ is shared it is noted in the module docs.
   `full_outputs` with the line count, and the parent's `read_output`
   finds the hidden line 1501) and a cap unit test. Hand mutation: 7/7
   killed.
-- Gap left: saved outputs are still lost on resume; children cannot call
-  `read_output` themselves.
+- Gap left: saved outputs are still lost on resume (closed in round
+  18c); children cannot call `read_output` themselves.
+
+## Round 18c: clipped outputs survive resume
+
+- Competitors: opencode keeps truncated tool output in files under its
+  data folder, so it outlives the process (`src/tool/truncate.ts`,
+  `src/tool/truncation-dir.ts`). Hermes writes spilled results to
+  `$HERMES_HOME/cache/spillover/{id}.txt` (`tools/tool_result_storage.py`).
+- REX before: `read_output`'s store lived in memory, so a run resumed
+  after the app closed could not read outputs it had already been told
+  about.
+- REX now: the store is attached to the run's state folder. Each kept
+  output is written to `state/outputs/<call id>.txt` with an ordered
+  `index.json`; outputs the store drops are deleted there too. Resume
+  loads them back in order. Only ids of ASCII letters, digits and `-` (up
+  to 64) become file names; any other id stays in memory only and is
+  never read back. A broken index or missing file is skipped. Still
+  nothing is written into the workspace.
+- Tests: a store unit test (mirror, cap, re-save order, unsafe id, stale
+  file removal, reload, broken index, missing file, unattached store) and
+  a scripted resume: run 1 `cat`s a 3,000-line log then parks and the app
+  "dies"; the resumed run's `read_output` finds the hidden line 1501.
+  Hand mutation: 9/9 killed.
+- Gap left: sub-agents still cannot call `read_output` themselves.
 
