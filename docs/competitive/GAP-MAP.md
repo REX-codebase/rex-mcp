@@ -136,3 +136,7 @@ is shared it is noted in the module docs.
   Parallel's hosted endpoints with no key (`tool/mcp-websearch.ts:5-7`);
   adopting that would send queries to a third party, so it is an owner
   decision.
+- Owner decision (5:25 IST): Exa's keyless endpoint was approved only if it
+  costs ₹0. Exa's MCP docs limit the free plan to "casual use" and ask for an
+  API key for production; their ToS bars sublicensing the Services to third
+  parties. REX therefore stays self-hosted; bring-your-own Exa key remains.
