@@ -35,7 +35,12 @@ is shared it is noted in the module docs.
   `AGENTS.md` / `CLAUDE.md`; Hermes `agent/coding_context.py` loads
   `AGENTS.md`, `CLAUDE.md`, `.cursorrules`. REX (round 2) loads the first of these at the workspace root into per-turn state, capped at 8k chars, symlinks refused. Gap left: no parent-dir walk or global file (opencode does both).
 - Sub-agent delegation: opencode `src/tool/task.ts`; Hermes
-  `tools/delegate_tool.py`.
+  `tools/delegate_tool.py`. REX (round 2): `explore` tool starts a read-only
+  explorer sub-agent (read/search/glob only, no recursion, inside the parent's
+  remaining budgets, honours cancel) and returns one report. Gap left: no
+  writing/parallel sub-agents: opencode picks agent types (`task.ts:46,131`);
+  Hermes gives children the parent toolsets and a batch/parallel mode
+  (`delegate_tool.py:6-8`).
 - Context compaction of old turns: opencode `session/compaction.ts`; Hermes
   `agent/context_compressor.py`. REX keeps old evidence on disk and sends a
   digest, which is a different design; to be compared on behaviour.

@@ -227,8 +227,7 @@ pub(super) fn run_explore<T: Transport>(
         let mut pair = TurnPair::default();
         let mut first = true;
         for (call, raw) in decoded.calls {
-            let (name, id, args, content, ok): (String, String, Value, String, bool) = match call
-            {
+            let (name, id, args, content, ok): (String, String, Value, String, bool) = match call {
                 AgentCall::CompleteTask { summary } => {
                     out.report = summary;
                     out.finished = true;
@@ -241,7 +240,8 @@ pub(super) fn run_explore<T: Transport>(
                         let c = format!("{name} is not available to the explorer; it can only read, search and glob");
                         (name, id, args, c, false)
                     } else if out.tool_calls >= limits.max_tool_calls {
-                        let c = "explorer tool-call budget exhausted; call complete_task".to_string();
+                        let c =
+                            "explorer tool-call budget exhausted; call complete_task".to_string();
                         (name, id, args, c, false)
                     } else {
                         out.tool_calls += 1;
@@ -253,7 +253,13 @@ pub(super) fn run_explore<T: Transport>(
                         match tools.prepare(request) {
                             Ok(p) if p.approval_required => {
                                 let _ = tools.cancel(&p.call_id);
-                                (name, id, args, "refused: explorer calls never take approval".into(), false)
+                                (
+                                    name,
+                                    id,
+                                    args,
+                                    "refused: explorer calls never take approval".into(),
+                                    false,
+                                )
                             }
                             Ok(p) => {
                                 let r = tools.execute(&p.call_id);
@@ -262,10 +268,17 @@ pub(super) fn run_explore<T: Transport>(
                                     (None, Some(e)) => e.detail.clone(),
                                     (None, None) => String::new(),
                                 };
-                                let (clipped, _) = rex_tools::clip_middle(&text, EXPLORE_RESULT_CHARS);
+                                let (clipped, _) =
+                                    rex_tools::clip_middle(&text, EXPLORE_RESULT_CHARS);
                                 (name, id, args, clipped, r.ok)
                             }
-                            Err(e) => (name, id, args, format!("prepare failed: {}", e.detail), false),
+                            Err(e) => (
+                                name,
+                                id,
+                                args,
+                                format!("prepare failed: {}", e.detail),
+                                false,
+                            ),
                         }
                     }
                 }

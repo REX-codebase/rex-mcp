@@ -74,6 +74,10 @@ const PROVIDER_RETRIES: u32 = 3;
 const DIGEST_WINDOW: usize = 6;
 const OUTCOME_CHARS: usize = 4_000;
 
+#[path = "explore.rs"]
+mod explore;
+use explore::{run_explore, ExploreLimits, ProviderLink};
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -443,6 +447,11 @@ enum AgentCall {
     },
     CompleteTask {
         summary: String,
+    },
+    /// Hand a focused read-only question to an explorer sub-agent.
+    Explore {
+        id: String,
+        task: String,
     },
 }
 
@@ -1457,7 +1466,12 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             &ctx,
             &tools,
             &mut ledger,
-            protocol,
+            &ProviderLink {
+                protocol,
+                base_url: &base_url,
+                key: &key,
+                model: &model,
+            },
             decoded.calls,
             decoded.thought_signature,
             &mut cp,
@@ -1555,7 +1569,7 @@ fn build_state_message(
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "explore", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
         "project_instructions": project.map(|p| json!({
@@ -1639,6 +1653,12 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "web_search",
             "Search the public web for grounded facts.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "explore",
+            "Delegate a read-only workspace question to an explorer sub-agent; returns one findings report.",
             false,
             false,
         ),
@@ -1789,6 +1809,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"glob_files","description":"Find workspace files by glob pattern (e.g. **/*.rs), newest first. Skips build output and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"pattern":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["pattern"]}},
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
+        {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"}},"required":["task"]}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
     ]}])
 }
@@ -2086,6 +2107,23 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     raw,
                 ));
             }
+            "explore" => match args.get("task").and_then(Value::as_str) {
+                Some(task) if !task.trim().is_empty() => calls.push((
+                    AgentCall::Explore {
+                        id,
+                        task: task.chars().take(explore::EXPLORE_TASK_CHARS).collect(),
+                    },
+                    raw,
+                )),
+                _ => calls.push((
+                    AgentCall::BadCall {
+                        name: "explore".into(),
+                        id,
+                        error: "explore missing task".into(),
+                    },
+                    raw,
+                )),
+            },
             "complete_task" => {
                 let summary = args
                     .get("summary")
@@ -2172,6 +2210,16 @@ fn decode_named_call(
                 Some(raw),
             ),
             None => bad("web_search missing query".into()),
+        },
+        "explore" => match args.get("task").and_then(Value::as_str) {
+            Some(task) if !task.trim().is_empty() => (
+                AgentCall::Explore {
+                    id,
+                    task: task.chars().take(explore::EXPLORE_TASK_CHARS).collect(),
+                },
+                Some(raw),
+            ),
+            _ => bad("explore missing task".into()),
         },
         "complete_task" => (
             AgentCall::CompleteTask {
@@ -2303,12 +2351,13 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
     ctx: &LoopCtx<S, T>,
     tools: &ToolRuntime,
     ledger: &mut Option<Ledger>,
-    protocol: ProviderProtocol,
+    link: &ProviderLink<'_>,
     calls: Vec<(AgentCall, Option<Value>)>,
     thought_signature: Option<String>,
     cp: &mut Checkpoint,
     started: Instant,
 ) -> DriveOut {
+    let protocol = link.protocol;
     let mut out = DriveOut {
         pair: Some(TurnPair::default()),
         digest_actions: Vec::new(),
@@ -2465,6 +2514,117 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     json!({"functionCall":{"name":"web_search","args":{"query": query}}}),
                 );
                 response_parts.push(function_response(protocol, "web_search", &id, ok, &content));
+            }
+            AgentCall::Explore { id, task } => {
+                if let Some(allowed) = &ctx.brief.allowed_tools {
+                    if !allowed.iter().any(|t| t == "explore") {
+                        out.digest_actions.push(DigestAction {
+                            tool: "explore".into(),
+                            ok: false,
+                            target: None,
+                            error_kind: Some("out_of_scope".into()),
+                        });
+                        push_model_part(
+                            &mut model_parts,
+                            raw,
+                            json!({"functionCall":{"name":"explore","args":{"task": task}}}),
+                        );
+                        response_parts.push(function_response(
+                            protocol,
+                            "explore",
+                            &id,
+                            false,
+                            "tool explore is not enabled for this run's role; use only the tools listed in your tool contract",
+                        ));
+                        continue;
+                    }
+                }
+                let budgets = ctx.brief.budgets;
+                let limits = ExploreLimits {
+                    max_turns: explore::EXPLORE_MAX_TURNS
+                        .min(budgets.max_steps.saturating_sub(cp.step).max(1)),
+                    max_tool_calls: explore::EXPLORE_MAX_TOOL_CALLS
+                        .min(budgets.max_tool_calls.saturating_sub(cp.tool_calls)),
+                    max_tokens: budgets.max_tokens.saturating_sub(cp.tokens_used),
+                };
+                let preview: String = task.chars().take(120).collect();
+                RunHandle::push_event(
+                    &ctx.handle.shared,
+                    AgentEvent::Info {
+                        message: format!("explorer sub-agent started: {preview}"),
+                    },
+                );
+                let outcome = run_explore(
+                    ctx.service.transport(),
+                    link,
+                    &ctx.handle,
+                    tools,
+                    &task,
+                    limits,
+                );
+                cp.tokens_used += outcome.tokens;
+                cp.tool_calls += outcome.tool_calls;
+                if let Some(l) = ledger.as_mut() {
+                    l.append(
+                        "explore",
+                        json!({
+                            "task": task, "finished": outcome.finished,
+                            "turns": outcome.turns, "tool_calls": outcome.tool_calls,
+                            "tokens": outcome.tokens, "files_read": outcome.files_read,
+                            "error": outcome.error,
+                        }),
+                    );
+                }
+                if outcome.cancelled {
+                    out.fatal = Some(TerminalReason::Cancelled);
+                    return out;
+                }
+                RunHandle::push_event(
+                    &ctx.handle.shared,
+                    AgentEvent::Info {
+                        message: format!(
+                            "explorer sub-agent {} after {} turns and {} tool calls",
+                            if outcome.finished {
+                                "reported"
+                            } else {
+                                "stopped"
+                            },
+                            outcome.turns,
+                            outcome.tool_calls
+                        ),
+                    },
+                );
+                let (report, clipped) =
+                    rex_tools::clip_middle(&outcome.report, explore::EXPLORE_REPORT_CHARS);
+                let content = serde_json::to_string(&json!({
+                    "finished": outcome.finished,
+                    "report": report,
+                    "report_truncated": clipped,
+                    "files_read": outcome.files_read,
+                    "turns": outcome.turns,
+                    "tool_calls": outcome.tool_calls,
+                    "error": outcome.error,
+                }))
+                .unwrap_or_default();
+                out.progress = true;
+                out.digest_actions.push(DigestAction {
+                    tool: "explore".into(),
+                    ok: outcome.finished,
+                    target: Some(format!("{} tool calls", outcome.tool_calls)),
+                    error_kind: outcome.error.as_ref().map(|_| "explorer_error".into()),
+                });
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"explore","args":{"task": task}}}),
+                );
+                response_parts.push(function_response(
+                    protocol,
+                    "explore",
+                    &id,
+                    outcome.finished,
+                    &content,
+                ));
             }
             AgentCall::CompleteTask { summary } => {
                 cp.gate_attempts += 1;
@@ -3017,6 +3177,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                 )),
                 AgentCall::WebSearch { .. } => Some("web_search".to_string()),
                 AgentCall::CompleteTask { .. } => Some("complete_task".to_string()),
+                AgentCall::Explore { .. } => Some("explore".to_string()),
             };
             if let Some(name) = name {
                 disallowed.push(name);
@@ -3042,7 +3203,12 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
             ctx,
             tools,
             ledger,
-            protocol,
+            &ProviderLink {
+                protocol,
+                base_url,
+                key,
+                model,
+            },
             decoded.calls,
             decoded.thought_signature,
             cp,
@@ -4229,6 +4395,83 @@ mod tests {
         let none = build_state_message(&brief, &cp, Budgets::default(), vec![], None);
         let v: serde_json::Value = serde_json::from_str(&none).unwrap();
         assert!(v["project_instructions"].is_null());
+    }
+
+    #[test]
+    fn explorer_sub_agent_reads_only_and_hands_back_one_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let glob = json!({"functionCall":{"name":"glob_files","args":{"pattern":"**/*"}}});
+        let explore =
+            json!({"functionCall":{"name":"explore","args":{"task":"where is the entry point?"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                // parent turn 1: delegate
+                call_turn(vec![explore]),
+                // child turn 1: tries to write (refused) and globs
+                call_turn(vec![create_call("evil.txt", "x"), glob]),
+                // child turn 2: reports
+                call_turn(vec![complete_call("ENTRY-REPORT: no source files yet")]),
+                // parent turn 2
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("find the entry point", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(done.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Info { message } if message.contains("explorer sub-agent reported after 2 turns and 1 tool calls")
+        )), "{:?}", done.events);
+        let run_dir = tmp.path().join("runs").join(&snap.id);
+        assert!(!run_dir.join("workspace").join("evil.txt").exists());
+        let posts = svc.service().transport().seen();
+        // child requests carry the explorer prompt and only read tools
+        let child: Value = serde_json::from_str(&posts[1]).unwrap();
+        let sys = child["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sys.contains("explorer sub-agent"));
+        let names: Vec<&str> = child["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["read_file", "search_files", "glob_files", "complete_task"]
+        );
+        // the refused write reached the child as an error, not the workspace
+        assert!(posts[2].contains("create_file is not available to the explorer"));
+        // the parent sees the report, not the raw glob output
+        assert!(posts[3].contains("ENTRY-REPORT"));
+        let ledger = fs::read_to_string(run_dir.join("state").join("ledger.jsonl"))
+            .or_else(|_| fs::read_to_string(run_dir.join("ledger.jsonl")))
+            .unwrap_or_default();
+        assert!(ledger.contains("\"kind\":\"explore\""), "{ledger}");
+    }
+
+    #[test]
+    fn explore_decodes_and_rejects_empty_task() {
+        let ok = decode_gemini_calls(&call_turn(vec![
+            json!({"functionCall":{"name":"explore","args":{"task":"q"}}}),
+        ]))
+        .unwrap();
+        assert!(matches!(&ok.calls[0].0, AgentCall::Explore { task, .. } if task == "q"));
+        let bad = decode_gemini_calls(&call_turn(vec![
+            json!({"functionCall":{"name":"explore","args":{"task":"  "}}}),
+        ]))
+        .unwrap();
+        assert!(matches!(&bad.calls[0].0, AgentCall::BadCall { .. }));
+        let (_, v, h) = assemble_run_prompt(Role::Adversary, &scoped_tools_for(Role::Adversary).0);
+        assert!(!v.is_empty() && !h.is_empty());
+        assert!(scoped_tools_for(Role::Adversary)
+            .0
+            .iter()
+            .any(|s| s.name == "explore"));
     }
 
     #[test]

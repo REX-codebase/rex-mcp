@@ -33,6 +33,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "search_files",
     "glob_files",
     "web_search",
+    "explore",
     "complete_task",
 ];
 
