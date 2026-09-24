@@ -84,6 +84,14 @@ pub fn check(path: &str, content: &str) -> Option<Vec<Finding>> {
                 found
             }
         }
+        Lang::Python => {
+            let found = check_delimiters(content, Lang::Python, false);
+            if found.is_empty() {
+                guarded_parse(content, python_parse_findings)
+            } else {
+                found
+            }
+        }
         other => {
             let jsx = path.ends_with(".jsx") || path.ends_with(".tsx");
             check_delimiters(content, other, jsx)
@@ -101,21 +109,53 @@ fn check_rust_parse(content: &str) -> Vec<Finding> {
     // can overflow a small stack, and a stack overflow aborts the process.
     // Skip very deep inputs (size is capped by check) and parse on a thread
     // with a big stack.
-    if nesting_depth(content) > RUST_PARSE_MAX_DEPTH {
+    guarded_parse(content, rust_parse_findings)
+}
+
+/// Run a parser on its own thread with a big stack, skipping inputs nested
+/// deeper than `PARSE_MAX_DEPTH` (parsers and AST drops recurse per level,
+/// and a stack overflow aborts the whole process).
+fn guarded_parse(content: &str, parse: fn(&str) -> Vec<Finding>) -> Vec<Finding> {
+    if nesting_depth(content) > PARSE_MAX_DEPTH {
         return Vec::new();
     }
     let owned = content.to_string();
     let worker = std::thread::Builder::new()
-        .stack_size(RUST_PARSE_STACK)
-        .spawn(move || rust_parse_findings(&owned));
+        .stack_size(PARSE_STACK)
+        .spawn(move || parse(&owned));
     match worker {
         Ok(handle) => handle.join().unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
 
-const RUST_PARSE_MAX_DEPTH: usize = 128;
-const RUST_PARSE_STACK: usize = 64 * 1024 * 1024;
+/// Full Python parse (ruff_python_parser, MIT), run only when the
+/// delimiter check is clean. Hermes runs `python -m py_compile` on each
+/// written `.py` file (`tools/file_operations_lint.py:17-22`), which needs a
+/// Python install; this needs none. The grammar is current (3.12 f-strings,
+/// 3.13 type parameter defaults, 3.14 t-strings). Errors that depend on the
+/// target Python version are not reported, since the version is unknown.
+fn python_parse_findings(content: &str) -> Vec<Finding> {
+    let err = match ruff_python_parser::parse_module(content) {
+        Ok(_) => return Vec::new(),
+        Err(e) => e,
+    };
+    let offset = (u32::from(err.location.start()) as usize).min(content.len());
+    let offset = (0..=offset)
+        .rev()
+        .find(|&i| content.is_char_boundary(i))
+        .unwrap_or(0);
+    let before = &content[..offset];
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    vec![Finding {
+        line: before.matches('\n').count() + 1,
+        col: before[line_start..].chars().count() + 1,
+        message: format!("Python syntax error: {}", err.error),
+    }]
+}
+
+const PARSE_MAX_DEPTH: usize = 128;
+const PARSE_STACK: usize = 64 * 1024 * 1024;
 
 /// Upper bound on bracket nesting (ignores strings and comments, so it can
 /// over-count; that only makes the skip more cautious).
@@ -1258,7 +1298,7 @@ mod tests {
     #[test]
     fn rust_parse_skips_deep_input_without_crashing() {
         let deep = format!("fn f() {{ {}{} }}\n", "(".repeat(5000), ")".repeat(5000));
-        assert!(nesting_depth(&deep) > RUST_PARSE_MAX_DEPTH);
+        assert!(nesting_depth(&deep) > PARSE_MAX_DEPTH);
         clean("a.rs", &deep);
         let edge = format!("const A: u8 = {}1{};\n", "(".repeat(120), ")".repeat(120));
         assert_eq!(nesting_depth(&edge), 120);
@@ -1277,13 +1317,13 @@ mod tests {
         );
         clean("a.rs", &deep_bad);
         // exactly at the limit still parses
-        let limit = RUST_PARSE_MAX_DEPTH - 1; // the fn body brace adds one
+        let limit = PARSE_MAX_DEPTH - 1; // the fn body brace adds one
         let at_limit = format!(
             "fn f() {{ let x = {}1 +{}; }}\n",
             "(".repeat(limit),
             ")".repeat(limit)
         );
-        assert_eq!(nesting_depth(&at_limit), RUST_PARSE_MAX_DEPTH);
+        assert_eq!(nesting_depth(&at_limit), PARSE_MAX_DEPTH);
         dirty("a.rs", &at_limit, "Rust syntax error");
         let under = format!("fn f() {{ let x = 1 +; }}\n{}", "// pad\n".repeat(1000));
         dirty("a.rs", &under, "Rust syntax error");
@@ -1314,6 +1354,35 @@ mod tests {
         assert!(!yaml_templated("x: \"${{ github.ref }}\""));
         assert!(yaml_templated("{{ x }}"));
         assert!(yaml_templated("a: ${{ b }} {{ c }}"));
+    }
+
+    #[test]
+    fn python_syntax_errors_past_balanced_brackets_are_caught() {
+        clean("a.py", "import os\n\ndef f(x, /, y=1, *, z):\n    match x:\n        case [a, *b]:\n            return a\n    return f\"{x!r:>{y}}\"\n");
+        clean("a.pyi", "class A:\n    def f(self) -> int: ...\n");
+        let f = check("a.py", "def f():\n    x = 1 +\n    return x\n").unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.starts_with("Python syntax error"), "{f:?}");
+        assert_eq!((f[0].line, f[0].col), (2, 12), "{f:?}");
+        let f = check("a.py", "# café\nx = é +\n").unwrap();
+        assert_eq!((f[0].line, f[0].col), (2, 8), "{f:?}");
+        dirty("a.py", "if x\n    pass\n", "Python syntax error");
+        dirty("a.py", "def f(:\n    pass\n)\n", "Python syntax error");
+        // current syntax parses: 3.12 f-strings, 3.13 defaults, 3.14 t-strings
+        clean("a.py", "x = f\"{d[\"k\"]}\"\n");
+        clean("a.py", "class A[T = int]: pass\ntype X[T] = list[T]\n");
+        clean("a.py", "x = t\"hi {name}\"\n");
+        // Python 2 print is an error
+        dirty("a.py", "print 'x'\n", "Python syntax error");
+        // unbalanced files keep the delimiter message
+        let f = check("a.py", "x = (1,\n").unwrap();
+        assert!(
+            f.iter().all(|f| !f.message.contains("Python syntax")),
+            "{f:?}"
+        );
+        // deep nesting is skipped instead of risking the stack
+        let deep = format!("x = {}1 +{}\n", "(".repeat(500), ")".repeat(500));
+        clean("a.py", &deep);
     }
 
     #[test]

@@ -438,3 +438,37 @@ is shared it is noted in the module docs.
   unchanged: 0 / 2 / 2 / 7.
 - Gap left: no schema checks (e.g. GitHub Actions keys); indentation
   errors that PyYAML would also reject can be missed.
+
+### Round 12d: full Python parse after writes
+
+- Before: `.py` writes got only the bracket/string/comment check, so
+  `x = 1 +`, a missing `:` or Python 2 `print 'x'` went through.
+- Hermes: `python -m py_compile` per written `.py` file
+  (`tools/file_operations_lint.py:17-22`), which needs Python installed.
+  opencode: only with a Python language server running
+  (`src/tool/edit.ts:198-200`).
+- REX now (`python_parse_findings` in `crates/rex-tools/src/check.rs`):
+  when the bracket check is clean, the file is parsed with
+  `ruff_python_parser` 0.0.14 (MIT, Astral; 46 new crates in Cargo.lock,
+  all MIT and/or Apache-2.0, one with an LLVM exception, one also under Unicode-DFS-2016). The first error comes
+  back with line and column (in characters). Errors that depend on the
+  target Python version are not reported, because REX does not know it.
+  It shares the depth guard and big-stack thread with the Rust parse
+  (`guarded_parse`).
+- Parser choice: `rustpython-parser` 0.4 was tried first and dropped. It
+  failed 22 of the 175 valid files in ruff's own test corpus (3.12
+  f-strings, 3.13 type parameter defaults, 3.14 t-strings, 3.14 except
+  without brackets). ruff's parser passes all 175.
+- Checked with a standalone build of the same parser: 7,094 of 7,094 `.py`
+  files in this repo, Hermes and opencode parse, and 312 of the 382 files
+  in ruff's invalid corpus are flagged. The other 70 are version-dependent
+  or semantic errors.
+- Tests: 1 new unit test (positions, multi-byte column, current syntax,
+  Python 2 print, depth skip). Hand mutation: 6/6 killed.
+- False-alarm sweep: this repo 0 of 317, opencode 2 of 3,926 and Hermes
+  2 of 11,586 (all older notes, none from Python). In the cargo registry
+  (20,602 files, now including ruff's test resources) the Python flags
+  seen are ruff's deliberately invalid inputs and
+  `unicode_names2-1.3.0/src/ngrams.py`, which is Python 2 code (a real
+  error for Python 3). The sweep prints only the first 40 flags.
+- Gap left: no name, import or type errors (needs a type checker or an LSP).
