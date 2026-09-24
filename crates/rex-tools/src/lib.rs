@@ -189,6 +189,12 @@ pub struct PreparedCall {
     pub risk: RiskClass,
     pub approval_required: bool,
     pub policy_reason: String,
+    /// Set only for a command that may get a standing approval for the
+    /// rest of a run: the exact argv and working directory, as a stable
+    /// key. `None` for file writes, MCP calls and any command that runs a
+    /// path (a script the model could rewrite between runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_key: Option<String>,
 }
 
 /// Original vs proposed content for a pending file write, for the diff UI.
@@ -441,6 +447,11 @@ impl ToolRuntime {
             risk,
             approval_required,
             policy_reason: reason.into(),
+            standing_key: if approval_required {
+                standing_key(&request)
+            } else {
+                None
+            },
         };
         let mut pending = self.pending.lock().expect("pending lock poisoned");
         let mut order = self.order.lock().expect("order lock poisoned");
@@ -1996,6 +2007,32 @@ fn checked_join(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
     }
     Ok(root.join(path))
 }
+/// Key for a run-scoped standing approval of one exact command.
+///
+/// Only a command that already passes `command_policy` qualifies (so no
+/// shells, interpreters or launchers), and only when the program is a bare
+/// name looked up on PATH. A program given as a path (`./build.sh`,
+/// `bin/tool`) is left out: the model can edit that file between two runs of
+/// the same command line. The key is the exact argv plus the working
+/// directory, so `npm test` never covers `npm test -- --update`.
+pub fn standing_key(request: &ToolRequest) -> Option<String> {
+    let ToolRequest::RunCommand { argv, cwd, .. } = request else {
+        return None;
+    };
+    if command_policy(argv).is_err() {
+        return None;
+    }
+    let program = argv.first()?;
+    if program.is_empty() || program.contains('/') || program.contains('\\') {
+        return None;
+    }
+    let dir = match cwd.as_deref().map(str::trim) {
+        None | Some("") | Some(".") => ".".to_string(),
+        Some(d) => d.trim_end_matches('/').to_string(),
+    };
+    serde_json::to_string(&(argv, dir)).ok()
+}
+
 fn command_policy(argv: &[String]) -> Result<(), ToolError> {
     if argv.is_empty() {
         return Err(err(ErrorKind::InvalidRequest, "empty command"));
@@ -3134,6 +3171,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[cfg(unix)]
+    #[test]
+    fn standing_key_covers_only_exact_bare_commands() {
+        let run = |argv: &[&str], cwd: Option<&str>| ToolRequest::RunCommand {
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            cwd: cwd.map(str::to_string),
+            timeout_ms: None,
+        };
+        let npm = standing_key(&run(&["npm", "test"], None)).expect("bare command qualifies");
+        // cwd spellings of the workspace root are one key; timeout is ignored
+        assert_eq!(
+            standing_key(&run(&["npm", "test"], Some("."))),
+            Some(npm.clone())
+        );
+        assert_eq!(
+            standing_key(&run(&["npm", "test"], Some(""))),
+            Some(npm.clone())
+        );
+        let mut timed = run(&["npm", "test"], None);
+        if let ToolRequest::RunCommand { timeout_ms, .. } = &mut timed {
+            *timeout_ms = Some(5);
+        }
+        assert_eq!(standing_key(&timed), Some(npm.clone()));
+        // any other argv or directory is a different key
+        assert_ne!(
+            standing_key(&run(&["npm", "test", "--", "-u"], None)),
+            Some(npm.clone())
+        );
+        assert_ne!(
+            standing_key(&run(&["npm", "test"], Some("web"))),
+            Some(npm.clone())
+        );
+        assert_eq!(
+            standing_key(&run(&["npm", "test"], Some("web/"))),
+            standing_key(&run(&["npm", "test"], Some("web")))
+        );
+        // programs given as a path can be rewritten by the model
+        assert_eq!(standing_key(&run(&["./build.sh"], None)), None);
+        assert_eq!(standing_key(&run(&["bin/tool", "x"], None)), None);
+        assert_eq!(standing_key(&run(&["tools\\x.exe"], None)), None);
+        // anything command_policy refuses never qualifies
+        assert_eq!(standing_key(&run(&["bash", "-c", "true"], None)), None);
+        assert_eq!(standing_key(&run(&["rm", "-rf", "x"], None)), None);
+        assert_eq!(standing_key(&run(&[], None)), None);
+        // file writes never qualify
+        let write = ToolRequest::CreateFile {
+            path: "a.txt".into(),
+            content: "x".into(),
+            overwrite: false,
+        };
+        assert_eq!(standing_key(&write), None);
+    }
+
+    #[test]
+    fn prepare_sets_standing_key_only_for_approval_commands() {
+        let rt = ToolRuntime::new(temp()).unwrap();
+        let cmd = rt
+            .prepare(ToolRequest::RunCommand {
+                argv: vec!["cargo".into(), "test".into()],
+                cwd: None,
+                timeout_ms: None,
+            })
+            .unwrap();
+        assert!(cmd.approval_required);
+        assert!(cmd.standing_key.is_some());
+        let write = rt
+            .prepare(ToolRequest::CreateFile {
+                path: "a.txt".into(),
+                content: "x".into(),
+                overwrite: false,
+            })
+            .unwrap();
+        assert!(write.approval_required);
+        assert_eq!(write.standing_key, None);
+        // absent from the JSON the UI sees when not set
+        let json = serde_json::to_value(&write).unwrap();
+        assert!(json.get("standing_key").is_none());
+    }
+
     #[test]
     fn trusted_scoring_runs_allowlisted_bare_names_only() {
         let dir = std::env::temp_dir().join(format!("rex-scoring-test-{}", std::process::id()));

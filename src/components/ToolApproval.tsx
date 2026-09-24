@@ -7,10 +7,14 @@ export function ToolApproval({
   call,
   busy,
   onDecision,
+  onAllowForRun,
 }: {
   call: PreparedToolCall;
   busy: boolean;
   onDecision: (approved: boolean) => void;
+  /** Offered only for a command with a standing key, and only where the
+   * backend supports it. */
+  onAllowForRun?: () => void;
 }) {
   const [diff, setDiff] = useState<FileDiff | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -92,6 +96,16 @@ export function ToolApproval({
         <button ref={denyRef} disabled={busy} onClick={() => onDecision(false)} className="approval-deny">
           Deny
         </button>
+        {call.standing_key && onAllowForRun && (
+          <button
+            disabled={busy}
+            onClick={onAllowForRun}
+            className="approval-deny"
+            title="Approves this exact command now and each time REX runs it again in this run. It ends with the run. A different command, or a file change, still asks."
+          >
+            Allow for this run
+          </button>
+        )}
         <button disabled={busy} onClick={() => onDecision(true)} className="approval-allow">
           {busy ? "Working…" : "Approve once"}
         </button>

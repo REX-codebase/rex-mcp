@@ -223,6 +223,18 @@ pub enum AgentEvent {
         call_id: String,
         approved: bool,
     },
+    /// The user approved this command and every later run of the exact
+    /// same command line for the rest of this run (never persisted).
+    StandingApprovalGranted {
+        call_id: String,
+        command: String,
+    },
+    /// A command ran under a standing approval the user granted earlier in
+    /// this run; no new approval was asked for.
+    ApprovedByStanding {
+        call_id: String,
+        command: String,
+    },
     /// Plan mode: the proposed plan is waiting on the trusted UI.
     PlanApprovalRequired {
         items: Vec<PlanItem>,
@@ -457,6 +469,9 @@ struct RunShared {
     events: VecDeque<AgentEvent>,
     pending_approval: Option<PreparedCall>,
     decision: Option<bool>,
+    /// Standing approvals for this run: exact command keys the user chose
+    /// "allow for this run" on. In memory only; a resumed run starts empty.
+    standing: Vec<String>,
     pending_question: Option<PendingQuestion>,
     /// Trusted UI reply to `pending_question`: `Some(None)` = declined.
     answer: Option<Option<String>>,
@@ -983,6 +998,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 events: VecDeque::new(),
                 pending_approval: None,
                 decision: None,
+                standing: Vec::new(),
                 pending_question: None,
                 answer: None,
                 queued_answers: VecDeque::new(),
@@ -1062,6 +1078,45 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             push_locked(
                 &mut state,
                 AgentEvent::ApprovalResolved { call_id, approved },
+            );
+        }
+        handle.cond.notify_all();
+        Ok(self.snapshot_of(run_id, handle))
+    }
+
+    /// Trusted UI decision: approve the pending command and allow the exact
+    /// same command line for the rest of this run. Refused unless the
+    /// pending call carries a standing key (bare, policy-clean commands
+    /// only; never file writes). Like `decide`, the model has no route here.
+    pub fn decide_always(&self, run_id: &str) -> Result<AgentSnapshot, String> {
+        let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+        let handle = runs.get(run_id).ok_or("unknown run")?;
+        {
+            let mut state = handle.shared.lock().map_err(|_| "run state poisoned")?;
+            if state.status != AgentStatus::AwaitingApproval {
+                return Err("run is not waiting for a decision".into());
+            }
+            let Some(call) = state.pending_approval.clone() else {
+                return Err("run is not waiting for a decision".into());
+            };
+            let Some(key) = call.standing_key.clone() else {
+                return Err("this request can only be approved once".into());
+            };
+            grant_standing(&mut state.standing, key)?;
+            state.decision = Some(true);
+            push_locked(
+                &mut state,
+                AgentEvent::StandingApprovalGranted {
+                    call_id: call.call_id.clone(),
+                    command: call.summary.clone(),
+                },
+            );
+            push_locked(
+                &mut state,
+                AgentEvent::ApprovalResolved {
+                    call_id: call.call_id,
+                    approved: true,
+                },
             );
         }
         handle.cond.notify_all();
@@ -1324,6 +1379,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 events: VecDeque::new(),
                 pending_approval: None,
                 decision: None,
+                standing: Vec::new(),
                 pending_question: None,
                 answer: None,
                 queued_answers: VecDeque::new(),
@@ -3926,6 +3982,25 @@ fn tool_name_of(request: &ToolRequest) -> &'static str {
     }
 }
 
+/// Cap on standing approvals in one run, so "allow for this run" stays a
+/// handful of named commands and never becomes a blanket pass.
+pub const MAX_STANDING_APPROVALS: usize = 8;
+
+/// Record a standing approval, refusing a new one past the cap. Granting a
+/// key that is already held is a no-op, not a second slot.
+fn grant_standing(standing: &mut Vec<String>, key: String) -> Result<(), String> {
+    if standing.contains(&key) {
+        return Ok(());
+    }
+    if standing.len() >= MAX_STANDING_APPROVALS {
+        return Err(format!(
+            "at most {MAX_STANDING_APPROVALS} standing approvals per run"
+        ));
+    }
+    standing.push(key);
+    Ok(())
+}
+
 enum Decision {
     Approved,
     Denied,
@@ -3951,6 +4026,24 @@ fn wait_for_decision_on(handle: &RunHandle, call: &PreparedCall) -> Decision {
             Ok(s) => s,
             Err(_) => return Decision::Cancelled,
         };
+        if handle.cancel.load(Ordering::SeqCst) {
+            return Decision::Cancelled;
+        }
+        // A standing approval the user granted earlier in this run covers
+        // this exact command line: run it without parking, and say so in
+        // the event log so nothing is approved silently.
+        if let Some(key) = call.standing_key.as_ref() {
+            if s.standing.contains(key) {
+                push_locked(
+                    &mut s,
+                    AgentEvent::ApprovedByStanding {
+                        call_id: call.call_id.clone(),
+                        command: call.summary.clone(),
+                    },
+                );
+                return Decision::Approved;
+            }
+        }
         s.status = AgentStatus::AwaitingApproval;
         s.pending_approval = Some(call.clone());
         push_locked(&mut s, AgentEvent::ApprovalRequired { call: call.clone() });
@@ -6237,6 +6330,103 @@ mod tests {
         let split = &posts[6];
         assert_eq!(wrote(split, "\\\"a.txt\\\""), 1, "{split}");
         assert_eq!(wrote(split, "\\\"b.txt\\\""), 1, "{split}");
+    }
+
+    #[test]
+    fn standing_approvals_are_capped_per_run_and_never_double_counted() {
+        let mut held = Vec::new();
+        for n in 0..MAX_STANDING_APPROVALS {
+            grant_standing(&mut held, format!("k{n}")).expect("under the cap");
+        }
+        // re-granting a held key is fine and takes no new slot
+        grant_standing(&mut held, "k0".into()).expect("already held");
+        assert_eq!(held.len(), MAX_STANDING_APPROVALS);
+        let refused = grant_standing(&mut held, "one-more".into()).unwrap_err();
+        assert!(refused.contains("at most"), "{refused}");
+        assert_eq!(held.len(), MAX_STANDING_APPROVALS);
+    }
+
+    #[test]
+    fn allow_for_this_run_covers_only_the_exact_command_and_is_logged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp = |to: &str| {
+            json!({"functionCall":{"name":"run_command","args":{
+            "argv":["cp","seed.txt", to]}}})
+        };
+        let script = Script::new(vec![
+            call_turn(vec![create_call("seed.txt", "SEED")]),
+            call_turn(vec![cp("x.txt")]),
+            call_turn(vec![cp("x.txt")]),
+            call_turn(vec![cp("y.txt")]),
+            call_turn(vec![complete_call("done")]),
+        ]);
+        let svc = Arc::new(service(tmp.path(), script));
+        let snap = svc.begin("standing", "gemini", Some(budgets())).unwrap();
+        let (svc2, id2) = (svc.clone(), snap.id.clone());
+        let refused_for_write = Arc::new(Mutex::new(None::<String>));
+        let refused = refused_for_write.clone();
+        std::thread::spawn(move || loop {
+            let s = svc2.snapshot(&id2).expect("snapshot");
+            if s.terminal_reason.is_some() {
+                return;
+            }
+            if s.status == AgentStatus::AwaitingApproval {
+                if let Some(call) = s.pending_approval.clone() {
+                    if call.tool == "create_file" {
+                        // a file write can never get a standing approval
+                        *refused.lock().unwrap() = svc2.decide_always(&id2).err();
+                        let _ = svc2.decide(&id2, true);
+                    } else if call.summary.contains("x.txt") {
+                        svc2.decide_always(&id2).expect("standing approval");
+                    } else {
+                        let _ = svc2.decide(&id2, true);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let done = wait_terminal(&svc, &snap.id, 30_000);
+        assert_eq!(
+            refused_for_write.lock().unwrap().as_deref(),
+            Some("this request can only be approved once")
+        );
+        let asked: Vec<String> = done
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ApprovalRequired { call } => Some(call.tool.clone()),
+                _ => None,
+            })
+            .collect();
+        // create, the first cp to x.txt, and the cp to y.txt; the second
+        // cp to x.txt ran under the standing approval
+        assert_eq!(
+            asked,
+            vec!["create_file", "run_command", "run_command"],
+            "{:?}",
+            done.events
+        );
+        let granted = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::StandingApprovalGranted { .. }))
+            .count();
+        let by_standing: Vec<&String> = done
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ApprovedByStanding { command, .. } => Some(command),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(granted, 1);
+        assert_eq!(by_standing.len(), 1);
+        assert!(by_standing[0].contains("x.txt"));
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("x.txt")).unwrap(), "SEED");
+        assert_eq!(fs::read_to_string(ws.join("y.txt")).unwrap(), "SEED");
+        // not waiting any more: the trusted route refuses
+        assert!(svc.decide_always(&snap.id).is_err());
     }
 
     #[test]

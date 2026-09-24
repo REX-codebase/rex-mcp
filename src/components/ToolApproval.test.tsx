@@ -47,4 +47,17 @@ describe("tool approval card", () => {
     rerender(<ToolApproval call={call("b")} busy={false} onDecision={() => {}} />);
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Deny" }));
   });
+  it("offers Allow for this run only for a command with a standing key and a handler", () => {
+    const onAllow = vi.fn();
+    const { rerender } = render(<ToolApproval call={call("a")} busy={false} onDecision={() => {}} onAllowForRun={onAllow} />);
+    expect(screen.queryByRole("button", { name: "Allow for this run" })).toBeNull();
+    const keyed = { ...call("b"), standing_key: '[["npm","test"],"."]' };
+    rerender(<ToolApproval call={keyed} busy={false} onDecision={() => {}} />);
+    expect(screen.queryByRole("button", { name: "Allow for this run" })).toBeNull();
+    rerender(<ToolApproval call={keyed} busy={false} onDecision={() => {}} onAllowForRun={onAllow} />);
+    fireEvent.click(screen.getByRole("button", { name: "Allow for this run" }));
+    expect(onAllow).toHaveBeenCalledTimes(1);
+    // the safe default is unchanged
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Deny" }));
+  });
 });

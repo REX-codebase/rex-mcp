@@ -81,4 +81,16 @@ describe("ActivityTimeline", () => {
     const { container } = render(<ActivityTimeline events={[{ state: "plan_updated", items: [] }]} />);
     expect(container.innerHTML).toBe("");
   });
+  it("names standing approvals so nothing runs unannounced", () => {
+    render(
+      <ActivityTimeline
+        events={[
+          { state: "standing_approval_granted", call_id: "c1", command: "npm test" },
+          { state: "approved_by_standing", call_id: "c2", command: "npm test" },
+        ]}
+      />
+    );
+    expect(screen.getByText("Allowed for this run · npm test")).toBeTruthy();
+    expect(screen.getByText("Ran under your approval for this run · npm test")).toBeTruthy();
+  });
 });

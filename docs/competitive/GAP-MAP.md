@@ -561,3 +561,37 @@ is shared it is noted in the module docs.
   files, removals ignored, sorted output, a size change seen with the
   modified time put back, the file cap). Hand mutation: 8/8 killed.
 - Gap left: a change that keeps both size and modified time is not seen.
+
+## Round 13: run-scoped standing approval
+
+- Competitors: opencode's permission prompt offers Allow once / Allow
+  always / Reject (`packages/tui/src/routes/session/permission.tsx`).
+  "Always" adds a session rule keyed on a command prefix
+  (`packages/opencode/src/permission/arity.ts`). Hermes keeps
+  per-session and permanent approval sets (`tools/approval.py`,
+  `_session_approved`, `_permanent_approved`).
+- REX before: only "Approve once", so a run that re-runs the same test
+  command after each fix asked for the same approval each time.
+- REX now: an "Allow for this run" button on command approvals
+  (`standing_key` in `crates/rex-tools/src/lib.rs`,
+  `AutonomousRunService::decide_always` and the standing check in the
+  approval wait in `crates/rex-providers/src/autonomous.rs`, Tauri
+  command `agent_decide_always`). It is stricter than both:
+  - it covers the exact argv plus working directory only, with no prefix
+    matching;
+  - only commands that pass the command policy qualify, and only when the
+    program is a bare name (never `./build.sh` or `bin/tool`, which the
+    model could rewrite);
+  - never offered for file writes, patches or MCP calls;
+  - kept in memory for one run (a resumed run starts empty), at most 8
+    per run;
+  - every command it lets through is logged (`ApprovedByStanding`) and
+    shown in the activity timeline. Deny keeps the default focus.
+- Tests: rex-tools key rules and a prepare test; a loop test (a second
+  identical `cp` runs without asking, a different target still asks, a
+  file write refuses a standing approval); a cap test; 2 vitest cases for
+  the button and the timeline rows. Hand mutation: 7/7 killed, plus one
+  equivalent mutant (the `approval_required` gate in `prepare`: every
+  command that passes the policy already needs approval).
+- Gap left: the dev sidecar (`rex-mcp` dev route) has no route for it, so
+  the button is desktop-only. MCP work is parked.

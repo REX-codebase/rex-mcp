@@ -35,6 +35,8 @@ import { RexTaskList, RexTaskView } from "./components/RexTaskView";
 import {
   agentCancel,
   agentDecide,
+  agentDecideAlways,
+  canAllowForRun,
   agentSnapshot,
   agentTeardown,
   type AgentSnapshot,
@@ -551,6 +553,20 @@ export default function App() {
       .finally(() => setLiveDeciding(false));
   };
 
+  // "Allow for this run" on a pending command (desktop app only).
+  const [allowForRunOk, setAllowForRunOk] = useState(false);
+  useEffect(() => {
+    canAllowForRun().then(setAllowForRunOk).catch(() => setAllowForRunOk(false));
+  }, []);
+  const onAllowForRun = () => {
+    if (!liveRun || liveDeciding) return;
+    setLiveDeciding(true);
+    agentDecideAlways(liveRun.id)
+      .then((snap) => setLiveRun(snap))
+      .catch((e) => setLiveRun((prev) => (prev ? { ...prev, error: String(e) } : prev)))
+      .finally(() => setLiveDeciding(false));
+  };
+
   // Plan decision for a plan-gated custody run: approval resumes the run
   // into the normal loop; rejection ends it as denied. The decision travels
   // through the custody channel, which shares the same run registry, so the
@@ -781,6 +797,7 @@ export default function App() {
                 custody={custody}
                 onPlanDecision={onPlanDecision}
                 planDeciding={planDeciding}
+                onAllowForRun={allowForRunOk ? onAllowForRun : undefined}
               />
             )}
             {rexTaskId && (

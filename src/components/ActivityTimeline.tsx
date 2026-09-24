@@ -120,6 +120,10 @@ function Row({ event, skipText, latestTool }: { event: AgentEvent; skipText?: Ag
       return <li className="tl-row tl-wait">Approval requested · {event.call.tool.replace(/_/g, " ")}</li>;
     case "approval_resolved":
       return <li className="tl-row tl-wait">{event.approved ? "Approved once" : "Denied"}</li>;
+    case "standing_approval_granted":
+      return <li className="tl-row tl-wait">Allowed for this run · {event.command}</li>;
+    case "approved_by_standing":
+      return <li className="tl-row tl-wait">Ran under your approval for this run · {event.command}</li>;
     case "plan_approval_required":
       return <li className="tl-row tl-wait">Plan proposed · {event.items.length} step{event.items.length === 1 ? "" : "s"} awaiting your approval</li>;
     case "plan_approval_resolved":

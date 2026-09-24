@@ -45,6 +45,7 @@ export function AgentRunView({
   custody,
   onPlanDecision,
   planDeciding,
+  onAllowForRun,
 }: {
   run: AgentSnapshot;
   deciding: boolean;
@@ -54,6 +55,7 @@ export function AgentRunView({
   custody?: { grantId: string; phase: string; operator: string } | null;
   onPlanDecision?: (approved: boolean) => void;
   planDeciding?: boolean;
+  onAllowForRun?: () => void;
 }) {
   const phase = phaseOf(run);
   const [shot, setShot] = useState<string | null>(null);
@@ -266,7 +268,7 @@ export function AgentRunView({
       )}
 
       {run.pending_approval && phase === "approval" && (
-        <ToolApproval call={run.pending_approval} busy={deciding} onDecision={onDecide} />
+        <ToolApproval call={run.pending_approval} busy={deciding} onDecision={onDecide} onAllowForRun={onAllowForRun} />
       )}
 
       {phase === "plan" && onPlanDecision && (

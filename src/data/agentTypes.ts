@@ -46,6 +46,8 @@ export type AgentEvent =
   | { state: "tool_finished"; result: ToolResult }
   | { state: "approval_required"; call: PreparedCall }
   | { state: "approval_resolved"; call_id: string; approved: boolean }
+  | { state: "standing_approval_granted"; call_id: string; command: string }
+  | { state: "approved_by_standing"; call_id: string; command: string }
   | { state: "plan_approval_required"; items: PlanItem[] }
   | { state: "plan_approval_resolved"; approved: boolean }
   | { state: "question_asked"; question: PendingQuestion }

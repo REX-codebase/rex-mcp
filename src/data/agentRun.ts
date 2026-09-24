@@ -67,6 +67,14 @@ export const agentBegin = (task: string) => {
 export const agentSnapshot = (runId: string) => get<AgentSnapshot>("agent_snapshot", `/runs/${runId}`, { runId });
 export const agentDecide = (runId: string, approved: boolean) =>
   call<AgentSnapshot>("agent_decide", `/runs/${runId}/decision`, { runId, approved });
+// "Allow for this run": approve the pending command and every later run of
+// the exact same command line until the run ends. Desktop app only; the dev
+// sidecar has no route for it, so it is never offered there.
+export const agentDecideAlways = async (runId: string) => {
+  if ((await backendKind()) !== "tauri") throw new Error("Allow for this run needs the desktop app");
+  return call<AgentSnapshot>("agent_decide_always", `/runs/${runId}/decision`, { runId });
+};
+export const canAllowForRun = async () => (await backendKind()) === "tauri";
 export const agentCancel = (runId: string) =>
   call<AgentSnapshot>("agent_cancel", `/runs/${runId}/cancel`, { runId });
 export const agentResume = (runId: string) =>

@@ -1240,6 +1240,16 @@ fn agent_decide(
     agent.decide(&run_id, approved)
 }
 
+/// Trusted UI decision: approve the pending command and the exact same
+/// command line for the rest of this run.
+#[tauri::command]
+fn agent_decide_always(
+    agent: State<'_, Arc<Agent>>,
+    run_id: String,
+) -> Result<AgentSnapshot, String> {
+    agent.decide_always(&run_id)
+}
+
 #[tauri::command]
 fn agent_cancel(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<AgentSnapshot, String> {
     agent.cancel(&run_id)
@@ -1559,6 +1569,7 @@ fn main() {
             agent_begin,
             agent_snapshot,
             agent_decide,
+            agent_decide_always,
             agent_cancel,
             agent_resume,
             agent_undo,
