@@ -275,7 +275,7 @@ is shared it is noted in the module docs.
   stack is only read through the flow stack, which is cleared.
 - Gap left: YAML check is still not a full parser (for example, no
   anchors-before-use or complex-key checks); opencode's LSP route covers
-  more.
+  more. Round 12c adds a full parse; see below.
 - App: AgentRunView shows the ask_user question (choices, free text, "Let
   REX decide") and an "Undo last file change" button on finished runs that
   wrote files. Covered by 2 vitest tests; rendered with the compiled theme
@@ -407,3 +407,34 @@ is shared it is noted in the module docs.
   does not accept. Pre-existing errors in edited files are still labelled
   as already there.
 - Gap left: no type or borrow errors (needs rustc or an LSP).
+
+### Round 12c: full YAML parse after writes
+
+- Before: YAML got line checks only (tabs, unclosed flow brackets,
+  duplicate keys, mixed lists and keys). Bad indentation inside a mapping
+  (`a:\n  b: 1\n c: 2`), aliases to anchors never defined, and plain
+  values containing `: ` on a wrapped line went through.
+- Hermes: in-process PyYAML event parse, `yaml.parse` not a load
+  (`tools/file_operations_lint.py:70-83,114`). opencode: only when a YAML
+  language server is running (`src/tool/edit.ts:198-200`).
+- REX now (`check_yaml_parse` in `crates/rex-tools/src/check.rs`): when
+  the line checks are clean and the file is not a template, it is parsed
+  with `saphyr-parser` 0.1.0 (YAML 1.2, MIT OR Apache-2.0; new dependency,
+  plus `arraydeque`), and the first error comes back with line and column.
+  Templates are skipped: any `{%`, or `{{` not written as GitHub Actions
+  `${{`.
+- Tuned to PyYAML: saphyr's indentation errors are dropped, because it is
+  stricter than PyYAML on flow and quoted content. Before this, the sweep
+  flagged 15 Hermes locale files (multi-line quoted strings) and
+  3 base64 CircleCI configs (a `]` less indented than its items); PyYAML
+  accepts all of them. Cost: an unclosed quote followed by a
+  less-indented line is not reported.
+- Tests: 1 new unit test, plus fixture updates in 2 existing tests. One
+  of them had marked a wrapped plain value containing `: ` as fine,
+  which PyYAML rejects; it is now a flagged case. Hand mutation: 10/10
+  killed.
+- False-alarm sweep: 0 YAML flags in this repo (317 files), opencode
+  (3,926), Hermes (11,586) and the cargo registry (18,666). Totals
+  unchanged: 0 / 2 / 2 / 7.
+- Gap left: no schema checks (e.g. GitHub Actions keys); indentation
+  errors that PyYAML would also reject can be missed.

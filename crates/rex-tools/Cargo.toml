@@ -14,3 +14,4 @@ libc = "0.2"
 # Full Rust syntax check after writes (already in Cargo.lock via serde).
 syn = { version = "2", default-features = false, features = ["full", "parsing"] }
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+saphyr-parser = "0.1"

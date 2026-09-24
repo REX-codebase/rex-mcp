@@ -68,7 +68,14 @@ pub fn check(path: &str, content: &str) -> Option<Vec<Finding>> {
     Some(match lang {
         Lang::Json => check_json(content),
         Lang::Toml => check_toml(content),
-        Lang::Yaml => check_yaml(content),
+        Lang::Yaml => {
+            let found = check_yaml(content);
+            if found.is_empty() && !yaml_templated(content) {
+                check_yaml_parse(content)
+            } else {
+                found
+            }
+        }
         Lang::Rust => {
             let found = check_delimiters(content, Lang::Rust, false);
             if found.is_empty() {
@@ -182,6 +189,43 @@ fn check_toml(content: &str) -> Vec<Finding> {
             }]
         }
     }
+}
+
+/// Helm/Jinja templates are not YAML until rendered.
+fn yaml_templated(content: &str) -> bool {
+    // `{{` not preceded by `$` (GitHub Actions `${{ }}` is plain YAML text)
+    content.contains("{%")
+        || content
+            .match_indices("{{")
+            .any(|(i, _)| !content[..i].ends_with('$'))
+}
+
+/// Full YAML 1.2 parse (saphyr-parser, MIT/Apache-2.0), run only when the
+/// line checks are clean and the file is not a template. Catches what the
+/// line checks cannot: bad indentation inside mappings, aliases to anchors
+/// never defined, stray block entries, unclosed quotes. Hermes parses YAML
+/// events in-process with PyYAML (`tools/file_operations_lint.py:70-83`,
+/// `yaml.parse`, not a load); this is the
+/// same idea without a Python runtime. Only the first error is reported.
+fn check_yaml_parse(content: &str) -> Vec<Finding> {
+    for event in saphyr_parser::Parser::new_from_str(content) {
+        if let Err(e) = event {
+            // saphyr follows the spec's indentation rules for flow and
+            // quoted content more strictly than PyYAML and most loaders
+            // (real files: Hermes locales, base64's CircleCI config), so
+            // those errors are not reported.
+            if e.info().starts_with("invalid indentation") {
+                return Vec::new();
+            }
+            let m = e.marker();
+            return vec![Finding {
+                line: m.line().max(1),
+                col: m.col() + 1,
+                message: format!("YAML parse error: {}", e.info()),
+            }];
+        }
+    }
+    Vec::new()
 }
 
 /// Conservative YAML check, tuned for no false alarms rather than full
@@ -1246,6 +1290,33 @@ mod tests {
     }
 
     #[test]
+    fn yaml_full_parse_catches_what_line_checks_miss() {
+        let f = check("a.yaml", "base: &b {x: 1}\nuse: *missing\n").unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!((f[0].line, f[0].col), (2, 6), "{f:?}");
+        assert!(f[0].message.starts_with("YAML parse error"), "{f:?}");
+        dirty("a.yaml", "a: \"never closed\n  b: 1\n", "YAML parse error");
+        dirty(
+            "a.yaml",
+            "g: long text that\n  wraps onto the next line: here\n",
+            "mapping values",
+        );
+        dirty("a.yaml", "a:\n  b: 1\n c: 2\n", "YAML parse error");
+        clean("a.yaml", "base: &b {x: 1}\nuse: *b\n---\nsecond: doc\n");
+        // indentation strictness beyond PyYAML is not reported
+        clean("a.yaml", "r:\n  e: \"one\nline two\"\n");
+        clean("a.yml", "i:\n  - [\n      'a'\n    ]\n");
+        // templates are skipped
+        clean("t.yaml", "a: {{ .Values.x }}\nuse: *nope\n");
+        clean("t.yaml", "{% if x %}\nuse: *nope\n{% endif %}\n");
+        clean("t.yaml", "a: 1\n{{- include \"x\" . }}\nuse: *nope\n");
+        assert!(yaml_templated("x: {{- y }}"));
+        assert!(!yaml_templated("x: \"${{ github.ref }}\""));
+        assert!(yaml_templated("{{ x }}"));
+        assert!(yaml_templated("a: ${{ b }} {{ c }}"));
+    }
+
+    #[test]
     fn toml_is_parsed_and_errors_carry_no_position_text() {
         clean("Cargo.toml", "[package]\nname = \"x\"\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n");
         dirty("a.toml", "[package]\nname = \"x\n", "invalid TOML");
@@ -1278,7 +1349,7 @@ mod tests {
         dirty("a.yaml", "a: {x: [1, {y: 2}], x: 2}\n", "duplicate key 'x'");
         clean(
             "flow.yaml",
-            "a: {x: 1, y: {x: 2}}\nb: [{x: 1}, {x: 2}]\nc: {x: 'a, x: b', y: \"x: 1\"}\nd: {x, x}\ne: {u: http://h/x, v: 1}\nf: {a:b: 1, a:c: 2}\ng: {*k : 1, *k : 2}\n",
+            "a: {x: 1, y: {x: 2}}\nb: [{x: 1}, {x: 2}]\nc: {x: 'a, x: b', y: \"x: 1\"}\nd: {x, x}\ne: {u: http://h/x, v: 1}\nf: {a:b: 1, a:c: 2}\nk: &k x\ng: {*k : 1, *k : 2}\n",
         );
         dirty("a.yaml", "a: {b: 1}}\n", "text after the flow collection");
         dirty(
@@ -1324,7 +1395,7 @@ mod tests {
         );
         clean(
             "ok.yaml",
-            "a:\n  b: 1\nc: |\n  d: 2\ne: &x\n  f: 3\ng: long text that\n  wraps onto the next line: here\nh: v\ni:\n  - j: 1\n    k: 2\nl: v # note\n# m:\nn: 1\n",
+            "a:\n  b: 1\nc: |\n  d: 2\ne: &x\n  f: 3\nh: v\ni:\n  - j: 1\n    k: 2\nl: v # note\n# m:\nn: 1\n",
         );
     }
 
