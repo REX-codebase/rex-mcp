@@ -1086,3 +1086,24 @@ is shared it is noted in the module docs.
   mutation run exposed was removed.
 - Gap left: `!` re-includes; `.git/info/exclude` and the global excludes
   file are not read.
+
+## Round 25: `!` re-includes in .gitignore
+
+- Competitors: ripgrep, which opencode's glob and grep and Hermes's
+  search run, follows git's rule that the last matching pattern wins and
+  `!pattern` re-includes a path.
+- REX before: a `.gitignore` with any `!` line kept only its directory
+  rules, so `*.log` plus `!keep.log` stopped hiding the other logs and
+  generated files leaked into search, glob and the change list (rounds 20
+  and 24's gap).
+- REX now: rules keep their order across the root and nested files;
+  the last one that matches decides, and a `!` rule un-ignores. A nested
+  file's rule can re-include what the root ignored and the other way
+  round. `\!` and `\#` start a literal name. A file inside an ignored
+  folder stays hidden because that folder is never entered, which is
+  also git's behaviour.
+- Tests: a walker test with file, folder and path negations, escapes,
+  a nested file that flips the root's rules, a re-include blocked by an
+  ignored parent folder, and a lone negation. Hand mutation: 5/5 killed.
+- Gap left: `.git/info/exclude` and the global excludes file are not
+  read.

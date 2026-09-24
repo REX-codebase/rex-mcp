@@ -121,14 +121,17 @@ impl Glob {
     }
 }
 
-/// One `.gitignore` rule. Negations (`!`) are not evaluated; when a file
-/// has any, only directory rules are kept (see `Ignore::parse`) so a
-/// re-included file is never hidden from search.
+/// One `.gitignore` rule. As in git, the last rule that matches a path
+/// decides: a `!` rule re-includes what an earlier rule ignored. A file
+/// inside an ignored folder stays ignored because the walk never enters
+/// that folder (git cannot re-include it either).
 #[derive(Debug, Clone)]
 struct Rule {
     glob: Regex,
     dir_only: bool,
     anchored: bool,
+    /// `!pattern`: matching paths are not ignored.
+    negate: bool,
     /// Folder of the `.gitignore` the rule came from, relative to the
     /// workspace root with a trailing `/` ("" for the root file). The rule
     /// only applies below it, matched against the rest of the path.
@@ -162,24 +165,27 @@ impl Ignore {
         } else {
             format!("{}/", base.trim_end_matches('/'))
         };
-        let lines: Vec<&str> = text.lines().map(str::trim).collect();
-        let has_negation = lines.iter().any(|l| l.starts_with('!'));
         let mut rules = Vec::new();
-        for line in lines {
-            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // `\!` and `\#` start a pattern with a literal `!` or `#`
+            let (negate, line) = match line.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, line),
+            };
+            let line = line
+                .strip_prefix("\\!")
+                .map(|r| format!("!{r}"))
+                .or_else(|| line.strip_prefix("\\#").map(|r| format!("#{r}")))
+                .unwrap_or_else(|| line.to_string());
+            let line = line.as_str();
             let dir_only = line.ends_with('/');
             let pat = line.trim_end_matches('/');
             let anchored = pat.starts_with('/') || pat.trim_start_matches('/').contains('/');
             let pat = pat.trim_start_matches('/');
             if pat.is_empty() {
-                continue;
-            }
-            // With negations present we cannot know which positive rules
-            // are overridden, so only keep directory rules; a hidden file
-            // is worse than a slower search.
-            if has_negation && !dir_only {
                 continue;
             }
             let Some(glob) = glob_to_regex(pat) else {
@@ -189,6 +195,7 @@ impl Ignore {
                 glob,
                 dir_only,
                 anchored,
+                negate,
                 base: base.clone(),
             });
         }
@@ -211,7 +218,7 @@ impl Ignore {
 
     /// Whether `rel` (relative to the workspace root) is ignored.
     pub fn is_ignored(&self, rel: &str, is_dir: bool) -> bool {
-        self.rules.iter().any(|r| {
+        let hit = |r: &Rule| {
             if r.dir_only && !is_dir {
                 return false;
             }
@@ -224,7 +231,13 @@ impl Ignore {
             } else {
                 r.glob.is_match(name) || r.glob.is_match(rest)
             }
-        })
+        };
+        // deeper files' rules come later, so they win over the root's
+        self.rules
+            .iter()
+            .rev()
+            .find(|r| hit(r))
+            .is_some_and(|r| !r.negate)
     }
 }
 
@@ -388,6 +401,47 @@ mod tests {
                 "z.tmp",
             ]
         );
+    }
+
+    #[test]
+    fn negation_re_includes_and_the_last_match_wins() {
+        let t = tree(&[
+            (
+                ".gitignore",
+                "*.log\n!keep.log\nout/\n!out/\ndocs/*.md\n!docs/README.md\n\\!bang.txt\n\\#hash.txt\n",
+            ),
+            ("a.log", "x"),
+            ("sub/keep.log", "x"),
+            ("sub/b.log", "x"),
+            ("out/app.js", "x"),
+            ("docs/guide.md", "x"),
+            ("docs/README.md", "x"),
+            ("!bang.txt", "x"),
+            ("#hash.txt", "x"),
+            ("plain.txt", "x"),
+            ("web/.gitignore", "!*.log\nkeep.log\n"),
+            ("web/c.log", "x"),
+            ("web/keep.log", "x"),
+        ]);
+        assert_eq!(
+            listed(t.path()),
+            [
+                ".gitignore",
+                "docs/README.md",
+                "out/app.js",
+                "plain.txt",
+                "sub/keep.log",
+                "web/.gitignore",
+                "web/c.log",
+            ]
+        );
+        // a file inside an ignored folder cannot be re-included
+        let t = tree(&[(".gitignore", "gen/\n!gen/keep.rs\n"), ("gen/keep.rs", "x")]);
+        assert_eq!(listed(t.path()), [".gitignore"]);
+        // a lone negation ignores nothing
+        let ig = Ignore::parse("!x.txt\n");
+        assert!(!ig.is_ignored("x.txt", false));
+        assert!(!ig.is_ignored("y.txt", false));
     }
 
     #[test]
