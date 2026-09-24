@@ -8059,6 +8059,49 @@ mod tests {
     }
 
     #[test]
+    fn tree_snapshot_leaves_out_build_output_and_gitignored_paths() {
+        use explore::{tree_changes, tree_snapshot};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/app.ts"), "a").unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "# generated\n/gen/\n*.log\nlib/out.js\nscratch/\n",
+        )
+        .unwrap();
+        let before = tree_snapshot(root).unwrap();
+        // what a build command leaves behind
+        for f in [
+            "dist/index.js",
+            "build/app.bin",
+            "coverage/lcov.info",
+            ".next/cache.json",
+            "gen/schema.rs",
+            "npm-debug.log",
+            "src/deep/trace.log",
+            "lib/out.js",
+        ] {
+            let p = root.join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "x").unwrap();
+        }
+        // real edits still show
+        fs::write(root.join("src/app.ts"), "ab").unwrap();
+        fs::write(root.join("lib/keep.js"), "k").unwrap();
+        // a dir-only rule does not hide a file of that name
+        fs::write(root.join("scratch"), "s").unwrap();
+        fs::create_dir_all(root.join("src/gen")).unwrap();
+        fs::write(root.join("src/gen/x.rs"), "x").unwrap();
+        let after = tree_snapshot(root).unwrap();
+        assert_eq!(
+            tree_changes(&before, &after),
+            ["lib/keep.js", "scratch", "src/app.ts", "src/gen/x.rs"]
+        );
+        assert!(after.contains_key(".gitignore"));
+    }
+
+    #[test]
     fn tree_snapshot_skips_build_dirs_and_finds_new_and_changed_files() {
         use explore::{tree_changes, tree_snapshot, tree_snapshot_capped};
         let tmp = tempfile::tempdir().unwrap();

@@ -962,3 +962,28 @@ is shared it is noted in the module docs.
   Hand mutation: 19/19 killed.
 - Gap left: no replace action; the instruction check is a short phrase
   list, not a full injection scanner like Hermes's threat patterns.
+
+## Round 20: build output left out of the changed-files list
+
+- Competitors: opencode's snapshot drops gitignored files
+  (`src/snapshot/index.ts`, `ls-files --exclude-standard` and "removing
+  gitignored files from snapshot"). Hermes's checkpoints exclude
+  `dist/`, `build/`, `out/`, caches, logs and similar through
+  `DEFAULT_EXCLUDES` (`tools/checkpoint_manager.py`).
+- REX before: the tree snapshot around `run_command` skipped only a short
+  list (`.git`, `target`, `node_modules`, virtualenvs, Python caches), so
+  a build that wrote `dist/` or `build/` listed every generated file as
+  changed by the run (round 18's gap).
+- REX now: the snapshot also skips the search walker's list
+  (`dist`, `build`, `coverage`, `.next`, `.cache` and others) and
+  whatever the workspace root `.gitignore` ignores, using REX's own
+  ignore matcher: anchored and unanchored rules, file globs such as
+  `*.log`, and directory-only rules that never hide a file of that name.
+  Files the agent writes through its own write tools are still listed
+  wherever they are.
+- Tests: a snapshot test where a "build" writes eight generated files
+  (dist, build, coverage, .next, a gitignored `/gen/`, two `*.log`, one
+  listed file) and only the three real edits plus a file sharing a
+  dir-only rule's name are reported. Hand mutation: 6/6 killed.
+- Gap left: nested `.gitignore` files and `!` re-includes are not read
+  (the matcher then keeps only directory rules, as in search).
