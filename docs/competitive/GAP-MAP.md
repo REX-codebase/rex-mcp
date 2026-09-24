@@ -236,7 +236,7 @@ is shared it is noted in the module docs.
   path claims nothing. Unit test plus 4 mutations (partial claim, no patch
   paths, no owner check, no insert), each failing it.
 - Gap left: `run_command` from parallel edit children is not checked for
-  file overlap (a command's writes are not known before it runs).
+  file overlap (a command's writes are not known before it runs). Round 12f adds an after-the-fact check; see below.
 
 ## Round 5: YAML/TOML checks and app panels
 
@@ -508,3 +508,35 @@ is shared it is noted in the module docs.
   Cargo registry: 322 flags in total, the same count as before this change.
   No JS/TS flags among the 40 printed.
 - Gap left: no type errors (needs tsc or an LSP).
+
+### Round 12f: commands in parallel edit children checked for overlap
+
+- Before: parallel edit children claim each file they create, edit or
+  patch, and another child of the batch is refused that file. A
+  `run_command` could still overwrite a claimed file unnoticed, because a
+  command's writes are not known before it runs.
+- Hermes: no file-overlap check in `tools/delegate_tool*.py`. opencode: a
+  per-path lock for its edit tool only (`src/tool/edit.ts:35-43`); bash
+  commands are not covered.
+- REX now (`claimed_by_others` / `changed_since` in
+  `crates/rex-providers/src/explore.rs`): just before an edit child's
+  approved command runs, REX takes a content hash of every file the other
+  children of the batch have claimed, and compares after. Changed files
+  are:
+  - put at the top of that command's result for the child, which is told
+    not to touch them again and to report the overlap;
+  - listed as `overlaps` ("path (edit sub-agent N)") in the batch result
+    the parent sees and in the ledger.
+  Hashes are taken after the approval wait, so a long wait does not widen
+  the window. Caveat: if the owning child writes its own file while the
+  command runs, the change is still reported against the command. The
+  message says the files were "modified while this command ran" rather
+  than claiming the command did it.
+- Tests: an end-to-end batch where both children copy over the same file
+  (exactly one overlap, on the non-owner, naming the owner, reported to
+  the parent; stable
+  over 3 runs), and a fingerprint unit test (missing files, same-length
+  change, only other children's files watched). Hand mutation: 8/8
+  killed.
+- Gap left: files a command creates that no child has claimed yet are not
+  claimed for it.

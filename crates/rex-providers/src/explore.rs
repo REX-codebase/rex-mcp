@@ -135,6 +135,45 @@ pub(super) fn claim_paths(
     None
 }
 
+/// Fingerprints of the files other children of the batch have claimed,
+/// taken around a `run_command` so its writes to them can be spotted
+/// afterwards (a command's writes are not known before it runs).
+pub(super) fn claimed_by_others(
+    root: &std::path::Path,
+    claims: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    index: usize,
+) -> Vec<(String, usize, Option<u64>)> {
+    let map = claims.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<(String, usize, Option<u64>)> = map
+        .iter()
+        .filter(|(_, owner)| **owner != index)
+        .map(|(path, owner)| (path.clone(), *owner, file_fingerprint(&root.join(path))))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Which of `before` differ now: (path, owning child index).
+pub(super) fn changed_since(
+    root: &std::path::Path,
+    before: &[(String, usize, Option<u64>)],
+) -> Vec<(String, usize)> {
+    before
+        .iter()
+        .filter(|(path, _, print)| file_fingerprint(&root.join(path)) != *print)
+        .map(|(path, owner, _)| (path.clone(), *owner))
+        .collect()
+}
+
+/// Content hash of a file (`None` when it cannot be read, e.g. missing).
+fn file_fingerprint(path: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(h.finish())
+}
+
 /// Paths a write request touches (a patch that does not parse touches
 /// none here; the tool rejects it anyway).
 pub(super) fn written_paths(request: &ToolRequest) -> Vec<String> {
@@ -216,6 +255,9 @@ pub(super) struct ExploreOutcome {
     pub files_written: Vec<String>,
     /// Approvals the user denied for this child.
     pub denials: u32,
+    /// Files another edit child of the batch owns that changed while one of
+    /// this child's commands ran, as "path (edit sub-agent N)" (capped at 32).
+    pub overlaps: Vec<String>,
     pub cancelled: bool,
     pub error: Option<String>,
 }
@@ -447,6 +489,8 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                             ToolRequest::RunCommand { .. } => Some("(run_command)".to_string()),
                             _ => None,
                         };
+                        let watch_command = limits.kind == ExplorerKind::Edit
+                            && matches!(request, ToolRequest::RunCommand { .. });
                         match tools.prepare(request) {
                             Ok(p) if p.approval_required && limits.kind != ExplorerKind::Edit => {
                                 let _ = tools.cancel(&p.call_id);
@@ -479,6 +523,14 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                                         }
                                     }
                                 }
+                                // fingerprint after the approval wait, right before the run
+                                let watch = watch_command.then(|| {
+                                    claimed_by_others(
+                                        tools.workspace_root(),
+                                        gate.claims,
+                                        gate.index,
+                                    )
+                                });
                                 let r = tools.execute(&p.call_id);
                                 if r.ok {
                                     if let Some(w) = &written {
@@ -494,8 +546,27 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                                     (None, Some(e)) => e.detail.clone(),
                                     (None, None) => String::new(),
                                 };
-                                let (clipped, _) =
+                                let (mut clipped, _) =
                                     rex_tools::clip_middle(&text, EXPLORE_RESULT_CHARS);
+                                let changed = watch
+                                    .map(|before| changed_since(tools.workspace_root(), &before))
+                                    .unwrap_or_default();
+                                if !changed.is_empty() {
+                                    let list: Vec<String> = changed
+                                        .iter()
+                                        .map(|(p, o)| format!("{p} (edit sub-agent {})", o + 1))
+                                        .collect();
+                                    clipped = format!(
+                                        "overlap: files another edit sub-agent in this batch is changing were modified while this command ran: {}. Do not touch them again; mention the overlap in your report.\n{clipped}",
+                                        list.join(", ")
+                                    );
+                                    for item in list {
+                                        if !out.overlaps.contains(&item) && out.overlaps.len() < 32
+                                        {
+                                            out.overlaps.push(item);
+                                        }
+                                    }
+                                }
                                 (name, id, args, clipped, r.ok)
                             }
                             Err(e) => (

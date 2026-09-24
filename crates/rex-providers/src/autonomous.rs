@@ -3484,6 +3484,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                                 "tokens": outcome.tokens, "files_read": outcome.files_read,
                                 "urls_fetched": outcome.urls_fetched, "child_kind": kind.label(),
                                 "files_written": outcome.files_written, "denials": outcome.denials,
+                                "overlaps": outcome.overlaps,
                                 "error": outcome.error, "batch": tasks.len(),
                             }),
                         );
@@ -3529,6 +3530,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         "urls_fetched": outcome.urls_fetched,
                         "files_written": outcome.files_written,
                         "denials": outcome.denials,
+                        "overlaps": outcome.overlaps,
                         "turns": outcome.turns,
                         "tool_calls": outcome.tool_calls,
                         "error": outcome.error,
@@ -6235,6 +6237,94 @@ mod tests {
         let split = &posts[6];
         assert_eq!(wrote(split, "\\\"a.txt\\\""), 1, "{split}");
         assert_eq!(wrote(split, "\\\"b.txt\\\""), 1, "{split}");
+    }
+
+    #[test]
+    fn a_command_that_changes_another_childs_file_is_reported_as_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clash = json!({"functionCall":{"name":"explore","args":{
+            "tasks":["write shared.txt","also write shared.txt"],"kind":"edit"}}});
+        let cp = json!({"functionCall":{"name":"run_command","args":{
+            "argv":["cp","seed.txt","shared.txt"]}}});
+        let script = Script::new(vec![
+            call_turn(vec![create_call("seed.txt", "SEED")]),
+            call_turn(vec![clash]),
+            // both children try shared.txt; one owns it, the other is refused
+            call_turn(vec![create_call("shared.txt", "S")]),
+            call_turn(vec![create_call("shared.txt", "S")]),
+            // then both copy over it: only the non-owner's copy is an overlap
+            call_turn(vec![cp.clone()]),
+            call_turn(vec![cp]),
+            call_turn(vec![complete_call("R")]),
+            call_turn(vec![complete_call("R")]),
+            call_turn(vec![complete_call("done")]),
+        ]);
+        script.post_delay_ms.store(200, Ordering::SeqCst);
+        let svc = Arc::new(service(tmp.path(), script));
+        let snap = svc.begin("overlap", "gemini", Some(budgets())).unwrap();
+        let (svc2, id2) = (svc.clone(), snap.id.clone());
+        std::thread::spawn(move || loop {
+            let s = svc2.snapshot(&id2).expect("snapshot");
+            if s.terminal_reason.is_some() {
+                return;
+            }
+            if s.status == AgentStatus::AwaitingApproval && s.pending_approval.is_some() {
+                let _ = svc2.decide(&id2, true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("shared.txt")).unwrap(), "SEED");
+        let posts = svc.service().transport().seen();
+        let batch = posts
+            .iter()
+            .find(|p| p.contains("explorers"))
+            .expect("batch result");
+        assert_eq!(
+            batch.matches("shared.txt (edit sub-agent ").count(),
+            1,
+            "{batch} {:?}",
+            done.events
+        );
+        assert!(
+            posts
+                .iter()
+                .any(|p| p.contains("overlap: files another edit sub-agent")),
+            "{posts:?}"
+        );
+        assert_eq!(
+            posts
+                .iter()
+                .filter(|p| p.contains("overlap: files another edit sub-agent"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn claimed_files_are_fingerprinted_and_changes_found() {
+        use explore::{changed_since, claimed_by_others};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        fs::write(root.join("b.txt"), "b").unwrap();
+        let claims = Mutex::new(std::collections::HashMap::from([
+            ("a.txt".to_string(), 0usize),
+            ("b.txt".to_string(), 1usize),
+            ("gone.txt".to_string(), 1usize),
+        ]));
+        // child 0 watches only what others own
+        let before = claimed_by_others(root, &claims, 0);
+        let paths: Vec<&str> = before.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert_eq!(paths, ["b.txt", "gone.txt"]);
+        assert!(before[0].2.is_some() && before[1].2.is_none());
+        assert!(changed_since(root, &before).is_empty());
+        fs::write(root.join("b.txt"), "B").unwrap();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        assert_eq!(changed_since(root, &before), [("b.txt".to_string(), 1)]);
+        fs::write(root.join("gone.txt"), "new").unwrap();
+        assert_eq!(changed_since(root, &before).len(), 2);
     }
 
     #[test]
