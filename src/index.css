@@ -65,7 +65,7 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 
 /* Hero settle: starter composer resolves into the single bottom composer */
 .hero-wrap{display:grid;grid-template-rows:1fr;transition:grid-template-rows 460ms cubic-bezier(.32,.72,0,1)}
-.hero-wrap>div{min-height:0}.hero-wrap.settling>div{overflow:hidden}
+.hero-wrap>div{min-height:0;min-width:0}.hero-wrap.settling>div{overflow:hidden}
 .hero-wrap.settling{grid-template-rows:0fr;pointer-events:none}
 .hero-settle-inner{animation:hero-in 380ms cubic-bezier(.32,.72,0,1) both}
 .hero-wrap.settling .hero-settle-inner{animation:hero-settle 440ms cubic-bezier(.32,.72,0,1) both}
@@ -720,3 +720,9 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 
 .approval-keys{display:inline-flex;align-items:center;gap:6px;margin-right:auto;font-size:11px;color:var(--color-faint)}
 .approval-actions button:focus-visible{outline:2px solid var(--color-accent);outline-offset:2px}
+
+/* Narrow windows (Tauri minWidth is 360): brand on its own row, then the
+   tab strip full width; the strip scrolls sideways instead of pushing the
+   Fast and Ultra controls off screen. */
+@media(max-width:560px){.top-shell{flex-wrap:wrap;row-gap:12px}.top-actions{flex-shrink:1;min-width:0;width:100%;flex-wrap:nowrap!important;justify-content:space-between}.view-tabs{min-width:0;overflow-x:auto;scrollbar-width:none}.view-tabs::-webkit-scrollbar{display:none}.brand-name{display:inline!important}.fast-control,.ultra-control{flex-shrink:0}}
+@media(max-width:520px){.task-controls{flex-wrap:wrap;row-gap:10px;padding-top:10px;padding-bottom:10px}.task-controls>:first-child{flex-basis:100%}.task-controls>:last-child{margin-left:auto}}
