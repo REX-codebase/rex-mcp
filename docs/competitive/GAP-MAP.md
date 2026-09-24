@@ -1279,3 +1279,25 @@ is shared it is noted in the module docs.
   killed (the folding-order mutant survived at first; a test was added).
 - Gap left: not the full Unicode confusables table (Armenian,
   Cherokee, math letters outside NFKC and similar are not folded).
+
+## Round 34: `**` inside a name follows git
+
+- Reference: gitignore(5): "Other consecutive asterisks are considered
+  regular asterisks"; `**` means any depth only as a whole path segment
+  (`**/x`, `x/**`, `a/**/b`).
+- REX before: `**` anywhere compiled to "anything, across folders", and
+  rules without `/` were also tried against the full path, so `a**b`
+  hid `a/x/b` and `x/c**d` hid `x/c/q/d`; git hides neither. That
+  full-path try was the Round 24 surviving mutant.
+- REX now: ignore patterns pass through `git_stars`, which keeps `**`
+  only as a whole segment and turns any other run of stars into one
+  `*`. Rules without `/` match only the name at any depth; the
+  full-path fallback is removed. The `glob_files` tool's own `**`
+  handling is unchanged.
+- Tests: a walker test (`a**b` hides `axyb` and `sub/aqqb` but not
+  `a/x/b`; `x/c**d` hides `x/cqd` but not `x/c/q/d`; `logs/**` hides
+  only the root `logs/`), and a table of star rewrites. Hand mutation:
+  5/5 killed. Putting the full-path fallback back is now an equivalent
+  mutant (a rule without `/` can no longer cross a folder), so the Round
+  24 survivor is closed.
+- Gap left: the global `core.excludesFile` is still not read.

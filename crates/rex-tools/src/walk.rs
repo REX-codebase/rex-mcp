@@ -95,6 +95,36 @@ pub fn glob_to_regex(glob: &str) -> Option<Regex> {
     Regex::new(&re).ok()
 }
 
+/// A .gitignore pattern with git's `**` rules applied: `**` counts as
+/// "any depth" only as a whole path segment (`**/x`, `x/**`, `a/**/b`);
+/// anywhere else it is a plain `*` that stays inside one name
+/// (gitignore(5): "Other consecutive asterisks are considered regular
+/// asterisks"). So `a**b` never crosses a `/`.
+fn git_stars(pat: &str) -> String {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut out = String::with_capacity(pat.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '*' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i] == '*' {
+            i += 1;
+        }
+        let whole_segment =
+            (start == 0 || chars[start - 1] == '/') && (i == chars.len() || chars[i] == '/');
+        out.push_str(if i - start >= 2 && whole_segment {
+            "**"
+        } else {
+            "*"
+        });
+    }
+    out
+}
+
 /// A compiled glob plus whether it applies to the basename only.
 #[derive(Debug, Clone)]
 pub struct Glob {
@@ -197,7 +227,7 @@ impl Ignore {
             if pat.is_empty() {
                 continue;
             }
-            let Some(glob) = glob_to_regex(pat) else {
+            let Some(glob) = glob_to_regex(&git_stars(pat)) else {
                 continue;
             };
             rules.push(Rule {
@@ -235,11 +265,8 @@ impl Ignore {
                 return false;
             };
             let name = rest.rsplit('/').next().unwrap_or(rest);
-            if r.anchored {
-                r.glob.is_match(rest)
-            } else {
-                r.glob.is_match(name) || r.glob.is_match(rest)
-            }
+            // a rule without `/` matches the name at any depth
+            r.glob.is_match(if r.anchored { rest } else { name })
         };
         // deeper files' rules come later, so they win over the root's
         self.rules
@@ -386,6 +413,38 @@ mod tests {
                 "web/src/app.ts",
             ]
         );
+    }
+
+    #[test]
+    fn double_star_inside_a_name_stays_in_one_name() {
+        let t = tree(&[
+            (".gitignore", "a**b\nlogs/**\nx/c**d\n"),
+            ("axyb", "x"),
+            ("x/cqd", "x"),
+            ("x/c/q/d", "x"),
+            ("sub/aqqb", "x"),
+            ("a/x/b", "x"),
+            ("logs/deep/x.txt", "x"),
+            ("sub/logs/y.txt", "x"),
+        ]);
+        assert_eq!(
+            listed(t.path()),
+            [".gitignore", "a/x/b", "sub/logs/y.txt", "x/c/q/d"]
+        );
+        for (pat, want) in [
+            ("a**b", "a*b"),
+            ("**/x", "**/x"),
+            ("x/**", "x/**"),
+            ("a/**/b", "a/**/b"),
+            ("***", "**"),
+            ("a/***b", "a/*b"),
+            ("b**/c", "b*/c"),
+            ("*", "*"),
+            ("**", "**"),
+            ("x", "x"),
+        ] {
+            assert_eq!(git_stars(pat), want, "{pat}");
+        }
     }
 
     #[test]
