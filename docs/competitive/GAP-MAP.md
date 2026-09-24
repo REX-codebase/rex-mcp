@@ -753,7 +753,7 @@ is shared it is noted in the module docs.
   mutant (dropping the success check) is equivalent today: failed tool
   results never carry a target.
 - Gap left: a command the main agent runs (not a sub-agent) that writes
-  files is still not listed.
+  files is still not listed (closed in round 18).
 
 ## Round 17: agent skills (`load_skill`)
 
@@ -856,4 +856,28 @@ is shared it is noted in the module docs.
   per-folder cap hid the walk cap, so 3 mutants survived.
 - Gap left: no remote skill sources (opencode can pull skills from URLs;
   that needs network and trust rules).
+
+## Round 18: files the main agent's commands write
+
+- Competitors: neither tracks which files a shell command wrote for a
+  per-session file list (see round 12f). This closes REX's own round 16b
+  gap.
+- REX before: the whole-run file list (`past_runs`) had create, edit,
+  patch and edit sub-agent writes, but not files made by the main
+  agent's own `run_command` (a `cp`, a code generator, a formatter).
+- REX now: right before an approved command runs (after the approval
+  wait, so the user's own edits meanwhile are not counted) REX stamps
+  the workspace (size and modified time, skipping `.git`, `target`,
+  `node_modules` and other build and cache folders, off above 20,000
+  files), stamps it again after, and adds new or changed files to the
+  run's list. A failed command counts too, because it may still have
+  written files. `run_command` always needs approval, so only that path
+  stamps.
+- Tests: a scripted run (`cp seed.txt made.txt` then `ls`) whose
+  `terminal.json` lists `seed.txt` and `made.txt` only. Hand mutation:
+  3/3 killed. A 4th, the stamp on the no-approval path, survived because
+  that path is unreachable for commands; I removed that code.
+- Gap left: build output outside the skipped folders (for example
+  `dist/`) is listed too, up to the 200-path cap; a change that keeps
+  size and modified time is not seen.
 

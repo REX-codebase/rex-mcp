@@ -4241,10 +4241,18 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         continue;
                     }
                 };
+                // A command's writes are not known in advance: stamp the tree
+                // right before it runs (after any approval wait) and compare
+                // after, so files it made count as changed by this run.
+                let is_command = matches!(request, ToolRequest::RunCommand { .. });
+                let mut tree_before = None;
                 let result = if prepared.approval_required {
                     match wait_for_decision(ctx, &prepared, started) {
                         Decision::Approved => {
                             let _ = tools.resolve_approval(&prepared.call_id, true);
+                            if is_command {
+                                tree_before = explore::tree_snapshot(tools.workspace_root());
+                            }
                             tools.execute(&prepared.call_id)
                         }
                         Decision::Denied => {
@@ -4272,8 +4280,19 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         }
                     }
                 } else {
+                    // run_command is always an Execute-class call that needs
+                    // approval, so only the approved arm above stamps the tree
                     tools.execute(&prepared.call_id)
                 };
+                // a failed command may still have written files, so this
+                // does not depend on result.ok
+                if let Some(before) = &tree_before {
+                    if let Some(after) = explore::tree_snapshot(tools.workspace_root()) {
+                        for path in explore::tree_changes(before, &after) {
+                            note_written(&mut cp.files_written, &path);
+                        }
+                    }
+                }
                 if let Some(l) = ledger.as_mut() {
                     l.append(
                         "tool",
@@ -6566,6 +6585,42 @@ mod tests {
         );
         assert!(written_paths("read_file", Some("a.rs")).is_empty());
         assert!(written_paths("create_file", None).is_empty());
+    }
+
+    #[test]
+    fn files_a_main_agent_command_writes_are_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_call = json!({"functionCall":{"name":"run_command","args":{
+            "argv":["cp","seed.txt","made.txt"]}}});
+        let ls_call = json!({"functionCall":{"name":"run_command","args":{"argv":["ls"]}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("seed.txt", "SEED")]),
+                call_turn(vec![cp_call]),
+                call_turn(vec![ls_call]),
+                call_turn(vec![
+                    plan_call(vec![("1", "copy", "done")]),
+                    complete_call("copied"),
+                ]),
+            ]),
+        ));
+        let snap = svc.begin("copy a file", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let run = tmp.path().join("runs").join(&snap.id);
+        assert_eq!(
+            fs::read_to_string(run.join("workspace").join("made.txt")).unwrap(),
+            "SEED",
+            "{:?}",
+            done.events
+        );
+        let term: Value = serde_json::from_str(
+            &fs::read_to_string(run.join("state").join("terminal.json")).unwrap(),
+        )
+        .unwrap();
+        // made.txt comes only from the command; ls changes nothing
+        assert_eq!(term["files"], json!(["seed.txt", "made.txt"]), "{term}");
     }
 
     #[test]
