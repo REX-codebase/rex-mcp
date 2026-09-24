@@ -539,4 +539,25 @@ is shared it is noted in the module docs.
   change, only other children's files watched). Hand mutation: 8/8
   killed.
 - Gap left: files a command creates that no child has claimed yet are not
-  claimed for it.
+  claimed for it. Closed in round 12g.
+
+### Round 12g: files an edit child's command writes are claimed for it
+
+- REX now (`tree_snapshot` / `tree_changes` in
+  `crates/rex-providers/src/explore.rs`): around each approved command of
+  an edit child, REX records the size and modified time of every file in
+  the workspace. It skips `.git`, `target`, `node_modules`, `.venv`,
+  `venv` and Python caches. Files the command created or changed that no
+  other child owns are claimed for this child and listed in its
+  `files_written`. A later create, edit or patch of them by another child
+  of the batch is then refused, as for files written with the edit tools.
+  Workspaces over 20,000 files are not scanned. Files already owned by
+  another child stay with it (the round 12f overlap note covers them).
+- Neither Hermes nor opencode tracks what a sub-agent's shell command
+  wrote (see round 12f).
+- Tests: a single-child batch whose `cp` makes a file (`files_written` is
+  the command marker plus `made.txt`; the unchanged source is not
+  listed), and a snapshot unit test (skipped directories, new and changed
+  files, removals ignored, sorted output, a size change seen with the
+  modified time put back, the file cap). Hand mutation: 8/8 killed.
+- Gap left: a change that keeps both size and modified time is not seen.

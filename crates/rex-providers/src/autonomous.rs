@@ -6303,6 +6303,112 @@ mod tests {
     }
 
     #[test]
+    fn a_file_a_command_creates_is_claimed_for_that_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let batch = json!({"functionCall":{"name":"explore","args":{
+            "task":"make made.txt","kind":"edit"}}});
+        let cp = json!({"functionCall":{"name":"run_command","args":{
+            "argv":["cp","seed.txt","made.txt"]}}});
+        let script = Script::new(vec![
+            call_turn(vec![create_call("seed.txt", "SEED")]),
+            call_turn(vec![batch]),
+            call_turn(vec![cp]),
+            call_turn(vec![complete_call("R")]),
+            call_turn(vec![complete_call("done")]),
+        ]);
+        let svc = Arc::new(service(tmp.path(), script));
+        let snap = svc.begin("claim", "gemini", Some(budgets())).unwrap();
+        let (svc2, id2) = (svc.clone(), snap.id.clone());
+        std::thread::spawn(move || loop {
+            let s = svc2.snapshot(&id2).expect("snapshot");
+            if s.terminal_reason.is_some() {
+                return;
+            }
+            if s.status == AgentStatus::AwaitingApproval && s.pending_approval.is_some() {
+                let _ = svc2.decide(&id2, true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("made.txt")).unwrap(), "SEED");
+        let posts = svc.service().transport().seen();
+        let batch = posts
+            .iter()
+            .find(|p| p.contains("files_written"))
+            .expect("batch result");
+        // the command marker plus the file it made (seed.txt was unchanged)
+        assert!(
+            batch.contains("files_written\\\":[\\\"(run_command)\\\",\\\"made.txt\\\"]"),
+            "{batch} {:?}",
+            done.events
+        );
+    }
+
+    #[test]
+    fn tree_snapshot_skips_build_dirs_and_finds_new_and_changed_files() {
+        use explore::{tree_changes, tree_snapshot, tree_snapshot_capped};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("node_modules/x")).unwrap();
+        fs::write(root.join("src/a.rs"), "a").unwrap();
+        fs::write(root.join("keep.txt"), "k").unwrap();
+        fs::write(root.join("target/debug/bin"), "b").unwrap();
+        fs::write(root.join(".git/HEAD"), "h").unwrap();
+        fs::write(root.join("node_modules/x/i.js"), "i").unwrap();
+        let before = tree_snapshot(root).unwrap();
+        let mut keys: Vec<&String> = before.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["keep.txt", "src/a.rs"]);
+        assert!(tree_changes(&before, &before).is_empty());
+        fs::write(root.join("src/a.rs"), "aa").unwrap();
+        fs::write(root.join("src/new.rs"), "n").unwrap();
+        fs::write(root.join("target/debug/bin"), "bb").unwrap();
+        let after = tree_snapshot(root).unwrap();
+        assert_eq!(tree_changes(&before, &after), ["src/a.rs", "src/new.rs"]);
+        // removed files are not "changed"
+        fs::remove_file(root.join("keep.txt")).unwrap();
+        let gone = tree_snapshot(root).unwrap();
+        assert!(!tree_changes(&after, &gone).contains(&"keep.txt".to_string()));
+        // order is sorted whatever the map order
+        for n in 0..8 {
+            fs::write(root.join(format!("z{n}.txt")), "z").unwrap();
+        }
+        let many = tree_snapshot(root).unwrap();
+        let listed = tree_changes(&gone, &many);
+        let mut sorted = listed.clone();
+        sorted.sort();
+        assert_eq!(listed.len(), 8);
+        assert_eq!(listed, sorted);
+        // a size change is seen even when the modified time is put back
+        let f = root.join("src/a.rs");
+        let t0 = fs::metadata(&f).unwrap().modified().unwrap();
+        let snap0 = tree_snapshot(root).unwrap();
+        fs::write(&f, "a much longer body").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(t0)
+            .unwrap();
+        assert_eq!(fs::metadata(&f).unwrap().modified().unwrap(), t0);
+        assert_eq!(
+            tree_changes(&snap0, &tree_snapshot(root).unwrap()),
+            ["src/a.rs"]
+        );
+        fs::remove_file(root.join("src/new.rs")).unwrap();
+        for n in 0..8 {
+            fs::remove_file(root.join(format!("z{n}.txt"))).unwrap();
+        }
+        // too many files: no snapshot
+        assert!(tree_snapshot_capped(root, 1).is_some());
+        assert!(tree_snapshot_capped(root, 0).is_none());
+    }
+
+    #[test]
     fn claimed_files_are_fingerprinted_and_changes_found() {
         use explore::{changed_since, claimed_by_others};
         let tmp = tempfile::tempdir().unwrap();

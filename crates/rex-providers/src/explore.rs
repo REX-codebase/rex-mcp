@@ -165,6 +165,78 @@ pub(super) fn changed_since(
         .collect()
 }
 
+/// Size and modification time of every file under `root`, skipping VCS,
+/// dependency and build directories. `None` when the tree has more than
+/// `TREE_SNAPSHOT_MAX` files (too big to scan around every command).
+pub(super) fn tree_snapshot(root: &std::path::Path) -> Option<TreeStamps> {
+    tree_snapshot_capped(root, TREE_SNAPSHOT_MAX)
+}
+
+pub(super) fn tree_snapshot_capped(root: &std::path::Path, max: usize) -> Option<TreeStamps> {
+    let mut out = TreeStamps::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name();
+                if !TREE_SKIP_DIRS.iter().any(|s| name == *s) {
+                    stack.push(path);
+                }
+            } else if kind.is_file() {
+                if out.len() >= max {
+                    return None;
+                }
+                let meta = entry.metadata().ok();
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let stamp = (
+                    meta.as_ref().map_or(0, |m| m.len()),
+                    meta.and_then(|m| m.modified().ok()),
+                );
+                out.insert(rel, stamp);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// path -> (size, modified time)
+pub(super) type TreeStamps =
+    std::collections::HashMap<String, (u64, Option<std::time::SystemTime>)>;
+
+const TREE_SNAPSHOT_MAX: usize = 20_000;
+const TREE_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+];
+
+/// Files that are new or changed in `after` compared with `before`, sorted.
+pub(super) fn tree_changes(before: &TreeStamps, after: &TreeStamps) -> Vec<String> {
+    let mut out: Vec<String> = after
+        .iter()
+        .filter(|(path, stamp)| before.get(*path) != Some(*stamp))
+        .map(|(path, _)| path.clone())
+        .collect();
+    out.sort();
+    out
+}
+
 /// Content hash of a file (`None` when it cannot be read, e.g. missing).
 fn file_fingerprint(path: &std::path::Path) -> Option<u64> {
     use std::hash::{Hash, Hasher};
@@ -531,6 +603,9 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                                         gate.index,
                                     )
                                 });
+                                let tree_before = watch_command
+                                    .then(|| tree_snapshot(tools.workspace_root()))
+                                    .flatten();
                                 let r = tools.execute(&p.call_id);
                                 if r.ok {
                                     if let Some(w) = &written {
@@ -551,6 +626,26 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                                 let changed = watch
                                     .map(|before| changed_since(tools.workspace_root(), &before))
                                     .unwrap_or_default();
+                                // files the command created or changed that no other child
+                                // owns become this child's, so a later edit by another child
+                                // of the batch is refused
+                                if let Some(before) = &tree_before {
+                                    if let Some(after) = tree_snapshot(tools.workspace_root()) {
+                                        for path in tree_changes(before, &after) {
+                                            if claim_paths(
+                                                gate.claims,
+                                                std::slice::from_ref(&path),
+                                                gate.index,
+                                            )
+                                            .is_none()
+                                                && !out.files_written.contains(&path)
+                                                && out.files_written.len() < 32
+                                            {
+                                                out.files_written.push(path);
+                                            }
+                                        }
+                                    }
+                                }
                                 if !changed.is_empty() {
                                     let list: Vec<String> = changed
                                         .iter()
