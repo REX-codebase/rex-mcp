@@ -71,3 +71,17 @@ is shared it is noted in the module docs.
   2 of 3,824 in opencode and 1 of 11,046 in Hermes flagged; all 3 are JSX
   prose like "1) item", and JSX notes are worded as possible. Gap left:
   no semantic (type/LSP) diagnostics, and no YAML/TOML check.
+- URL fetch. opencode `src/tool/webfetch.ts` (5 MB cap, format text/
+  markdown/html, permission `webfetch`); Hermes `tools/web_tools_extract.py`.
+  REX before: `web_search` only. REX now: `web_fetch`
+  (`crates/rex-providers/src/fetch.rs`) goes through REX-search's own
+  fetcher, which handles robots.txt, refuses private addresses on every hop,
+  and applies the redirect limit, body cap and HTML-to-text. REX also
+  refuses URLs that look like data channels before any request is made:
+  query over 256 chars, encoded-looking runs over 64 chars, embedded
+  credentials. Long pages are paged by char offset. Live smoke test
+  (ignored test `live_fetch_example_dot_com`) fetched example.com.
+  Gap left: no markdown/html output format.
+- Found while wiring this: `web_search` in the autonomous loop sends
+  `seeds: []`, so with the built-in keyless REX provider it has no seeds to
+  crawl. Not changed yet.

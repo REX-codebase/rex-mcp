@@ -297,6 +297,13 @@ pub(super) fn run_explore<T: Transport>(
                     "web_search is not available to the explorer".into(),
                     false,
                 ),
+                AgentCall::WebFetch { id, .. } => (
+                    "web_fetch".into(),
+                    id,
+                    json!({}),
+                    "web_fetch is not available to the explorer".into(),
+                    false,
+                ),
                 AgentCall::Explore { id, .. } => (
                     "explore".into(),
                     id,
