@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ToolApproval } from "./ToolApproval";
 import { ActivityTimeline } from "./ActivityTimeline";
+import { RunMeters, runMeters } from "./RunMeters";
 import {
   agentAnswer,
   agentAnswerMany,
@@ -187,11 +188,11 @@ export function AgentRunView({
 
   return (
     <section className="live-run agent-run" aria-label="Autonomous run">
-      <div className="live-status" role="status">
-        <span className={`live-dot ${working ? "is-live" : ""}`} aria-hidden="true" />
-        <span className="eyebrow">Agent loop</span>
-        <span className="live-status-text">
-          {terminal
+      <header className="run-head">
+        <div className="run-head-row" role="status">
+          <span className={`live-dot ${working ? "is-live" : ""}`} aria-hidden="true" />
+          <span className="run-head-status">
+            {terminal
             ? terminalLabel(terminal)
             : phase === "approval"
               ? "Waiting on your approval"
@@ -202,32 +203,27 @@ export function AgentRunView({
                 : phase === "verifying"
                   ? "Verifying the work…"
                   : run.model
-                    ? `${run.model} · step ${run.step}/${run.max_steps}`
+                    ? "Working"
                     : "Contacting the live model catalog…"}
-        </span>
-        {(working || phase === "approval" || phase === "plan" || phase === "question") && (
-          <button type="button" className="agent-cancel" onClick={onCancel} disabled={cancelling}>
-            {cancelling ? "Cancelling…" : "Cancel"}
-          </button>
-        )}
-      </div>
-      {custody && (
-        <p className="custody-line">
-          Custody {custody.phase.replace(/_/g, " ")} · operator {custody.operator} · grant {custody.grantId.slice(0, 18)}
+          </span>
+          {(working || phase === "approval" || phase === "plan" || phase === "question") && (
+            <button type="button" className="agent-cancel" onClick={onCancel} disabled={cancelling}>
+              {cancelling ? "Cancelling…" : "Cancel"}
+            </button>
+          )}
+        </div>
+        {/* Provenance: which engine produced this run. Stated on the run itself,
+            never inferred from the transport badge in the top bar. */}
+        <p className="run-head-meta">
+          <span className="engine-line">Engine · model <b>{run.provider}/{run.model || "resolving…"}</b></span>
+          {custody && (
+            <span className="custody-line">
+              Custody {custody.phase.replace(/_/g, " ")} · operator {custody.operator} · grant {custody.grantId.slice(0, 18)}
+            </span>
+          )}
         </p>
-      )}
-      {/* Provenance: which engine produced this run. Stated on the run itself,
-          never inferred from the transport badge in the top bar. */}
-      <p className="engine-line">
-        Engine · model <b>{run.provider}/{run.model || "resolving…"}</b>
-      </p>
-
-      <div className="agent-budgets" aria-label="Budgets">
-        <span>Step {run.step}/{run.max_steps}</span>
-        <span>Tools {run.tool_calls}/{run.max_tool_calls}</span>
-        <span>Tokens {formatTokens(run.tokens_used)}/{formatTokens(run.max_tokens)}</span>
-        <span>{formatClock(run.elapsed_ms)} / {formatClock(run.max_wall_ms)}</span>
-      </div>
+        <RunMeters meters={runMeters(run)} />
+      </header>
 
       {run.plan.length > 0 && (
         <ol className="agent-plan" aria-label="Todo plan">

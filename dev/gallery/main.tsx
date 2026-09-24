@@ -31,10 +31,11 @@ const base: AgentSnapshot = {
   preview: null, completion_summary: null, error: null,
 };
 
-const approval: AgentSnapshot = { ...base, status: "awaiting_approval", pending_approval: { call_id: "c6", tool: "run_command", summary: "npm test -- --run", risk: "medium" as never, approval_required: true, policy_reason: "Commands run with your user permissions." } };
+const approval: AgentSnapshot = { ...base, status: "awaiting_approval", pending_approval: { call_id: "c6", tool: "run_command", summary: "npm test -- --run", risk: "execute", approval_required: true, policy_reason: "Commands run with your user permissions." } };
 const done: AgentSnapshot = { ...base, status: "completed", terminal_reason: { kind: "completed" }, plan: base.plan.map((p) => ({ ...p, status: "done" })), completion_summary: "Renamed 3 imports across 3 files. Type check and 41 tests pass.", events: [...base.events, fin("c6", "edit_file", "src/pages/Hero.tsx", { bytes_written: 990, diff: "@@ -2 +2 @@\n-import pexels from \"pexels\";\n+import pexels from \"stocksnap\";" }), fin("c7", "run_command", null, { command: ["npm", "test", "--", "--run"], exit_code: 0, duration_ms: 8100 }, true, "Tests 41 passed (41)"), { state: "gate_result", attempt: 1, passed: true, failures: [] }] };
 
-const states: Record<string, AgentSnapshot> = { running: base, approval, done };
+const limit: AgentSnapshot = { ...base, step: 21, tool_calls: 72, tokens_used: 201000, elapsed_ms: 512000 };
+const states: Record<string, AgentSnapshot> = { running: base, approval, done, limit };
 const which = new URLSearchParams(location.search).get("s") ?? "running";
 const noop = () => undefined;
 ReactDOM.createRoot(document.getElementById("root")!).render(
