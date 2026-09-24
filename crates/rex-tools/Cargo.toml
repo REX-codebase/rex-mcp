@@ -16,4 +16,8 @@ syn = { version = "2", default-features = false, features = ["full", "parsing"] 
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
 # Python syntax check (MIT, Astral)
 ruff_python_parser = "0.0.14"
+# JS/TS syntax check (MIT)
+oxc_parser = "0.151"
+oxc_allocator = "0.151"
+oxc_span = "0.151"
 saphyr-parser = "0.1"

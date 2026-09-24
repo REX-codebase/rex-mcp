@@ -92,6 +92,23 @@ pub fn check(path: &str, content: &str) -> Option<Vec<Finding>> {
                 found
             }
         }
+        Lang::Js => {
+            // The parser decides: a clean parse clears lexical false alarms
+            // (JSX prose like "1) item"); on a failed parse the delimiter
+            // wording is kept when it found something, since it names the
+            // unmatched bracket.
+            let jsx = path.ends_with(".jsx") || path.ends_with(".tsx");
+            let found = check_delimiters(content, Lang::Js, jsx);
+            let path = path.to_string();
+            let parsed = guarded_parse_with(content, move |c| {
+                js_parse_findings(&path, c).unwrap_or_default()
+            });
+            match parsed {
+                Some(p) if p.is_empty() => Vec::new(),
+                Some(p) if found.is_empty() => p,
+                _ => found,
+            }
+        }
         other => {
             let jsx = path.ends_with(".jsx") || path.ends_with(".tsx");
             check_delimiters(content, other, jsx)
@@ -116,16 +133,25 @@ fn check_rust_parse(content: &str) -> Vec<Finding> {
 /// deeper than `PARSE_MAX_DEPTH` (parsers and AST drops recurse per level,
 /// and a stack overflow aborts the whole process).
 fn guarded_parse(content: &str, parse: fn(&str) -> Vec<Finding>) -> Vec<Finding> {
+    guarded_parse_with(content, parse).unwrap_or_default()
+}
+
+/// Like `guarded_parse`, but `None` when the parse was skipped or failed to
+/// run, so callers can tell "clean" from "not checked".
+fn guarded_parse_with<F>(content: &str, parse: F) -> Option<Vec<Finding>>
+where
+    F: FnOnce(&str) -> Vec<Finding> + Send + 'static,
+{
     if nesting_depth(content) > PARSE_MAX_DEPTH {
-        return Vec::new();
+        return None;
     }
     let owned = content.to_string();
     let worker = std::thread::Builder::new()
         .stack_size(PARSE_STACK)
         .spawn(move || parse(&owned));
     match worker {
-        Ok(handle) => handle.join().unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(handle) => handle.join().ok(),
+        Err(_) => None,
     }
 }
 
@@ -140,18 +166,42 @@ fn python_parse_findings(content: &str) -> Vec<Finding> {
         Ok(_) => return Vec::new(),
         Err(e) => e,
     };
-    let offset = (u32::from(err.location.start()) as usize).min(content.len());
-    let offset = (0..=offset)
-        .rev()
-        .find(|&i| content.is_char_boundary(i))
-        .unwrap_or(0);
-    let before = &content[..offset];
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let (line, col) = line_col(content, u32::from(err.location.start()) as usize);
     vec![Finding {
-        line: before.matches('\n').count() + 1,
-        col: before[line_start..].chars().count() + 1,
+        line,
+        col,
         message: format!("Python syntax error: {}", err.error),
     }]
+}
+
+/// Full JavaScript/TypeScript parse (oxc_parser, MIT), JSX/TSX included,
+/// with the dialect taken from the file name. Hermes runs `node --check` on
+/// `.js` and single-file `tsc --noEmit` on `.ts`, skipping the latter when
+/// a language server claims the file (`tools/file_operations_lint.py:17-29`).
+/// Syntax only: no types, no resolution. `None` when the name maps to no
+/// dialect.
+fn js_parse_findings(path: &str, content: &str) -> Option<Vec<Finding>> {
+    let source_type = oxc_span::SourceType::from_path(path).ok()?;
+    let allocator = oxc_allocator::Allocator::default();
+    // CommonJS modules run inside a function wrapper, so a top-level
+    // `return` is valid there; snippets use it too.
+    let options = oxc_parser::ParseOptions {
+        allow_return_outside_function: true,
+        ..oxc_parser::ParseOptions::default()
+    };
+    let ret = oxc_parser::Parser::new(&allocator, content, source_type)
+        .with_options(options)
+        .parse();
+    let Some(d) = ret.diagnostics.first() else {
+        return Some(Vec::new());
+    };
+    let offset = d.labels.first().map_or(0, |l| l.offset() as usize);
+    let (line, col) = line_col(content, offset);
+    Some(vec![Finding {
+        line,
+        col,
+        message: format!("JS/TS syntax error: {}", d.message),
+    }])
 }
 
 const PARSE_MAX_DEPTH: usize = 128;
@@ -1383,6 +1433,42 @@ mod tests {
         // deep nesting is skipped instead of risking the stack
         let deep = format!("x = {}1 +{}\n", "(".repeat(500), ")".repeat(500));
         clean("a.py", &deep);
+    }
+
+    #[test]
+    fn js_ts_full_parse_catches_errors_and_clears_jsx_prose() {
+        let f = check("a.ts", "const a = 1;\nlet x = 1 +;\n").unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.starts_with("JS/TS syntax error"), "{f:?}");
+        assert_eq!((f[0].line, f[0].col), (2, 12), "{f:?}");
+        dirty("a.js", "const o = { a: 1 b: 2 };\n", "JS/TS syntax error");
+        dirty(
+            "a.ts",
+            "function f(x: number) { return x + }\n",
+            "JS/TS syntax error",
+        );
+        // TS syntax in a .js file is an error; in .ts it is fine
+        dirty("a.js", "let x: number = 1;\n", "JS/TS syntax error");
+        clean("a.ts", "let x: number = 1;\nexport type T<U> = U[];\n");
+        clean("a.d.ts", "declare function f(x: string): void;\n");
+        clean("a.mjs", "export const a = await import('./b.js');\n");
+        // CommonJS top-level return
+        clean("a.cjs", "if (!x) return;\nmodule.exports = 1;\n");
+        // JSX prose the lexical check would flag parses clean
+        clean(
+            "a.tsx",
+            "export const A = () => <ol><li>1) item</li></ol>;\n",
+        );
+        // unbalanced: the delimiter wording (naming the bracket) is kept
+        let f = check("a.js", "function f() {\n").unwrap();
+        assert!(!f.is_empty(), "{f:?}");
+        assert!(f.iter().all(|f| !f.message.contains("JS/TS")), "{f:?}");
+        // too deep to parse: the lexical result stands
+        let deep = format!("let x = {}1{};\n", "(".repeat(300), ")".repeat(300));
+        clean("a.js", &deep);
+        let deep_bad = format!("let x = {}1{};\n", "(".repeat(300), ")".repeat(299));
+        assert!(!check("a.js", &deep_bad).unwrap().is_empty());
+        assert!(js_parse_findings("a.unknownext", "x").is_none());
     }
 
     #[test]

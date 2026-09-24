@@ -472,3 +472,39 @@ is shared it is noted in the module docs.
   `unicode_names2-1.3.0/src/ngrams.py`, which is Python 2 code (a real
   error for Python 3). The sweep prints only the first 40 flags.
 - Gap left: no name, import or type errors (needs a type checker or an LSP).
+
+### Round 12e: full JavaScript/TypeScript parse after writes
+
+- Before: `.js/.jsx/.ts/.tsx/.mjs/.cjs/.mts/.cts` writes got only the
+  lexical bracket check. Balanced-but-wrong code (`let x = 1 +;`, a missing
+  comma in an object, TS types in a `.js` file) went through, and JSX prose
+  like "1) item" could raise a false alarm.
+- Hermes: `node --check` for `.js` and single-file `npx tsc --noEmit` for
+  `.ts`. It skips the tsc run when a language server claims the file,
+  because single-file tsc ignores tsconfig (`tools/file_operations_lint.py:17-29`).
+  Both need Node installed. opencode: LSP diagnostics with each edit when
+  a TS server is running (`src/tool/edit.ts:198-200`).
+- REX now (`js_parse_findings` in `crates/rex-tools/src/check.rs`): the
+  file is parsed with `oxc_parser` 0.151 (MIT; 32 new crates in Cargo.lock,
+  MIT and/or Apache-2.0, plus 4 ICU data crates under the permissive
+  Unicode-3.0 licence), with the dialect taken from
+  the file name (TS, JSX, `.d.ts`, module or script). A top-level `return`
+  is allowed (CommonJS runs inside a function wrapper). The parser decides
+  the result:
+  - A clean parse clears any lexical flag. This removes the JSX prose false
+    alarms.
+  - A failed parse reports the lexical finding if there is one (it names
+    the unmatched bracket), otherwise the parser's first error with line
+    and column.
+  - Files nested more than 128 deep are not parsed, so the lexical result
+    stands. The parse uses the same big-stack thread as the Rust and
+    Python parses.
+- Checked with a standalone build of the same parser: 7,257 of 7,257 JS/TS
+  files in this repo, opencode and Hermes parse.
+- Tests: 1 new unit test. Hand mutation: 8/8 killed.
+- False-alarm sweep: this repo 0 of 317, and opencode down from 2 to 0 of
+  3,926 (both old JSX prose flags cleared). Hermes 1 of 11,586 (the
+  non-Rust `d@rko.rs` text file from Round 12b; the old JSX flag cleared).
+  Cargo registry: 322 flags in total, the same count as before this change.
+  No JS/TS flags among the 40 printed.
+- Gap left: no type errors (needs tsc or an LSP).
