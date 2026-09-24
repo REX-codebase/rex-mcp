@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ToolApproval, ToolReceiptCard } from "./ToolApproval";
 import {
+  agentAnswer,
   agentCapture,
   agentPreviewAction,
+  agentUndo,
   type AgentSnapshot,
 } from "../data/agentRun";
 import {
@@ -53,6 +55,10 @@ function EventLine({ event }: { event: AgentEvent }) {
       return <li className="agent-event agent-event-wait">Plan proposed · {event.items.length} step{event.items.length === 1 ? "" : "s"} awaiting your approval</li>;
     case "plan_approval_resolved":
       return <li className="agent-event agent-event-wait">{event.approved ? "Plan approved · executing" : "Plan rejected · run stopped before any tool ran"}</li>;
+    case "question_asked":
+      return <li className="agent-event agent-event-wait">Question for you · {event.question.question.length > 140 ? `${event.question.question.slice(0, 140)}…` : event.question.question}</li>;
+    case "question_resolved":
+      return <li className="agent-event agent-event-wait">{event.answered ? "You answered · continuing" : "No answer · REX decides and states its assumption"}</li>;
     case "gate_result":
       return (
         <li className={`agent-event ${event.passed ? "agent-event-ok" : "agent-event-err"}`}>
@@ -91,6 +97,45 @@ export function AgentRunView({
   const canvasRef = useRef<HTMLDivElement>(null);
   const runId = run.id;
   const previewLive = run.preview != null;
+  const [answerText, setAnswerText] = useState("");
+  const [answering, setAnswering] = useState(false);
+  const [answerError, setAnswerError] = useState<string | null>(null);
+  const [undoing, setUndoing] = useState(false);
+  const [undoNote, setUndoNote] = useState<string | null>(null);
+  const questionId = run.pending_question?.call_id ?? null;
+
+  useEffect(() => {
+    // a new question starts with an empty box
+    setAnswerText("");
+    setAnswerError(null);
+  }, [questionId]);
+
+  const sendAnswer = useCallback(
+    async (text: string | null) => {
+      setAnswering(true);
+      setAnswerError(null);
+      try {
+        await agentAnswer(runId, text);
+      } catch (err) {
+        setAnswerError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setAnswering(false);
+      }
+    },
+    [runId]
+  );
+
+  const undoLast = useCallback(async () => {
+    setUndoing(true);
+    try {
+      const r = await agentUndo(runId);
+      setUndoNote(`Undid ${r.tool.replace(/_/g, " ")} · ${r.files.join(", ")}`);
+    } catch (err) {
+      setUndoNote(`Undo refused · ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setUndoing(false);
+    }
+  }, [runId]);
 
   useEffect(() => {
     setShot(run.preview?.desktop_shot ?? null);
@@ -150,6 +195,8 @@ export function AgentRunView({
             ? terminalLabel(terminal)
             : phase === "approval"
               ? "Waiting on your approval"
+              : phase === "question"
+                ? "REX has a question for you"
               : phase === "plan"
                 ? "Plan proposed · waiting on your approval"
                 : phase === "verifying"
@@ -158,7 +205,7 @@ export function AgentRunView({
                     ? `${run.model} · step ${run.step}/${run.max_steps}`
                     : "Contacting the live model catalog…"}
         </span>
-        {(working || phase === "approval" || phase === "plan") && (
+        {(working || phase === "approval" || phase === "plan" || phase === "question") && (
           <button type="button" className="agent-cancel" onClick={onCancel} disabled={cancelling}>
             {cancelling ? "Cancelling…" : "Cancel"}
           </button>
@@ -219,6 +266,40 @@ export function AgentRunView({
         </section>
       )}
 
+      {phase === "question" && run.pending_question && (
+        <section className="plan-approval question-panel" role="alertdialog" aria-labelledby="question-title">
+          <div className="tool-approval-head">
+            <span className="approval-shield" aria-hidden="true">?</span>
+            <div>
+              <p className="eyebrow">REX is asking</p>
+              <h3 id="question-title">{run.pending_question.question}</h3>
+            </div>
+          </div>
+          {run.pending_question.choices.length > 0 && (
+            <div className="question-choices">
+              {run.pending_question.choices.map((choice) => (
+                <button key={choice} type="button" disabled={answering} onClick={() => void sendAnswer(choice)}>
+                  {choice}
+                </button>
+              ))}
+            </div>
+          )}
+          <textarea
+            className="question-input"
+            aria-label="Your answer"
+            value={answerText}
+            maxLength={2000}
+            onChange={(e) => setAnswerText(e.target.value)}
+            placeholder="Or type your own answer"
+          />
+          {answerError && <p className="approval-note">{answerError}</p>}
+          <div className="approval-actions">
+            <button type="button" disabled={answering} onClick={() => void sendAnswer(null)} className="approval-deny">Let REX decide</button>
+            <button type="button" disabled={answering || !answerText.trim()} onClick={() => void sendAnswer(answerText)} className="approval-allow">{answering ? "Sending…" : "Send answer"}</button>
+          </div>
+        </section>
+      )}
+
       <ul className="agent-events" aria-label="Run events">
         {run.events.slice(-8).map((event, i) => (
           <EventLine key={i} event={event} />
@@ -236,6 +317,15 @@ export function AgentRunView({
           </summary>
           <ToolReceiptCard result={lastReceipt} />
         </details>
+      )}
+
+      {terminal && receipts.some((r) => r.result.ok && ["create_file", "edit_file", "apply_patch"].includes(r.result.tool)) && (
+        <div className="agent-undo">
+          <button type="button" disabled={undoing} onClick={() => void undoLast()}>
+            {undoing ? "Undoing…" : "Undo last file change"}
+          </button>
+          {undoNote && <span className="agent-undo-note">{undoNote}</span>}
+        </div>
       )}
 
       {phase === "completed" && run.completion_summary && (

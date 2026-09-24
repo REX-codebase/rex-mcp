@@ -48,6 +48,8 @@ export type AgentEvent =
   | { state: "approval_resolved"; call_id: string; approved: boolean }
   | { state: "plan_approval_required"; items: PlanItem[] }
   | { state: "plan_approval_resolved"; approved: boolean }
+  | { state: "question_asked"; question: PendingQuestion }
+  | { state: "question_resolved"; call_id: string; answered: boolean }
   | { state: "gate_result"; attempt: number; passed: boolean; failures: string[] }
   | { state: "retry"; attempt: number; reason: string }
   | { state: "info"; message: string };

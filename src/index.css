@@ -388,6 +388,12 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .plan-approval{margin:20px 0;border:1px solid color-mix(in srgb,#6aa8ff 42%,var(--color-line));border-radius:18px;background:color-mix(in srgb,#6aa8ff 7%,var(--color-surface));padding:20px;box-shadow:0 18px 45px rgba(0,0,0,.12)}
 .plan-approval .approval-shield{background:#6aa8ff;color:#0d1526}
 .plan-approval .approval-allow{background:#6aa8ff;color:#0d1526}
+.question-choices{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.question-choices button{border:1px solid var(--color-line);border-radius:999px;padding:6px 14px;background:var(--color-surface);cursor:pointer}
+.question-input{width:100%;min-height:64px;margin:8px 0;border:1px solid var(--color-line);border-radius:10px;padding:8px;font:inherit;background:var(--color-surface);color:inherit}
+.agent-undo{display:flex;align-items:center;gap:12px;margin:12px 0}
+.agent-undo button{border:1px solid var(--color-line);border-radius:10px;padding:6px 12px;font-size:13px;background:var(--color-surface);cursor:pointer}
+.agent-undo-note{font-size:.9em;opacity:.8}
 @media(max-width:520px){.plan-approval{padding:16px}}
 
 /* Autonomous agent loop */

@@ -156,3 +156,19 @@ is shared it is noted in the module docs.
   requests were in flight at once.
 - Gap left: children are still read-only; Hermes gives them the parent's
   toolsets and opencode lets the model pick agent types.
+
+## Round 5: YAML/TOML checks and app panels
+
+- Syntax check now covers TOML (full parse via the `toml` crate already in
+  Cargo.lock; messages carry no position text so shifted problems still
+  count as pre-existing) and YAML (REX's own conservative check: tab
+  indentation, unclosed or mismatched flow collections; block scalars and
+  brackets inside plain scalars such as `${{ x }}` are ignored). False-alarm
+  sweep: 0 YAML/TOML files flagged across this repo, opencode, Hermes and
+  the local cargo registry (630 YAML + 248 TOML files).
+- Gap left: YAML check is not a full parser (no duplicate-key or
+  indentation-structure errors); opencode's LSP route covers more.
+- App: AgentRunView shows the ask_user question (choices, free text, "Let
+  REX decide") and an "Undo last file change" button on finished runs that
+  wrote files. Covered by 2 vitest tests; rendered with the compiled theme
+  and checked visually.
