@@ -1260,3 +1260,22 @@ is shared it is noted in the module docs.
 - Gap left: a doomed write still claims its path for the batch, so a
   sibling sub-agent is kept off that file; the desktop app's approval
   path does not preflight.
+
+## Round 33: notes check folds Cyrillic and Greek look-alikes
+
+- Competitors: Hermes's threat scan applies NFKC only and says in its
+  code that it does not fold cross-script look-alikes such as Cyrillic
+  "а" (`tools/threat_patterns.py`). opencode has no notes scan.
+- REX before: same as Hermes (Round 23): "іgnore previous instructions"
+  with a Cyrillic "і" passed the check and could be stored as a note that
+  goes into every later prompt.
+- REX now: after NFKC and before lower-casing, a hand-picked list of 52
+  Cyrillic and Greek letters that pass for Latin are mapped to that
+  Latin letter. Russian or Greek notes still pass.
+- Tests: mixed-script payloads for three checks (override, system
+  prompt, approval bypass), an upper-case case that only works if
+  folding comes before lower-casing, every mapped pair, unmapped letters
+  unchanged, plain Russian and Greek notes pass. Hand mutation: 5/5
+  killed (the folding-order mutant survived at first; a test was added).
+- Gap left: not the full Unicode confusables table (Armenian,
+  Cherokee, math letters outside NFKC and similar are not folded).
