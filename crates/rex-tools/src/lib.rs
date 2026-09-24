@@ -294,6 +294,45 @@ pub struct ToolRuntime {
     seen: Arc<Mutex<HashMap<PathBuf, u64>>>,
     /// Optional on-disk write journal enabling undo (see `journal`).
     journal: Option<Arc<journal::Journal>>,
+    /// When set, `read_file` on a PNG/JPEG/GIF/WebP image succeeds and
+    /// queues the image for the run host to attach to the next model turn
+    /// (see [`ToolRuntime::take_images`]). Off by default: a caller that
+    /// cannot show images to a model gets the plain binary-file error.
+    images: Option<Arc<Mutex<Vec<ImageRead>>>>,
+}
+
+/// One image read through `read_file`, waiting to be shown to the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRead {
+    /// Workspace-relative path as the model asked for it.
+    pub path: String,
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+/// Largest image `read_file` will queue. Kept so the base64 form stays
+/// under 5 MB, the per-image limit Anthropic documents.
+pub const MAX_IMAGE_BYTES: u64 = 3_750_000;
+
+/// Most images queued for one model turn; a further read in the same turn
+/// is refused so the model knows it was not attached.
+pub const MAX_QUEUED_IMAGES: usize = 3;
+
+/// Image kind from the file's magic bytes, never from its name, so a text
+/// file called `x.png` is still read as text.
+pub fn sniff_image(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 /// How a run reaches third-party MCP servers. Implemented by the run host
@@ -327,7 +366,23 @@ impl ToolRuntime {
             mcp: None,
             seen: Arc::new(Mutex::new(HashMap::new())),
             journal: None,
+            images: None,
         })
+    }
+
+    /// Let `read_file` return images for the run host to attach to the next
+    /// model turn instead of refusing them as binary.
+    pub fn with_image_reads(mut self) -> Self {
+        self.images = Some(Arc::new(Mutex::new(Vec::new())));
+        self
+    }
+
+    /// Images queued by `read_file` since the last call, oldest first.
+    pub fn take_images(&self) -> Vec<ImageRead> {
+        match &self.images {
+            Some(q) => std::mem::take(&mut *q.lock().expect("image queue poisoned")),
+            None => Vec::new(),
+        }
     }
 
     /// Attach the run's live MCP sessions. Without this, `mcp_call` requests
@@ -858,6 +913,9 @@ impl ToolRuntime {
                 ErrorKind::InvalidRequest,
                 "target is not a regular file",
             ));
+        }
+        if let Some(done) = self.read_image(path, &target, meta.len())? {
+            return Ok(done);
         }
         let paged = offset.is_some() || limit.is_some() || meta.len() > RAW_READ_BYTES;
         if !paged {
@@ -1578,6 +1636,63 @@ impl ToolRuntime {
                 format!("failed to spawn scoring command '{}' ({e}){hint}", argv[0])
             }
         })
+    }
+
+    /// `read_file` of an image when image reads are on: queue the bytes and
+    /// tell the model where they will show up. `None` means "not an image
+    /// (or image reads are off); read it as text".
+    fn read_image(
+        &self,
+        path: &str,
+        target: &Path,
+        len: u64,
+    ) -> Result<Option<ExecData>, ToolError> {
+        let Some(queue) = &self.images else {
+            return Ok(None);
+        };
+        let mut head = [0u8; 12];
+        let n = File::open(target)
+            .and_then(|mut f| f.read(&mut head))
+            .map_err(io_err)?;
+        let Some(mime) = sniff_image(&head[..n]) else {
+            return Ok(None);
+        };
+        if len > MAX_IMAGE_BYTES {
+            return Err(err(
+                ErrorKind::TooLarge,
+                &format!("{mime} image is {len} bytes; images over {MAX_IMAGE_BYTES} bytes are not attached"),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(len as usize);
+        File::open(target)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .map_err(io_err)?;
+        // re-check what was actually read, not the earlier peek
+        if sniff_image(&bytes) != Some(mime) || bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return Err(err(
+                ErrorKind::InvalidRequest,
+                "image changed while it was being read",
+            ));
+        }
+        let read = bytes.len() as u64;
+        let mut queued = queue.lock().expect("image queue poisoned");
+        if queued.len() >= MAX_QUEUED_IMAGES {
+            return Err(err(
+                ErrorKind::InvalidRequest,
+                &format!("{MAX_QUEUED_IMAGES} images are already attached to the next turn; read more after it"),
+            ));
+        }
+        queued.push(ImageRead {
+            path: path.to_string(),
+            mime,
+            bytes,
+        });
+        Ok(Some(exec(
+            Some(format!(
+                "{mime} image, {read} bytes. The image itself is attached to your next turn."
+            )),
+            receipt(&self.root, Some(target), read, 0),
+        )))
     }
 
     fn resolve_existing(&self, raw: &str, allow_dir: bool) -> Result<PathBuf, ToolError> {
@@ -3221,6 +3336,87 @@ mod tests {
             overwrite: false,
         };
         assert_eq!(standing_key(&write), None);
+    }
+
+    #[test]
+    fn image_reads_queue_real_images_only_when_turned_on() {
+        let dir = temp();
+        let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8, 0, 0, 13, 1, 2, 3]].concat();
+        fs::write(dir.join("shot.png"), &png).unwrap();
+        fs::write(dir.join("fake.png"), "just text\n").unwrap();
+        let read = |rt: &ToolRuntime, path: &str| {
+            let p = rt
+                .prepare(ToolRequest::ReadFile {
+                    path: path.into(),
+                    offset: None,
+                    limit: None,
+                })
+                .unwrap();
+            rt.execute(&p.call_id)
+        };
+
+        // off by default: still the binary-file refusal, nothing queued
+        let plain = ToolRuntime::new(&dir).unwrap();
+        let r = read(&plain, "shot.png");
+        assert!(!r.ok);
+        assert!(r.error.unwrap().detail.contains("binary file"));
+        assert!(plain.take_images().is_empty());
+
+        let rt = ToolRuntime::new(&dir).unwrap().with_image_reads();
+        let r = read(&rt, "shot.png");
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.output.unwrap();
+        assert!(out.starts_with("image/png image, 15 bytes"), "{out}");
+        assert_eq!(r.receipt.bytes_read, 15);
+        // a text file named .png is read as text: magic bytes decide
+        let r = read(&rt, "fake.png");
+        assert_eq!(r.output.as_deref(), Some("just text\n"));
+        let queued = rt.take_images();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].path, "shot.png");
+        assert_eq!(queued[0].mime, "image/png");
+        assert_eq!(queued[0].bytes, png);
+        // taking drains the queue
+        assert!(rt.take_images().is_empty());
+
+        // over the cap: refused, not queued
+        let mut big = png.clone();
+        big.resize(MAX_IMAGE_BYTES as usize + 1, 0);
+        fs::write(dir.join("big.png"), &big).unwrap();
+        let r = read(&rt, "big.png");
+        assert!(!r.ok);
+        assert!(r.error.unwrap().detail.contains("not attached"));
+        assert!(rt.take_images().is_empty());
+        // exactly at the cap is fine
+        big.truncate(MAX_IMAGE_BYTES as usize);
+        fs::write(dir.join("big.png"), &big).unwrap();
+        assert!(read(&rt, "big.png").ok);
+        assert_eq!(rt.take_images().len(), 1);
+
+        // at most MAX_QUEUED_IMAGES per turn; the next read says so
+        for _ in 0..MAX_QUEUED_IMAGES {
+            assert!(read(&rt, "shot.png").ok);
+        }
+        let r = read(&rt, "shot.png");
+        assert!(!r.ok);
+        assert!(r.error.unwrap().detail.contains("already attached"));
+        assert_eq!(rt.take_images().len(), MAX_QUEUED_IMAGES);
+        assert!(read(&rt, "shot.png").ok, "a new turn starts empty");
+    }
+
+    #[test]
+    fn sniff_image_uses_magic_bytes() {
+        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff_image(b"GIF87a..."), Some("image/gif"));
+        assert_eq!(sniff_image(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(sniff_image(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_image(b"RIFF\0\0\0\0WAVEfmt "), None);
+        assert_eq!(sniff_image(b"RIFF"), None);
+        assert_eq!(sniff_image(b"\x89PNG\r\n"), None);
+        assert_eq!(sniff_image(&[0xFF, 0xD8]), None);
+        assert_eq!(sniff_image(b"<svg xmlns"), None);
+        assert_eq!(sniff_image(b""), None);
     }
 
     #[test]

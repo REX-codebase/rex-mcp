@@ -16,6 +16,7 @@ rex-tools = { path = "../rex-tools" }
 rex-search = { path = "../rex-search" }
 rex-preview = { path = "../rex-preview" }
 url = "2"
+base64 = { workspace = true }
 
 
 [dev-dependencies]

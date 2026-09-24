@@ -1671,7 +1671,8 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             // failure leaves the run working, just without undo.
             let t = ToolRuntime::new(&ctx.workspace)
                 .and_then(|j| j.with_journal(ctx.state_dir.join("journal")))
-                .unwrap_or(t);
+                .unwrap_or(t)
+                .with_image_reads();
             match &ctx.mcp_caller {
                 Some(caller) => t.with_mcp_caller(caller.clone()),
                 None => t,
@@ -1919,6 +1920,8 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             project.as_ref(),
             user_rules.as_ref(),
         );
+        // Images read_file queued last turn ride on this turn only.
+        let (wire_images, evidence_images) = WireImage::from_reads(&tools.take_images());
         let request_body = build_request(
             protocol,
             &model,
@@ -1926,13 +1929,27 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             &state_msg,
             cp.last_pair.as_ref(),
             &ctx.mcp_tools,
+            &wire_images,
         );
+        let evidence_body = if wire_images.is_empty() {
+            request_body.clone()
+        } else {
+            build_request(
+                protocol,
+                &model,
+                &ctx.system_prompt,
+                &state_msg,
+                cp.last_pair.as_ref(),
+                &ctx.mcp_tools,
+                &evidence_images,
+            )
+        };
         let turn_no = cp.step + 1;
         let _ = fs::write(
             ctx.state_dir
                 .join("evidence")
                 .join(format!("turn-{turn_no}-request.json")),
-            &request_body,
+            &evidence_body,
         );
 
         // ---- provider turn with bounded retry/backoff --------------------
@@ -1966,7 +1983,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         cp.step += 1;
         let (usage_total, response_text) =
             (usage_tokens(protocol, &response), response.len() as u64);
-        cp.tokens_used += usage_total.unwrap_or((request_body.len() as u64 + response_text) / 4);
+        cp.tokens_used += usage_total.unwrap_or((evidence_body.len() as u64 + response_text) / 4);
         if let Some(l) = ledger.as_mut() {
             l.append(
                 "model_turn",
@@ -2317,6 +2334,74 @@ pub fn role_prompt_identity(role: Role) -> (String, String) {
     (version, hash)
 }
 
+/// An image `read_file` queued last turn, ready for the wire. `data` is
+/// base64, or a short placeholder in the copy written to evidence.
+struct WireImage {
+    label: String,
+    mime: &'static str,
+    data: String,
+}
+
+impl WireImage {
+    /// Wire form and evidence form (image bytes left out of evidence).
+    fn from_reads(reads: &[rex_tools::ImageRead]) -> (Vec<WireImage>, Vec<WireImage>) {
+        use base64::Engine as _;
+        let label = |r: &rex_tools::ImageRead| format!("Image from read_file {}:", r.path);
+        let wire = reads
+            .iter()
+            .map(|r| WireImage {
+                label: label(r),
+                mime: r.mime,
+                data: base64::engine::general_purpose::STANDARD.encode(&r.bytes),
+            })
+            .collect();
+        let evidence = reads
+            .iter()
+            .map(|r| WireImage {
+                label: label(r),
+                mime: r.mime,
+                data: format!("<{} image bytes omitted from evidence>", r.bytes.len()),
+            })
+            .collect();
+        (wire, evidence)
+    }
+}
+
+/// The turn's user message: the state text, then any images read last
+/// turn, each after a label naming its file. Verified shapes: Gemini
+/// `inlineData`, Anthropic base64 `image` blocks, OpenAI `image_url` data
+/// URLs (the same forms Hermes' adapters emit).
+fn user_content(protocol: ProviderProtocol, state_msg: &str, images: &[WireImage]) -> Value {
+    let mut parts = vec![match protocol {
+        ProviderProtocol::Gemini => json!({"text": state_msg}),
+        _ => json!({"type":"text","text": state_msg}),
+    }];
+    for img in images {
+        match protocol {
+            ProviderProtocol::Gemini => {
+                parts.push(json!({"text": img.label}));
+                parts.push(json!({"inlineData":{"mimeType": img.mime,"data": img.data}}));
+            }
+            ProviderProtocol::Anthropic => {
+                parts.push(json!({"type":"text","text": img.label}));
+                parts.push(json!({"type":"image","source":{
+                    "type":"base64","media_type": img.mime,"data": img.data}}));
+            }
+            ProviderProtocol::OpenAiCompatible => {
+                parts.push(json!({"type":"text","text": img.label}));
+                parts.push(json!({"type":"image_url","image_url":{
+                    "url": format!("data:{};base64,{}", img.mime, img.data)}}));
+            }
+        }
+    }
+    match protocol {
+        ProviderProtocol::Gemini => Value::Array(parts),
+        // plain string when there is nothing to attach, as before
+        _ if images.is_empty() => json!(state_msg),
+        _ => Value::Array(parts),
+    }
+}
+
 fn build_request(
     protocol: ProviderProtocol,
     model: &str,
@@ -2324,10 +2409,12 @@ fn build_request(
     state_msg: &str,
     prev: Option<&TurnPair>,
     mcp_tools: &[ExtTool],
+    images: &[WireImage],
 ) -> String {
+    let user = user_content(protocol, state_msg, images);
     match protocol {
         ProviderProtocol::Gemini => {
-            let mut contents = vec![json!({"role":"user","parts":[{"text": state_msg}]})];
+            let mut contents = vec![json!({"role":"user","parts": user})];
             if let Some(pair) = prev {
                 if !pair.model_parts.is_empty() {
                     contents.push(json!({"role":"model","parts": pair.model_parts}));
@@ -2352,7 +2439,7 @@ fn build_request(
                     messages.push(json!({"role":"user","content":pair.response_parts}));
                 }
             }
-            messages.push(json!({"role":"user","content":state_msg}));
+            messages.push(json!({"role":"user","content": user}));
             json!({"model":model,"max_tokens":8192,"temperature":0.2,
                 "system":system,
                 "messages":messages,"tools":anthropic_tool_definitions_with(mcp_tools)})
@@ -2366,7 +2453,7 @@ fn build_request(
                 }
                 messages.extend(pair.response_parts.clone());
             }
-            messages.push(json!({"role":"user","content":state_msg}));
+            messages.push(json!({"role":"user","content": user}));
             json!({"model":model,"messages":messages,"tools":openai_tool_definitions_with(mcp_tools),
                 "tool_choice":"auto","temperature":0.2,"max_tokens":8192})
             .to_string()
@@ -2377,7 +2464,7 @@ fn build_request(
 fn gemini_tool_definitions() -> Value {
     json!([{"functionDeclarations":[
         {"name":"update_plan","description":"Replace the visible todo plan. Keep 2-8 items; one in_progress at a time.","parameters":{"type":"OBJECT","properties":{"items":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"id":{"type":"STRING"},"title":{"type":"STRING"},"status":{"type":"STRING","enum":["pending","in_progress","done","blocked"]},"note":{"type":"STRING"}},"required":["id","title","status"]}}},"required":["items"]}},
-        {"name":"read_file","description":"Read a file inside the selected workspace. Small files return exact text; large files, or any call with offset/limit, return numbered lines with a footer saying where to continue. A directory path returns its listing.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"offset":{"type":"INTEGER","description":"1-based first line"},"limit":{"type":"INTEGER","description":"max lines (default 2000)"}},"required":["path"]}},
+        {"name":"read_file","description":"Read a file inside the selected workspace. Small files return exact text; large files, or any call with offset/limit, return numbered lines with a footer saying where to continue. A directory path returns its listing. A PNG, JPEG, GIF or WebP image (up to 3.75 MB, 3 per turn) is attached to your next turn where the run supports images; elsewhere it is refused as binary.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"offset":{"type":"INTEGER","description":"1-based first line"},"limit":{"type":"INTEGER","description":"max lines (default 2000)"}},"required":["path"]}},
         {"name":"create_file","description":"Create a file inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"content":{"type":"STRING"},"overwrite":{"type":"BOOLEAN"}},"required":["path","content","overwrite"]}},
         {"name":"edit_file","description":"Replace text in a workspace file. Copy `expected` from the file; exact match is tried first, then a unique indentation/whitespace-tolerant match, and a miss reports the closest region. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"expected":{"type":"STRING"},"replacement":{"type":"STRING"},"replace_all":{"type":"BOOLEAN"}},"required":["path","expected","replacement","replace_all"]}},
         {"name":"search_files","description":"Search file contents inside the workspace. Literal case-insensitive by default; set regex=true for a regular expression. Skips .git, build output, node_modules and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"},"regex":{"type":"BOOLEAN"},"include":{"type":"STRING","description":"glob such as *.rs or src/**/*.{ts,tsx}"}},"required":["query"]}},
@@ -5015,6 +5102,7 @@ mod tests {
             "state",
             Some(&pair),
             &[],
+            &[],
         );
         assert!(request.contains("tool_result"));
         assert!(request.contains("toolu_2"));
@@ -5053,6 +5141,7 @@ mod tests {
             "state",
             Some(&pair),
             &[],
+            &[],
         );
         assert!(request.contains("tool_call_id"));
         assert!(request.contains("call_42"));
@@ -5068,6 +5157,7 @@ mod tests {
             "state",
             None,
             &[],
+            &[],
         );
 
         let openai = build_request(
@@ -5076,6 +5166,7 @@ mod tests {
             "sys",
             "state",
             None,
+            &[],
             &[],
         );
 
@@ -5399,6 +5490,130 @@ mod tests {
             "stale read of f1 was summarized: {targets:?}"
         );
         assert!(targets[0].ends_with("f2.txt"), "{targets:?}");
+    }
+
+    #[test]
+    fn images_ride_on_the_state_message_in_each_protocol_shape() {
+        let reads = vec![rex_tools::ImageRead {
+            path: "ui/shot.png".into(),
+            mime: "image/png",
+            bytes: vec![1, 2, 3],
+        }];
+        let (wire, evidence) = WireImage::from_reads(&reads);
+        assert_eq!(wire[0].data, "AQID");
+        assert!(evidence[0].data.contains("3 image bytes omitted"));
+        let req = |p: ProviderProtocol, imgs: &[WireImage]| -> Value {
+            serde_json::from_str(&build_request(p, "m", "sys", "state", None, &[], imgs)).unwrap()
+        };
+
+        let g = req(ProviderProtocol::Gemini, &wire);
+        let parts = &g["contents"][0]["parts"];
+        assert_eq!(parts[0]["text"], "state");
+        assert_eq!(parts[1]["text"], "Image from read_file ui/shot.png:");
+        assert_eq!(parts[2]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[2]["inlineData"]["data"], "AQID");
+
+        let a = req(ProviderProtocol::Anthropic, &wire);
+        let last = a["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"][0]["text"], "state");
+        assert_eq!(last["content"][2]["type"], "image");
+        assert_eq!(last["content"][2]["source"]["type"], "base64");
+        assert_eq!(last["content"][2]["source"]["media_type"], "image/png");
+        assert_eq!(last["content"][2]["source"]["data"], "AQID");
+
+        let o = req(ProviderProtocol::OpenAiCompatible, &wire);
+        let last = o["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["content"][2]["type"], "image_url");
+        assert_eq!(
+            last["content"][2]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
+
+        // without images the shapes are exactly as before
+        let a = req(ProviderProtocol::Anthropic, &[]);
+        assert_eq!(a["messages"][0]["content"], "state");
+        let o = req(ProviderProtocol::OpenAiCompatible, &[]);
+        assert_eq!(o["messages"][1]["content"], "state");
+        let g = req(ProviderProtocol::Gemini, &[]);
+        assert_eq!(g["contents"][0]["parts"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_read_image_is_shown_to_the_model_once_and_kept_out_of_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        let ws = root.join("runs").join("img-ws");
+        fs::create_dir_all(&ws).unwrap();
+        let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8, 0, 0, 13, 7, 7, 7]].concat();
+        fs::write(ws.join("shot.png"), &png).unwrap();
+        let script = vec![
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_file","args":{"path":"shot.png"}}}),
+            ]),
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_file","args":{"path":"shot.png","limit":1}}}),
+            ]),
+            text_turn("done"),
+            text_turn("done"),
+            text_turn("done"),
+        ];
+        let svc = Arc::new(service(&root, Script::new(script)));
+        let snap = svc
+            .begin_in_workspace_with_options(
+                "look at the screenshot",
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws),
+                Role::Worker,
+                RunOptions::default(),
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 20_000);
+        assert!(done.events.iter().any(|e| matches!(e,
+            AgentEvent::ToolFinished { result } if result.ok && result.tool == "read_file"
+                && result.output.as_deref().unwrap_or("").starts_with("image/png image, 15 bytes"))));
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let posts = svc.service.transport().seen();
+        let with_image: Vec<usize> = posts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.contains(&b64))
+            .map(|(i, _)| i)
+            .collect();
+        // turn 2 carries the first read, turn 3 the second; never later
+        assert_eq!(with_image, vec![1, 2], "posts: {}", posts.len());
+        let second: Value = serde_json::from_str(&posts[1]).unwrap();
+        let parts = &second["contents"][0]["parts"];
+        assert_eq!(parts[1]["text"], "Image from read_file shot.png:");
+        assert_eq!(parts[2]["inlineData"]["data"], b64.as_str());
+        assert!(posts.len() > 3 && !posts[3].contains(&b64));
+        // evidence files record the request without the image bytes
+        let mut evidence = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("turn-") && n.ends_with("-request.json"))
+                {
+                    evidence.push(fs::read_to_string(&p).unwrap());
+                }
+            }
+        }
+        assert!(evidence.len() >= 3);
+        assert!(evidence.iter().all(|e| !e.contains(&b64)));
+        assert!(evidence
+            .iter()
+            .any(|e| e.contains("15 image bytes omitted from evidence")));
     }
 
     #[test]
@@ -5779,6 +5994,7 @@ mod tests {
             "state",
             None,
             &[],
+            &[],
         );
 
         let value: Value = serde_json::from_str(&request).unwrap();
@@ -5797,6 +6013,7 @@ mod tests {
             "state",
             None,
             &[],
+            &[],
         );
         assert!(anthropic.contains("REX CONSTITUTION"));
         let openai = build_request(
@@ -5805,6 +6022,7 @@ mod tests {
             &system,
             "state",
             None,
+            &[],
             &[],
         );
 
@@ -5874,7 +6092,7 @@ mod tests {
             ProviderProtocol::Anthropic,
             ProviderProtocol::OpenAiCompatible,
         ] {
-            let body = build_request(protocol, "m", "sys", "state", None, &tools);
+            let body = build_request(protocol, "m", "sys", "state", None, &tools, &[]);
             assert!(
                 body.contains("\"mcp_call\""),
                 "protocol {protocol:?} must declare mcp_call"
@@ -5885,7 +6103,7 @@ mod tests {
             ProviderProtocol::Anthropic,
             ProviderProtocol::OpenAiCompatible,
         ] {
-            let body = build_request(protocol, "m", "sys", "state", None, &[]);
+            let body = build_request(protocol, "m", "sys", "state", None, &[], &[]);
             assert!(
                 !body.contains("mcp_call"),
                 "protocol {protocol:?} must not declare mcp_call without servers"

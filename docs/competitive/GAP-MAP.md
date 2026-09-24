@@ -595,3 +595,41 @@ is shared it is noted in the module docs.
   command that passes the policy already needs approval).
 - Gap left: the dev sidecar (`rex-mcp` dev route) has no route for it, so
   the button is desktop-only. MCP work is parked.
+
+## Round 14: the model can look at images in the workspace
+
+- Competitors: opencode's `read` tool returns PNG/JPEG/GIF/WebP files as
+  image attachments (`packages/opencode/src/tool/read.ts`,
+  `SUPPORTED_IMAGE_MIMES`). Hermes has `vision_analyze`
+  (`tools/vision_tools.py`), which attaches images natively to a
+  vision-capable model or sends them to a helper model.
+- REX before: `read_file` refused every image as a binary file, so the
+  model could not look at a screenshot, mockup or chart in the workspace.
+- REX now (`with_image_reads` / `take_images` / `sniff_image` in
+  `crates/rex-tools/src/lib.rs`, `WireImage` / `user_content` in
+  `crates/rex-providers/src/autonomous.rs`):
+  - In autonomous runs, `read_file` on a PNG, JPEG, GIF or WebP returns a
+    short note ("image/png image, N bytes ...") and queues the image.
+  - The next model turn carries it after the state message, with a label
+    naming the file. Formats: Gemini `inlineData`, Anthropic base64
+    `image` blocks, OpenAI `image_url` data URLs (the same shapes Hermes'
+    adapters emit, `agent/gemini_native_adapter.py`,
+    `agent/anthropic_message_convert.py`). It is sent on that one turn
+    only, so image tokens don't pile up.
+  - The kind comes from magic bytes, never from the file name, so a text
+    file named `x.png` is still read as text. Limits: 3.75 MB per image
+    (keeps base64 under Anthropic's 5 MB per-image limit), 3 per turn. A
+    read over either limit is refused with a clear message, not dropped
+    silently.
+  - Evidence files record the request with the image bytes replaced by a
+    placeholder, and the token estimate uses that copy.
+  - Other callers (explorer children, CLI tools) keep the binary-file
+    refusal, and the tool description says so.
+- Tests: 2 rex-tools tests (queueing, off by default, name vs magic bytes,
+  size cap, queue cap, draining; magic-byte sniffing) and 2 loop tests
+  (all 3 wire shapes plus unchanged shapes with no image; a run where the
+  image reaches the next request only, and never reaches evidence). Hand
+  mutation: 12/12 killed.
+- Gap left: a model without image input will reject the request. REX
+  does not yet know which models take images, so it cannot fall back to
+  text. SVG is not rasterised (Hermes does rasterise it).
