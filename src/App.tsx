@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { TopBar } from "./components/TopBar";
+import { BackendBadge, TopBar } from "./components/TopBar";
 import { Composer } from "./components/Composer";
 import { StateRail } from "./components/StateRail";
 import { SessionView } from "./components/SessionView";
@@ -664,10 +664,13 @@ export default function App() {
         </div>
       )}
       <div className="ultra-atmosphere" aria-hidden="true"><span className="ultra-horizon" /><span className="ultra-scan" /></div>
-      <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={toggleFast} live={liveCapable} />
+      <TopBar view={view} onView={setView} ultra={ultra} onUltra={() => { setUltra((v) => !v); setUltraPulse((v) => v + 1); }} fast={fast} onFast={toggleFast} />
       <div className="ultra-status" role="status" aria-live="polite"><span>ULTRA</span><b>{ultra ? "Verification tier engaged" : "Verification tier offline"}</b><small>{ultra ? "Contract, adversary and clean-room judge active" : "No extra capabilities are active"}</small></div>
       <div className="mx-auto w-full max-w-[820px] px-5 pt-3 sm:px-8">
-        <OperatorModeChip mode={operatorMode} onSwitch={chooseOperatorMode} />
+        <div className="status-row">
+          <OperatorModeChip mode={operatorMode} onSwitch={chooseOperatorMode} />
+          <BackendBadge live={liveCapable} />
+        </div>
         {fableSession && <FableCountdown sessionName={fableSession} />}
       </div>
       <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "TEMPO PROFILE ARMED" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small><i aria-hidden="true" /></div>
