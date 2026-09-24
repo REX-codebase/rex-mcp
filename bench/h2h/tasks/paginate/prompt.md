@@ -1,0 +1,1 @@
+pager.py has bugs: paginate() should use 1-based page numbers (page 1 is the first page), and page_count() must count a final partial page (10 items at size 3 is 4 pages; 0 items is 0 pages). Fix both. Page numbers below 1 should raise ValueError.

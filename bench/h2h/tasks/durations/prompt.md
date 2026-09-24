@@ -1,0 +1,1 @@
+Implement parse_duration in timeparse.py. It takes strings like "1h30m", "45s", "2h" or "1h5m10s" (units h, m, s, in that order, each at most once, surrounding spaces allowed) and returns the total seconds as an int. Anything else (empty string, unknown unit, wrong order, repeated unit, missing number) raises ValueError.
