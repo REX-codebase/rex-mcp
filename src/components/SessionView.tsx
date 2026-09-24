@@ -103,7 +103,7 @@ function FollowUpComposer({ busy, onFollowUp, focusWhenReady }: { busy: boolean;
         className="followup-input"
       />
       <div className="followup-controls">
-        <span className="hidden text-[11px] text-faint md:inline">Ctrl + Enter</span>
+        <span className="composer-meta-keys hidden text-[11px] text-faint md:inline-flex"><kbd>Ctrl</kbd><kbd>Enter</kbd> send</span>
         <button type="button" onClick={send} disabled={!canSend} title={!text.trim() ? "Describe the change first" : busy ? "A turn is in progress" : "Send the follow-up"} className="run-button" aria-label={busy ? "Follow-up in progress" : "Send follow-up"}>
           <span>{busy ? "Working" : "Follow up"}</span>
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8h9m-3.5-3.5L12.5 8 9 11.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
