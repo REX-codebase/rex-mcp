@@ -119,3 +119,20 @@ is shared it is noted in the module docs.
   declines automatically and prints the question.
 - Gap left: no UI panel renders the question yet (the phase `question` and
   types exist); one question per call (opencode/Hermes batch several).
+
+## Round 4: web_search with the keyless engine
+
+- Bug found in REX: autonomous runs sent `seeds: []`, and the keyless
+  REX-search engine only crawls outward from seeds, so web_search on the
+  default provider could not find any page.
+- REX now: `web_search` takes optional `sites` (URLs or bare domains).
+  Seeds also come from URLs and well-formed domains in the query (free-text
+  domains need a common ending so `main.rs`/`config.json` are not taken as
+  sites). Each seed passes web_fetch's URL vetting; IP literals and local
+  names (`localhost`, `.local`, `.internal`, ...) are refused; max 5. With no
+  seed, the model gets guidance (pass sites or use web_fetch) instead of a
+  silent empty result. Keyed providers (Exa, Tinyfish) are unchanged.
+- Gap left: no web-wide index at ₹0. opencode reaches one through Exa's and
+  Parallel's hosted endpoints with no key (`tool/mcp-websearch.ts:5-7`);
+  adopting that would send queries to a third party, so it is an owner
+  decision.

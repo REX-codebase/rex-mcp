@@ -32,7 +32,7 @@
 use crate::http::Transport;
 use crate::provider_failure::structured_http_failure;
 use crate::providers::{find_spec, ProviderProtocol};
-use crate::search::SearchRouter;
+use crate::search::{SearchProvider, SearchRouter};
 use crate::secrets::SecretStore;
 use crate::service::ProviderService;
 use rex_preview::{
@@ -485,6 +485,9 @@ enum AgentCall {
         id: String,
         query: String,
         max_results: usize,
+        /// Model-supplied sites (URLs or bare domains) to seed the keyless
+        /// engine; ignored by keyed providers.
+        sites: Vec<String>,
     },
     CompleteTask {
         summary: String,
@@ -506,6 +509,105 @@ enum AgentCall {
         question: String,
         choices: Vec<String>,
     },
+}
+
+/// What the model hears when the keyless engine has nowhere to start.
+const NO_SEED_GUIDANCE: &str = "The keyless REX search crawls outward from seed sites and has no web-wide index. \
+    Call web_search again with `sites` (URLs or domains likely to hold the answer, e.g. docs.rs, developer.mozilla.org, \
+    the project's own site), or use web_fetch on a URL you already know.";
+const MAX_SEEDS: usize = 5;
+/// Domains in free query text only count with one of these endings, so
+/// file names like `main.rs` or `config.json` are not mistaken for sites.
+const QUERY_TLDS: &[&str] = &[
+    "com", "org", "net", "io", "dev", "app", "ai", "gov", "edu", "info", "co", "uk", "in", "de",
+];
+
+fn string_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|t| t.trim().chars().take(300).collect::<String>())
+                .filter(|t| !t.is_empty())
+                .take(MAX_SEEDS * 2)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A bare domain such as `docs.rs` -> `https://docs.rs/`. `strict` limits
+/// the ending to QUERY_TLDS (used for words pulled out of free text).
+fn domain_seed(token: &str, strict: bool) -> Option<String> {
+    let t = token.trim().trim_end_matches('/').to_ascii_lowercase();
+    if t.contains('@') || t.contains(':') || t.len() > 253 {
+        return None;
+    }
+    let labels: Vec<&str> = t.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|l| {
+            l.is_empty()
+                || l.len() > 63
+                || l.starts_with('-')
+                || !l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    {
+        return None;
+    }
+    let tld = labels[labels.len() - 1];
+    let tld_ok = if strict {
+        QUERY_TLDS.contains(&tld)
+    } else {
+        tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+    };
+    tld_ok.then(|| format!("https://{t}/"))
+}
+
+/// Seeds for the keyless engine: model-supplied sites first, then URLs and
+/// well-formed domains that appear in the query. Every seed passes the same
+/// URL vetting as web_fetch; duplicates are dropped and the list is capped.
+fn search_seeds(query: &str, sites: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let from_sites = sites.iter().map(|s| (s.as_str(), false));
+    let from_query = query
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| "()[]<>{},;\"'`".contains(c)))
+        .map(|w| (w, true));
+    for (token, strict) in from_sites.chain(from_query) {
+        let lower = token.to_ascii_lowercase();
+        let candidate = if lower.starts_with("http://") || lower.starts_with("https://") {
+            Some(token.to_string())
+        } else {
+            domain_seed(token, strict)
+        };
+        let Some(candidate) = candidate else { continue };
+        let Ok(url) = fetch::vet_url(&candidate) else {
+            continue;
+        };
+        // Seeds name public sites. IP literals and local names are refused
+        // here as well as at fetch time (which re-checks every hop).
+        let local = match url.host() {
+            Some(url::Host::Domain(d)) => {
+                let d = d.trim_end_matches('.');
+                d == "localhost"
+                    || [".localhost", ".local", ".internal", ".lan", ".home.arpa"]
+                        .iter()
+                        .any(|suffix| d.ends_with(suffix))
+            }
+            Some(_) | None => true,
+        };
+        if local {
+            continue;
+        }
+        let url = url.to_string();
+        if !out.contains(&url) {
+            out.push(url);
+        }
+        if out.len() >= MAX_SEEDS {
+            break;
+        }
+    }
+    out
 }
 
 /// Decode `ask_user` args. Choices may arrive as strings or as objects with
@@ -2002,7 +2104,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"apply_patch","description":"Change several files at once, all-or-nothing. Format: '*** Begin Patch' then per file '*** Add File: path' (lines prefixed '+'), '*** Delete File: path', or '*** Update File: path' (optional '*** Move to: path') with '@@' hunks of ' ' context, '-' removed and '+' added lines; end with '*** End Patch'. Include enough context lines to make each hunk unique. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"patch":{"type":"STRING"}},"required":["patch"]}},
         {"name":"glob_files","description":"Find workspace files by glob pattern (e.g. **/*.rs), newest first. Skips build output and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"pattern":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["pattern"]}},
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
-        {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
+        {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
         {"name":"web_fetch","description":"Read one public web page (http/https) as plain text, e.g. docs or an issue you already have the URL for. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"}},"required":["url"]}},
         {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"}},"required":["task"]}},
         {"name":"ask_user","description":"Ask the user one question when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Give up to 4 short choices, best first; the user may also answer freely. If they decline or do not answer in time, you are told to proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}},
@@ -2294,11 +2396,13 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     .map(|n| n as usize)
                     .unwrap_or(5)
                     .clamp(1, 8);
+                let sites = string_list(&args, "sites");
                 calls.push((
                     AgentCall::WebSearch {
                         id,
                         query,
                         max_results,
+                        sites,
                     },
                     raw,
                 ));
@@ -2438,6 +2542,7 @@ fn decode_named_call(
                         .and_then(Value::as_u64)
                         .unwrap_or(5)
                         .clamp(1, 8) as usize,
+                    sites: string_list(&args, "sites"),
                 },
                 Some(raw),
             ),
@@ -2704,11 +2809,16 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 id,
                 query,
                 max_results,
+                sites,
             } => {
+                let seeds = search_seeds(&query, &sites);
                 let (ok, content) = match &ctx.search {
+                    Some(router) if router.active() == SearchProvider::Rex && seeds.is_empty() => {
+                        (false, NO_SEED_GUIDANCE.to_string())
+                    }
                     Some(router) => {
                         let request: SearchRequest = match serde_json::from_value(json!({
-                            "query": query, "seeds": [], "max_results": max_results
+                            "query": query, "seeds": seeds, "max_results": max_results
                         })) {
                             Ok(r) => r,
                             Err(e) => {
@@ -2750,7 +2860,10 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     None => (false, "web search is not configured in this build".into()),
                 };
                 if let Some(l) = ledger.as_mut() {
-                    l.append("web_search", json!({"query": query, "ok": ok}));
+                    l.append(
+                        "web_search",
+                        json!({"query": query, "seeds": seeds, "ok": ok}),
+                    );
                 }
                 out.digest_actions.push(DigestAction {
                     tool: "web_search".into(),
@@ -5107,6 +5220,45 @@ mod tests {
         let done = wait_terminal(&svc, &snap.id, 60_000);
         assert_eq!(done.status, AgentStatus::Cancelled);
         assert!(svc.answer(&snap.id, Some("late")).is_err());
+    }
+
+    #[test]
+    fn search_seeds_come_from_sites_and_real_domains_in_the_query() {
+        // model-supplied sites: bare domains and URLs, deduped
+        let s = search_seeds(
+            "tokio spawn blocking",
+            &[
+                "docs.rs".into(),
+                "https://docs.rs/".into(),
+                "https://tokio.rs/tokio/tutorial".into(),
+            ],
+        );
+        assert_eq!(s, ["https://docs.rs/", "https://tokio.rs/tokio/tutorial"]);
+        // domains in free text need a common ending; file names are not sites
+        let q = search_seeds(
+            "fix main.rs and config.json per developer.mozilla.org (see https://example.com/a)",
+            &[],
+        );
+        assert_eq!(
+            q,
+            ["https://developer.mozilla.org/", "https://example.com/a"]
+        );
+        // private and malformed targets never become seeds
+        let bad = search_seeds(
+            "x",
+            &[
+                "http://127.0.0.1/".into(),
+                "localhost".into(),
+                "e.g.".into(),
+                "a@b.com".into(),
+                "file:///etc/passwd".into(),
+            ],
+        );
+        assert!(bad.is_empty(), "{bad:?}");
+        // capped
+        let many: Vec<String> = (0..9).map(|i| format!("site{i}.org")).collect();
+        assert_eq!(search_seeds("q", &many).len(), MAX_SEEDS);
+        assert!(search_seeds("how do closures work", &[]).is_empty());
     }
 
     #[test]
