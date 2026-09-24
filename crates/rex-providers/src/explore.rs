@@ -718,6 +718,13 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                         ("web_fetch".into(), id, args, clipped, ok)
                     }
                 }
+                AgentCall::PastRuns { id, .. } => (
+                    "past_runs".into(),
+                    id,
+                    json!({}),
+                    "past_runs is not available to sub-agents".into(),
+                    false,
+                ),
                 AgentCall::ReadOutput { id, .. } => (
                     "read_output".into(),
                     id,

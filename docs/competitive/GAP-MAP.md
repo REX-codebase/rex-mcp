@@ -687,3 +687,39 @@ is shared it is noted in the module docs.
   unknown id gets a readable error. Hand mutation: 13/13 killed.
 - Gap left: edit sub-agents' clipped command output is not kept. The
   saved text is lost on resume.
+
+## Round 16: recall earlier runs in the same workspace (`past_runs`)
+
+- Competitors: Hermes' `session_search` tool
+  (`tools/session_search_tool.py`) lets the model search past sessions
+  (full-text search over its session database, no LLM calls). opencode
+  has no model-facing tool for earlier sessions: its tool directory
+  (`packages/opencode/src/tool/`) has none.
+- REX before: a new run knew nothing about earlier runs in the same
+  workspace unless the user resumed a named session. The completion
+  summary lived only in memory and was lost when the app closed.
+- REX now:
+  - `terminal.json` also stores the outcome label, the completion summary
+    and the files the run's recent turns wrote (`files_changed`).
+  - The `past_runs` tool (`crates/rex-providers/src/run_history.rs`)
+    returns up to 5 earlier finished runs of this same workspace, newest
+    first: run id, task, outcome, summary and up to 10 files. Tasks and
+    summaries are cut at 600 characters.
+  - An optional query keeps runs whose task, summary or files contain
+    every word, case-insensitively.
+  - It reads only REX's own run records: never file contents, never other
+    workspaces, never the current run. The reply tells the model to check
+    the files before relying on it. Runs that are still going are left
+    out. Older `terminal.json` files still count, with outcome "finished"
+    and no summary.
+  - Sub-agents get a clear refusal. Role allowlists apply.
+- Tests: 2 run_history tests (workspace filter, newest first, unfinished
+  and own runs left out, legacy records, all-words case-insensitive query,
+  limit, clipping, file cap, default workspace), a `files_changed` test,
+  and a scripted two-run test: run 2 recalls run 1's id, summary, outcome
+  and index.html, a miss says so, and run 2 never lists itself. Hand
+  mutation: 13/13 killed, plus 1 equivalent in the loop test (the current
+  run has no terminal.json while it runs; the unit test covers `exclude`).
+- Gap left: files come from the turn digest (last 12 turns), so a long
+  run lists only its later changes. There is no ranking beyond newest
+  first.

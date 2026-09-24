@@ -23,6 +23,7 @@ mod output_store;
 pub mod policy;
 mod provider_failure;
 pub mod providers;
+pub mod run_history;
 pub mod search;
 pub mod secrets;
 pub mod service;

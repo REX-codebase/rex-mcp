@@ -551,6 +551,11 @@ enum AgentCall {
         /// Flat text instead of the default Markdown (`format: "text"`).
         text: bool,
     },
+    /// Recall earlier finished runs in this workspace.
+    PastRuns {
+        id: String,
+        query: Option<String>,
+    },
     /// Page or search the full text of an earlier clipped command output.
     ReadOutput {
         id: String,
@@ -2173,7 +2178,7 @@ fn build_state_message(
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "read_output", "explore", "ask_user", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "read_output", "past_runs", "explore", "ask_user", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
         "project_instructions": project.map(|p| json!({
@@ -2278,6 +2283,12 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "read_output",
             "Page or search the full output of an earlier run_command in this run that came back clipped.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "past_runs",
+            "Recall earlier finished runs in this workspace: task, outcome, summary, files changed.",
             false,
             false,
         ),
@@ -2537,6 +2548,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
         {"name":"web_fetch","description":"Read one public web page (http/https), e.g. docs or an issue you already have the URL for. HTML comes back as Markdown (headings, lists, absolute links, code blocks); format=text gives flat text. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"},"format":{"type":"STRING","enum":["markdown","text"],"description":"markdown (default) or text"}},"required":["url"]}},
         {"name":"read_output","description":"Page or search the full output of an earlier run_command in this run whose result said output_truncated. Pass the call_id from that result's full_output. offset pages from a 1-based line (200 lines per page); query returns matching lines (literal, case-insensitive). The last 8 clipped outputs are kept, in memory, for this run only.","parameters":{"type":"OBJECT","properties":{"call_id":{"type":"STRING"},"offset":{"type":"INTEGER","description":"1-based first line"},"query":{"type":"STRING","description":"literal text to find"}},"required":["call_id"]}},
+        {"name":"past_runs","description":"Recall earlier finished REX runs in this same workspace, newest first: task, outcome, completion summary and files changed. Optional query keeps runs whose task, summary or files contain every word (case-insensitive). Returns at most 5. Use it to pick up where earlier work stopped instead of redoing it; verify against the files before relying on it.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING","description":"words to match"}}}},
         {"name":"explore","description":"Delegate a focused question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob, or (kind edit) one self-contained change to a writing sub-agent. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"},"kind":{"type":"STRING","enum":["explore","research","edit"],"description":"explore (default): workspace only. research: workspace plus web_fetch of public pages, for questions that need docs or issue pages. edit: one self-contained change per task (up to 3 in parallel, each on different files); the child can write and run commands, each needing the user's approval as usual, and reports files changed"}}}},
         {"name":"ask_user","description":"Ask the user when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Pass one question, or up to 3 related questions at once in `questions` so the user answers them together. Give up to 4 short choices per question, best first; the user may also answer freely. At most 3 questions per run. Anything declined or unanswered in time means proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}},"questions":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}}}}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
@@ -2864,6 +2876,16 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     raw,
                 )),
             },
+            "past_runs" => calls.push((
+                AgentCall::PastRuns {
+                    id,
+                    query: args
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                },
+                raw,
+            )),
             "read_output" => match parse_read_output(&args) {
                 Ok((call_id, offset, query)) => calls.push((
                     AgentCall::ReadOutput {
@@ -2984,6 +3006,7 @@ const AGENT_CALL_NAMES: &[&str] = &[
     "web_search",
     "web_fetch",
     "read_output",
+    "past_runs",
     "ask_user",
     "explore",
     "complete_task",
@@ -3074,6 +3097,16 @@ fn decode_named_call(
             ),
             None => bad("web_fetch missing url".into()),
         },
+        "past_runs" => (
+            AgentCall::PastRuns {
+                id,
+                query: args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            },
+            Some(raw),
+        ),
         "read_output" => match parse_read_output(&args) {
             Ok((call_id, offset, query)) => (
                 AgentCall::ReadOutput {
@@ -3581,6 +3614,63 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     json!({"functionCall":{"name":"web_fetch","args":{"url": url, "offset": offset, "format": if text { "text" } else { "markdown" }}}}),
                 );
                 response_parts.push(function_response(protocol, "web_fetch", &id, ok, &content));
+            }
+            AgentCall::PastRuns { id, query } => {
+                let allowed = ctx
+                    .brief
+                    .allowed_tools
+                    .as_ref()
+                    .is_none_or(|a| a.iter().any(|t| t == "past_runs"));
+                let (ok, content) = if !allowed {
+                    (
+                        false,
+                        "tool past_runs is not enabled for this run's role; use only the tools listed in your tool contract".to_string(),
+                    )
+                } else {
+                    // runs_root/<run id>/state is this run's state dir
+                    let runs = match ctx.state_dir.parent().and_then(Path::parent) {
+                        Some(root) => crate::run_history::past_runs(
+                            root,
+                            &ctx.workspace,
+                            query.as_deref(),
+                            Some(&ctx.brief.id),
+                            crate::run_history::MAX_RECALL,
+                        ),
+                        None => Vec::new(),
+                    };
+                    (
+                        true,
+                        json!({
+                            "count": runs.len(),
+                            "runs": runs,
+                            "note": if runs.is_empty() {
+                                "no earlier finished runs in this workspace match"
+                            } else {
+                                "records from earlier runs; check the files before relying on them"
+                            },
+                        })
+                        .to_string(),
+                    )
+                };
+                if let Some(l) = ledger.as_mut() {
+                    l.append("past_runs", json!({"query": query, "ok": ok}));
+                }
+                out.digest_actions.push(DigestAction {
+                    tool: "past_runs".into(),
+                    ok,
+                    target: query.clone(),
+                    error_kind: (!ok).then(|| "out_of_scope".to_string()),
+                });
+                let mut call_args = json!({});
+                if let Some(q) = &query {
+                    call_args["query"] = json!(q);
+                }
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"past_runs","args": call_args}}),
+                );
+                response_parts.push(function_response(protocol, "past_runs", &id, ok, &content));
             }
             AgentCall::ReadOutput {
                 id,
@@ -4718,6 +4808,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                 AgentCall::Explore { .. } => Some("explore".to_string()),
                 AgentCall::WebFetch { .. } => Some("web_fetch".to_string()),
                 AgentCall::ReadOutput { .. } => Some("read_output".to_string()),
+                AgentCall::PastRuns { .. } => Some("past_runs".to_string()),
                 AgentCall::AskUser { .. } => Some("ask_user".to_string()),
             };
             if let Some(name) = name {
@@ -5049,7 +5140,9 @@ fn finish<S: SecretStore + 'static, T: Transport + 'static>(
     cp: &Checkpoint,
 ) {
     let elapsed = ctx.checkpoint.elapsed_base_ms + started.elapsed().as_millis() as u64;
+    let mut summary = None;
     if let Ok(mut s) = ctx.handle.shared.lock() {
+        summary = s.completion_summary.clone();
         s.status = reason.status();
         s.elapsed_ms = elapsed;
         s.pending_approval = None;
@@ -5069,9 +5162,31 @@ fn finish<S: SecretStore + 'static, T: Transport + 'static>(
     }
     let _ = write_json(
         &ctx.state_dir.join("terminal.json"),
-        &json!({"reason": reason, "elapsed_ms": elapsed}),
+        &json!({
+            "reason": reason, "elapsed_ms": elapsed,
+            // for past_runs recall (crate::run_history)
+            "outcome": terminal_label(&reason), "summary": summary,
+            "files": files_changed(cp),
+        }),
     );
     let _ = write_json(&ctx.state_dir.join("checkpoint.json"), cp);
+}
+
+/// Files the run's recent turns wrote successfully, in first-seen order.
+/// Taken from the turn digest, so a long run lists its later changes only.
+fn files_changed(cp: &Checkpoint) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for action in cp.digest.iter().flat_map(|d| &d.actions) {
+        if !action.ok || !matches!(action.tool.as_str(), "create_file" | "edit_file") {
+            continue;
+        }
+        if let Some(t) = action.target.as_ref().filter(|t| !t.is_empty()) {
+            if !out.contains(t) {
+                out.push(t.clone());
+            }
+        }
+    }
+    out
 }
 
 fn terminal_label(reason: &TerminalReason) -> String {
@@ -6221,6 +6336,108 @@ mod tests {
             other => panic!("expected provider error, got {other:?}"),
         }
         assert_eq!(done.status, AgentStatus::Failed);
+    }
+
+    #[test]
+    fn files_changed_lists_successful_writes_once() {
+        let act = |tool: &str, ok: bool, target: &str| DigestAction {
+            tool: tool.into(),
+            ok,
+            target: Some(target.into()),
+            error_kind: None,
+        };
+        let cp = Checkpoint {
+            digest: vec![
+                DigestEntry {
+                    turn: 1,
+                    actions: vec![
+                        act("read_file", true, "a.rs"),
+                        act("edit_file", false, "b.rs"),
+                        act("create_file", true, "c.rs"),
+                    ],
+                },
+                DigestEntry {
+                    turn: 2,
+                    actions: vec![
+                        act("edit_file", true, "c.rs"),
+                        act("edit_file", true, ""),
+                        act("run_command", true, "cargo test"),
+                        act("edit_file", true, "d.rs"),
+                    ],
+                },
+            ],
+            ..Checkpoint::default()
+        };
+        assert_eq!(files_changed(&cp), vec!["c.rs", "d.rs"]);
+    }
+
+    #[test]
+    fn past_runs_recalls_an_earlier_run_in_the_same_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        let ws = root.join("runs").join("recall-ws");
+        fs::create_dir_all(&ws).unwrap();
+        let svc = Arc::new(service(
+            &root,
+            Script::new(vec![
+                // run 1: build and complete
+                call_turn(vec![create_call("index.html", PAGE)]),
+                call_turn(vec![
+                    plan_call(vec![("1", "build page", "done")]),
+                    complete_call("built the tea house landing page"),
+                ]),
+                // run 2: recall first
+                call_turn(vec![
+                    json!({"functionCall":{"name":"past_runs","args":{"query":"TEA house"}}}),
+                ]),
+                call_turn(vec![
+                    json!({"functionCall":{"name":"past_runs","args":{"query":"nothing-like-this"}}}),
+                ]),
+                text_turn("done"),
+                text_turn("done"),
+                text_turn("done"),
+            ]),
+        ));
+        let start = |task: &str| {
+            svc.begin_in_workspace_with_options(
+                task,
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws.clone()),
+                Role::Worker,
+                RunOptions::default(),
+                SessionMeta::default(),
+            )
+            .unwrap()
+        };
+        let first = start("build a tea house page");
+        auto_approve(svc.clone(), first.id.clone());
+        let done = wait_terminal(&svc, &first.id, 120_000);
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "{:?}",
+            done.terminal_reason
+        );
+        let n_first = svc.service.transport().seen().len();
+        let second = start("improve the page");
+        auto_approve(svc.clone(), second.id.clone());
+        let _ = wait_terminal(&svc, &second.id, 20_000);
+        let posts = svc.service.transport().seen();
+        let recall = &posts[n_first + 1];
+        let at = recall.find("functionResponse").expect("tool reply");
+        let reply = &recall[at..];
+        assert!(reply.contains(&first.id), "{reply}");
+        assert!(reply.contains("built the tea house landing page"));
+        assert!(reply.contains(r#"\"outcome\":\"completed\""#));
+        assert!(reply.contains("index.html"));
+        assert!(reply.contains(r#"\"count\":1"#));
+        // its own run is never listed
+        assert!(!reply.contains(&second.id));
+        let miss = &posts[n_first + 2];
+        let at = miss.find("functionResponse").unwrap();
+        assert!(miss[at..].contains(r#"\"count\":0"#));
+        assert!(miss[at..].contains("no earlier finished runs"));
     }
 
     #[test]
