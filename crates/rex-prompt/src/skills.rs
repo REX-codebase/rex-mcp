@@ -19,7 +19,9 @@
 //! - user: `$XDG_CONFIG_HOME/rex/skills` (or `~/.config/rex/skills`), then
 //!   `~/.agents/skills` and `~/.claude/skills`.
 //!
-//! Only `<skills dir>/<folder>/SKILL.md` is read (one level). Symlinks,
+//! `<skills dir>/<folder>/SKILL.md` is read, also nested up to three
+//! folders deep (opencode globs `skills/**/SKILL.md`). Symlinks, hidden
+//! folders,
 //! non-UTF-8 files, files without a valid name or a description are
 //! skipped.
 
@@ -29,8 +31,12 @@ use std::path::{Path, PathBuf};
 
 /// Skill folders under a workspace or home directory, in priority order.
 pub const PROJECT_SKILL_DIRS: &[&str] = &[".rex/skills", ".agents/skills", ".claude/skills"];
-/// Folders looked at per skills directory at most.
+/// Subfolders looked at per folder at most.
 const MAX_FOLDERS_PER_DIR: usize = 64;
+/// Folders looked at per skills directory at most, across all levels.
+const MAX_FOLDERS_VISITED: usize = 256;
+/// Deepest SKILL.md, in folders below the skills directory.
+pub const MAX_SKILL_DEPTH: usize = 3;
 /// Skills listed at most.
 pub const MAX_SKILLS: usize = 40;
 /// Bytes read from one SKILL.md at most.
@@ -158,7 +164,11 @@ fn clip(s: &str, max: usize) -> (String, bool) {
     }
 }
 
-/// Skill folders in one skills directory, sorted, capped.
+/// Skill folders in one skills directory: `<dir>/<folder>/SKILL.md`, also
+/// nested (`<dir>/tools/lint/SKILL.md`) up to [`MAX_SKILL_DEPTH`] folders
+/// deep. Sorted depth-first; hidden folders and symlinks are skipped; at
+/// most [`MAX_FOLDERS_PER_DIR`] subfolders per folder and
+/// [`MAX_FOLDERS_VISITED`] folders per skills directory are looked at.
 fn scan(dir: &Path, label: &str, out: &mut Vec<SkillInfo>) {
     let Ok(meta) = fs::symlink_metadata(dir) else {
         return;
@@ -166,6 +176,11 @@ fn scan(dir: &Path, label: &str, out: &mut Vec<SkillInfo>) {
     if !meta.is_dir() {
         return;
     }
+    let mut visited = 0;
+    walk(dir, label, 1, &mut visited, out);
+}
+
+fn walk(dir: &Path, label: &str, depth: usize, visited: &mut usize, out: &mut Vec<SkillInfo>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -173,26 +188,31 @@ fn scan(dir: &Path, label: &str, out: &mut Vec<SkillInfo>) {
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.starts_with('.'))
         .collect();
     folders.sort();
     folders.truncate(MAX_FOLDERS_PER_DIR);
     for folder in folders {
-        if out.len() >= MAX_SKILLS {
+        if out.len() >= MAX_SKILLS || *visited >= MAX_FOLDERS_VISITED {
             return;
         }
-        let path = dir.join(&folder).join("SKILL.md");
-        let Some((name, description, _, _)) = read_skill(&path) else {
-            continue;
-        };
-        if out.iter().any(|s| s.name == name) {
-            continue;
+        *visited += 1;
+        let sub = dir.join(&folder);
+        let sub_label = format!("{label}/{folder}");
+        let path = sub.join("SKILL.md");
+        if let Some((name, description, _, _)) = read_skill(&path) {
+            if !out.iter().any(|s| s.name == name) {
+                out.push(SkillInfo {
+                    name,
+                    description,
+                    source: format!("{sub_label}/SKILL.md"),
+                    path,
+                });
+            }
         }
-        out.push(SkillInfo {
-            name,
-            description,
-            source: format!("{label}/{folder}/SKILL.md"),
-            path,
-        });
+        if depth < MAX_SKILL_DEPTH {
+            walk(&sub, &sub_label, depth + 1, visited, out);
+        }
     }
 }
 
@@ -514,6 +534,62 @@ mod tests {
         fs::create_dir_all(&lone).unwrap();
         skill(&root, ".agents/skills", "parent", &md("parent", "p", "p"));
         assert!(discover_with(&lone, None, None).is_empty());
+    }
+
+    #[test]
+    fn nested_skill_folders_are_found_to_three_levels() {
+        let ws = dir();
+        let base = ws.join(".agents/skills");
+        skill(&base, "", "a", &md("a", "top", "x"));
+        skill(&base, "a", "ref", "no front matter");
+        skill(&base, "tools", "lint", &md("lint", "two deep", "x"));
+        skill(&base, "tools/web", "css", &md("css", "three deep", "x"));
+        skill(&base, "tools/web/css", "four", &md("four", "too deep", "x"));
+        skill(&base, ".hidden", "h", &md("h", "hidden folder", "x"));
+        let got = discover_with(&ws, None, None);
+        let names: Vec<(&str, &str)> = got
+            .iter()
+            .map(|s| (s.name.as_str(), s.source.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("a", ".agents/skills/a/SKILL.md"),
+                ("lint", ".agents/skills/tools/lint/SKILL.md"),
+                ("css", ".agents/skills/tools/web/css/SKILL.md"),
+            ]
+        );
+        assert_eq!(
+            load(&got, "css").unwrap().source,
+            ".agents/skills/tools/web/css/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn folder_walk_is_bounded() {
+        let ws = dir();
+        let base = ws.join(".rex/skills");
+        // nested empty folders use up the walk before the skill: 40 x 12
+        // folders is over MAX_FOLDERS_VISITED
+        for i in 0..40 {
+            for j in 0..10 {
+                fs::create_dir_all(base.join(format!("a{i:02}/b/c{j}"))).unwrap();
+            }
+        }
+        skill(&base, "", "zz", &md("zz", "late", "x"));
+        assert!(discover_with(&ws, None, None).is_empty());
+        // more than MAX_FOLDERS_PER_DIR subfolders: the rest are not read
+        let wide = dir();
+        let wbase = wide.join(".rex/skills");
+        for i in 0..MAX_FOLDERS_PER_DIR {
+            fs::create_dir_all(wbase.join(format!("a{i:02}"))).unwrap();
+        }
+        skill(&wbase, "", "zz", &md("zz", "late", "x"));
+        assert!(discover_with(&wide, None, None).is_empty());
+        let small = dir();
+        skill(&small.join(".rex/skills"), "", "zz", &md("zz", "late", "x"));
+        fs::create_dir_all(small.join(".rex/skills/a/b")).unwrap();
+        assert_eq!(discover_with(&small, None, None).len(), 1);
     }
 
     #[test]

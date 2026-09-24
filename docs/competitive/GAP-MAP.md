@@ -832,5 +832,28 @@ is shared it is noted in the module docs.
   mutation: 17/17 killed. The first pass left 4 survivors: two overlapping
   checks (I removed the redundant symlink check) and two tests whose
   byte cap happened to land on a character boundary (fixed).
-- Gap left: no nested skill folders and no remote skill sources.
+- Gap left: no nested skill folders (closed in 17c) and no remote skill
+  sources.
+
+## Round 17c: nested skill folders
+
+- Competitors: opencode globs `skills/**/SKILL.md` under `.claude` and
+  `.agents` and `{skill,skills}/**/SKILL.md` in its config dirs
+  (`packages/opencode/src/skill/index.ts`), so a skill can sit in a
+  category folder. Hermes groups skills by category folder too
+  (`~/.hermes/skills/<category>/<skill>/SKILL.md`, `tools/skills_tool.py`).
+- REX before: only `<skills dir>/<folder>/SKILL.md` (one level).
+- REX now: a SKILL.md up to three folders below the skills directory is
+  found (`tools/web/css/SKILL.md`). The walk is depth-first and sorted,
+  skips hidden folders and symlinks, reads at most 64 subfolders per
+  folder and 256 folders per skills directory, and still stops at 40
+  skills. First name wins as before.
+- Tests: nested lookup (one, two and three deep found, four deep and a
+  hidden folder not, a non-skill `ref` folder ignored, load of a nested
+  skill) and a bounded-walk test (400+ nested empty folders use up the
+  walk; 64 folders fill the per-folder cap). Hand mutation: 10/10 killed
+  after the bounded-walk test was rebuilt: in the first pass the
+  per-folder cap hid the walk cap, so 3 mutants survived.
+- Gap left: no remote skill sources (opencode can pull skills from URLs;
+  that needs network and trust rules).
 
