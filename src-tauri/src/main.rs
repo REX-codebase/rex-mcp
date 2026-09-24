@@ -1250,7 +1250,31 @@ fn agent_resume(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<AgentSna
 /// Undo the newest file write of a finished run (journal-backed; refused
 /// when the user changed a touched file afterwards).
 #[tauri::command]
-fn agent_undo(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<serde_json::Value, String> {
+fn agent_undo(
+    agent: State<'_, Arc<Agent>>,
+    run_id: String,
+    to: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    // `to`: rewind every write after journal entry N (0 = all), all or nothing
+    if let Some(seq) = to {
+        return agent.undo_to_write(&run_id, seq).map(|entries| {
+            let mut files: Vec<String> = Vec::new();
+            for e in &entries {
+                for f in &e.files {
+                    if !files.contains(&f.path) {
+                        files.push(f.path.clone());
+                    }
+                }
+            }
+            serde_json::json!({
+                "ok": true,
+                "call_id": entries.first().map(|e| e.call_id.clone()),
+                "tool": entries.first().map(|e| e.tool.clone()),
+                "files": files,
+                "undone": entries.iter().map(|e| serde_json::json!({"seq": e.seq, "tool": e.tool})).collect::<Vec<_>>(),
+            })
+        });
+    }
     agent.undo_last_write(&run_id).map(|entry| {
         serde_json::json!({
             "ok": true,

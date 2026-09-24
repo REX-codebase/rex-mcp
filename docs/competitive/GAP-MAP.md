@@ -110,8 +110,21 @@ is shared it is noted in the module docs.
   so user edits are never clobbered. No git needed. Exposed as Tauri command
   `agent_undo`, sidecar route `POST /api/agent/runs/:id/undo` and
   `agentUndo()` in `src/data/agentRun.ts`. The app shows "Undo last file
-  change" on finished runs that wrote files (round 5, c75d092). Gap left:
-  no undo to an arbitrary step in one call.
+  change" on finished runs that wrote files (round 5, c75d092). Round 9:
+  `Journal::undo_to(seq)` rewinds every write after entry `seq` (0 = the
+  whole run) in one call, all or nothing: each step is checked against
+  the file state the earlier undos would leave before any file is
+  touched, so one file changed by the user blocks the whole rewind and
+  nothing moves. Exposed as `undo_to_write` on the service, `{"to": N}`
+  on the sidecar undo route, an optional `to` on Tauri `agent_undo`
+  (review only; the Tauri crate does not build here) and
+  `agentUndo(runId, to)`. Compare opencode's per-step `revert`
+  (`src/snapshot/index.ts:36-42`) and Hermes' shadow-git checkpoints
+  (`tools/checkpoint_manager.py:1-9`). Tests: journal rewind to a step,
+  to zero, through a file two writes touched, and the blocked all-or-
+  nothing case; service rewind; sidecar response shape. 3 mutations
+  (no simulated state, off-by-one on `seq`, no pre-check) each fail.
+- Gap left: the app has no control to pick the step yet (API only).
 
 ## Round 4: ask the user (`ask_user`)
 

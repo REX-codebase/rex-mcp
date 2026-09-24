@@ -1127,6 +1127,27 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         &self,
         run_id: &str,
     ) -> Result<rex_tools::journal::JournalEntry, String> {
+        let (journal, workspace) = self.finished_run_journal(run_id)?;
+        journal.undo_last(&workspace)
+    }
+
+    /// Undo every write after journal entry `seq` in one call (0 = the
+    /// whole run), newest first. All or nothing: if any step is blocked by
+    /// a later change to a file, no file is touched.
+    pub fn undo_to_write(
+        &self,
+        run_id: &str,
+        seq: u64,
+    ) -> Result<Vec<rex_tools::journal::JournalEntry>, String> {
+        let (journal, workspace) = self.finished_run_journal(run_id)?;
+        journal.undo_to(&workspace, seq)
+    }
+
+    /// The write journal and workspace of a run that is not active.
+    fn finished_run_journal(
+        &self,
+        run_id: &str,
+    ) -> Result<(rex_tools::journal::Journal, PathBuf), String> {
         {
             let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
             if let Some(handle) = runs.get(run_id) {
@@ -1149,9 +1170,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         if !journal_dir.join("journal.jsonl").exists() {
             return Err("this run has no write journal".into());
         }
-        rex_tools::journal::Journal::open(journal_dir)
-            .map_err(|e| e.to_string())?
-            .undo_last(&workspace)
+        let journal = rex_tools::journal::Journal::open(journal_dir).map_err(|e| e.to_string())?;
+        Ok((journal, workspace))
     }
 
     /// The run's workspace from its checkpoint, re-validated under the
@@ -6187,6 +6207,34 @@ mod tests {
             .unwrap_err()
             .contains("nothing to undo"));
         assert!(svc.undo_last_write("no-such-run").is_err());
+    }
+
+    #[test]
+    fn finished_run_can_be_rewound_in_one_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("x.txt", "one")]),
+                call_turn(vec![create_call("y.txt", "two")]),
+                call_turn(vec![create_call("x.txt", "three")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("three writes", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        wait_terminal(&svc, &snap.id, 60_000);
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("x.txt")).unwrap(), "three");
+        let undone = svc.undo_to_write(&snap.id, 1).unwrap();
+        assert_eq!(undone.len(), 2);
+        assert_eq!(fs::read_to_string(ws.join("x.txt")).unwrap(), "one");
+        assert!(!ws.join("y.txt").exists());
+        assert_eq!(svc.undo_to_write(&snap.id, 0).unwrap().len(), 1);
+        assert!(!ws.join("x.txt").exists());
+        assert!(svc.undo_to_write("no-such-run", 0).is_err());
     }
 
     #[test]

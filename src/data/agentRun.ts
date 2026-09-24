@@ -76,8 +76,13 @@ export const agentAnswer = (runId: string, answer: string | null) =>
 /** Answer every question of an ask_user batch at once (null declines one). */
 export const agentAnswerMany = (runId: string, answers: (string | null)[]) =>
   call<AgentSnapshot>("agent_answer", `/runs/${runId}/answer`, { runId, answer: null, answers });
-export const agentUndo = (runId: string) =>
-  call<{ ok: boolean; call_id: string; tool: string; files: string[] }>("agent_undo", `/runs/${runId}/undo`, { runId });
+/** Undo the newest write, or with `to` every write after journal entry `to` (0 = all), all or nothing. */
+export const agentUndo = (runId: string, to?: number) =>
+  call<{ ok: boolean; call_id: string; tool: string; files: string[]; undone?: { seq: number; tool: string }[] }>(
+    "agent_undo",
+    `/runs/${runId}/undo`,
+    to === undefined ? { runId } : { runId, to },
+  );
 export const agentPreviewAction = (runId: string, action: PreviewPointerAction) =>
   call<{ ok: boolean }>("agent_preview_action", `/runs/${runId}/action`, { runId, action });
 export const agentCapture = (runId: string) =>

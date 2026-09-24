@@ -196,6 +196,59 @@ impl Journal {
         self.rewrite(&entries).map_err(|e| e.to_string())?;
         Ok(entries[idx].clone())
     }
+
+    /// Undo every write after `seq` (newest first), leaving the workspace
+    /// as it was right after write `seq`; `seq` 0 undoes the whole run.
+    /// All or nothing: every step is checked against the file state the
+    /// earlier undos would leave before any file is touched, so a file
+    /// changed after the agent wrote it refuses the whole rewind.
+    pub fn undo_to(&self, root: &Path, seq: u64) -> Result<Vec<JournalEntry>, String> {
+        let entries = self.entries();
+        let todo: Vec<&JournalEntry> = entries
+            .iter()
+            .rev()
+            .filter(|e| !e.undone && e.seq > seq)
+            .collect();
+        if todo.is_empty() {
+            return Err(format!("nothing to undo after write {seq}"));
+        }
+        // simulated fingerprints: path -> Some(fp) / None (absent)
+        let mut state: std::collections::HashMap<String, Option<u64>> =
+            std::collections::HashMap::new();
+        for e in &todo {
+            for f in &e.files {
+                if f.path.contains("..") || Path::new(&f.path).is_absolute() {
+                    return Err(format!("journal path {} is not workspace-relative", f.path));
+                }
+                let now = match state.get(&f.path) {
+                    Some(fp) => *fp,
+                    None => fs::read(root.join(&f.path)).ok().map(|b| fingerprint(&b)),
+                };
+                if now != f.after_fp {
+                    return Err(format!(
+                        "{} changed after the agent wrote it (write {}); nothing was undone so those changes are kept",
+                        f.path, e.seq
+                    ));
+                }
+            }
+            for f in &e.files {
+                let before = match &f.before_blob {
+                    Some(name) => Some(fingerprint(
+                        &fs::read(self.dir.join("blobs").join(name)).map_err(|err| {
+                            format!("journal blob for {} is missing: {err}", f.path)
+                        })?,
+                    )),
+                    None => None,
+                };
+                state.insert(f.path.clone(), before);
+            }
+        }
+        let mut done = Vec::new();
+        for _ in 0..todo.len() {
+            done.push(self.undo_last(root)?);
+        }
+        Ok(done)
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +266,61 @@ mod tests {
         ));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn three_writes(root: &Path, j: &Journal) {
+        fs::write(root.join("a.txt"), "one").unwrap();
+        let p = Pending::capture(root, &["a.txt".into(), "new.txt".into()]);
+        fs::write(root.join("a.txt"), "two").unwrap();
+        fs::write(root.join("new.txt"), "created").unwrap();
+        j.record(root, "c1", "apply_patch", p).unwrap();
+        let p = Pending::capture(root, &["b.txt".into()]);
+        fs::write(root.join("b.txt"), "b").unwrap();
+        j.record(root, "c2", "create_file", p).unwrap();
+        let p = Pending::capture(root, &["a.txt".into()]);
+        fs::write(root.join("a.txt"), "three").unwrap();
+        j.record(root, "c3", "edit_file", p).unwrap();
+    }
+
+    #[test]
+    fn undo_to_rewinds_to_a_step_or_the_whole_run() {
+        let root = tmp();
+        let j = Journal::open(root.join(".j")).unwrap();
+        three_writes(&root, &j);
+        let done = j.undo_to(&root, 1).unwrap();
+        assert_eq!(done.iter().map(|e| e.seq).collect::<Vec<_>>(), [3, 2]);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "two");
+        assert!(!root.join("b.txt").exists());
+        assert!(root.join("new.txt").exists());
+        assert!(j.undo_to(&root, 1).unwrap_err().contains("nothing to undo"));
+        assert_eq!(j.undo_to(&root, 0).unwrap().len(), 1);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "one");
+        assert!(!root.join("new.txt").exists());
+        // one call through a file two writes touched (a.txt: 3 then 1)
+        let root = tmp();
+        let j = Journal::open(root.join(".j")).unwrap();
+        three_writes(&root, &j);
+        assert_eq!(j.undo_to(&root, 0).unwrap().len(), 3);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "one");
+        assert!(!root.join("b.txt").exists() && !root.join("new.txt").exists());
+    }
+
+    #[test]
+    fn undo_to_is_all_or_nothing_when_a_later_step_is_blocked() {
+        let root = tmp();
+        let j = Journal::open(root.join(".j")).unwrap();
+        three_writes(&root, &j);
+        // someone edits b.txt, which only write 2 touched
+        fs::write(root.join("b.txt"), "user").unwrap();
+        let e = j.undo_to(&root, 0).unwrap_err();
+        assert!(e.contains("b.txt") && e.contains("write 2"), "{e}");
+        // write 3 (a.txt) was undoable on its own but nothing was touched
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "three");
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "user");
+        assert!(j.entries().iter().all(|e| !e.undone));
+        // a rewind that stops before write 2 still works
+        assert_eq!(j.undo_to(&root, 2).unwrap().len(), 1);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "two");
     }
 
     #[test]

@@ -529,6 +529,29 @@ fn route(
                 &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
             ),
         },
+        // {"to": N} rewinds every write after journal entry N (0 = all)
+        // in one all-or-nothing call; no body undoes the newest write.
+        ("POST", ["api", "agent", "runs", id, "undo"])
+            if serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("to").and_then(|t| t.as_u64()))
+                .is_some() =>
+        {
+            let to = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("to").and_then(|t| t.as_u64()))
+                .unwrap_or(0);
+            match agent.undo_to_write(id, to) {
+                Ok(entries) => json_response(
+                    200,
+                    &undo_json(serde_json::to_value(&entries).unwrap_or_default()).to_string(),
+                ),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
         ("POST", ["api", "agent", "runs", id, "undo"]) => match agent.undo_last_write(id) {
             Ok(entry) => json_response(
                 200,
@@ -896,9 +919,41 @@ fn read_proof_bundle(state_dir: &std::path::Path, task_id: &str) -> Result<Strin
     std::fs::read_to_string(&path).map_err(|_| format!("no proof bundle for task {task_id}"))
 }
 
+/// Response body for a multi-step undo: `entries` is the serialized list
+/// of undone journal entries, newest first.
+fn undo_json(entries: serde_json::Value) -> serde_json::Value {
+    let list = entries.as_array().cloned().unwrap_or_default();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    for e in &list {
+        for f in e["files"].as_array().into_iter().flatten() {
+            if !files.contains(&f["path"]) {
+                files.push(f["path"].clone());
+            }
+        }
+    }
+    serde_json::json!({
+        "ok": true,
+        "call_id": list.first().map(|e| e["call_id"].clone()),
+        "tool": list.first().map(|e| e["tool"].clone()),
+        "files": files,
+        "undone": list.iter().map(|e| serde_json::json!({"seq": e["seq"], "tool": e["tool"]})).collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::read_proof_bundle;
+    use super::{read_proof_bundle, undo_json};
+
+    #[test]
+    fn undo_json_lists_each_file_once_newest_entry_first() {
+        let v = undo_json(serde_json::json!([
+            {"seq": 3, "call_id": "c3", "tool": "edit_file", "files": [{"path": "a.txt"}]},
+            {"seq": 2, "call_id": "c2", "tool": "apply_patch", "files": [{"path": "b.txt"}, {"path": "a.txt"}]},
+        ]));
+        assert_eq!(v["call_id"], "c3");
+        assert_eq!(v["files"], serde_json::json!(["a.txt", "b.txt"]));
+        assert_eq!(v["undone"][1]["seq"], 2);
+    }
 
     #[test]
     fn proof_bundle_reads_persisted_bundle_and_refuses_traversal() {
