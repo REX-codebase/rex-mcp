@@ -1575,9 +1575,33 @@ fn write_brief(state_dir: &Path, brief: &TaskBrief) -> Result<(), String> {
     write_json(&path, brief)
 }
 
+/// Write JSON so a reader (or a crash) never sees half a file: the text
+/// goes to a temp file in the same directory, is synced, and is renamed
+/// over the target. Hermes writes its session state the same way
+/// (`atomic_json_write` in `utils.py`).
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    fs::write(path, text).map_err(|e| e.to_string())
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "bad state file path".to_string())?;
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, text.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(|e| e.to_string())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
@@ -5545,9 +5569,28 @@ fn finish<S: SecretStore + 'static, T: Transport + 'static>(
     cp: &Checkpoint,
 ) {
     let elapsed = ctx.checkpoint.elapsed_base_ms + started.elapsed().as_millis() as u64;
-    let mut summary = None;
+    let summary = ctx
+        .handle
+        .shared
+        .lock()
+        .ok()
+        .and_then(|s| s.completion_summary.clone());
+    // The files land before the run shows as terminal, so anyone who sees
+    // it finished (the UI, undo, a test) also finds them complete on disk.
+    if let Some(l) = ledger.as_mut() {
+        l.append("terminal", json!({"reason": reason}));
+    }
+    let _ = write_json(
+        &ctx.state_dir.join("terminal.json"),
+        &json!({
+            "reason": reason, "elapsed_ms": elapsed,
+            // for past_runs recall (crate::run_history)
+            "outcome": terminal_label(&reason), "summary": summary,
+            "files": files_changed(cp),
+        }),
+    );
+    let _ = write_json(&ctx.state_dir.join("checkpoint.json"), cp);
     if let Ok(mut s) = ctx.handle.shared.lock() {
-        summary = s.completion_summary.clone();
         s.status = reason.status();
         s.elapsed_ms = elapsed;
         s.pending_approval = None;
@@ -5562,19 +5605,6 @@ fn finish<S: SecretStore + 'static, T: Transport + 'static>(
         );
         s.terminal = Some(reason.clone());
     }
-    if let Some(l) = ledger.as_mut() {
-        l.append("terminal", json!({"reason": reason}));
-    }
-    let _ = write_json(
-        &ctx.state_dir.join("terminal.json"),
-        &json!({
-            "reason": reason, "elapsed_ms": elapsed,
-            // for past_runs recall (crate::run_history)
-            "outcome": terminal_label(&reason), "summary": summary,
-            "files": files_changed(cp),
-        }),
-    );
-    let _ = write_json(&ctx.state_dir.join("checkpoint.json"), cp);
 }
 
 /// Files the run changed, in first-seen order: the whole-run list, then
@@ -9108,6 +9138,94 @@ mod tests {
         .unwrap();
         assert_eq!(q.chars().count(), QUESTION_CHARS);
         assert_eq!(c, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn state_files_are_complete_the_moment_a_run_shows_finished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let turns = (0..30)
+            .map(|_| call_turn(vec![complete_call("done")]))
+            .collect();
+        let svc = Arc::new(service(tmp.path(), Script::new(turns)));
+        for _ in 0..30 {
+            let snap = svc.begin("finish", "gemini", Some(budgets())).unwrap();
+            // poll with no sleep, to land right as the run turns terminal
+            let start = Instant::now();
+            while svc.snapshot(&snap.id).unwrap().terminal_reason.is_none() {
+                assert!(start.elapsed() < Duration::from_secs(20));
+            }
+            let state = svc.run_dir(&snap.id).join("state");
+            read_json::<Checkpoint>(&state.join("checkpoint.json")).unwrap();
+            let t: Value = read_json(&state.join("terminal.json")).unwrap();
+            assert!(t["outcome"].is_string(), "{t}");
+            let temps = fs::read_dir(&state)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".tmp")
+                })
+                .count();
+            assert_eq!(temps, 0);
+        }
+    }
+
+    #[test]
+    fn a_reader_never_sees_half_written_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("c.json");
+        let big = json!({"a": "x".repeat(200_000)});
+        write_json(&path, &big).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (path, stop) = (path.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut bad = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    if read_json::<Value>(&path).is_err() {
+                        bad += 1;
+                    }
+                }
+                bad
+            })
+        };
+        for i in 0..200 {
+            let v = if i % 2 == 0 {
+                json!({"b": i})
+            } else {
+                big.clone()
+            };
+            write_json(&path, &v).unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(reader.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn write_json_replaces_whole_files_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.json");
+        write_json(&path, &json!({"a": "x".repeat(5000)})).unwrap();
+        write_json(&path, &json!({"a": 1})).unwrap();
+        let v: Value = read_json(&path).unwrap();
+        assert_eq!(v, json!({"a": 1}));
+        // a failed write reports the error and leaves nothing behind
+        let missing = tmp.path().join("no-dir").join("s.json");
+        assert!(write_json(&missing, &json!({})).is_err());
+        assert!(write_json(Path::new("/"), &json!({})).is_err());
+        // the rename fails onto a directory; the temp file is removed
+        fs::create_dir(tmp.path().join("d.json")).unwrap();
+        fs::write(tmp.path().join("d.json").join("keep"), "").unwrap();
+        assert!(write_json(&tmp.path().join("d.json"), &json!({})).is_err());
+        let names: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let mut names = names;
+        names.sort();
+        assert_eq!(names, vec!["d.json".to_string(), "s.json".to_string()]);
     }
 
     #[test]

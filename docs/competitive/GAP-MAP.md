@@ -1219,3 +1219,28 @@ is shared it is noted in the module docs.
   first pass, so a test was added).
 - Gap left: edit sub-agents and the desktop app's own approval path do
   not call preflight yet.
+
+## Round 31: run state files are written whole, before a run shows finished
+
+- Competitors: Hermes writes session state to a temp file, syncs it and
+  swaps it in with `os.replace` (`atomic_json_write`, `atomic_replace`
+  in `utils.py`; used by `gateway/session_persistence.py`).
+- REX before: `checkpoint.json` and `terminal.json` were written with a
+  plain truncate-and-write, and only after the run was already marked
+  terminal. Anything that acted on "finished" right away (undo, the UI,
+  a test) could read a half-written or empty checkpoint; this is what
+  made `finished_run_writes_can_be_undone_from_the_journal` fail once
+  with "no checkpointed run with this id". A crash mid-write could also
+  leave a broken checkpoint that resume cannot read.
+- REX now: state JSON goes to a temp file in the same folder, is synced,
+  and is renamed over the target; a failed write removes the temp file.
+  The terminal ledger line, `terminal.json` and `checkpoint.json` are
+  written before the run is marked terminal.
+- Tests: 30 runs polled with no sleep, each checkpoint and terminal file
+  parsed the moment the run shows finished, no temp files left; a reader
+  thread reading while 200 writes alternate large and small content never
+  sees broken JSON; replace, failed-write and failed-rename cleanup.
+  Hand mutation: 3/3 killed (old ordering, plain write, no temp cleanup).
+  The provider suite then passed 4 runs in a row.
+- Gap left: the sync step itself is not tested (it only matters on power
+  loss), and other state files outside `write_json` were not audited.
