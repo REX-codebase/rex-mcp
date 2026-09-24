@@ -509,6 +509,7 @@ enum AgentCall {
     Explore {
         id: String,
         tasks: Vec<String>,
+        kind: explore::ExplorerKind,
     },
     /// Ask the user a blocking question through the trusted UI.
     AskUser {
@@ -1989,7 +1990,7 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "explore",
-            "Delegate a read-only workspace question to an explorer sub-agent; returns one findings report.",
+            "Delegate a read-only question to an explorer sub-agent (workspace only) or a research sub-agent (workspace plus web_fetch); returns one findings report.",
             false,
             false,
         ),
@@ -2147,7 +2148,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
         {"name":"web_fetch","description":"Read one public web page (http/https) as plain text, e.g. docs or an issue you already have the URL for. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"}},"required":["url"]}},
-        {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"}}}},
+        {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"},"kind":{"type":"STRING","enum":["explore","research"],"description":"explore (default): workspace only. research: workspace plus web_fetch of public pages, for questions that need docs or issue pages"}}}},
         {"name":"ask_user","description":"Ask the user when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Pass one question, or up to 3 related questions at once in `questions` so the user answers them together. Give up to 4 short choices per question, best first; the user may also answer freely. At most 3 questions per run. Anything declined or unanswered in time means proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}},"questions":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}}}}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
     ]}])
@@ -2477,8 +2478,10 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     raw,
                 )),
             },
-            "explore" => match explore::parse_explore_tasks(&args) {
-                Ok(tasks) => calls.push((AgentCall::Explore { id, tasks }, raw)),
+            "explore" => match explore::parse_explore_tasks(&args)
+                .and_then(|t| explore::parse_explore_kind(&args).map(|k| (t, k)))
+            {
+                Ok((tasks, kind)) => calls.push((AgentCall::Explore { id, tasks, kind }, raw)),
                 Err(error) => calls.push((
                     AgentCall::BadCall {
                         name: "explore".into(),
@@ -2591,8 +2594,10 @@ fn decode_named_call(
             Ok(questions) => (AgentCall::AskUser { id, questions }, Some(raw)),
             Err(e) => bad(e),
         },
-        "explore" => match explore::parse_explore_tasks(&args) {
-            Ok(tasks) => (AgentCall::Explore { id, tasks }, Some(raw)),
+        "explore" => match explore::parse_explore_tasks(&args)
+            .and_then(|t| explore::parse_explore_kind(&args).map(|k| (t, k)))
+        {
+            Ok((tasks, kind)) => (AgentCall::Explore { id, tasks, kind }, Some(raw)),
             Err(e) => bad(e),
         },
         "complete_task" => (
@@ -3045,14 +3050,22 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 );
                 response_parts.push(function_response(protocol, "web_fetch", &id, ok, &content));
             }
-            AgentCall::Explore { id, tasks } => {
-                let call_args = if tasks.len() == 1 {
+            AgentCall::Explore { id, tasks, kind } => {
+                let mut call_args = if tasks.len() == 1 {
                     json!({"task": tasks[0]})
                 } else {
                     json!({"tasks": tasks})
                 };
+                if kind != explore::ExplorerKind::Explore {
+                    call_args["kind"] = json!(kind.label());
+                }
                 if let Some(allowed) = &ctx.brief.allowed_tools {
-                    if !allowed.iter().any(|t| t == "explore") {
+                    // A research child fetches web pages, so it needs the
+                    // parent's own web_fetch permission as well.
+                    let needs_fetch = kind == explore::ExplorerKind::Research;
+                    if !allowed.iter().any(|t| t == "explore")
+                        || (needs_fetch && !allowed.iter().any(|t| t == "web_fetch"))
+                    {
                         out.digest_actions.push(DigestAction {
                             tool: "explore".into(),
                             ok: false,
@@ -3086,13 +3099,14 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         .min(budgets.max_tool_calls.saturating_sub(cp.tool_calls))
                         / n,
                     max_tokens: budgets.max_tokens.saturating_sub(cp.tokens_used) / n as u64,
+                    kind,
                 };
                 for task in &tasks {
                     let preview: String = task.chars().take(120).collect();
                     RunHandle::push_event(
                         &ctx.handle.shared,
                         AgentEvent::Info {
-                            message: format!("explorer sub-agent started: {preview}"),
+                            message: format!("{} sub-agent started: {preview}", kind.label()),
                         },
                     );
                 }
@@ -3141,6 +3155,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                                 "task": task, "finished": outcome.finished,
                                 "turns": outcome.turns, "tool_calls": outcome.tool_calls,
                                 "tokens": outcome.tokens, "files_read": outcome.files_read,
+                                "urls_fetched": outcome.urls_fetched, "child_kind": kind.label(),
                                 "error": outcome.error, "batch": tasks.len(),
                             }),
                         );
@@ -3182,6 +3197,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         "report": report,
                         "report_truncated": clipped,
                         "files_read": outcome.files_read,
+                        "urls_fetched": outcome.urls_fetched,
                         "turns": outcome.turns,
                         "tool_calls": outcome.tool_calls,
                         "error": outcome.error,
@@ -5208,6 +5224,106 @@ mod tests {
             .or_else(|_| fs::read_to_string(run_dir.join("ledger.jsonl")))
             .unwrap_or_default();
         assert!(ledger.contains("\"kind\":\"explore\""), "{ledger}");
+    }
+
+    #[test]
+    fn explore_kind_is_parsed_and_research_gets_web_fetch_only() {
+        use explore::ExplorerKind;
+        assert_eq!(
+            explore::parse_explore_kind(&json!({})),
+            Ok(ExplorerKind::Explore)
+        );
+        assert_eq!(
+            explore::parse_explore_kind(&json!({"kind":" research "})),
+            Ok(ExplorerKind::Research)
+        );
+        assert!(explore::parse_explore_kind(&json!({"kind":"writer"})).is_err());
+        let bad = decode_provider_calls(
+            ProviderProtocol::Gemini,
+            &json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"explore","args":{"task":"q","kind":"writer"}}}]}}]}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(&bad.calls[0].0, AgentCall::BadCall { .. }));
+    }
+
+    #[test]
+    fn research_child_fetches_through_vetting_and_explorer_cannot_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetch_local =
+            json!({"functionCall":{"name":"web_fetch","args":{"url":"http://127.0.0.1/secret"}}});
+        let research = json!({"functionCall":{"name":"explore","args":{
+            "task":"what does the upstream doc say?","kind":"research"}}});
+        let plain =
+            json!({"functionCall":{"name":"explore","args":{"task":"same, workspace only"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![research]),
+                // research child: a private address is refused by vetting
+                call_turn(vec![fetch_local.clone()]),
+                call_turn(vec![complete_call("RESEARCH-REPORT")]),
+                call_turn(vec![plain]),
+                // explore child: web_fetch is not one of its tools
+                call_turn(vec![fetch_local]),
+                call_turn(vec![complete_call("EXPLORE-REPORT")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("research check", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(
+            done.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Info { message } if message.starts_with("research sub-agent started")
+            )),
+            "{:?}",
+            done.events
+        );
+        let posts = svc.service().transport().seen();
+        let child: Value = serde_json::from_str(&posts[1]).unwrap();
+        assert!(child["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("research sub-agent"));
+        let names: Vec<&str> = child["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "read_file",
+                "search_files",
+                "glob_files",
+                "web_fetch",
+                "complete_task"
+            ]
+        );
+        // blocked by vetting or by the fetcher's own address check, never fetched
+        assert!(
+            posts[2].contains("refused:") || posts[2].contains("unsafe_address"),
+            "{}",
+            posts[2]
+        );
+        assert!(posts[3].contains("RESEARCH-REPORT"));
+        let explore_child: Value = serde_json::from_str(&posts[4]).unwrap();
+        let names: Vec<&str> = explore_child["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"web_fetch"));
+        assert!(
+            posts[5].contains("web_fetch is not available to the explorer"),
+            "{}",
+            posts[5]
+        );
     }
 
     #[test]

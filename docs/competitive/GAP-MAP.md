@@ -158,8 +158,15 @@ is shared it is noted in the module docs.
   run). The parent gets one `explorers` list of reports; each child gets its
   own ledger entry. A concurrency probe in the test proves both child
   requests were in flight at once.
-- Gap left: children are still read-only; Hermes gives them the parent's
-  toolsets and opencode lets the model pick agent types.
+- Round 6: `explore` takes `kind`: `explore` (default, workspace only) or
+  `research` (workspace plus `web_fetch`, with the parent's vetting:
+  robots, private addresses and data-like URLs refused). A research child
+  needs the parent run's own web_fetch permission. Reports list
+  `urls_fetched`. Compare opencode's `subagent_type` (`tool/task.ts:46`)
+  with built-in `general` and `explore` agents (`agent/agent.ts:183-216`).
+- Gap left: no writing child. opencode's `general` agent and Hermes
+  children can edit; REX children stay read-only, so writes always go
+  through the parent's approval gate.
 
 ## Round 5: YAML/TOML checks and app panels
 
