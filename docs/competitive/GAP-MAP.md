@@ -1191,3 +1191,31 @@ is shared it is noted in the module docs.
   counted).
 - Gap left: counting is per exact call; a read with a shifted offset or
   a reworded search is not caught.
+
+## Round 30: doomed writes fail before the user is asked
+
+- Competitors: opencode's edit tool works out the replacement (and fails
+  on a missing match) before it asks permission (`src/tool/edit.ts`);
+  its write tool reads the old file before asking (`src/tool/write.ts`).
+  Hermes has no approval step for writes; its read-before-overwrite
+  check runs when the call runs (`tools/file_tools.py`).
+- REX before: every check ran only after approval, so the user could be
+  asked to approve an overwrite of an unread file, an edit whose expected
+  text was not in the file, or a patch that did not apply, and then see
+  it fail.
+- REX now: a new `ToolRuntime::preflight` runs the checks a write would
+  fail at execution (size limits, existing file without the overwrite
+  flag, unread or changed file, empty or missing expected text, patch
+  that does not apply) without writing. In autonomous runs a call that
+  needs approval is preflighted first; a failure is cancelled and goes
+  back to the model as "failed before approval: ..." with no approval
+  request. Execution still repeats every check, so nothing is weakened
+  if the file changes while approval is pending.
+- Tests: rex-tools unit test covering each check, that reads and new
+  files pass, that a read clears the overwrite check and an outside
+  change brings it back, and that preflight never writes; a scripted
+  run where an unread overwrite raises no approval request and the file
+  is kept. Hand mutation: 10/10 killed (the edit size check survived the
+  first pass, so a test was added).
+- Gap left: edit sub-agents and the desktop app's own approval path do
+  not call preflight yet.

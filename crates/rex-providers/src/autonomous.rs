@@ -4437,6 +4437,27 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 // A command's writes are not known in advance: stamp the tree
                 // right before it runs (after any approval wait) and compare
                 // after, so files it made count as changed by this run.
+                // A write that would fail anyway is not put to the user.
+                if prepared.approval_required {
+                    if let Err(e) = tools.preflight(&request) {
+                        let _ = tools.cancel(&prepared.call_id);
+                        let content = format!("failed before approval: {}", e.detail);
+                        out.digest_actions.push(DigestAction {
+                            tool: tool_name.into(),
+                            ok: false,
+                            target: None,
+                            error_kind: Some(format!("{:?}", e.kind).to_lowercase()),
+                        });
+                        push_model_part(
+                            &mut model_parts,
+                            raw,
+                            json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}),
+                        );
+                        response_parts
+                            .push(function_response(protocol, tool_name, &id, false, &content));
+                        continue;
+                    }
+                }
                 let is_command = matches!(request, ToolRequest::RunCommand { .. });
                 let mut tree_before = None;
                 let result = if prepared.approval_required {
@@ -8640,6 +8661,53 @@ mod tests {
         let fourth: Value = serde_json::from_str(&fourth).unwrap();
         assert_eq!(fourth["ok"], true, "{fourth}");
         assert!(fourth["output"].as_str().unwrap().contains("ALPHA"));
+    }
+
+    #[test]
+    fn doomed_overwrite_fails_before_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let ws = root.join("runs").join("ow-ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("old.txt"), "keep me").unwrap();
+        let svc = Arc::new(service(
+            &root,
+            Script::new(vec![
+                call_turn(vec![create_call("old.txt", "clobbered")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin_in_workspace_with_options(
+                "rewrite old.txt",
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws.clone()),
+                Role::Worker,
+                RunOptions::default(),
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let asked = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ApprovalRequired { .. }))
+            .count();
+        assert_eq!(asked, 0, "the user was asked to approve a doomed write");
+        let posts = svc.service().transport().seen();
+        assert!(
+            posts.len() >= 2,
+            "{} {:?}",
+            posts.len(),
+            done.terminal_reason
+        );
+        let reply = response_contents(&posts[1]).last().cloned().unwrap();
+        assert!(reply.starts_with("failed before approval: "), "{reply}");
+        assert!(reply.contains("not read in this run"), "{reply}");
+        assert_eq!(fs::read_to_string(ws.join("old.txt")).unwrap(), "keep me");
     }
 
     #[test]

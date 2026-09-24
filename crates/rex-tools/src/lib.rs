@@ -504,6 +504,61 @@ impl ToolRuntime {
         &self.root
     }
 
+    /// The checks a write would fail at execution, run before anyone is
+    /// asked to approve it: an overwrite of a file not read in this run or
+    /// changed since, an edit whose expected text is not in the file, a
+    /// patch that does not apply. Execution repeats every check, so this
+    /// only saves the user from approving a call that cannot succeed.
+    /// opencode's edit tool likewise works out the replacement before it
+    /// asks (`src/tool/edit.ts`). Other calls pass.
+    pub fn preflight(&self, request: &ToolRequest) -> Result<(), ToolError> {
+        match request {
+            ToolRequest::CreateFile {
+                path,
+                content,
+                overwrite,
+            } => {
+                if content.len() > MAX_WRITE_BYTES {
+                    return Err(err(ErrorKind::TooLarge, "write exceeds 2 MiB limit"));
+                }
+                let target = self.resolve_for_write(path)?;
+                if target.exists() {
+                    if !overwrite {
+                        return Err(err(
+                            ErrorKind::AlreadyExists,
+                            "file exists and overwrite is false",
+                        ));
+                    }
+                    self.check_not_stale(&target)?;
+                    self.check_seen_before_overwrite(&target)?;
+                }
+                Ok(())
+            }
+            ToolRequest::EditFile {
+                path,
+                expected,
+                replacement,
+                replace_all,
+            } => {
+                if expected.is_empty() {
+                    return Err(err(
+                        ErrorKind::InvalidRequest,
+                        "expected text must not be empty",
+                    ));
+                }
+                let target = self.resolve_existing(path, false)?;
+                let old = fs::read_to_string(&target).map_err(io_err)?;
+                if old.len() > MAX_FILE_BYTES as usize {
+                    return Err(err(ErrorKind::TooLarge, "file exceeds 2 MiB edit limit"));
+                }
+                self.check_not_stale(&target)?;
+                plan_edit_checked(&old, expected, replacement, *replace_all).map(|_| ())
+            }
+            ToolRequest::ApplyPatch { patch } => self.plan_patch(patch).map(|_| ()),
+            _ => Ok(()),
+        }
+    }
+
     pub fn prepare(&self, request: ToolRequest) -> Result<PreparedCall, ToolError> {
         validate_request(&request)?;
         let (risk, reason) = classify(&request);
@@ -2789,6 +2844,107 @@ mod tests {
                 arguments: json!({}),
             })
             .is_err());
+    }
+
+    #[test]
+    fn preflight_catches_doomed_writes_before_approval() {
+        let root = temp();
+        fs::write(root.join("old.txt"), "keep me").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let create = |path: &str, overwrite: bool| ToolRequest::CreateFile {
+            path: path.into(),
+            content: "new".into(),
+            overwrite,
+        };
+        let edit = |expected: &str| ToolRequest::EditFile {
+            path: "old.txt".into(),
+            expected: expected.into(),
+            replacement: "x".into(),
+            replace_all: false,
+        };
+        let kind = |r: Result<(), ToolError>| r.unwrap_err().kind;
+        // new files and reads pass
+        assert!(rt.preflight(&create("fresh.txt", false)).is_ok());
+        assert!(rt
+            .preflight(&ToolRequest::ReadFile {
+                path: "old.txt".into(),
+                offset: None,
+                limit: None
+            })
+            .is_ok());
+        // existing file: no overwrite flag, then an unread overwrite
+        assert_eq!(
+            kind(rt.preflight(&create("old.txt", false))),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            kind(rt.preflight(&create("old.txt", true))),
+            ErrorKind::Conflict
+        );
+        // too large is caught too
+        let big = ToolRequest::CreateFile {
+            path: "fresh.txt".into(),
+            content: "a".repeat(MAX_WRITE_BYTES + 1),
+            overwrite: false,
+        };
+        assert_eq!(kind(rt.preflight(&big)), ErrorKind::TooLarge);
+        // edits: empty, missing and present expected text; missing file
+        assert_eq!(kind(rt.preflight(&edit(""))), ErrorKind::InvalidRequest);
+        assert!(rt.preflight(&edit("not there")).is_err());
+        assert!(rt.preflight(&edit("keep")).is_ok());
+        assert!(rt
+            .preflight(&ToolRequest::EditFile {
+                path: "nope.txt".into(),
+                expected: "a".into(),
+                replacement: "b".into(),
+                replace_all: false,
+            })
+            .is_err());
+        // an edit of a file over the edit limit is caught
+        fs::write(
+            root.join("huge.txt"),
+            "a".repeat(MAX_FILE_BYTES as usize + 1),
+        )
+        .unwrap();
+        let huge = ToolRequest::EditFile {
+            path: "huge.txt".into(),
+            expected: "a".into(),
+            replacement: "b".into(),
+            replace_all: false,
+        };
+        assert_eq!(kind(rt.preflight(&huge)), ErrorKind::TooLarge);
+        // a bad patch is caught
+        assert!(rt
+            .preflight(&ToolRequest::ApplyPatch {
+                patch: "not a patch".into()
+            })
+            .is_err());
+        // after a read the overwrite passes; after an outside change it and
+        // the edit are stale again
+        assert!(
+            approved(
+                &rt,
+                ToolRequest::ReadFile {
+                    path: "old.txt".into(),
+                    offset: None,
+                    limit: None
+                }
+            )
+            .ok
+        );
+        assert!(rt.preflight(&create("old.txt", true)).is_ok());
+        fs::write(root.join("old.txt"), "keep me, changed").unwrap();
+        assert_eq!(
+            kind(rt.preflight(&create("old.txt", true))),
+            ErrorKind::Conflict
+        );
+        assert_eq!(kind(rt.preflight(&edit("keep"))), ErrorKind::Conflict);
+        // preflight never writes
+        assert!(!root.join("fresh.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("old.txt")).unwrap(),
+            "keep me, changed"
+        );
     }
 
     #[test]
