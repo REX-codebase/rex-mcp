@@ -3,6 +3,8 @@
 // reachable, but only behind an explicit opt-in: pressing Run with no backend
 // and no tour mode just highlights this panel.
 
+import { useEffect, useRef } from "react";
+
 export function SetupChecklist({
   hot,
   tour,
@@ -16,12 +18,18 @@ export function SetupChecklist({
   onOpenSettings: () => void;
   onRecheck: () => void;
 }) {
+  const panelRef = useRef<HTMLElement>(null);
+  // Run with no backend lights this panel; bring it on screen, since it
+  // now sits below the composer.
+  useEffect(() => {
+    if (hot) panelRef.current?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }, [hot]);
   if (tour) {
     return (
       <section className="setup-panel" aria-label="Tour mode">
         <p className="eyebrow">Tour mode</p>
         <p className="mt-2 text-[13px] leading-relaxed text-muted">
-          You are browsing a simulated interface tour. Runs are sample data —
+          You are browsing a simulated interface tour. Runs are sample data;
           nothing reaches a model.{" "}
           <button type="button" className="setup-link" onClick={() => onTour(false)}>
             Turn tour mode off
@@ -31,7 +39,7 @@ export function SetupChecklist({
     );
   }
   return (
-    <section className={`setup-panel ${hot ? "attn" : ""}`} aria-label="Connect a backend">
+    <section ref={panelRef} className={`setup-panel ${hot ? "attn" : ""}`} aria-label="Connect a backend">
       <p className="eyebrow">No backend connected</p>
       <h2 className="mt-2 text-[17px] font-medium tracking-[-0.01em] text-text">
         Three steps to a real run
@@ -40,7 +48,7 @@ export function SetupChecklist({
         <li>
           <span className="step-n" aria-hidden="true">1</span>
           <span>
-            Start the backend — the dev sidecar or the desktop shell:
+            Start the backend, either the dev server or the desktop app:
             <br />
             <code>cargo run -p rex-mcp --bin rex-dev-server</code>
             <span className="text-faint"> or </span>
@@ -50,8 +58,8 @@ export function SetupChecklist({
         <li>
           <span className="step-n" aria-hidden="true">2</span>
           <span>
-            Connect a model key in Settings. Keys are stored by the Rust
-            backend in a 0600 file — the UI never sees them.{" "}
+            Add a model key in Settings. The backend keeps it in a file only
+            your user account can read; this window never sees it.{" "}
             <button type="button" className="setup-link" onClick={onOpenSettings}>
               Open Settings
             </button>
@@ -60,14 +68,14 @@ export function SetupChecklist({
         <li>
           <span className="step-n" aria-hidden="true">3</span>
           <span>
-            Describe a task above and press Run. The agent loop plans, asks
-            for approvals, and seals an evidence receipt.
+            Describe a task above and press Run. REX plans, asks before
+            risky steps, and leaves a receipt of what it did.
           </span>
         </li>
       </ol>
       <div className="setup-actions">
         <button type="button" className="setup-btn primary" onClick={onRecheck}>
-          I started it — check again
+          I started it, check again
         </button>
       </div>
       <p className="setup-tour">

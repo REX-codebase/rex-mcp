@@ -706,15 +706,6 @@ export default function App() {
           />
         ) : (
           <>
-            {backendProbed && !liveCapable && (
-              <SetupChecklist
-                hot={checklistHot}
-                tour={tourMode}
-                onTour={chooseTourMode}
-                onOpenSettings={() => setView("settings")}
-                onRecheck={reprobeBackend}
-              />
-            )}
             {hero !== "gone" && (
               <div className={`hero-wrap ${hero === "settling" ? "settling" : ""}`}>
                 <div>
@@ -738,6 +729,17 @@ export default function App() {
                   </div>
                 </div>
               </div>
+            )}
+            {/* Setup sits under the composer: the task box stays the first thing
+                on screen, and step 3 ("describe a task above") reads true. */}
+            {backendProbed && !liveCapable && (
+              <SetupChecklist
+                hot={checklistHot}
+                tour={tourMode}
+                onTour={chooseTourMode}
+                onOpenSettings={() => setView("settings")}
+                onRecheck={reprobeBackend}
+              />
             )}
             <StateRail state={state} blockedReason={latest?.blockedReason} />
             {import.meta.env.DEV && new URLSearchParams(window.location.search).has("approval-preview") && <ToolApprovalPreview />}
