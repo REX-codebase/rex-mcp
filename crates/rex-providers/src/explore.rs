@@ -747,6 +747,13 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                     "past_runs is not available to sub-agents".into(),
                     false,
                 ),
+                AgentCall::Remember { id, .. } => (
+                    "remember".into(),
+                    id,
+                    json!({}),
+                    "remember is not available to sub-agents".into(),
+                    false,
+                ),
                 AgentCall::LoadSkill { id, .. } => (
                     "load_skill".into(),
                     id,

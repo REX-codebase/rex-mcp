@@ -2434,6 +2434,12 @@ fn kill_tree(child: &mut std::process::Child) {
         let _ = child.kill();
     }
 }
+/// True when `text` holds something the output redactor would hide
+/// (API keys, tokens, bearer credentials, `password=` values).
+pub fn contains_secret(text: &str) -> bool {
+    redact(text).1 > 0
+}
+
 fn redact(input: &str) -> (String, usize) {
     let patterns = [
         r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+",

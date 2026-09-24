@@ -27,6 +27,7 @@ pub mod run_history;
 pub mod search;
 pub mod secrets;
 pub mod service;
+pub mod workspace_notes;
 
 pub mod autonomous;
 pub mod live;

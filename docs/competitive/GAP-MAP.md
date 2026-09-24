@@ -928,3 +928,37 @@ is shared it is noted in the module docs.
   Hand mutation: 9/9 killed.
 - Gap left: sub-agents still cannot call `read_output` themselves.
 
+
+## Round 19: workspace notes (`remember`)
+
+- Competitors: Hermes gives the agent a `memory` tool (add, replace,
+  remove) over a curated `MEMORY.md` of about 2,200 characters, shows it
+  at the start of every session and scans each entry for injection and
+  exfiltration patterns first (`tools/memory_tool.py`,
+  `tools/memory_tool_store.py`). opencode has no agent-written memory;
+  it reads only the instruction files people write (`AGENTS.md` etc.).
+- REX before: `past_runs` could recall what earlier runs did, but the
+  agent had no way to keep a fact (build command, layout, a pitfall) for
+  the next run of the same workspace.
+- REX now: a `remember` tool (`action` add or remove, `text`). Notes
+  live in REX's own runs folder under `.notes/<hash of workspace>.json`,
+  never in the workspace, and are per workspace. Later runs see them in
+  the state under `notes`, labelled as possibly stale and ranked below
+  the constitution, approvals, tool limits and the task. Limits: 400
+  characters per note, 20 notes, 2,200 characters in all. A note is
+  refused when the output redactor would flag a secret in it, when it
+  reads like an instruction to a future agent, or when it is empty or
+  too long. The same note is not stored twice; remove needs a piece of
+  text that matches exactly one note. Writes go through a temp file and
+  rename. Sub-agents cannot use it. Unlike Hermes there is no replace
+  action (remove then add) and no user-profile file.
+- Tests: a store unit test set (per-workspace path outside the
+  workspace, add/dedupe/remove, ambiguous and missing remove, secret and
+  instruction refusals, count and size caps, corrupt and hand-edited
+  files), an argument test, and a scripted three-run test: run 1 saves a
+  fact, gets the secret and instruction refusals and a bad action, adds
+  and removes a scratch note; run 2 of the same workspace sees only the
+  kept fact with its label; run 3 of another workspace sees nothing.
+  Hand mutation: 19/19 killed.
+- Gap left: no replace action; the instruction check is a short phrase
+  list, not a full injection scanner like Hermes's threat patterns.
