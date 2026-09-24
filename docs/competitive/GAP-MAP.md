@@ -33,7 +33,7 @@ is shared it is noted in the module docs.
 
 - Project instruction files: opencode `session/instruction.ts` loads
   `AGENTS.md` / `CLAUDE.md`; Hermes `agent/coding_context.py` loads
-  `AGENTS.md`, `CLAUDE.md`, `.cursorrules`. REX (round 2) loads the first of these at the workspace root into per-turn state, capped at 8k chars, symlinks refused. Gap left: no parent-dir walk or global file (opencode does both).
+  `AGENTS.md`, `CLAUDE.md`, `.cursorrules`. REX (round 2) loads the first of these at the workspace root into per-turn state, capped at 8k chars, symlinks refused. Round 5 (48566bc): the nearest file from the workspace up to its git root wins (no walk without a git root or when the root is $HOME), plus a user-level `~/.config/rex/AGENTS.md` sent as `user_instructions` with its own precedence note. opencode (`session/instruction.ts:122-126`) walks to the worktree the same way.
 - Sub-agent delegation: opencode `src/tool/task.ts`; Hermes
   `tools/delegate_tool.py`. REX (round 2): `explore` tool starts a read-only
   explorer sub-agent (read/search/glob only, no recursion, inside the parent's
