@@ -814,6 +814,66 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
 
     /// Rehydrate a run from its on-disk checkpoint after a process restart
     /// and continue the loop where it stopped.
+    /// Undo the newest file write a run made, from its on-disk journal.
+    /// Refused while the run is active, and refused (changing nothing) when
+    /// a touched file changed after the agent wrote it.
+    pub fn undo_last_write(
+        &self,
+        run_id: &str,
+    ) -> Result<rex_tools::journal::JournalEntry, String> {
+        {
+            let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+            if let Some(handle) = runs.get(run_id) {
+                if handle
+                    .shared
+                    .lock()
+                    .map(|s| s.terminal.is_none())
+                    .unwrap_or(false)
+                {
+                    return Err("run is still active; cancel or wait for it before undoing".into());
+                }
+            }
+        }
+        let run_dir = self.run_dir(run_id);
+        let state_dir = run_dir.join("state");
+        let checkpoint = read_json::<Checkpoint>(&state_dir.join("checkpoint.json"))
+            .map_err(|_| "no checkpointed run with this id".to_string())?;
+        let workspace = self.checkpoint_workspace(&run_dir, &checkpoint)?;
+        let journal_dir = state_dir.join("journal");
+        if !journal_dir.join("journal.jsonl").exists() {
+            return Err("this run has no write journal".into());
+        }
+        rex_tools::journal::Journal::open(journal_dir)
+            .map_err(|e| e.to_string())?
+            .undo_last(&workspace)
+    }
+
+    /// The run's workspace from its checkpoint, re-validated under the
+    /// runs root (a tampered checkpoint must not redirect a run or an undo).
+    fn checkpoint_workspace(
+        &self,
+        run_dir: &Path,
+        checkpoint: &Checkpoint,
+    ) -> Result<PathBuf, String> {
+        let runs_root_canon = self.runs_root.canonicalize().map_err(|e| e.to_string())?;
+        let workspace = match checkpoint.workspace.clone() {
+            Some(stored) => {
+                let canon = stored
+                    .canonicalize()
+                    .map_err(|_| "checkpointed workspace is missing".to_string())?;
+                if !canon.starts_with(&runs_root_canon) {
+                    return Err("checkpointed workspace escaped the runs root".into());
+                }
+                canon
+            }
+            None => run_dir.join("workspace"),
+        };
+        if !workspace.is_dir() {
+            return Err("checkpointed workspace is missing".into());
+        }
+        Ok(workspace)
+    }
+
     pub fn resume(&self, run_id: &str) -> Result<AgentSnapshot, String> {
         {
             let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
@@ -856,22 +916,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         // back to the default `<run_dir>/workspace` layout. A stored path is
         // re-validated under the runs root: a tampered checkpoint must not
         // redirect the resumed run elsewhere.
-        let runs_root_canon = self.runs_root.canonicalize().map_err(|e| e.to_string())?;
-        let workspace = match checkpoint.workspace.clone() {
-            Some(stored) => {
-                let canon = stored
-                    .canonicalize()
-                    .map_err(|_| "checkpointed workspace is missing".to_string())?;
-                if !canon.starts_with(&runs_root_canon) {
-                    return Err("checkpointed workspace escaped the runs root".into());
-                }
-                canon
-            }
-            None => run_dir.join("workspace"),
-        };
-        if !workspace.is_dir() {
-            return Err("checkpointed workspace is missing".into());
-        }
+        let workspace = self.checkpoint_workspace(&run_dir, &checkpoint)?;
         let handle = Arc::new(RunHandle {
             shared: Mutex::new(RunShared {
                 status: AgentStatus::Running,
@@ -1163,10 +1208,17 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
     let started = Instant::now();
     let mut ledger = Ledger::open(&ctx.state_dir);
     let tools = match ToolRuntime::new(&ctx.workspace) {
-        Ok(t) => match &ctx.mcp_caller {
-            Some(caller) => t.with_mcp_caller(caller.clone()),
-            None => t,
-        },
+        Ok(t) => {
+            // Journal writes so a finished run can be undone; a journal
+            // failure leaves the run working, just without undo.
+            let t = ToolRuntime::new(&ctx.workspace)
+                .and_then(|j| j.with_journal(ctx.state_dir.join("journal")))
+                .unwrap_or(t);
+            match &ctx.mcp_caller {
+                Some(caller) => t.with_mcp_caller(caller.clone()),
+                None => t,
+            }
+        }
         Err(e) => {
             finish(
                 &ctx,
@@ -4653,6 +4705,38 @@ mod tests {
             .0
             .iter()
             .any(|s| s.name == "web_fetch"));
+    }
+
+    #[test]
+    fn finished_run_writes_can_be_undone_from_the_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("x.txt", "agent text")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("write then finish", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        wait_terminal(&svc, &snap.id, 60_000);
+        let file = tmp
+            .path()
+            .join("runs")
+            .join(&snap.id)
+            .join("workspace")
+            .join("x.txt");
+        assert!(file.exists());
+        let undone = svc.undo_last_write(&snap.id).unwrap();
+        assert_eq!(undone.tool, "create_file");
+        assert!(!file.exists());
+        assert!(svc
+            .undo_last_write(&snap.id)
+            .unwrap_err()
+            .contains("nothing to undo"));
+        assert!(svc.undo_last_write("no-such-run").is_err());
     }
 
     #[test]

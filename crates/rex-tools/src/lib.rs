@@ -6,6 +6,7 @@
 
 pub mod check;
 pub mod fuzzy;
+pub mod journal;
 pub mod patch;
 pub mod sandbox;
 pub mod walk;
@@ -285,6 +286,8 @@ pub struct ToolRuntime {
     /// process, the user, a concurrent run) is refused as stale, so a model
     /// never overwrites edits it has not seen.
     seen: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    /// Optional on-disk write journal enabling undo (see `journal`).
+    journal: Option<Arc<journal::Journal>>,
 }
 
 /// How a run reaches third-party MCP servers. Implemented by the run host
@@ -317,6 +320,7 @@ impl ToolRuntime {
             order: Default::default(),
             mcp: None,
             seen: Arc::new(Mutex::new(HashMap::new())),
+            journal: None,
         })
     }
 
@@ -325,6 +329,54 @@ impl ToolRuntime {
     pub fn with_mcp_caller(mut self, caller: Arc<dyn McpCaller>) -> Self {
         self.mcp = Some(caller);
         self
+    }
+
+    /// Journal every successful file write under `dir` so it can be undone
+    /// with [`ToolRuntime::undo_last_write`] or [`journal::Journal::undo_last`].
+    pub fn with_journal(mut self, dir: impl Into<PathBuf>) -> Result<Self, ToolError> {
+        self.journal = Some(Arc::new(journal::Journal::open(dir).map_err(io_err)?));
+        Ok(self)
+    }
+
+    /// Undo the newest journaled write. Refuses (changing nothing) if a
+    /// touched file changed after the agent wrote it.
+    pub fn undo_last_write(&self) -> Result<journal::JournalEntry, ToolError> {
+        let j = self.journal.as_ref().ok_or_else(|| {
+            err(
+                ErrorKind::InvalidRequest,
+                "no write journal for this runtime",
+            )
+        })?;
+        let entry = j
+            .undo_last(&self.root)
+            .map_err(|e| err(ErrorKind::Conflict, &e))?;
+        for f in &entry.files {
+            self.note_seen(&self.root.join(&f.path));
+        }
+        Ok(entry)
+    }
+
+    /// Workspace-relative paths a write request will touch, for journaling.
+    fn write_targets(&self, request: &ToolRequest) -> Option<Vec<String>> {
+        let rels = match request {
+            ToolRequest::CreateFile { path, .. } => {
+                vec![relative(&self.root, &self.resolve_for_write(path).ok()?)]
+            }
+            ToolRequest::EditFile { path, .. } => {
+                vec![relative(
+                    &self.root,
+                    &self.resolve_existing(path, false).ok()?,
+                )]
+            }
+            ToolRequest::ApplyPatch { patch } => self
+                .plan_patch(patch)
+                .ok()?
+                .iter()
+                .map(|(t, _)| relative(&self.root, t))
+                .collect(),
+            _ => return None,
+        };
+        Some(rels)
     }
 
     fn fingerprint(bytes: &[u8]) -> u64 {
@@ -657,7 +709,16 @@ impl ToolRuntime {
                 }
             }
         };
+        let before = match &self.journal {
+            Some(_) => self
+                .write_targets(&call.request)
+                .map(|rels| journal::Pending::capture(&self.root, &rels)),
+            None => None,
+        };
         let outcome = self.execute_inner(&call.request);
+        if let (Ok(_), Some(j), Some(pending)) = (&outcome, &self.journal, before) {
+            let _ = j.record(&self.root, call_id, &call.prepared.tool, pending);
+        }
         match outcome {
             Ok(mut data) => {
                 let (clean, redactions) = redact(&data.output.unwrap_or_default());
@@ -2265,6 +2326,56 @@ mod tests {
             rt.resolve_approval(&p.call_id, true).unwrap();
         }
         rt.execute(&p.call_id)
+    }
+
+    #[test]
+    fn journaled_runtime_undoes_agent_writes_but_keeps_user_edits() {
+        let root = temp();
+        let jdir = temp();
+        let rt = ToolRuntime::new(&root)
+            .unwrap()
+            .with_journal(&jdir)
+            .unwrap();
+        fs::write(root.join("a.txt"), "orig\n").unwrap();
+        assert!(
+            approved(
+                &rt,
+                ToolRequest::EditFile {
+                    path: "a.txt".into(),
+                    expected: "orig".into(),
+                    replacement: "agent".into(),
+                    replace_all: false,
+                }
+            )
+            .ok
+        );
+        assert!(approved(&rt, ToolRequest::ApplyPatch {
+            patch: "*** Begin Patch\n*** Add File: b.txt\n+new\n*** Update File: a.txt\n@@\n-agent\n+agent2\n*** End Patch".into(),
+        }).ok);
+        // a failed write is not journaled
+        assert!(
+            !approved(
+                &rt,
+                ToolRequest::EditFile {
+                    path: "a.txt".into(),
+                    expected: "no such text".into(),
+                    replacement: "x".into(),
+                    replace_all: false,
+                }
+            )
+            .ok
+        );
+        assert_eq!(rt.undo_last_write().unwrap().tool, "apply_patch");
+        assert!(!root.join("b.txt").exists());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "agent\n");
+        // the runtime still accepts writes after undo (seen state updated)
+        fs::write(root.join("a.txt"), "user\n").unwrap();
+        let e = rt.undo_last_write().unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Conflict);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user\n");
+        // an un-journaled runtime says so
+        let plain = ToolRuntime::new(temp()).unwrap();
+        assert!(plain.undo_last_write().is_err());
     }
 
     #[test]

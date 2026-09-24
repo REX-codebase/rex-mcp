@@ -85,3 +85,15 @@ is shared it is noted in the module docs.
 - Found while wiring this: `web_search` in the autonomous loop sends
   `seeds: []`, so with the built-in keyless REX provider it has no seeds to
   crawl. Not changed yet.
+- Checkpoint/undo. Hermes snapshots into a shadow git store before
+  mutating calls (`tools/checkpoint_manager.py:1-9`); opencode keeps git
+  snapshots with `restore`/`revert` (`src/snapshot/index.ts:36-42`). REX
+  before: none. REX now (`crates/rex-tools/src/journal.rs`): every
+  successful create/edit/patch is journaled on disk with the prior bytes (or
+  "absent") and a fingerprint of what the agent wrote. `undo_last_write`
+  works on the runtime and on the service for finished or crashed runs. It
+  goes newest-first, restores deleted files, removes created ones, and
+  refuses (changing nothing) when a file changed after the agent wrote it,
+  so user edits are never clobbered. No git needed. Gap left: undo is a
+  service API; the daemon route and UI button are not wired yet, and there's
+  no undo to an arbitrary step in one call.
