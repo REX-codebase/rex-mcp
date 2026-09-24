@@ -200,8 +200,15 @@ is shared it is noted in the module docs.
   starting `{{` or `{%`) are not checked. Sweep: 0 YAML files flagged in
   this repo, opencode, Hermes and the cargo registry (748 YAML files; the
   5 flags in the sweep are pre-existing JSX/Kotlin/C notes).
-- Gap left: YAML check is still not a full parser (no indentation-structure
-  errors); opencode's LSP route covers more.
+- Round 8: a key indented under a key that already holds a plain value
+  ("'image' is indented under 'web'") is flagged. Multi-line quoted
+  strings (with `\"` and `''` escapes) are skipped until they close, and
+  wrapped prose whose "key" has spaces or punctuation is left alone.
+  Sweep: 0 YAML files flagged across this repo, opencode, Hermes and the
+  cargo registry (same 5 pre-existing non-YAML notes). 4 mutations of the
+  new logic each fail the test.
+- Gap left: YAML check is still not a full parser (no flow-collection or
+  sequence/mapping mix errors); opencode's LSP route covers more.
 - App: AgentRunView shows the ask_user question (choices, free text, "Let
   REX decide") and an "Undo last file change" button on finished runs that
   wrote files. Covered by 2 vitest tests; rendered with the compiled theme

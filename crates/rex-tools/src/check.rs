@@ -135,6 +135,10 @@ fn check_yaml(content: &str) -> Vec<Finding> {
     });
     // open block mappings: (key column, keys seen with their line)
     let mut scopes: Vec<(usize, Vec<(String, usize)>)> = Vec::new();
+    // last `key: plain value` line: (key column, line, key)
+    let mut last_scalar: Option<(usize, usize, String)> = None;
+    // a quoted value still open from an earlier line (multi-line string)
+    let mut open_quote: Option<char> = None;
     let mut block_indent: Option<usize> = None;
     // open flow brackets: (char, line, col)
     let mut flow: Vec<(char, usize, usize)> = Vec::new();
@@ -142,6 +146,12 @@ fn check_yaml(content: &str) -> Vec<Finding> {
         let line_no = idx + 1;
         let indent = raw.len() - raw.trim_start_matches([' ', '\t']).len();
         let body = raw.trim_start_matches([' ', '\t']);
+        if let Some(q) = open_quote {
+            if quote_closes(raw, q) {
+                open_quote = None;
+            }
+            continue;
+        }
         if let Some(bi) = block_indent {
             if body.is_empty() || indent > bi {
                 continue;
@@ -178,6 +188,41 @@ fn check_yaml(content: &str) -> Vec<Finding> {
                 break;
             }
             let key_at = find_mapping_colon(&chars[start.min(chars.len())..]);
+            // A key that already has a plain value cannot own nested keys:
+            // `name: web\n  image: x` is a YAML error. Only simple keys on
+            // the deeper line count, so wrapped plain text is not flagged.
+            let prev = last_scalar.take();
+            if let (Some((pcol, pline, pkey)), Some(c)) = (prev, key_at) {
+                let key: String = chars[start..start + c].iter().collect();
+                let simple = !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+                if indent > pcol && simple && !raw[..indent].contains('\t') {
+                    out.push(Finding {
+                        line: line_no,
+                        col: indent + 1,
+                        message: format!(
+                            "'{key}' is indented under '{pkey}', which already has a value on line {pline}"
+                        ),
+                    });
+                }
+            }
+            if let Some(c) = key_at {
+                let value: String = chars[start + c + 1..].iter().collect();
+                let value = value.split(" #").next().unwrap_or("").trim();
+                if let Some(q) = value.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                    if !quote_closes(&value[1..], q) {
+                        open_quote = Some(q);
+                    }
+                }
+                let plain = !value.is_empty()
+                    && !value.starts_with(['|', '>', '[', '{', '&', '!', '*', '\'', '"', '#']);
+                if plain {
+                    let key: String = chars[start..start + c].iter().collect();
+                    last_scalar = Some((indent + start, line_no, key.trim().to_string()));
+                }
+            }
             if !templated && !raw[..indent].contains('\t') {
                 let col = indent + start;
                 let new_item = start > 0;
@@ -297,6 +342,28 @@ fn check_yaml(content: &str) -> Vec<Finding> {
         });
     }
     cap(out)
+}
+
+/// Whether `text` holds the closing `q` of a quoted scalar (`\"` escapes
+/// in double quotes, `''` in single quotes).
+fn quote_closes(text: &str, q: char) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if q == '"' && chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == q {
+            if q == '\'' && chars.get(i + 1) == Some(&'\'') {
+                i += 2;
+                continue;
+            }
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Normalised mapping key, or `None` for keys REX does not compare
@@ -886,6 +953,40 @@ mod tests {
         dirty("a.yaml", "a: {x: [1, 2}\n", "closed with");
         let f = check("a.yaml", "x: 1\na: [1, 2\n").unwrap();
         assert_eq!((f[0].line, f[0].col), (2, 4), "{f:?}");
+    }
+
+    #[test]
+    fn yaml_key_under_a_plain_value_is_flagged() {
+        let f = check("a.yaml", "services:\n  web: nginx\n    image: x\n").unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!((f[0].line, f[0].col), (3, 5));
+        assert!(
+            f[0].message.contains("'image' is indented under 'web'"),
+            "{f:?}"
+        );
+        dirty("a.yml", "- name: a\n    run: b\n", "indented under 'name'");
+        // valid shapes (and wrapped text with a non-simple "key", left
+        // unflagged on purpose): nested mapping, block scalar, anchors,
+        // sequence items, comments in between
+        // a multi-line string closes (past an escaped quote) and checking
+        // resumes on the lines after it
+        let f = check(
+            "loc.yaml",
+            "r:\n  e: \"say \\\"hi\n  e: still text\\\" end\"\n  e: 2\n",
+        )
+        .unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].line, 4, "{f:?}");
+        assert!(f[0].message.contains("duplicate key 'e'"), "{f:?}");
+        // multi-line quoted strings (seen in Hermes locale files)
+        clean(
+            "loc.yaml",
+            "r:\n  e: \"Could not parse: {x}.\nUse quotes, for example: `a`.\"\n  f: \"ok\"\n  g: 'it''s\n  e: dup'\n  h: 1\n",
+        );
+        clean(
+            "ok.yaml",
+            "a:\n  b: 1\nc: |\n  d: 2\ne: &x\n  f: 3\ng: long text that\n  wraps onto the next line: here\nh: v\ni:\n  - j: 1\n    k: 2\nl: v # note\n# m:\nn: 1\n",
+        );
     }
 
     #[test]
