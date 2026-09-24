@@ -143,11 +143,12 @@ export function SessionView({ session, busy, onFollowUp, onNewTask, focusCompose
         <TurnBlock key={turn.id} turn={turn} receipt={session.receipt} engine={session.engine} expanded={i === latestIndex} />
       ))}
       <FollowUpComposer busy={busy} onFollowUp={onFollowUp} focusWhenReady={focusComposer} />
+      {/* One disclaimer, not two: the tour banner above already says this is
+          sample data, so the note under the composer stays a single line. */}
       <p className="mt-3 text-[11px] leading-relaxed text-faint">
-        Follow-ups keep this run&rsquo;s context instead of starting over. Preview: responses are
-        simulated locally, nothing is sent to a model.
+        Follow-ups keep this run&rsquo;s context instead of starting over. Preview only: no backend
+        is connected, so this is sample data and nothing is sent to a model.
       </p>
-      <p className="mt-6 text-xs leading-relaxed text-faint">Preview only. No backend is connected, so this is sample interface data, not real agent output.</p>
     </section>
   );
 }
