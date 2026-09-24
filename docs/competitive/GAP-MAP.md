@@ -264,9 +264,15 @@ is shared it is noted in the module docs.
   Mismatched closers and unclosed flows were already caught. Sweep: 0
   YAML files flagged across this repo, opencode, Hermes and the cargo
   registry. 4 mutations of the rule each fail the test.
+- Round 10: duplicate keys inside flow mappings (`{x: 1, x: 2}`, nested,
+  quoted keys, across lines) are flagged; value-only entries (`{x, x}`),
+  aliases, colons inside plain keys and URLs are left alone. Sweep: 0
+  YAML files flagged over about 1,190 flow-mapping lines (mostly in
+  Hermes). Mutations: 6 of 7 fail the test; the survivor (not clearing
+  the key stack after a mismatch) cannot change output, because the
+  stack is only read through the flow stack, which is cleared.
 - Gap left: YAML check is still not a full parser (no sequence/mapping
-  mix errors, no flow-mapping duplicate keys); opencode's LSP route
-  covers more.
+  mix errors); opencode's LSP route covers more.
 - App: AgentRunView shows the ask_user question (choices, free text, "Let
   REX decide") and an "Undo last file change" button on finished runs that
   wrote files. Covered by 2 vitest tests; rendered with the compiled theme

@@ -142,6 +142,9 @@ fn check_yaml(content: &str) -> Vec<Finding> {
     let mut block_indent: Option<usize> = None;
     // open flow brackets: (char, line, col)
     let mut flow: Vec<(char, usize, usize)> = Vec::new();
+    // per open flow bracket: keys seen (with line) and whether the next
+    // entry of a `{` mapping starts here (after `{` or `,`)
+    let mut flow_keys: Vec<(Vec<(String, usize)>, bool)> = Vec::new();
     for (idx, raw) in content.lines().enumerate() {
         let line_no = idx + 1;
         let indent = raw.len() - raw.trim_start_matches([' ', '\t']).len();
@@ -284,7 +287,32 @@ fn check_yaml(content: &str) -> Vec<Finding> {
         // quoted strings and comments
         while i < chars.len() {
             let c = chars[i];
+            if c != ' ' && c != '#' && flow.last().is_some_and(|f| f.0 == '{') {
+                if let Some((keys, expect)) = flow_keys.last_mut() {
+                    if *expect {
+                        *expect = false;
+                        if let Some(key) = flow_key(&chars[i..]).filter(|_| !templated) {
+                            if let Some((_, first)) = keys.iter().find(|(k, _)| *k == key) {
+                                out.push(Finding {
+                                    line: line_no,
+                                    col: indent + i + 1,
+                                    message: format!(
+                                        "duplicate key '{key}' in flow mapping (first on line {first})"
+                                    ),
+                                });
+                            } else {
+                                keys.push((key, line_no));
+                            }
+                        }
+                    }
+                }
+            }
             match c {
+                ',' => {
+                    if let Some((_, expect)) = flow_keys.last_mut() {
+                        *expect = true;
+                    }
+                }
                 '"' | '\'' => {
                     let q = c;
                     i += 1;
@@ -304,9 +332,14 @@ fn check_yaml(content: &str) -> Vec<Finding> {
                     }
                 }
                 '#' if i == 0 || chars[i - 1] == ' ' => break,
-                '[' | '{' => flow.push((c, line_no, indent + i + 1)),
+                '[' | '{' => {
+                    flow.push((c, line_no, indent + i + 1));
+                    // the flag is only read while a `{` is innermost
+                    flow_keys.push((Vec::new(), true));
+                }
                 ']' | '}' => {
                     let want = if c == ']' { '[' } else { '{' };
+                    flow_keys.pop();
                     match flow.pop() {
                         Some((open, _, _)) if open == want => {}
                         Some((open, l, _)) => {
@@ -318,6 +351,7 @@ fn check_yaml(content: &str) -> Vec<Finding> {
                                 ),
                             });
                             flow.clear();
+                            flow_keys.clear();
                             break;
                         }
                         None => {}
@@ -360,6 +394,54 @@ fn check_yaml(content: &str) -> Vec<Finding> {
         });
     }
     cap(out)
+}
+
+/// The key of a flow-mapping entry starting at `chars` (`key: value`,
+/// `"key": value`), or `None` for a value-only entry, a nested
+/// collection or anything unclear.
+fn flow_key(chars: &[char]) -> Option<String> {
+    let (key, rest) = match chars.first()? {
+        '"' | '\'' => {
+            let q = chars[0];
+            let mut j = 1;
+            while j < chars.len() {
+                if q == '"' && chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == q {
+                    if q == '\'' && chars.get(j + 1) == Some(&'\'') {
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if j >= chars.len() {
+                return None;
+            }
+            (chars[1..j].iter().collect::<String>(), &chars[j + 1..])
+        }
+        '{' | '[' | ']' | '}' | ',' | '?' | '&' | '*' | '!' | '|' | '>' => return None,
+        _ => {
+            let end = (0..chars.len()).find(|&j| {
+                matches!(chars[j], ',' | '{' | '}' | '[' | ']' | '#')
+                    || (chars[j] == ':'
+                        && chars
+                            .get(j + 1)
+                            .is_none_or(|n| matches!(n, ' ' | ',' | '}' | ']')))
+            })?;
+            if chars[end] != ':' {
+                return None;
+            }
+            let key: String = chars[..end].iter().collect();
+            (key.trim().to_string(), &chars[end..])
+        }
+    };
+    let rest: String = rest.iter().collect();
+    let rest = rest.trim_start();
+    (rest.starts_with(':') && !key.is_empty()).then_some(key)
 }
 
 /// Whether `text` holds the closing `q` of a quoted scalar (`\"` escapes
@@ -970,6 +1052,22 @@ mod tests {
         dirty("a.yaml", "a: [1, 2\nb: 3\n", "never closed");
         dirty("a.yaml", "a: {x: [1, 2}\n", "closed with");
         dirty("a.yaml", "a: [1, 2] x\n", "text after the flow collection");
+        dirty(
+            "a.yaml",
+            "a: {x: 1, y: 2, x: 3}\n",
+            "duplicate key 'x' in flow mapping",
+        );
+        dirty(
+            "a.yaml",
+            "a: {\"k\": 1,\n    k: 2}\n",
+            "duplicate key 'k' in flow mapping (first on line 1)",
+        );
+        dirty("a.yaml", "- {a: {b: 1, b: 2}}\n", "duplicate key 'b'");
+        dirty("a.yaml", "a: {x: [1, {y: 2}], x: 2}\n", "duplicate key 'x'");
+        clean(
+            "flow.yaml",
+            "a: {x: 1, y: {x: 2}}\nb: [{x: 1}, {x: 2}]\nc: {x: 'a, x: b', y: \"x: 1\"}\nd: {x, x}\ne: {u: http://h/x, v: 1}\nf: {a:b: 1, a:c: 2}\ng: {*k : 1, *k : 2}\n",
+        );
         dirty("a.yaml", "a: {b: 1}}\n", "text after the flow collection");
         dirty(
             "a.yml",
