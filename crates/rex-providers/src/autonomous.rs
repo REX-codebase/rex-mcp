@@ -464,6 +464,36 @@ struct Checkpoint {
     /// without it fall back to `<run_dir>/workspace`.
     #[serde(default)]
     workspace: Option<PathBuf>,
+    /// Every file this run changed (create, edit, patch, edit sub-agents),
+    /// in first-seen order and capped at FILES_WRITTEN_CAP, for past_runs.
+    /// Unlike the 12-turn digest it covers the whole run.
+    #[serde(default)]
+    files_written: Vec<String>,
+}
+
+/// Most paths `Checkpoint::files_written` keeps.
+const FILES_WRITTEN_CAP: usize = 200;
+
+/// Adds `path` to `list` once. Empty paths and markers such as
+/// "(run_command)" are skipped; the list stops growing at the cap.
+fn note_written(list: &mut Vec<String>, path: &str) {
+    let path = path.trim();
+    if path.is_empty() || path.starts_with('(') || list.len() >= FILES_WRITTEN_CAP {
+        return;
+    }
+    if !list.iter().any(|p| p == path) {
+        list.push(path.to_string());
+    }
+}
+
+/// Paths a successful write call changed, from its receipt target
+/// (apply_patch joins several paths with ", ").
+fn written_paths<'a>(tool: &str, target: Option<&'a str>) -> Vec<&'a str> {
+    match (tool, target) {
+        ("create_file" | "edit_file", Some(t)) => vec![t],
+        ("apply_patch", Some(t)) => t.split(", ").collect(),
+        _ => Vec::new(),
+    }
 }
 
 struct RunShared {
@@ -3868,6 +3898,9 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         out.mutating_success = true;
                         out.progress = true;
                     }
+                    for f in &outcome.files_written {
+                        note_written(&mut cp.files_written, f);
+                    }
                     if let Some(l) = ledger.as_mut() {
                         l.append(
                             "explore",
@@ -4268,6 +4301,11 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 }
                 if !result.ok && cp.consec_fail == 2 {
                     content.push_str(" warning: this exact call has failed twice; change approach instead of retrying it unchanged");
+                }
+                if result.ok {
+                    for f in written_paths(tool_name, receipt.target.as_deref()) {
+                        note_written(&mut cp.files_written, f);
+                    }
                 }
                 out.digest_actions.push(DigestAction {
                     tool: tool_name.into(),
@@ -5172,18 +5210,17 @@ fn finish<S: SecretStore + 'static, T: Transport + 'static>(
     let _ = write_json(&ctx.state_dir.join("checkpoint.json"), cp);
 }
 
-/// Files the run's recent turns wrote successfully, in first-seen order.
-/// Taken from the turn digest, so a long run lists its later changes only.
+/// Files the run changed, in first-seen order: the whole-run list, then
+/// any writes only the recent-turn digest knows about (a checkpoint saved
+/// before `files_written` existed and then resumed).
 fn files_changed(cp: &Checkpoint) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    let mut out = cp.files_written.clone();
     for action in cp.digest.iter().flat_map(|d| &d.actions) {
-        if !action.ok || !matches!(action.tool.as_str(), "create_file" | "edit_file") {
+        if !action.ok {
             continue;
         }
-        if let Some(t) = action.target.as_ref().filter(|t| !t.is_empty()) {
-            if !out.contains(t) {
-                out.push(t.clone());
-            }
+        for f in written_paths(&action.tool, action.target.as_deref()) {
+            note_written(&mut out, f);
         }
     }
     out
@@ -6372,6 +6409,90 @@ mod tests {
     }
 
     #[test]
+    fn files_changed_merges_whole_run_list_and_digest() {
+        let act = |tool: &str, target: &str| DigestAction {
+            tool: tool.into(),
+            ok: true,
+            target: Some(target.into()),
+            error_kind: None,
+        };
+        let cp = Checkpoint {
+            files_written: vec!["early.rs".into(), "b.rs".into()],
+            digest: vec![DigestEntry {
+                turn: 20,
+                actions: vec![
+                    act("edit_file", "b.rs"),
+                    act("apply_patch", "p/one.rs, p/two.rs"),
+                    act("run_command", "rm x"),
+                ],
+            }],
+            ..Checkpoint::default()
+        };
+        assert_eq!(
+            files_changed(&cp),
+            vec!["early.rs", "b.rs", "p/one.rs", "p/two.rs"]
+        );
+        // markers, blanks and repeats are skipped; the list is capped
+        let mut list = Vec::new();
+        for f in ["(run_command)", "  ", "a.rs", "a.rs", " c.rs "] {
+            note_written(&mut list, f);
+        }
+        assert_eq!(list, vec!["a.rs", "c.rs"]);
+        for i in 0..FILES_WRITTEN_CAP + 5 {
+            note_written(&mut list, &format!("f{i}"));
+        }
+        assert_eq!(list.len(), FILES_WRITTEN_CAP);
+        assert_eq!(
+            list[FILES_WRITTEN_CAP - 1],
+            format!("f{}", FILES_WRITTEN_CAP - 3)
+        );
+        assert!(written_paths("read_file", Some("a.rs")).is_empty());
+        assert!(written_paths("create_file", None).is_empty());
+    }
+
+    #[test]
+    fn long_run_records_files_older_than_the_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut turns = vec![call_turn(vec![
+            json!({"functionCall":{"name":"apply_patch","args":{"patch":"*** Begin Patch\n*** Add File: p1.txt\n+one\n*** Add File: p2.txt\n+two\n*** End Patch"}}}),
+        ])];
+        for i in 2..=14 {
+            turns.push(call_turn(vec![create_call(&format!("f{i}.txt"), "x")]));
+        }
+        // a failed edit is not a changed file
+        turns.push(call_turn(vec![
+            json!({"functionCall":{"name":"edit_file","args":{
+            "path":"f2.txt.bak","expected":"nope","replacement":"y","replace_all":false}}}),
+        ]));
+        turns.push(call_turn(vec![
+            plan_call(vec![("1", "write files", "done")]),
+            complete_call("wrote fifteen files"),
+        ]));
+        let svc = Arc::new(service(tmp.path(), Script::new(turns)));
+        let mut b = budgets();
+        b.max_steps = 20;
+        let snap = svc.begin("write many files", "gemini", Some(b)).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 120_000);
+        assert!(
+            matches!(done.terminal_reason, Some(TerminalReason::Completed)),
+            "{:?}",
+            done.terminal_reason
+        );
+        let state = tmp.path().join("runs").join(&snap.id).join("state");
+        let term: Value =
+            serde_json::from_str(&fs::read_to_string(state.join("terminal.json")).unwrap())
+                .unwrap();
+        let files: Vec<String> = serde_json::from_value(term["files"].clone()).unwrap();
+        let mut want = vec!["p1.txt".to_string(), "p2.txt".to_string()];
+        want.extend((2..=14).map(|i| format!("f{i}.txt")));
+        assert_eq!(files, want);
+        // the whole-run list survives in the checkpoint for resume
+        let cp = fs::read_to_string(state.join("checkpoint.json")).unwrap();
+        assert!(cp.contains("\"files_written\""), "{cp}");
+    }
+
+    #[test]
     fn past_runs_recalls_an_earlier_run_in_the_same_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.keep();
@@ -7312,6 +7433,17 @@ mod tests {
             "{batch} {:?}",
             done.events
         );
+        // the run's own file list takes the child's file, not the marker
+        let term = fs::read_to_string(
+            tmp.path()
+                .join("runs")
+                .join(&snap.id)
+                .join("state")
+                .join("terminal.json"),
+        )
+        .unwrap();
+        let term: Value = serde_json::from_str(&term).unwrap();
+        assert_eq!(term["files"], json!(["seed.txt", "made.txt"]), "{term}");
     }
 
     #[test]

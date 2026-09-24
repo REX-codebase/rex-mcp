@@ -720,6 +720,37 @@ is shared it is noted in the module docs.
   and index.html, a miss says so, and run 2 never lists itself. Hand
   mutation: 13/13 killed, plus 1 equivalent in the loop test (the current
   run has no terminal.json while it runs; the unit test covers `exclude`).
-- Gap left: files come from the turn digest (last 12 turns), so a long
-  run lists only its later changes. There is no ranking beyond newest
-  first.
+- Gap left: files came from the turn digest (last 12 turns), so a long
+  run listed only its later changes (closed in round 16b). There is no
+  ranking beyond newest first.
+
+## Round 16b: whole-run file list for `past_runs`
+
+- Competitors: Hermes' session search returns matching messages from a
+  session, not a list of changed files (`tools/session_search_tool.py`).
+  opencode has no recall tool (round 16). This round closes REX's own
+  round 16 gap; it adds nothing either competitor has.
+- REX before: `terminal.json`'s `files` came from the 12-turn digest, so
+  a long run lost its early changes. It also skipped `apply_patch`
+  entirely, and files an edit sub-agent wrote were never listed.
+- REX now:
+  - The checkpoint keeps `files_written` for the whole run:
+    create_file, edit_file, every path of an apply_patch (added, changed
+    or deleted) and the files edit sub-agents wrote. The list keeps
+    first-seen order, skips repeats, blanks and markers such as
+    "(run_command)", and stops at 200 paths.
+  - It lives in the checkpoint, so it survives resume. A checkpoint saved
+    before this round still works: the digest's writes are merged in
+    after the list.
+  - Only successful calls count. The prompt and tools are unchanged, so
+    the prompt identity (and checkpoint resume) is not affected.
+- Tests: a merge unit test (whole-run list first, digest extras after,
+  apply_patch split, markers, blanks, repeats, the cap); a scripted
+  16-turn run (one apply_patch adding two files, 13 create_file turns and
+  a failed edit) whose `terminal.json` lists all 15 files in order; and
+  the round 12f sub-agent test now checks the run lists `seed.txt` and
+  `made.txt` but not the marker. Hand mutation: 12/12 killed. One more
+  mutant (dropping the success check) is equivalent today: failed tool
+  results never carry a target.
+- Gap left: a command the main agent runs (not a sub-agent) that writes
+  files is still not listed.
