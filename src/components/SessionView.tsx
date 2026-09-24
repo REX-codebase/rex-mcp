@@ -40,18 +40,33 @@ function TurnBlock({ turn, receipt, engine, expanded }: { turn: Turn; receipt: s
         </button>
       )}
       {(expanded || open) && (
-        <ol className="mt-2 border-t border-line" aria-label="Evidence">
+        <ol className="tl-list session-evidence" aria-label="Evidence">
           {turn.steps.map((s) => (
-            <li key={s.id} className="evidence-row">
-              <span className={`mt-2 h-1.5 w-1.5 shrink-0 rounded-full ${s.ok ? "bg-done" : "bg-danger"}`} />
-              <div className="min-w-0 flex-1">
-                <p className="text-sm text-text">{s.name}</p>
-                <p className="mt-0.5 text-xs leading-relaxed text-muted">{s.detail}</p>
+            <li key={s.id} className="tl-row">
+              <div className="tl-head">
+                <span className={`tl-mark ${s.ok ? "is-ok" : "is-err"}`} aria-hidden="true">
+                  {s.ok ? (
+                    <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 5.2 4.1 7.3 8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                  ) : (
+                    <svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 3l4 4M7 3 3 7" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+                  )}
+                </span>
+                <span className="tl-verb">{s.name}</span>
+                <span className="tl-detail">{s.detail}</span>
+                <span className="tl-meta"><span>{fmt(s.durationMs)}</span></span>
               </div>
-              <span className="shrink-0 font-mono text-[11px] text-faint">{fmt(s.durationMs)}</span>
             </li>
           ))}
-          {turn.steps.length === 0 && <li className="py-4 text-sm text-muted">No evidence yet.</li>}
+          {!finished && (
+            <li className="tl-row" aria-live="polite">
+              <div className="tl-head">
+                <span className="tl-mark is-live" aria-hidden="true"><i /></span>
+                <span className="tl-verb text-muted">{turn.state === "verifying" ? "Verifying" : "Working"}</span>
+                <span className="tl-detail">next step in progress</span>
+              </div>
+            </li>
+          )}
+          {finished && turn.steps.length === 0 && <li className="tl-row tl-text">No evidence yet.</li>}
         </ol>
       )}
       {finished && turn.steps.length > 0 && (expanded || open) && (
