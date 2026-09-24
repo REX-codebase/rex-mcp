@@ -19,8 +19,11 @@ export function InstalledAgentsSettings() {
     {desktop ? items.map((item) => <div className="settings-row settings-row-wrap" key={item.id}>
       <span><span className="text-sm text-text">{item.name}</span><small className="block text-xs text-faint">{item.automation}</small></span>
       <span className="text-xs text-faint" title={`${item.compatibility.entitlement_note}. ${item.approval_boundary}`}>{STATE[item.state]}{item.version ? ` · ${item.version}` : ""}</span>
-    </div>) : <div className="settings-row"><span className="text-sm text-text">Desktop detection</span><span className="text-xs text-faint">Open the REX app</span></div>}
-    <p className="settings-note">Only OpenAI Codex CLI is offered: OpenAI documents codex exec for non-interactive automation and the CLI keeps its own ChatGPT or API-key sign-in. The Antigravity, Claude Code, Cursor and Pi routes were removed on 19 Sep 2026 because their providers' current terms do not permit third-party harness use of a consumer subscription.</p>
-    <p className="settings-note">Compatibility reviewed 19 Sep 2026. REX probes the installed CLI offline and fails closed - no runs - if its documented interface, version support, or terms basis no longer matches the reviewed contract.</p>
+    </div>) : <div className="settings-row"><span className="text-sm text-text">OpenAI Codex CLI</span><span className="text-xs text-faint">Detected in the desktop app</span></div>}
+    <details className="settings-more">
+      <summary>Why only Codex CLI, and how REX checks it</summary>
+      <p className="settings-note">Only OpenAI Codex CLI is offered: OpenAI documents codex exec for non-interactive automation and the CLI keeps its own ChatGPT or API-key sign-in. The Antigravity, Claude Code, Cursor and Pi routes were removed on 19 Sep 2026 because their providers' current terms do not permit third-party harness use of a consumer subscription.</p>
+      <p className="settings-note">Compatibility reviewed 19 Sep 2026. REX probes the installed CLI offline and fails closed - no runs - if its documented interface, version support, or terms basis no longer matches the reviewed contract.</p>
+    </details>
   </section>;
 }
