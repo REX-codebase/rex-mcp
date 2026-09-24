@@ -410,6 +410,10 @@ struct TurnPair {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Checkpoint {
+    /// Full text of this run's clipped command outputs, for read_output.
+    /// In memory only: a resumed run starts empty.
+    #[serde(skip)]
+    outputs: crate::output_store::OutputStore,
     step: usize,
     tool_calls: usize,
     tokens_used: u64,
@@ -546,6 +550,13 @@ enum AgentCall {
         offset: usize,
         /// Flat text instead of the default Markdown (`format: "text"`).
         text: bool,
+    },
+    /// Page or search the full text of an earlier clipped command output.
+    ReadOutput {
+        id: String,
+        call_id: String,
+        offset: usize,
+        query: Option<String>,
     },
     /// Hand a focused read-only question to an explorer sub-agent.
     /// One task, or up to `explore::EXPLORE_MAX_PARALLEL` run concurrently.
@@ -2162,7 +2173,7 @@ fn build_state_message(
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "explore", "ask_user", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "read_output", "explore", "ask_user", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
         "project_instructions": project.map(|p| json!({
@@ -2261,6 +2272,12 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "web_fetch",
             "Read one public web page as text (robots-aware, private addresses refused).",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "read_output",
+            "Page or search the full output of an earlier run_command in this run that came back clipped.",
             false,
             false,
         ),
@@ -2519,6 +2536,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
         {"name":"web_fetch","description":"Read one public web page (http/https), e.g. docs or an issue you already have the URL for. HTML comes back as Markdown (headings, lists, absolute links, code blocks); format=text gives flat text. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"},"format":{"type":"STRING","enum":["markdown","text"],"description":"markdown (default) or text"}},"required":["url"]}},
+        {"name":"read_output","description":"Page or search the full output of an earlier run_command in this run whose result said output_truncated. Pass the call_id from that result's full_output. offset pages from a 1-based line (200 lines per page); query returns matching lines (literal, case-insensitive). The last 8 clipped outputs are kept, in memory, for this run only.","parameters":{"type":"OBJECT","properties":{"call_id":{"type":"STRING"},"offset":{"type":"INTEGER","description":"1-based first line"},"query":{"type":"STRING","description":"literal text to find"}},"required":["call_id"]}},
         {"name":"explore","description":"Delegate a focused question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob, or (kind edit) one self-contained change to a writing sub-agent. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"},"kind":{"type":"STRING","enum":["explore","research","edit"],"description":"explore (default): workspace only. research: workspace plus web_fetch of public pages, for questions that need docs or issue pages. edit: one self-contained change per task (up to 3 in parallel, each on different files); the child can write and run commands, each needing the user's approval as usual, and reports files changed"}}}},
         {"name":"ask_user","description":"Ask the user when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Pass one question, or up to 3 related questions at once in `questions` so the user answers them together. Give up to 4 short choices per question, best first; the user may also answer freely. At most 3 questions per run. Anything declined or unanswered in time means proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}},"questions":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}}}}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
@@ -2846,6 +2864,25 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     raw,
                 )),
             },
+            "read_output" => match parse_read_output(&args) {
+                Ok((call_id, offset, query)) => calls.push((
+                    AgentCall::ReadOutput {
+                        id,
+                        call_id,
+                        offset,
+                        query,
+                    },
+                    raw,
+                )),
+                Err(error) => calls.push((
+                    AgentCall::BadCall {
+                        name: "read_output".into(),
+                        id,
+                        error,
+                    },
+                    raw,
+                )),
+            },
             "ask_user" => match parse_ask_user(&args) {
                 Ok(questions) => calls.push((AgentCall::AskUser { id, questions }, raw)),
                 Err(error) => calls.push((
@@ -2925,11 +2962,28 @@ fn decode_provider_calls(
     }
 }
 
+/// `read_output` arguments: (call_id, offset, query).
+fn parse_read_output(args: &Value) -> Result<(String, usize, Option<String>), String> {
+    let call_id = args
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or("read_output missing call_id")?;
+    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((call_id.to_string(), offset, query))
+}
+
 /// Calls the loop handles itself rather than through [`ToolRequest`].
 const AGENT_CALL_NAMES: &[&str] = &[
     "update_plan",
     "web_search",
     "web_fetch",
+    "read_output",
     "ask_user",
     "explore",
     "complete_task",
@@ -3019,6 +3073,18 @@ fn decode_named_call(
                 Some(raw),
             ),
             None => bad("web_fetch missing url".into()),
+        },
+        "read_output" => match parse_read_output(&args) {
+            Ok((call_id, offset, query)) => (
+                AgentCall::ReadOutput {
+                    id,
+                    call_id,
+                    offset,
+                    query,
+                },
+                Some(raw),
+            ),
+            Err(e) => bad(e),
         },
         "ask_user" => match parse_ask_user(&args) {
             Ok(questions) => (AgentCall::AskUser { id, questions }, Some(raw)),
@@ -3516,6 +3582,54 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 );
                 response_parts.push(function_response(protocol, "web_fetch", &id, ok, &content));
             }
+            AgentCall::ReadOutput {
+                id,
+                call_id,
+                offset,
+                query,
+            } => {
+                let allowed = ctx
+                    .brief
+                    .allowed_tools
+                    .as_ref()
+                    .is_none_or(|a| a.iter().any(|t| t == "read_output"));
+                let (ok, content) = if allowed {
+                    cp.outputs.render(&call_id, offset, query.as_deref())
+                } else {
+                    (
+                        false,
+                        "tool read_output is not enabled for this run's role; use only the tools listed in your tool contract".to_string(),
+                    )
+                };
+                if let Some(l) = ledger.as_mut() {
+                    l.append(
+                        "read_output",
+                        json!({"call_id": call_id, "offset": offset, "query": query, "ok": ok}),
+                    );
+                }
+                out.digest_actions.push(DigestAction {
+                    tool: "read_output".into(),
+                    ok,
+                    target: Some(call_id.clone()),
+                    error_kind: (!ok).then(|| "no_saved_output".to_string()),
+                });
+                let mut call_args = json!({"call_id": call_id, "offset": offset});
+                if let Some(q) = &query {
+                    call_args["query"] = json!(q);
+                }
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"read_output","args": call_args}}),
+                );
+                response_parts.push(function_response(
+                    protocol,
+                    "read_output",
+                    &id,
+                    ok,
+                    &content,
+                ));
+            }
             AgentCall::Explore { id, tasks, kind } => {
                 let mut call_args = if tasks.len() == 1 {
                     json!({"task": tasks[0]})
@@ -3988,10 +4102,31 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     }
                     None => (None, false),
                 };
+                // Keep the full text of a clipped command output so the
+                // model can page or search it with read_output.
+                let full_output = if matches!(request, ToolRequest::RunCommand { .. })
+                    && (out_clipped || err_clipped)
+                {
+                    let full = if out_clipped {
+                        result.output.as_deref()
+                    } else {
+                        result.error.as_ref().map(|e| e.detail.as_str())
+                    };
+                    full.map(|text| {
+                        let lines = cp.outputs.save(&result.call_id, text);
+                        json!({
+                            "call_id": result.call_id, "lines": lines,
+                            "hint": "the middle was clipped; read_output with this call_id pages or searches the full text",
+                        })
+                    })
+                } else {
+                    None
+                };
                 let mut content = serde_json::to_string(&json!({
                     "ok": result.ok,
                     "output": output,
                     "error": error,
+                    "full_output": full_output,
                     "receipt": {
                         "bytes_read": receipt.bytes_read,
                         "bytes_written": receipt.bytes_written,
@@ -4582,6 +4717,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                 AgentCall::CompleteTask { .. } => Some("complete_task".to_string()),
                 AgentCall::Explore { .. } => Some("explore".to_string()),
                 AgentCall::WebFetch { .. } => Some("web_fetch".to_string()),
+                AgentCall::ReadOutput { .. } => Some("read_output".to_string()),
                 AgentCall::AskUser { .. } => Some("ask_user".to_string()),
             };
             if let Some(name) = name {
@@ -5044,6 +5180,18 @@ mod tests {
                 }
             }
             let next = self.turns.lock().unwrap().pop_front();
+            // `__LAST_TOOL_ID__` in a scripted turn becomes the newest
+            // rex-tools call id in this request, for tools that take one.
+            let next = next.map(|turn| match body.rfind("tool-") {
+                Some(at) if turn.contains("__LAST_TOOL_ID__") => {
+                    let id: String = body[at..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                        .collect();
+                    turn.replace("__LAST_TOOL_ID__", &id)
+                }
+                _ => turn,
+            });
             match next {
                 Some(body) => Ok((200, body)),
                 None => Ok((200, text_turn("nothing more to do"))),
@@ -5743,6 +5891,73 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::Info { message } if message.contains("rejected a turn carrying 1 image")))
             .count();
         assert_eq!(rejections, 1);
+    }
+
+    #[test]
+    fn read_output_pages_and_searches_a_clipped_command_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        let ws = root.join("runs").join("out-ws");
+        fs::create_dir_all(&ws).unwrap();
+        let log: Vec<String> = (1..=3000)
+            .map(|i| {
+                if i == 1500 {
+                    "test deep::middle FAILED".to_string()
+                } else {
+                    format!("line {i} ok")
+                }
+            })
+            .collect();
+        fs::write(ws.join("log.txt"), log.join("\n")).unwrap();
+        let script = Script::new(vec![
+            call_turn(vec![
+                json!({"functionCall":{"name":"run_command","args":{"argv":["cat","log.txt"]}}}),
+            ]),
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_output","args":{"call_id":"__LAST_TOOL_ID__","query":"failed"}}}),
+            ]),
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_output","args":{"call_id":"__LAST_TOOL_ID__","offset":1500}}}),
+            ]),
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_output","args":{"call_id":"tool-nope"}}}),
+            ]),
+            text_turn("done"),
+            text_turn("done"),
+            text_turn("done"),
+        ]);
+        let svc = Arc::new(service(&root, script));
+        let snap = svc
+            .begin_in_workspace_with_options(
+                "find the failing test",
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws),
+                Role::Worker,
+                RunOptions::default(),
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let _ = wait_terminal(&svc, &snap.id, 20_000);
+        let posts = svc.service.transport().seen();
+        assert!(posts.len() >= 5, "{}", posts.len());
+        // the clipped result hides the middle but points at read_output
+        assert!(!posts[1].contains("deep::middle FAILED"));
+        assert!(posts[1].contains("full_output"));
+        let at = posts[1].find("full_output").unwrap();
+        let tail = &posts[1][at..(at + 300).min(posts[1].len())];
+        assert!(tail.contains(r#"\"lines\":30"#), "{tail}");
+        // a search finds the line the model never saw (the command's
+        // output starts with one header line, so log line 1500 is 1501)
+        assert!(posts[2].contains(r#"1501: test deep::middle FAILED"#));
+        assert!(posts[2].contains(r#"\"matches\":1"#));
+        // paging from a line shows it in context
+        assert!(posts[3].contains(r#"1500: line 1499 ok\\n1501: test deep::middle FAILED"#));
+        assert!(posts[3].contains(r#"\"next_offset\":1700"#));
+        // an unknown id is an error the model can read
+        assert!(posts[4].contains("no saved output for call_id tool-nope"));
     }
 
     #[test]

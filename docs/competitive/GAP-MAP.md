@@ -657,3 +657,33 @@ is shared it is noted in the module docs.
 - Gap left: SVG is not rasterised. REX still has no per-model capability
   data, so the first image turn on a text-only model costs one failed
   request.
+
+## Round 15: the full text of clipped command output (`read_output`)
+
+- Competitors: opencode writes any tool output past 2,000 lines or 50 KB to
+  a file and returns a preview plus a hint to read or grep that file
+  (`packages/opencode/src/tool/truncate.ts`). Its read tool may open that
+  directory, and old files are removed after 7 days.
+- REX before: a `run_command` result reached the model as head plus tail
+  in 4,000 characters (`OUTCOME_CHARS`). The middle of a long test or build
+  log, often where the failure is, was gone for good.
+- REX now (`crates/rex-providers/src/output_store.rs`, the `read_output`
+  tool in `crates/rex-providers/src/autonomous.rs`):
+  - When a command's output or error text is clipped, the result carries
+    `full_output` (call_id, line count and a hint), and REX keeps the full
+    text.
+  - `read_output` pages it (200 lines, numbered, with `next_offset`) or
+    searches it (literal, case-insensitive, up to 100 numbered matching
+    lines).
+  - Unlike opencode, nothing is written to disk or into the workspace. The
+    text is kept in memory for this run only: the last 8 outputs, 1.1 MB
+    each. A reply is capped at 16,000 characters and 400 per line.
+  - It is read-only and needs no approval. Role allowlists apply, and
+    sub-agents get a clear refusal.
+- Tests: 2 store tests (paging, end of text, search, match cap, oldest
+  dropped, same id replaced, line and reply caps, byte cap on a char
+  boundary) and a scripted run. In that run `cat` of a 3,000-line log
+  hides line 1,500, a search finds it, paging shows it in context, and an
+  unknown id gets a readable error. Hand mutation: 13/13 killed.
+- Gap left: edit sub-agents' clipped command output is not kept. The
+  saved text is lost on resume.

@@ -19,6 +19,7 @@ pub mod error;
 mod history;
 pub mod http;
 mod memory;
+mod output_store;
 pub mod policy;
 mod provider_failure;
 pub mod providers;
