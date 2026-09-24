@@ -494,15 +494,28 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .agent-event-err { color: #c22f2f; }
 .agent-event-text { color: inherit; opacity: 0.85; }
 .agent-done-note {
-  margin: 12px 0 0;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  margin: 16px 0 4px;
+  border: 1px solid color-mix(in srgb, #50c878 30%, var(--color-line));
+  border-radius: 12px;
+  background: color-mix(in srgb, #50c878 6%, transparent);
+  padding: 12px 14px;
   font-size: 14px;
-  color: #0a7a3d;
+  line-height: 1.55;
+  color: var(--color-text);
 }
+.agent-done-note > span { color: #50c878; font-weight: 700; }
 .agent-gate-failures {
-  margin: 10px 0 0;
-  padding-left: 18px;
+  margin: 16px 0 4px;
+  border: 1px solid color-mix(in srgb, #e5484d 35%, var(--color-line));
+  border-radius: 12px;
+  background: color-mix(in srgb, #e5484d 6%, transparent);
+  padding: 12px 14px 12px 32px;
   font-size: 12.5px;
-  color: #c22f2f;
+  line-height: 1.6;
+  color: var(--color-text);
 }
 
 /* Installed-agent run lifecycle */

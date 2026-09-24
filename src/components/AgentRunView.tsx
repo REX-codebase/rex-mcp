@@ -236,6 +236,19 @@ export function AgentRunView({
         <RunMeters meters={runMeters(run)} />
       </header>
 
+      {/* The outcome leads: a finished run shows what happened before the
+          plan and the step-by-step activity. */}
+      {phase === "completed" && run.completion_summary && (
+        <p className="agent-done-note" role="note"><span aria-hidden="true">✓</span>{run.completion_summary}</p>
+      )}
+      {terminal && terminal.kind === "gates_failed" && (
+        <ul className="agent-gate-failures">
+          {terminal.failures.map((f, i) => (
+            <li key={i}>{f}</li>
+          ))}
+        </ul>
+      )}
+
       {run.plan.length > 0 && (
         <ol className="agent-plan" aria-label="Todo plan">
           {run.plan.map((item) => (
@@ -428,16 +441,6 @@ export function AgentRunView({
         </div>
       )}
 
-      {phase === "completed" && run.completion_summary && (
-        <p className="agent-done-note">✓ {run.completion_summary}</p>
-      )}
-      {terminal && terminal.kind === "gates_failed" && (
-        <ul className="agent-gate-failures">
-          {terminal.failures.map((f, i) => (
-            <li key={i}>{f}</li>
-          ))}
-        </ul>
-      )}
 
       {run.preview && (
         <div className="preview-runtime live-preview">

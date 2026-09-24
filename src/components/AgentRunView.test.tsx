@@ -175,6 +175,27 @@ describe("AgentRunView ask_user and undo", () => {
     await waitFor(() => expect(calls.answer).toEqual([["run-1", "5173"]]));
   });
 
+  it("a finished run leads with its summary, above the plan and activity", () => {
+    render(
+      <AgentRunView
+        run={snap({
+          status: "completed",
+          terminal_reason: { kind: "completed" } as AgentSnapshot["terminal_reason"],
+          completion_summary: "Renamed 3 imports.",
+          plan: [{ id: "p1", title: "Find imports", status: "done" }] as AgentSnapshot["plan"],
+        })}
+        deciding={false}
+        cancelling={false}
+        onDecide={noop}
+        onCancel={noop}
+      />
+    );
+    const note = screen.getByRole("note");
+    expect(note.textContent).toContain("Renamed 3 imports.");
+    const plan = screen.getByLabelText("Todo plan");
+    expect(note.compareDocumentPosition(plan) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("offers undo only after a finished run that wrote files", async () => {
     const wrote = {
       state: "tool_finished",
