@@ -88,7 +88,7 @@ const OUTCOME_CHARS: usize = 4_000;
 mod explore;
 #[path = "fetch.rs"]
 mod fetch;
-use explore::{run_explore, ExploreLimits, ProviderLink};
+use explore::{run_explore, ExploreLimits, ExploreOutcome, ProviderLink};
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -499,9 +499,10 @@ enum AgentCall {
         offset: usize,
     },
     /// Hand a focused read-only question to an explorer sub-agent.
+    /// One task, or up to `explore::EXPLORE_MAX_PARALLEL` run concurrently.
     Explore {
         id: String,
-        task: String,
+        tasks: Vec<String>,
     },
     /// Ask the user a blocking question through the trusted UI.
     AskUser {
@@ -2106,7 +2107,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
         {"name":"web_fetch","description":"Read one public web page (http/https) as plain text, e.g. docs or an issue you already have the URL for. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"}},"required":["url"]}},
-        {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"}},"required":["task"]}},
+        {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"}}}},
         {"name":"ask_user","description":"Ask the user one question when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Give up to 4 short choices, best first; the user may also answer freely. If they decline or do not answer in time, you are told to proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
     ]}])
@@ -2443,19 +2444,13 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     raw,
                 )),
             },
-            "explore" => match args.get("task").and_then(Value::as_str) {
-                Some(task) if !task.trim().is_empty() => calls.push((
-                    AgentCall::Explore {
-                        id,
-                        task: task.chars().take(explore::EXPLORE_TASK_CHARS).collect(),
-                    },
-                    raw,
-                )),
-                _ => calls.push((
+            "explore" => match explore::parse_explore_tasks(&args) {
+                Ok(tasks) => calls.push((AgentCall::Explore { id, tasks }, raw)),
+                Err(error) => calls.push((
                     AgentCall::BadCall {
                         name: "explore".into(),
                         id,
-                        error: "explore missing task".into(),
+                        error,
                     },
                     raw,
                 )),
@@ -2570,15 +2565,9 @@ fn decode_named_call(
             ),
             Err(e) => bad(e),
         },
-        "explore" => match args.get("task").and_then(Value::as_str) {
-            Some(task) if !task.trim().is_empty() => (
-                AgentCall::Explore {
-                    id,
-                    task: task.chars().take(explore::EXPLORE_TASK_CHARS).collect(),
-                },
-                Some(raw),
-            ),
-            _ => bad("explore missing task".into()),
+        "explore" => match explore::parse_explore_tasks(&args) {
+            Ok(tasks) => (AgentCall::Explore { id, tasks }, Some(raw)),
+            Err(e) => bad(e),
         },
         "complete_task" => (
             AgentCall::CompleteTask {
@@ -3005,7 +2994,12 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 );
                 response_parts.push(function_response(protocol, "web_fetch", &id, ok, &content));
             }
-            AgentCall::Explore { id, task } => {
+            AgentCall::Explore { id, tasks } => {
+                let call_args = if tasks.len() == 1 {
+                    json!({"task": tasks[0]})
+                } else {
+                    json!({"tasks": tasks})
+                };
                 if let Some(allowed) = &ctx.brief.allowed_tools {
                     if !allowed.iter().any(|t| t == "explore") {
                         out.digest_actions.push(DigestAction {
@@ -3017,7 +3011,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         push_model_part(
                             &mut model_parts,
                             raw,
-                            json!({"functionCall":{"name":"explore","args":{"task": task}}}),
+                            json!({"functionCall":{"name":"explore","args": call_args}}),
                         );
                         response_parts.push(function_response(
                             protocol,
@@ -3029,100 +3023,157 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         continue;
                     }
                 }
+                // The parent's remaining budgets are split evenly across the
+                // children, so a batch never spends more than one explorer
+                // could.
                 let budgets = ctx.brief.budgets;
+                let n = tasks.len().max(1);
                 let limits = ExploreLimits {
                     max_turns: explore::EXPLORE_MAX_TURNS
                         .min(budgets.max_steps.saturating_sub(cp.step).max(1)),
                     max_tool_calls: explore::EXPLORE_MAX_TOOL_CALLS
-                        .min(budgets.max_tool_calls.saturating_sub(cp.tool_calls)),
-                    max_tokens: budgets.max_tokens.saturating_sub(cp.tokens_used),
+                        .min(budgets.max_tool_calls.saturating_sub(cp.tool_calls))
+                        / n,
+                    max_tokens: budgets.max_tokens.saturating_sub(cp.tokens_used) / n as u64,
                 };
-                let preview: String = task.chars().take(120).collect();
-                RunHandle::push_event(
-                    &ctx.handle.shared,
-                    AgentEvent::Info {
-                        message: format!("explorer sub-agent started: {preview}"),
-                    },
-                );
-                let outcome = run_explore(
-                    ctx.service.transport(),
-                    link,
-                    &ctx.handle,
-                    tools,
-                    &task,
-                    limits,
-                );
-                cp.tokens_used += outcome.tokens;
-                cp.tool_calls += outcome.tool_calls;
-                if let Some(l) = ledger.as_mut() {
-                    l.append(
-                        "explore",
-                        json!({
-                            "task": task, "finished": outcome.finished,
-                            "turns": outcome.turns, "tool_calls": outcome.tool_calls,
-                            "tokens": outcome.tokens, "files_read": outcome.files_read,
-                            "error": outcome.error,
-                        }),
+                for task in &tasks {
+                    let preview: String = task.chars().take(120).collect();
+                    RunHandle::push_event(
+                        &ctx.handle.shared,
+                        AgentEvent::Info {
+                            message: format!("explorer sub-agent started: {preview}"),
+                        },
                     );
                 }
-                if outcome.cancelled {
+                let transport = ctx.service.transport();
+                let outcomes: Vec<ExploreOutcome> = if tasks.len() == 1 {
+                    vec![run_explore(
+                        transport,
+                        link,
+                        &ctx.handle,
+                        tools,
+                        &tasks[0],
+                        limits,
+                    )]
+                } else {
+                    std::thread::scope(|scope| {
+                        let workers: Vec<_> = tasks
+                            .iter()
+                            .map(|task| {
+                                let handle = &ctx.handle;
+                                scope.spawn(move || {
+                                    run_explore(transport, link, handle, tools, task, limits)
+                                })
+                            })
+                            .collect();
+                        workers
+                            .into_iter()
+                            .map(|w| {
+                                w.join().unwrap_or_else(|_| ExploreOutcome {
+                                    error: Some("explorer thread panicked".into()),
+                                    ..ExploreOutcome::default()
+                                })
+                            })
+                            .collect()
+                    })
+                };
+                let mut cancelled = false;
+                let mut entries: Vec<Value> = Vec::new();
+                for (task, outcome) in tasks.iter().zip(&outcomes) {
+                    cp.tokens_used += outcome.tokens;
+                    cp.tool_calls += outcome.tool_calls;
+                    cancelled |= outcome.cancelled;
+                    if let Some(l) = ledger.as_mut() {
+                        l.append(
+                            "explore",
+                            json!({
+                                "task": task, "finished": outcome.finished,
+                                "turns": outcome.turns, "tool_calls": outcome.tool_calls,
+                                "tokens": outcome.tokens, "files_read": outcome.files_read,
+                                "error": outcome.error, "batch": tasks.len(),
+                            }),
+                        );
+                    }
+                    if outcome.cancelled {
+                        continue;
+                    }
+                    RunHandle::push_event(
+                        &ctx.handle.shared,
+                        AgentEvent::Info {
+                            message: format!(
+                                "explorer sub-agent {} after {} turns and {} tool calls",
+                                if outcome.finished {
+                                    "reported"
+                                } else {
+                                    "stopped"
+                                },
+                                outcome.turns,
+                                outcome.tool_calls
+                            ),
+                        },
+                    );
+                    let preview: String = task.chars().take(120).collect();
+                    crate::memory::record(
+                        &mut cp.observations,
+                        crate::memory::Observation::new(
+                            cp.step,
+                            "explore",
+                            Some(preview),
+                            outcome.finished,
+                            &outcome.report,
+                        ),
+                    );
+                    let (report, clipped) =
+                        rex_tools::clip_middle(&outcome.report, explore::EXPLORE_REPORT_CHARS / n);
+                    entries.push(json!({
+                        "task": task,
+                        "finished": outcome.finished,
+                        "report": report,
+                        "report_truncated": clipped,
+                        "files_read": outcome.files_read,
+                        "turns": outcome.turns,
+                        "tool_calls": outcome.tool_calls,
+                        "error": outcome.error,
+                    }));
+                }
+                if cancelled {
                     out.fatal = Some(TerminalReason::Cancelled);
                     return out;
                 }
-                RunHandle::push_event(
-                    &ctx.handle.shared,
-                    AgentEvent::Info {
-                        message: format!(
-                            "explorer sub-agent {} after {} turns and {} tool calls",
-                            if outcome.finished {
-                                "reported"
-                            } else {
-                                "stopped"
-                            },
-                            outcome.turns,
-                            outcome.tool_calls
-                        ),
-                    },
-                );
-                let (report, clipped) =
-                    rex_tools::clip_middle(&outcome.report, explore::EXPLORE_REPORT_CHARS);
-                let content = serde_json::to_string(&json!({
-                    "finished": outcome.finished,
-                    "report": report,
-                    "report_truncated": clipped,
-                    "files_read": outcome.files_read,
-                    "turns": outcome.turns,
-                    "tool_calls": outcome.tool_calls,
-                    "error": outcome.error,
-                }))
-                .unwrap_or_default();
-                crate::memory::record(
-                    &mut cp.observations,
-                    crate::memory::Observation::new(
-                        cp.step,
-                        "explore",
-                        Some(preview.clone()),
-                        outcome.finished,
-                        &outcome.report,
-                    ),
-                );
+                let all_finished = outcomes.iter().all(|o| o.finished);
+                let content = if entries.len() == 1 {
+                    let mut single = entries.remove(0);
+                    if let Some(obj) = single.as_object_mut() {
+                        obj.remove("task");
+                    }
+                    single.to_string()
+                } else {
+                    json!({"explorers": entries}).to_string()
+                };
                 out.progress = true;
                 out.digest_actions.push(DigestAction {
                     tool: "explore".into(),
-                    ok: outcome.finished,
-                    target: Some(format!("{} tool calls", outcome.tool_calls)),
-                    error_kind: outcome.error.as_ref().map(|_| "explorer_error".into()),
+                    ok: all_finished,
+                    target: Some(format!(
+                        "{} explorer(s), {} tool calls",
+                        outcomes.len(),
+                        outcomes.iter().map(|o| o.tool_calls).sum::<usize>()
+                    )),
+                    error_kind: outcomes
+                        .iter()
+                        .any(|o| o.error.is_some())
+                        .then(|| "explorer_error".into()),
                 });
                 push_model_part(
                     &mut model_parts,
                     raw,
-                    json!({"functionCall":{"name":"explore","args":{"task": task}}}),
+                    json!({"functionCall":{"name":"explore","args": call_args}}),
                 );
                 response_parts.push(function_response(
                     protocol,
                     "explore",
                     &id,
-                    outcome.finished,
+                    all_finished,
                     &content,
                 ));
             }
@@ -4166,6 +4217,11 @@ mod tests {
         turns: Mutex<VecDeque<String>>,
         fail_posts: Mutex<(u32, u16)>,
         posts: Mutex<Vec<String>>,
+        /// Concurrency probe: each post sleeps `post_delay_ms` while
+        /// counted in flight; `max_in_flight` records the peak overlap.
+        post_delay_ms: std::sync::atomic::AtomicU64,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
     }
 
     impl Script {
@@ -4174,6 +4230,9 @@ mod tests {
                 turns: Mutex::new(turns.into()),
                 fail_posts: Mutex::new((0, 500)),
                 posts: Mutex::new(Vec::new()),
+                post_delay_ms: Default::default(),
+                in_flight: Default::default(),
+                max_in_flight: Default::default(),
             }
         }
         fn failing(turns: Vec<String>, count: u32, status: u16) -> Self {
@@ -4181,6 +4240,9 @@ mod tests {
                 turns: Mutex::new(turns.into()),
                 fail_posts: Mutex::new((count, status)),
                 posts: Mutex::new(Vec::new()),
+                post_delay_ms: Default::default(),
+                in_flight: Default::default(),
+                max_in_flight: Default::default(),
             }
         }
         fn seen(&self) -> Vec<String> {
@@ -4203,6 +4265,13 @@ mod tests {
             body: &str,
         ) -> Result<(u16, String), ProviderError> {
             self.posts.lock().unwrap().push(body.to_string());
+            let delay = self.post_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(delay));
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
             {
                 let mut fail = self.fail_posts.lock().unwrap();
                 if fail.0 > 0 {
@@ -5055,6 +5124,70 @@ mod tests {
     }
 
     #[test]
+    fn explore_batch_runs_children_in_parallel_and_returns_every_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let batch = json!({"functionCall":{"name":"explore","args":{
+            "tasks":["where is the config loaded?","which module owns auth?"]}}});
+        let script = Script::new(vec![
+            call_turn(vec![batch]),
+            call_turn(vec![complete_call("REPORT-ONE")]),
+            call_turn(vec![complete_call("REPORT-TWO")]),
+            call_turn(vec![complete_call("done")]),
+        ]);
+        // every provider post takes 300ms while counted in flight; parent
+        // turns are sequential, so only concurrent children can overlap
+        script.post_delay_ms.store(300, Ordering::SeqCst);
+        let svc = Arc::new(service(tmp.path(), script));
+        let snap = svc
+            .begin("parallel explore", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let reported = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Info { message } if message.starts_with("explorer sub-agent reported")))
+            .count();
+        assert_eq!(reported, 2, "{:?}", done.events);
+        // both child requests were in flight at the same time
+        assert_eq!(
+            svc.service()
+                .transport()
+                .max_in_flight
+                .load(Ordering::SeqCst),
+            2
+        );
+        let posts = svc.service().transport().seen();
+        assert!(
+            posts[3].contains("REPORT-ONE") && posts[3].contains("REPORT-TWO"),
+            "{}",
+            posts[3]
+        );
+        assert!(posts[3].contains("explorers"));
+        let run_dir = tmp.path().join("runs").join(&snap.id);
+        let ledger = fs::read_to_string(run_dir.join("state").join("ledger.jsonl"))
+            .or_else(|_| fs::read_to_string(run_dir.join("ledger.jsonl")))
+            .unwrap_or_default();
+        assert_eq!(ledger.matches("\"batch\":2").count(), 2, "{ledger}");
+    }
+
+    #[test]
+    fn explore_task_lists_are_normalised_and_capped() {
+        use super::explore::{parse_explore_tasks, EXPLORE_MAX_PARALLEL};
+        assert!(parse_explore_tasks(&json!({})).is_err());
+        assert!(parse_explore_tasks(&json!({"tasks":["  ", ""]})).is_err());
+        assert_eq!(
+            parse_explore_tasks(&json!({"tasks":["a", "a", " b "], "task":"c"})).unwrap(),
+            ["a", "b", "c"]
+        );
+        let too_many: Vec<String> = (0..=EXPLORE_MAX_PARALLEL)
+            .map(|i| format!("q{i}"))
+            .collect();
+        let err = parse_explore_tasks(&json!({"tasks": too_many})).unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+    }
+
+    #[test]
     fn older_tool_results_stay_visible_until_superseded() {
         let tmp = tempfile::tempdir().unwrap();
         let glob = json!({"functionCall":{"name":"glob_files","args":{"pattern":"*"}}});
@@ -5311,7 +5444,7 @@ mod tests {
             json!({"functionCall":{"name":"explore","args":{"task":"q"}}}),
         ]))
         .unwrap();
-        assert!(matches!(&ok.calls[0].0, AgentCall::Explore { task, .. } if task == "q"));
+        assert!(matches!(&ok.calls[0].0, AgentCall::Explore { tasks, .. } if tasks == &["q"]));
         let bad = decode_gemini_calls(&call_turn(vec![
             json!({"functionCall":{"name":"explore","args":{"task":"  "}}}),
         ]))

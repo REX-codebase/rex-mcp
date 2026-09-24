@@ -140,3 +140,19 @@ is shared it is noted in the module docs.
   costs ₹0. Exa's MCP docs limit the free plan to "casual use" and ask for an
   API key for production; their ToS bars sublicensing the Services to third
   parties. REX therefore stays self-hosted; bring-your-own Exa key remains.
+
+## Round 4: parallel explorers
+
+- Hermes: batch mode runs several children in parallel
+  (`tools/delegate_tool.py:6-8`, concurrency cap via
+  `delegation.max_concurrent_children`, line 500).
+- REX now: `explore` takes `tasks` (up to 3 independent questions) as well as
+  `task`. Children run concurrently on scoped threads; the parent's
+  remaining tool-call and token budgets are split evenly, so a batch never
+  spends more than one explorer could. Each child stays read-only, cannot
+  recurse or ask the user, and stops on cancel (any cancelled child ends the
+  run). The parent gets one `explorers` list of reports; each child gets its
+  own ledger entry. A concurrency probe in the test proves both child
+  requests were in flight at once.
+- Gap left: children are still read-only; Hermes gives them the parent's
+  toolsets and opencode lets the model pick agent types.
