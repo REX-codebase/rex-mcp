@@ -33,4 +33,9 @@ describe("Settings cost section", () => {
     renderIt();
     expect(screen.getByText("Alt + P")).toBeTruthy();
   });
+  it("documents the approval keys", () => {
+    renderIt();
+    expect(screen.getByText("Close a menu or dialog; deny an approval or reject a plan")).toBeTruthy();
+    expect(screen.getByText("Run the task, send a follow-up, or send a typed answer")).toBeTruthy();
+  });
 });
