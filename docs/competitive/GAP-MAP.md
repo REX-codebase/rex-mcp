@@ -271,8 +271,19 @@ is shared it is noted in the module docs.
   Hermes). Mutations: 6 of 7 fail the test; the survivor (not clearing
   the key stack after a mismatch) cannot change output, because the
   stack is only read through the flow stack, which is cleared.
-- Gap left: YAML check is still not a full parser (no sequence/mapping
-  mix errors); opencode's LSP route covers more.
+- Round 11: lists and keys mixed at one indent are flagged: a `- `
+  item at the column of a key that already has a value (`a: 1` then
+  `- x`), and a key at the column of a list that is not owned by a key
+  there (`- x` then `b: 1`, or `list:` / `  - a` / `  key: 1`). A list
+  right under its key (`a:` then `- x`) with sibling keys after it, lists
+  inside list items, block scalars, comments and document markers are
+  left alone; templated files are skipped. Sweep: 0 new flags across this
+  repo, opencode, Hermes and the cargo registry (26,894 files checked;
+  the same 5 pre-existing non-YAML notes before and after). Mutations:
+  7 of 7 fail the test after one dead check was removed.
+- Gap left: YAML check is still not a full parser (for example, no
+  anchors-before-use or complex-key checks); opencode's LSP route covers
+  more.
 - App: AgentRunView shows the ask_user question (choices, free text, "Let
   REX decide") and an "Undo last file change" button on finished runs that
   wrote files. Covered by 2 vitest tests; rendered with the compiled theme

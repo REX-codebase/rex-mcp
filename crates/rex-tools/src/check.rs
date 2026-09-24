@@ -137,6 +137,11 @@ fn check_yaml(content: &str) -> Vec<Finding> {
     let mut scopes: Vec<(usize, Vec<(String, usize)>)> = Vec::new();
     // last `key: plain value` line: (key column, line, key)
     let mut last_scalar: Option<(usize, usize, String)> = None;
+    // block sequences and mapping keys at one indent: the previous block
+    // line (indent, key column, key text, key has an inline value) and the
+    // open `- ` runs (column, how the run started, first line)
+    let mut prev_line: Option<(usize, Option<usize>, String, bool)> = None;
+    let mut runs: Vec<(usize, SeqStart, usize)> = Vec::new();
     // a quoted value still open from an earlier line (multi-line string)
     let mut open_quote: Option<char> = None;
     let mut block_indent: Option<usize> = None;
@@ -166,6 +171,8 @@ fn check_yaml(content: &str) -> Vec<Finding> {
         }
         if flow.is_empty() && (body.starts_with("---") || body.starts_with("...")) {
             scopes.clear();
+            runs.clear();
+            prev_line = None;
         }
         if flow.is_empty() && raw[..indent].contains('\t') {
             out.push(Finding {
@@ -226,7 +233,18 @@ fn check_yaml(content: &str) -> Vec<Finding> {
                     last_scalar = Some((indent + start, line_no, key.trim().to_string()));
                 }
             }
-            if !templated && !raw[..indent].contains('\t') {
+            let doc_marker = body.starts_with("---") || body.starts_with("...");
+            if !templated && !doc_marker && !raw[..indent].contains('\t') {
+                seq_map_mix(
+                    &chars,
+                    indent,
+                    start,
+                    key_at,
+                    line_no,
+                    &mut prev_line,
+                    &mut runs,
+                    &mut out,
+                );
                 let col = indent + start;
                 let new_item = start > 0;
                 if let Some(c) = key_at {
@@ -468,6 +486,80 @@ fn quote_closes(text: &str, q: char) -> bool {
 
 /// Normalised mapping key, or `None` for keys REX does not compare
 /// (merge keys, explicit `?` keys, aliases, empty keys).
+/// How a block sequence (`- ` items at one column) started, which decides
+/// whether a mapping key may follow at that column.
+#[derive(Clone, Copy, PartialEq)]
+enum SeqStart {
+    /// right under `key:` at the same column: later keys there are siblings
+    UnderKey,
+    /// indented under its parent, or first in the document: a key at the
+    /// same column would mix a sequence and a mapping
+    Alone,
+    /// anything else; never flagged
+    Unknown,
+}
+
+/// Flag a `- ` item at the column of a key that already has a value, and a
+/// key at the column of a sequence that does not belong to a key there.
+#[allow(clippy::too_many_arguments)]
+fn seq_map_mix(
+    chars: &[char],
+    indent: usize,
+    start: usize,
+    key_at: Option<usize>,
+    line_no: usize,
+    prev_line: &mut Option<(usize, Option<usize>, String, bool)>,
+    runs: &mut Vec<(usize, SeqStart, usize)>,
+    out: &mut Vec<Finding>,
+) {
+    let key_info = key_at.map(|c| {
+        let key: String = chars[start..start + c].iter().collect();
+        let value: String = chars[start + c + 1..].iter().collect();
+        let value = value.split(" #").next().unwrap_or("").trim().to_string();
+        (key.trim().to_string(), !value.is_empty())
+    });
+    if start > 0 {
+        runs.retain(|(c, _, _)| *c <= indent);
+        if !runs.iter().any(|(c, _, _)| *c == indent) {
+            let kind = match prev_line {
+                Some((_, Some(kc), key, true)) if *kc == indent => {
+                    out.push(Finding {
+                        line: line_no,
+                        col: indent + 1,
+                        message: format!(
+                            "list item at the same indent as '{key}', which already has a value"
+                        ),
+                    });
+                    SeqStart::Unknown
+                }
+                Some((_, Some(kc), _, false)) if *kc == indent => SeqStart::UnderKey,
+                Some((pi, _, _, _)) if *pi < indent => SeqStart::Alone,
+                None => SeqStart::Alone,
+                _ => SeqStart::Unknown,
+            };
+            runs.push((indent, kind, line_no));
+        }
+    } else if let Some((key, _)) = &key_info {
+        runs.retain(|(c, _, _)| *c <= indent);
+        if let Some((_, SeqStart::Alone, first)) = runs.iter().find(|(c, _, _)| *c == indent) {
+            out.push(Finding {
+                line: line_no,
+                col: indent + 1,
+                message: format!(
+                    "key '{key}' at the same indent as the list that starts on line {first}"
+                ),
+            });
+        }
+        runs.retain(|(c, _, _)| *c < indent);
+    } else {
+        runs.retain(|(c, _, _)| *c <= indent);
+    }
+    *prev_line = Some(match key_info {
+        Some((key, has_value)) => (indent, Some(indent + start), key, has_value),
+        None => (indent, None, String::new(), false),
+    });
+}
+
 fn yaml_key(chars: &[char]) -> Option<String> {
     let raw: String = chars.iter().collect();
     let k = raw.trim();
@@ -1117,6 +1209,46 @@ mod tests {
     }
 
     #[test]
+    fn yaml_lists_and_keys_mixed_at_one_indent_are_flagged() {
+        dirty(
+            "a.yaml",
+            "a: 1\n- x\n",
+            "list item at the same indent as 'a'",
+        );
+        dirty(
+            "a.yaml",
+            "- x\n- y\nb: 1\n",
+            "key 'b' at the same indent as the list that starts on line 1",
+        );
+        dirty(
+            "a.yaml",
+            "list:\n  - a\n  key: 1\n",
+            "key 'key' at the same indent",
+        );
+        dirty("a.yaml", "- a: 1\n  - x\n", "same indent as 'a'");
+        dirty("a.yaml", "a: [1,\n  2]\n- x\n", "same indent as 'a'");
+        dirty("a.yaml", "a: 1\n---\n- x\nb: 2\n", "key 'b'");
+        // valid shapes: a list right under its key, siblings after it,
+        // lists inside list items, nested mappings in items, documents
+        clean("a.yaml", "a:\n- x\n- y\nb: 1\nc:\n  - z\nd: 2\n");
+        clean(
+            "a.yml",
+            "- items:\n  - a\n  other: 1\n- name: x\n  tags:\n  - t\n  more: 2\n",
+        );
+        clean(
+            "a.yml",
+            "steps:\n  - name: s\n    with:\n      k: v\n  - run: b\nnext: 1\n",
+        );
+        clean("a.yaml", "a: 1\n---\n- x\n");
+        clean("a.yaml", "a: # note\n- x\n");
+        clean("a.yaml", "a: #note\n- x\n");
+        clean("a.yml", "- k:\n    - x\n- y:\n    z: 1\n");
+        dirty("a.yaml", "a:\n- x\nb: 1\n- y\n", "same indent as 'b'");
+        clean("a.yaml", "text: |\n  - a\n  b: 1\nc: 2\n");
+        clean("a.yaml", "- a\n# c\n- b\n");
+    }
+
+    #[test]
     fn yaml_duplicate_keys_are_found_per_mapping() {
         let f = check("a.yaml", "name: a\nimage: x\nname: b\n").unwrap();
         assert_eq!(f.len(), 1, "{f:?}");
@@ -1135,7 +1267,10 @@ mod tests {
             "ci.yml",
             "jobs:\n  a:\n    name: x\n    steps:\n      - name: s1\n        run: a\n      - name: s2\n        run: b\n  b:\n    name: y\n---\njobs: 1\n",
         );
-        clean("a.yaml", "- name: a\n- name: b\nx:\n- name: c\n- name: d\n");
+        clean(
+            "a.yaml",
+            "w:\n- name: a\n- name: b\nx:\n- name: c\n- name: d\n",
+        );
         clean(
             "a.yaml",
             "base: &b\n  x: 1\nc:\n  <<: *b\n  <<: *b\n  x: 2\n",
