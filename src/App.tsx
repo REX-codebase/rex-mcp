@@ -141,6 +141,8 @@ export default function App() {
   // Plan mode: the run proposes a plan and parks in awaiting_plan until the
   // user approves it. Reset on each new run start.
   const [planMode, setPlanMode] = useState(false);
+  // Opt-in per run: each history summary is an extra model call.
+  const [summarizeHistory, setSummarizeHistory] = useState(false);
   const [planDeciding, setPlanDeciding] = useState(false);
   const livePoll = useRef<number | null>(null);
   const [installedRun, setInstalledRun] = useState<InstalledRunSnapshot | null>(null);
@@ -493,8 +495,10 @@ export default function App() {
       // the next run starts in the default execution mode unless the user
       // opts in again.
       const mode = planMode;
+      const summarize = summarizeHistory;
       setPlanMode(false);
-      custodyBegin(label, mode)
+      setSummarizeHistory(false);
+      custodyBegin(label, mode, summarize)
         .then((view) => {
           setCustody({ grantId: view.grant_id, phase: view.phase, operator: view.operator });
           setLiveRun(view.snapshot);
@@ -715,6 +719,8 @@ export default function App() {
                       onRun={onRun}
                       planMode={planMode}
                       setPlanMode={setPlanMode}
+                      summarizeHistory={summarizeHistory}
+                      setSummarizeHistory={setSummarizeHistory}
                       fableGate={fableGate}
                       setFableGate={toggleFableGate}
                       executionPath={executionPath}

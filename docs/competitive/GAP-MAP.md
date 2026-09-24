@@ -367,6 +367,11 @@ is shared it is noted in the module docs.
   summary next turn; stale reads left out after an edit and after a
   patch; token budget respected), 1 vitest. Mutations: 17 of 17 fail the
   tests.
-- Gap left: no switch in the app UI yet (the API takes it). REX
-  summarises dropped tool results, not the whole conversation, because
+- App: a "Summarize" checkbox next to Plan mode, off by default and
+  reset after each run like Plan mode; its tooltip says each summary is
+  an extra model call on the user's key. The "Ctrl + Enter" hint now
+  shows from the xl breakpoint so the controls stay on one line at
+  1040px. Rendered with the compiled CSS in the dark theme at 1040px and
+  1440px. 2 vitest tests.
+- Gap left: REX summarises dropped tool results, not the whole conversation, because
   its loop sends fresh state each turn instead of a growing transcript.

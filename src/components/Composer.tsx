@@ -3,7 +3,7 @@ import { ModelStatus } from "./ModelStatus";
 import { EXAMPLE_TASKS, type RunState } from "../data/mock";
 import type { ExecutionPath } from "../data/executionPath";
 
-export function Composer({ task, setTask, state, onRun, planMode, setPlanMode, fableGate, setFableGate, executionPath }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void; planMode: boolean; setPlanMode: (v: boolean) => void; fableGate: boolean; setFableGate: (v: boolean) => void; executionPath: ExecutionPath }) {
+export function Composer({ task, setTask, state, onRun, planMode, setPlanMode, summarizeHistory = false, setSummarizeHistory, fableGate, setFableGate, executionPath }: { task: string; setTask: (t: string) => void; state: RunState; onRun: () => void; planMode: boolean; setPlanMode: (v: boolean) => void; summarizeHistory?: boolean; setSummarizeHistory?: (v: boolean) => void; fableGate: boolean; setFableGate: (v: boolean) => void; executionPath: ExecutionPath }) {
   const busy = state === "working" || state === "verifying";
   const canRun = task.trim().length > 0 && !busy;
   const areaRef = useRef<HTMLTextAreaElement>(null);
@@ -47,11 +47,17 @@ export function Composer({ task, setTask, state, onRun, planMode, setPlanMode, f
               <input type="checkbox" checked={planMode} disabled={busy} onChange={(e) => setPlanMode(e.target.checked)} aria-label="Plan mode" />
               <span>Plan mode</span>
             </label>
+            {setSummarizeHistory && (
+              <label className="plan-toggle" title="Summarize old results: when older tool results no longer fit in REX's working memory, the model writes a short summary of them. Each summary is an extra model call on your key, so this is off by default.">
+                <input type="checkbox" checked={summarizeHistory} disabled={busy} onChange={(e) => setSummarizeHistory(e.target.checked)} aria-label="Summarize old results" />
+                <span>Summarize</span>
+              </label>
+            )}
             <label className="plan-toggle" title="Fable gate: opens a THINK→PROVE→ATTACK→WRITE session with a mechanical deliberation timer and evidence-gated unlock. The countdown shows above the run.">
               <input type="checkbox" checked={fableGate} disabled={busy} onChange={(e) => setFableGate(e.target.checked)} aria-label="Fable gate" />
               <span>Fable gate</span>
             </label>
-            <span className="hidden text-[11px] text-faint md:inline">Ctrl + Enter</span>
+            <span className="hidden text-[11px] text-faint xl:inline">Ctrl + Enter</span>
             <button type="button" onClick={onRun} disabled={!canRun} title={!task.trim() ? "Describe a task first" : busy ? "A run is in progress" : "Start the run"} className="run-button" aria-label={busy ? "Run in progress" : "Run task"}>
               <span>{busy ? "Running" : "Run"}</span>
               <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8h9m-3.5-3.5L12.5 8 9 11.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
