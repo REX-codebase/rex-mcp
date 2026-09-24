@@ -829,7 +829,8 @@ is shared it is noted in the module docs.
   and symlinked file and folder refused; a `decode_prefix` unit test; a
   large SKILL.md and a large `AGENTS.md` cut inside a character still
   load; the scripted run reads `ship.sh` and refuses `../../../x`. Hand
-  mutation: 17/17 killed. The first pass left 4 survivors: two overlapping
+  mutation: 16/16 distinct mutants killed
+  (17 runs; one mutant was run twice). The first pass left 4 survivors: two overlapping
   checks (I removed the redundant symlink check) and two tests whose
   byte cap happened to land on a character boundary (fixed).
 - Gap left: no nested skill folders (closed in 17c) and no remote skill
