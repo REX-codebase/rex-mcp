@@ -1650,12 +1650,14 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
 
         // ---- dynamic context build ---------------------------------------
         let project = rex_prompt::project::load(&ctx.workspace);
+        let user_rules = rex_prompt::project::load_user();
         let state_msg = build_state_message(
             &ctx.brief,
             &cp,
             budgets,
             current_plan(&ctx.handle),
             project.as_ref(),
+            user_rules.as_ref(),
         );
         let request_body = build_request(
             protocol,
@@ -1834,6 +1836,7 @@ fn build_state_message(
     budgets: Budgets,
     plan: Vec<PlanItem>,
     project: Option<&rex_prompt::project::ProjectInstructions>,
+    user_rules: Option<&rex_prompt::project::ProjectInstructions>,
 ) -> String {
     let digest: Vec<&DigestEntry> = cp.digest.iter().rev().take(DIGEST_WINDOW).collect();
     let digest: Vec<&DigestEntry> = digest.into_iter().rev().collect();
@@ -1862,6 +1865,13 @@ fn build_state_message(
             "truncated": p.truncated,
             "precedence": rex_prompt::project::PRECEDENCE,
             "text": p.text,
+        })),
+        "user_instructions": user_rules.map(|u| json!({
+            "source": u.source,
+            "sha256": u.sha256,
+            "truncated": u.truncated,
+            "precedence": rex_prompt::project::USER_PRECEDENCE,
+            "text": u.text,
         })),
         "budget": {
             "step": cp.step, "max_steps": budgets.max_steps,
@@ -5049,7 +5059,14 @@ mod tests {
             continued_from: None,
         };
         let cp = Checkpoint::default();
-        let msg = build_state_message(&brief, &cp, Budgets::default(), vec![], project.as_ref());
+        let msg = build_state_message(
+            &brief,
+            &cp,
+            Budgets::default(),
+            vec![],
+            project.as_ref(),
+            None,
+        );
         let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(v["project_instructions"]["source"], "AGENTS.md");
         assert!(v["project_instructions"]["text"]
@@ -5061,9 +5078,38 @@ mod tests {
             .unwrap()
             .contains("never override"));
         // absent file -> null, and the system prompt identity is unaffected
-        let none = build_state_message(&brief, &cp, Budgets::default(), vec![], None);
+        let none = build_state_message(&brief, &cp, Budgets::default(), vec![], None, None);
         let v: serde_json::Value = serde_json::from_str(&none).unwrap();
         assert!(v["project_instructions"].is_null());
+        assert!(v["user_instructions"].is_null());
+        // user-level file travels separately with its own label and rank
+        let cfg = tempfile::tempdir().unwrap();
+        fs::create_dir_all(cfg.path().join("rex")).unwrap();
+        fs::write(
+            cfg.path().join("rex").join("AGENTS.md"),
+            "prefer small diffs",
+        )
+        .unwrap();
+        let user = rex_prompt::project::load_user_from(cfg.path());
+        let both = build_state_message(
+            &brief,
+            &cp,
+            Budgets::default(),
+            vec![],
+            project.as_ref(),
+            user.as_ref(),
+        );
+        let v: serde_json::Value = serde_json::from_str(&both).unwrap();
+        assert_eq!(v["project_instructions"]["source"], "AGENTS.md");
+        assert_eq!(
+            v["user_instructions"]["source"],
+            rex_prompt::project::USER_SOURCE
+        );
+        assert_eq!(v["user_instructions"]["text"], "prefer small diffs");
+        assert!(v["user_instructions"]["precedence"]
+            .as_str()
+            .unwrap()
+            .contains("never override"));
     }
 
     #[test]
