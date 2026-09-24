@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PreparedToolCall, ToolResult } from "../data/backend";
 import { toolCallDiff, type FileDiff } from "../data/workspace";
 import { DiffViewer } from "./DiffViewer";
@@ -14,6 +14,13 @@ export function ToolApproval({
 }) {
   const [diff, setDiff] = useState<FileDiff | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
+  const denyRef = useRef<HTMLButtonElement>(null);
+
+  // A new request takes focus on Deny, the safe choice: a stray Enter or
+  // Space can only refuse. Approving always needs a deliberate move.
+  useEffect(() => {
+    denyRef.current?.focus();
+  }, [call.call_id]);
 
   useEffect(() => {
     let alive = true;
@@ -42,6 +49,12 @@ export function ToolApproval({
       role="alertdialog"
       aria-labelledby="tool-approval-title"
       aria-describedby="tool-approval-detail"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && !busy) {
+          event.preventDefault();
+          onDecision(false);
+        }
+      }}
     >
       <div className="tool-approval-head">
         <span className="approval-shield" aria-hidden="true">
@@ -73,7 +86,10 @@ export function ToolApproval({
         This request came from the model. Only your click can approve it.
       </p>
       <div className="approval-actions">
-        <button disabled={busy} onClick={() => onDecision(false)} className="approval-deny">
+        <span className="approval-keys" aria-hidden="true">
+          <kbd>Esc</kbd> denies
+        </span>
+        <button ref={denyRef} disabled={busy} onClick={() => onDecision(false)} className="approval-deny">
           Deny
         </button>
         <button disabled={busy} onClick={() => onDecision(true)} className="approval-allow">
