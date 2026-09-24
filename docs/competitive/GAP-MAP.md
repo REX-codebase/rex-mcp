@@ -181,9 +181,22 @@ is shared it is noted in the module docs.
   needs the parent run's own web_fetch permission. Reports list
   `urls_fetched`. Compare opencode's `subagent_type` (`tool/task.ts:46`)
   with built-in `general` and `explore` agents (`agent/agent.ts:183-216`).
-- Gap left: no writing child. opencode's `general` agent and Hermes
-  children can edit; REX children stay read-only, so writes always go
-  through the parent's approval gate.
+- Round 8: `kind: "edit"` starts a writing child for one self-contained
+  change (read, search, glob, create/edit file, apply_patch, run_command;
+  no web, ask_user or recursion). Each write or command that needs
+  approval parks on the parent's trusted UI decision (`wait_for_decision`),
+  the same gate the parent's own calls use; a denial is counted toward the
+  run's denial limit, and no decision stops the child. It runs one at a
+  time (an edit batch is rejected), is refused for roles with no write
+  tools (Adversary/Shadow can still explore), and each child tool is also
+  checked against the run's role list. The parent gets `files_written`
+  and `denials` with the report and in the ledger. Tests: approve-then-deny
+  (only the approved file exists), batch rejection, read-only role
+  refusal; 5 of 6 mutations fail a test directly, and the per-tool role
+  check (defence in depth, no current role reaches it) fails only together
+  with the role gate.
+- Gap left: the edit child is sequential. opencode and Hermes can run
+  several writing children at once; REX keeps one approval slot per run.
 
 ## Round 5: YAML/TOML checks and app panels
 
