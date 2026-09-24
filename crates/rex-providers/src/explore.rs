@@ -211,7 +211,7 @@ pub(super) fn child_read_output(
 /// Size and modification time of every file under `root`, skipping VCS,
 /// dependency and build directories (`TREE_SKIP_DIRS` and
 /// `rex_tools::walk::ALWAYS_SKIP`, e.g. `dist`, `build`) and whatever the
-/// workspace root `.gitignore` ignores, so generated output a command
+/// workspace's `.gitignore` files (root and nested) ignore, so generated output a command
 /// writes is not reported as a file the run changed. opencode's snapshot
 /// drops gitignored files (`src/snapshot/index.ts`) and Hermes's
 /// checkpoints exclude `dist/`, `build/` and similar
@@ -223,9 +223,11 @@ pub(super) fn tree_snapshot(root: &std::path::Path) -> Option<TreeStamps> {
 
 pub(super) fn tree_snapshot_capped(root: &std::path::Path, max: usize) -> Option<TreeStamps> {
     let mut out = TreeStamps::new();
-    let ignore = rex_tools::walk::Ignore::load(root);
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    let mut stack = vec![(
+        root.to_path_buf(),
+        std::rc::Rc::new(rex_tools::walk::Ignore::load(root)),
+    )];
+    while let Some((dir, ignore)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -246,7 +248,11 @@ pub(super) fn tree_snapshot_capped(root: &std::path::Path, max: usize) -> Option
                     .chain(rex_tools::walk::ALWAYS_SKIP)
                     .any(|s| name == *s);
                 if !skipped && !ignore.is_ignored(&rel, true) {
-                    stack.push(path);
+                    let inner = match ignore.enter(root, &path) {
+                        Some(i) => std::rc::Rc::new(i),
+                        None => ignore.clone(),
+                    };
+                    stack.push((path, inner));
                 }
             } else if kind.is_file() {
                 if ignore.is_ignored(&rel, false) {

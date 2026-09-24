@@ -8233,6 +8233,8 @@ mod tests {
         let root = tmp.path();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/app.ts"), "a").unwrap();
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        fs::write(root.join("pkg/.gitignore"), "*.gen\n").unwrap();
         fs::write(
             root.join(".gitignore"),
             "# generated\n/gen/\n*.log\nlib/out.js\nscratch/\n",
@@ -8249,6 +8251,8 @@ mod tests {
             "npm-debug.log",
             "src/deep/trace.log",
             "lib/out.js",
+            "pkg/a.gen",
+            "pkg/deep/b.gen",
         ] {
             let p = root.join(f);
             fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -8259,12 +8263,20 @@ mod tests {
         fs::write(root.join("lib/keep.js"), "k").unwrap();
         // a dir-only rule does not hide a file of that name
         fs::write(root.join("scratch"), "s").unwrap();
+        // a nested .gitignore rule does not reach above its folder
+        fs::write(root.join("a.gen"), "g").unwrap();
         fs::create_dir_all(root.join("src/gen")).unwrap();
         fs::write(root.join("src/gen/x.rs"), "x").unwrap();
         let after = tree_snapshot(root).unwrap();
         assert_eq!(
             tree_changes(&before, &after),
-            ["lib/keep.js", "scratch", "src/app.ts", "src/gen/x.rs"]
+            [
+                "a.gen",
+                "lib/keep.js",
+                "scratch",
+                "src/app.ts",
+                "src/gen/x.rs"
+            ]
         );
         assert!(after.contains_key(".gitignore"));
     }

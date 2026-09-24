@@ -129,9 +129,16 @@ struct Rule {
     glob: Regex,
     dir_only: bool,
     anchored: bool,
+    /// Folder of the `.gitignore` the rule came from, relative to the
+    /// workspace root with a trailing `/` ("" for the root file). The rule
+    /// only applies below it, matched against the rest of the path.
+    base: String,
 }
 
-/// Ignore rules from the workspace root `.gitignore`.
+/// Ignore rules from the workspace root `.gitignore` and, while walking,
+/// the `.gitignore` files of the folders below it (`Ignore::enter`), the
+/// way git and ripgrep read them. opencode's glob and grep and Hermes's
+/// search both run ripgrep, so nested files count there too.
 #[derive(Debug, Clone, Default)]
 pub struct Ignore {
     rules: Vec<Rule>,
@@ -144,6 +151,17 @@ impl Ignore {
     }
 
     pub fn parse(text: &str) -> Self {
+        Self::parse_in(text, "")
+    }
+
+    /// Rules of a `.gitignore` that sits in folder `base` (relative to the
+    /// workspace root, "" for the root).
+    pub fn parse_in(text: &str, base: &str) -> Self {
+        let base = if base.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", base.trim_end_matches('/'))
+        };
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         let has_negation = lines.iter().any(|l| l.starts_with('!'));
         let mut rules = Vec::new();
@@ -171,22 +189,40 @@ impl Ignore {
                 glob,
                 dir_only,
                 anchored,
+                base: base.clone(),
             });
         }
         Self { rules }
     }
 
+    /// These rules plus those of `dir/.gitignore`, when `dir` (below
+    /// `root`) has one; `None` when it has none, so callers keep sharing
+    /// the current rules.
+    pub fn enter(&self, root: &Path, dir: &Path) -> Option<Self> {
+        let text = fs::read_to_string(dir.join(".gitignore")).ok()?;
+        let rel = rel_path(root, dir);
+        if rel.is_empty() {
+            return None;
+        }
+        let mut next = self.clone();
+        next.rules.extend(Self::parse_in(&text, &rel).rules);
+        Some(next)
+    }
+
     /// Whether `rel` (relative to the workspace root) is ignored.
     pub fn is_ignored(&self, rel: &str, is_dir: bool) -> bool {
-        let base = rel.rsplit('/').next().unwrap_or(rel);
         self.rules.iter().any(|r| {
             if r.dir_only && !is_dir {
                 return false;
             }
+            let Some(rest) = rel.strip_prefix(r.base.as_str()) else {
+                return false;
+            };
+            let name = rest.rsplit('/').next().unwrap_or(rest);
             if r.anchored {
-                r.glob.is_match(rel)
+                r.glob.is_match(rest)
             } else {
-                r.glob.is_match(base) || r.glob.is_match(rel)
+                r.glob.is_match(name) || r.glob.is_match(rest)
             }
         })
     }
@@ -232,7 +268,10 @@ fn walk_inner(
             if ALWAYS_SKIP.contains(&name.as_str()) || ignore.is_ignored(&rel, true) {
                 continue;
             }
-            walk_inner(root, &path, ignore, cap, depth + 1, out, capped);
+            match ignore.enter(root, &path) {
+                Some(inner) => walk_inner(root, &path, &inner, cap, depth + 1, out, capped),
+                None => walk_inner(root, &path, ignore, cap, depth + 1, out, capped),
+            }
             if *capped {
                 return;
             }
@@ -257,4 +296,119 @@ pub fn rel_path(root: &Path, p: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tree(files: &[(&str, &str)]) -> Tmp {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let t = Tmp(std::env::temp_dir().join(format!(
+            "rex-walk-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        )));
+        fs::create_dir_all(t.path()).unwrap();
+        for (p, body) in files {
+            let f = t.path().join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, body).unwrap();
+        }
+        t
+    }
+
+    fn listed(root: &Path) -> Vec<String> {
+        let (files, _) = walk_files(root, root, &Ignore::load(root), 1000);
+        files.iter().map(|f| rel_path(root, f)).collect()
+    }
+
+    #[test]
+    fn nested_gitignore_applies_below_its_folder_only() {
+        let t = tree(&[
+            (".gitignore", "*.log\n"),
+            ("web/.gitignore", "/out/\ncache.json\nsrc/gen.ts\n"),
+            ("web/out/bundle.js", "x"),
+            ("web/cache.json", "x"),
+            ("web/src/cache.json", "x"),
+            ("web/src/gen.ts", "x"),
+            ("web/src/app.ts", "x"),
+            ("web/deep/out/keep.js", "x"),
+            ("web/a.log", "x"),
+            ("api/cache.json", "x"),
+            ("api/out/keep.txt", "x"),
+            ("api/src/gen.ts", "x"),
+        ]);
+        assert_eq!(
+            listed(t.path()),
+            [
+                ".gitignore",
+                "api/cache.json",
+                "api/out/keep.txt",
+                "api/src/gen.ts",
+                "web/.gitignore",
+                "web/deep/out/keep.js",
+                "web/src/app.ts",
+            ]
+        );
+    }
+
+    #[test]
+    fn rules_stack_through_several_levels() {
+        let t = tree(&[
+            ("a/.gitignore", "*.tmp\n"),
+            ("a/b/.gitignore", "secret/\n"),
+            ("a/b/x.tmp", "x"),
+            ("a/b/secret/k.txt", "x"),
+            ("a/b/c/secret/k.txt", "x"),
+            ("a/secret/k.txt", "x"),
+            ("a/b/ok.rs", "x"),
+            ("z.tmp", "x"),
+        ]);
+        assert_eq!(
+            listed(t.path()),
+            [
+                "a/.gitignore",
+                "a/b/.gitignore",
+                "a/b/ok.rs",
+                "a/secret/k.txt",
+                "z.tmp",
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_base_is_matched_on_whole_folder_names() {
+        let ig = Ignore::parse_in("x.txt\n", "web");
+        assert!(ig.is_ignored("web/x.txt", false));
+        assert!(ig.is_ignored("web/sub/x.txt", false));
+        assert!(!ig.is_ignored("webapp/x.txt", false));
+        assert!(!ig.is_ignored("x.txt", false));
+        // the folder itself is not matched by its own rules
+        let dir = Ignore::parse_in("*\n", "web/");
+        assert!(!dir.is_ignored("web", true));
+        assert!(dir.is_ignored("web/a", false));
+        // a folder with no .gitignore shares the current rules
+        let t = tree(&[("plain/a.txt", "x")]);
+        assert!(Ignore::default()
+            .enter(t.path(), &t.path().join("plain"))
+            .is_none());
+        assert!(Ignore::default().enter(t.path(), t.path()).is_none());
+        // the root .gitignore is loaded once, not again on entering the root
+        fs::write(t.path().join(".gitignore"), "*.txt\n").unwrap();
+        assert!(Ignore::default().enter(t.path(), t.path()).is_none());
+    }
 }

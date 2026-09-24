@@ -1059,3 +1059,30 @@ is shared it is noted in the module docs.
   folding, lowercasing, both load filters).
 - Gap left: cross-script look-alikes (Cyrillic letters) are not folded,
   same as Hermes.
+
+## Round 24: nested .gitignore files
+
+- Competitors: opencode's glob and grep tools run ripgrep
+  (`src/tool/glob.ts`, `src/tool/grep.ts`, `@opencode-ai/core/ripgrep`),
+  and Hermes's file search prefers `rg` (`tools/file_operations.py`);
+  ripgrep reads the `.gitignore` of every folder it walks.
+- REX before: search_files, glob_files and the run_command change
+  snapshot read only the workspace root `.gitignore`, so a monorepo's
+  `web/.gitignore` (build output, generated files) was ignored by REX
+  (round 20's gap).
+- REX now: entering a folder with its own `.gitignore` adds its rules,
+  which apply only below that folder and match against the path from
+  there (anchored `/out/` means `web/out`, not `web/deep/out`). Rules stack
+  through levels; a folder without a file shares its parent's rules
+  (no copy); the root file is not read twice. The same walker feeds
+  search_files, glob_files and the change snapshot. `!` re-includes
+  still turn a file's rules into directory-only rules, as before.
+- Tests: three walker tests (nested scope and anchoring, three-level
+  stacking, folder-name boundaries and entry cases) and the snapshot test
+  now has a nested rule that hides `pkg/*.gen` but not a root `a.gen`.
+  Hand mutation: 7 of 8 distinct killed; the survivor drops the
+  full-path match for rules without `/`, which only differs for `**`
+  inside a name (kept as it was before this round). One dead guard the
+  mutation run exposed was removed.
+- Gap left: `!` re-includes; `.git/info/exclude` and the global excludes
+  file are not read.
