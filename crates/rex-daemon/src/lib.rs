@@ -2227,6 +2227,7 @@ fn capability_set(workspace: &Path) -> CapabilitySet {
             "read_file",
             "create_file",
             "edit_file",
+            "apply_patch",
             "search_files",
             "glob_files",
             "run_command",

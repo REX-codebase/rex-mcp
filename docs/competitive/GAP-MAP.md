@@ -26,6 +26,7 @@ is shared it is noted in the module docs.
 | Command output capture | first 512 KiB per stream | spill to file, `tools/hook_output_spill.py` | 2000 lines / 50 KB + file, `src/tool/truncate.ts` | head + tail per stream, so the final error survives |
 | Output to model | byte slice at 4000: panics on multi-byte text; drops the tail; failed commands passed their full output | not compared yet | truncation service, `truncate.ts` | char-safe head+tail clip for output and error detail; truncation flag set |
 | Web excerpt clip | byte slice at 300: panics on multi-byte text | n/a | n/a | char-boundary clip |
+| Multi-file patch | none | not compared yet | `src/tool/apply_patch.ts` | `apply_patch`: same envelope format, tolerant unique hunk matching, plan-all-then-write, temp+rename, rollback on failure, every path (incl. move target) checked by custody scope |
 | Identical-call loop | repeated-failure stop only | loop guardrail controller, `agent/tool_guardrails.py` | `DOOM_LOOP_THRESHOLD = 3`, `session/processor.ts` | nudge on the 3rd identical call, whether it succeeds or fails; no-progress budget still terminates |
 
 ## Round 2 candidates (verified present in both, absent in REX)
@@ -33,7 +34,6 @@ is shared it is noted in the module docs.
 - Project instruction files: opencode `session/instruction.ts` loads
   `AGENTS.md` / `CLAUDE.md`; Hermes `agent/coding_context.py` loads
   `AGENTS.md`, `CLAUDE.md`, `.cursorrules`. REX loads none.
-- Multi-file atomic patch: opencode `src/tool/apply_patch.ts`.
 - Sub-agent delegation: opencode `src/tool/task.ts`; Hermes
   `tools/delegate_tool.py`.
 - Context compaction of old turns: opencode `session/compaction.ts`; Hermes

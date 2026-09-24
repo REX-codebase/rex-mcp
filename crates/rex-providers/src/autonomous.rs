@@ -1547,7 +1547,7 @@ fn build_state_message(
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "run_command", "web_search", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
         "budget": {
@@ -1602,6 +1602,12 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
             "Search file contents (literal or regex, optional include glob); skips build output and .gitignore.",
             false,
             false,
+        ),
+        ToolSpec::new(
+            "apply_patch",
+            "Apply an atomic multi-file patch (add/update/move/delete); all hunks apply or nothing is written.",
+            true,
+            true,
         ),
         ToolSpec::new(
             "glob_files",
@@ -1764,6 +1770,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"create_file","description":"Create a file inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"content":{"type":"STRING"},"overwrite":{"type":"BOOLEAN"}},"required":["path","content","overwrite"]}},
         {"name":"edit_file","description":"Replace text in a workspace file. Copy `expected` from the file; exact match is tried first, then a unique indentation/whitespace-tolerant match, and a miss reports the closest region. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"expected":{"type":"STRING"},"replacement":{"type":"STRING"},"replace_all":{"type":"BOOLEAN"}},"required":["path","expected","replacement","replace_all"]}},
         {"name":"search_files","description":"Search file contents inside the workspace. Literal case-insensitive by default; set regex=true for a regular expression. Skips .git, build output, node_modules and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"},"regex":{"type":"BOOLEAN"},"include":{"type":"STRING","description":"glob such as *.rs or src/**/*.{ts,tsx}"}},"required":["query"]}},
+        {"name":"apply_patch","description":"Change several files at once, all-or-nothing. Format: '*** Begin Patch' then per file '*** Add File: path' (lines prefixed '+'), '*** Delete File: path', or '*** Update File: path' (optional '*** Move to: path') with '@@' hunks of ' ' context, '-' removed and '+' added lines; end with '*** End Patch'. Include enough context lines to make each hunk unique. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"patch":{"type":"STRING"}},"required":["patch"]}},
         {"name":"glob_files","description":"Find workspace files by glob pattern (e.g. **/*.rs), newest first. Skips build output and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"pattern":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["pattern"]}},
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
@@ -2623,6 +2630,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         request,
                         ToolRequest::CreateFile { .. }
                             | ToolRequest::EditFile { .. }
+                            | ToolRequest::ApplyPatch { .. }
                             | ToolRequest::RunCommand { .. }
                     ) {
                         out.mutating_success = true;
@@ -2747,6 +2755,7 @@ fn tool_name_of(request: &ToolRequest) -> &'static str {
         ToolRequest::EditFile { .. } => "edit_file",
         ToolRequest::SearchFiles { .. } => "search_files",
         ToolRequest::GlobFiles { .. } => "glob_files",
+        ToolRequest::ApplyPatch { .. } => "apply_patch",
         ToolRequest::RunCommand { .. } => "run_command",
         ToolRequest::McpCall { .. } => "mcp_call",
     }
@@ -2986,6 +2995,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                         ToolRequest::EditFile { .. } => "edit_file",
                         ToolRequest::SearchFiles { .. } => "search_files",
                         ToolRequest::GlobFiles { .. } => "glob_files",
+                        ToolRequest::ApplyPatch { .. } => "apply_patch",
                         ToolRequest::RunCommand { .. } => "run_command",
                         ToolRequest::McpCall { .. } => "mcp_call",
                     }
@@ -3162,7 +3172,7 @@ fn verify_gates<S: SecretStore + 'static, T: Transport + 'static>(
     // inspection itself - so requiring one would make completion impossible.
     let role_can_mutate = match &ctx.brief.allowed_tools {
         None => true,
-        Some(allowed) => ["create_file", "edit_file", "run_command"]
+        Some(allowed) => ["create_file", "edit_file", "apply_patch", "run_command"]
             .iter()
             .any(|t| allowed.iter().any(|a| a == t)),
     };

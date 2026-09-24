@@ -70,7 +70,7 @@ impl CapabilitySet {
     fn tool_class(tool: &str) -> ToolClass {
         match tool {
             "read_file" | "search_files" | "glob_files" => ToolClass::Read,
-            "create_file" | "edit_file" => ToolClass::Write,
+            "create_file" | "edit_file" | "apply_patch" => ToolClass::Write,
             _ => ToolClass::Execute,
         }
     }
@@ -105,12 +105,24 @@ impl CapabilitySet {
 
     /// Full scope decision for one normalized tool request.
     pub fn permits(&self, request: &ToolRequest) -> Result<(), CapabilityDenial> {
+        let patch_owned: Vec<String>;
         let (tool, paths): (&str, Vec<&str>) = match request {
             ToolRequest::ReadFile { path, .. } => ("read_file", vec![path]),
             ToolRequest::CreateFile { path, .. } => ("create_file", vec![path]),
             ToolRequest::EditFile { path, .. } => ("edit_file", vec![path]),
             ToolRequest::SearchFiles { path, .. } => {
                 ("search_files", path.as_deref().into_iter().collect())
+            }
+            // Every path in the patch (including move targets) must be in
+            // scope; an unparseable patch has no paths and fails later.
+            ToolRequest::ApplyPatch { patch } => {
+                patch_owned = rex_tools::patch::parse(patch)
+                    .map(|ops| rex_tools::patch_paths(&ops))
+                    .unwrap_or_default();
+                (
+                    "apply_patch",
+                    patch_owned.iter().map(String::as_str).collect(),
+                )
             }
             ToolRequest::GlobFiles { path, .. } => {
                 ("glob_files", path.as_deref().into_iter().collect())

@@ -5,6 +5,7 @@
 //! an unguessable pending call. Risky calls require a separate user decision.
 
 pub mod fuzzy;
+pub mod patch;
 pub mod sandbox;
 pub mod walk;
 
@@ -157,6 +158,9 @@ pub enum ToolRequest {
         #[serde(default)]
         include: Option<String>,
     },
+    /// Atomic multi-file patch (`*** Begin Patch` envelope): add, update,
+    /// move and delete files; every hunk must apply or nothing is written.
+    ApplyPatch { patch: String },
     /// Find files by glob pattern, newest first.
     GlobFiles {
         pattern: String,
@@ -435,6 +439,32 @@ impl ToolRuntime {
                     modified: content.clone(),
                 }))
             }
+            ToolRequest::ApplyPatch { patch } => {
+                let changes = self.plan_patch(patch)?;
+                let mut original = String::new();
+                let mut modified = String::new();
+                let mut names = Vec::new();
+                for (_, change) in &changes {
+                    let (path, before, after) = match change {
+                        patch::Change::Write {
+                            path,
+                            original,
+                            content,
+                        } => (path, original.clone().unwrap_or_default(), content.clone()),
+                        patch::Change::Delete { path, original } => {
+                            (path, original.clone(), String::new())
+                        }
+                    };
+                    names.push(path.clone());
+                    original.push_str(&format!("=== {path} ===\n{before}\n"));
+                    modified.push_str(&format!("=== {path} ===\n{after}\n"));
+                }
+                Ok(Some(FileDiff {
+                    path: names.join(", "),
+                    original,
+                    modified,
+                }))
+            }
             ToolRequest::EditFile {
                 path,
                 expected,
@@ -687,6 +717,7 @@ impl ToolRuntime {
                 regex.unwrap_or(false),
                 include.as_deref(),
             ),
+            ToolRequest::ApplyPatch { patch } => self.apply_patch(patch),
             ToolRequest::GlobFiles {
                 pattern,
                 path,
@@ -1079,6 +1110,149 @@ impl ToolRuntime {
         let mut r = receipt(&self.root, Some(&base), bytes_read, 0);
         r.output_truncated = more || capped;
         Ok(exec(Some(out), r))
+    }
+
+    /// Parse and plan a patch against the workspace without writing.
+    fn plan_patch(&self, text: &str) -> Result<Vec<(PathBuf, patch::Change)>, ToolError> {
+        if text.len() > MAX_WRITE_BYTES {
+            return Err(err(ErrorKind::TooLarge, "patch exceeds 2 MiB limit"));
+        }
+        let ops = patch::parse(text).map_err(|e| err(ErrorKind::InvalidRequest, &e))?;
+        let mut tool_error: Option<ToolError> = None;
+        let planned = patch::plan(&ops, |p| {
+            let res = (|| {
+                let target = self.resolve_for_write(p)?;
+                if !target.exists() {
+                    return Ok(None);
+                }
+                let meta = fs::metadata(&target).map_err(io_err)?;
+                if !meta.is_file() {
+                    return Err(err(
+                        ErrorKind::InvalidRequest,
+                        "target is not a regular file",
+                    ));
+                }
+                if meta.len() > MAX_FILE_BYTES {
+                    return Err(err(ErrorKind::TooLarge, "file exceeds 2 MiB edit limit"));
+                }
+                fs::read_to_string(&target).map(Some).map_err(io_err)
+            })();
+            res.map_err(|e: ToolError| {
+                let msg = format!("{p}: {}", e.detail);
+                tool_error = Some(err(e.kind, &msg));
+                msg
+            })
+        });
+        let changes = match planned {
+            Ok(c) => c,
+            Err(e) => return Err(tool_error.unwrap_or_else(|| err(ErrorKind::Conflict, &e))),
+        };
+        let mut out = Vec::with_capacity(changes.len());
+        for change in changes {
+            let path = match &change {
+                patch::Change::Write { path, content, .. } => {
+                    if content.len() > MAX_WRITE_BYTES {
+                        return Err(err(ErrorKind::TooLarge, "patched file exceeds 2 MiB limit"));
+                    }
+                    path
+                }
+                patch::Change::Delete { path, .. } => path,
+            };
+            out.push((self.resolve_for_write(path)?, change));
+        }
+        Ok(out)
+    }
+
+    /// Apply a patch all-or-nothing: plan everything, refuse stale files,
+    /// then write each file via a temp file + rename; if any step fails,
+    /// already-applied files are restored to their original bytes.
+    fn apply_patch(&self, text: &str) -> Result<ExecData, ToolError> {
+        let changes = self.plan_patch(text)?;
+        if changes.is_empty() {
+            return Err(err(ErrorKind::InvalidRequest, "patch makes no changes"));
+        }
+        for (target, _) in &changes {
+            if target.exists() {
+                self.check_not_stale(target)?;
+            }
+        }
+        let mut applied: Vec<usize> = Vec::new();
+        let mut failure: Option<ToolError> = None;
+        for (idx, (target, change)) in changes.iter().enumerate() {
+            let step = match change {
+                patch::Change::Write { content, .. } => write_atomic(target, content),
+                patch::Change::Delete { .. } => fs::remove_file(target).map_err(io_err),
+            };
+            match step {
+                Ok(()) => applied.push(idx),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = failure {
+            for idx in applied.into_iter().rev() {
+                let (target, change) = &changes[idx];
+                let _ = match change {
+                    patch::Change::Write {
+                        original: Some(o), ..
+                    }
+                    | patch::Change::Delete { original: o, .. } => write_atomic(target, o),
+                    patch::Change::Write { original: None, .. } => {
+                        fs::remove_file(target).map_err(io_err)
+                    }
+                };
+            }
+            return Err(err(
+                e.kind,
+                &format!("patch rolled back, nothing changed: {}", e.detail),
+            ));
+        }
+        let mut summary = Vec::new();
+        let mut diffs = String::new();
+        let (mut read_bytes, mut written) = (0u64, 0u64);
+        for (target, change) in &changes {
+            let rel = relative(&self.root, target);
+            match change {
+                patch::Change::Write {
+                    original, content, ..
+                } => {
+                    self.note_seen(target);
+                    summary.push(format!(
+                        "{} {rel}",
+                        if original.is_some() { "M" } else { "A" }
+                    ));
+                    let before = original.as_deref().unwrap_or("");
+                    read_bytes += before.len() as u64;
+                    written += content.len() as u64;
+                    diffs.push_str(&simple_diff(before, content, &rel));
+                }
+                patch::Change::Delete { original, .. } => {
+                    self.seen.lock().expect("seen lock poisoned").remove(target);
+                    summary.push(format!("D {rel}"));
+                    read_bytes += original.len() as u64;
+                    diffs.push_str(&simple_diff(original, "", &rel));
+                }
+            }
+        }
+        let mut r = receipt(&self.root, None, read_bytes, written);
+        r.target = Some(
+            summary
+                .iter()
+                .map(|s| s[2..].to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        r.diff = Some(diffs);
+        Ok(exec(
+            Some(format!(
+                "applied patch to {} file(s):\n{}",
+                summary.len(),
+                summary.join("\n")
+            )),
+            r,
+        ))
     }
 
     fn glob_files(
@@ -1592,6 +1766,7 @@ fn tool_name(r: &ToolRequest) -> &'static str {
         ToolRequest::EditFile { .. } => "edit_file",
         ToolRequest::SearchFiles { .. } => "search_files",
         ToolRequest::GlobFiles { .. } => "glob_files",
+        ToolRequest::ApplyPatch { .. } => "apply_patch",
         ToolRequest::RunCommand { .. } => "run_command",
         ToolRequest::McpCall { .. } => "mcp_call",
     }
@@ -1608,6 +1783,12 @@ fn summarize(r: &ToolRequest) -> String {
             path.as_deref().unwrap_or("."),
             query
         ),
+        ToolRequest::ApplyPatch { patch } => {
+            let files = patch::parse(patch)
+                .map(|ops| patch_paths(&ops).join(", "))
+                .unwrap_or_else(|_| "unparseable patch".into());
+            format!("Apply patch: {files}")
+        }
         ToolRequest::GlobFiles { pattern, path, .. } => format!(
             "Find files {:?} under {:?}",
             pattern,
@@ -1659,7 +1840,9 @@ fn classify(r: &ToolRequest) -> (RiskClass, &'static str) {
             RiskClass::Read,
             "bounded read inside the selected workspace",
         ),
-        ToolRequest::CreateFile { .. } | ToolRequest::EditFile { .. } => (
+        ToolRequest::CreateFile { .. }
+        | ToolRequest::EditFile { .. }
+        | ToolRequest::ApplyPatch { .. } => (
             RiskClass::Write,
             "changes workspace files and requires user approval",
         ),
@@ -1687,6 +1870,9 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         }
         ToolRequest::SearchFiles { query, .. } if query.trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "search query is empty"))
+        }
+        ToolRequest::ApplyPatch { patch } if patch.trim().is_empty() => {
+            Err(err(ErrorKind::InvalidRequest, "patch is empty"))
         }
         ToolRequest::GlobFiles { pattern, .. } if pattern.trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "glob pattern is empty"))
@@ -2541,6 +2727,113 @@ mod tests {
         let (small, cut) = read_capped(&b"ok\n"[..], 4096);
         assert_eq!((small.as_slice(), cut), (&b"ok\n"[..], false));
     }
+    fn patch_call(rt: &ToolRuntime, patch: &str) -> ToolResult {
+        let p = rt
+            .prepare(ToolRequest::ApplyPatch {
+                patch: patch.into(),
+            })
+            .unwrap();
+        assert!(p.approval_required, "patches are writes");
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        rt.execute(&p.call_id)
+    }
+    #[test]
+    fn apply_patch_changes_several_files_at_once() {
+        let root = temp();
+        fs::write(root.join("a.rs"), "fn a() {\n    1\n}\n").unwrap();
+        fs::write(root.join("old.txt"), "bye\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = patch_call(
+            &rt,
+            "*** Begin Patch\n*** Update File: a.rs\n@@\n fn a() {\n-    1\n+    2\n }\n*** Add File: src/new.rs\n+pub fn n() {}\n*** Delete File: old.txt\n*** End Patch\n",
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(
+            fs::read_to_string(root.join("a.rs")).unwrap(),
+            "fn a() {\n    2\n}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/new.rs")).unwrap(),
+            "pub fn n() {}\n"
+        );
+        assert!(!root.join("old.txt").exists());
+        let out = r.output.unwrap();
+        assert!(
+            out.contains("M a.rs") && out.contains("A src/new.rs") && out.contains("D old.txt"),
+            "{out}"
+        );
+        assert!(r.receipt.diff.unwrap().contains("+    2"));
+    }
+    #[test]
+    fn apply_patch_rolls_back_when_a_later_write_fails() {
+        let root = temp();
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        fs::write(root.join("blocker"), "i am a file\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = patch_call(
+            &rt,
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+two\n*** Add File: blocker/x.txt\n+x\n*** End Patch",
+        );
+        let e = r.error.unwrap();
+        assert!(e.detail.contains("rolled back"), "{}", e.detail);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".rex-patch-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+    #[test]
+    fn apply_patch_refuses_escape_stale_and_bad_hunks_without_writing() {
+        let root = temp();
+        fs::write(root.join("s.txt"), "v1\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = patch_call(
+            &rt,
+            "*** Begin Patch\n*** Add File: ../evil.txt\n+x\n*** End Patch",
+        );
+        assert_eq!(r.error.unwrap().kind, ErrorKind::OutsideWorkspace);
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "s.txt".into(),
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        fs::write(root.join("s.txt"), "v1 edited by user\n").unwrap();
+        let r = patch_call(
+            &rt,
+            "*** Begin Patch\n*** Update File: s.txt\n@@\n-v1 edited by user\n+v2\n*** End Patch",
+        );
+        assert!(r.error.unwrap().detail.contains("changed on disk"));
+        let r = patch_call(&rt, "*** Begin Patch\n*** Add File: fresh.txt\n+ok\n*** Update File: s.txt\n@@\n-nope\n+v3\n*** End Patch");
+        assert_eq!(r.error.unwrap().kind, ErrorKind::Conflict);
+        assert!(!root.join("fresh.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("s.txt")).unwrap(),
+            "v1 edited by user\n"
+        );
+    }
+    #[test]
+    fn apply_patch_diff_preview_matches_result() {
+        let root = temp();
+        fs::write(root.join("p.txt"), "a\nb\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::ApplyPatch {
+                patch: "*** Begin Patch\n*** Update File: p.txt\n@@\n a\n-b\n+c\n*** End Patch"
+                    .into(),
+            })
+            .unwrap();
+        let d = rt.pending_diff(&p.call_id).unwrap().unwrap();
+        assert_eq!(d.path, "p.txt");
+        assert!(d.modified.contains("a\nc\n"));
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        assert_eq!(fs::read_to_string(root.join("p.txt")).unwrap(), "a\nc\n");
+    }
     #[test]
     fn shell_is_hard_denied() {
         let rt = ToolRuntime::new(temp()).unwrap();
@@ -2985,4 +3278,52 @@ fn binary_error(len: u64) -> ToolError {
         ErrorKind::InvalidRequest,
         &format!("binary file ({len} bytes); it cannot be read as text"),
     )
+}
+
+/// Every path a patch touches, including move destinations.
+pub fn patch_paths(ops: &[patch::Op]) -> Vec<String> {
+    let mut out = Vec::new();
+    for op in ops {
+        match op {
+            patch::Op::Add { path, .. } | patch::Op::Delete { path } => out.push(path.clone()),
+            patch::Op::Update { path, move_to, .. } => {
+                out.push(path.clone());
+                if let Some(d) = move_to {
+                    out.push(d.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Write via a sibling temp file and rename, keeping an existing file's
+/// permissions (new files are 0600, like `create_file`).
+fn write_atomic(target: &Path, content: &str) -> Result<(), ToolError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| err(ErrorKind::InvalidRequest, "target has no parent"))?;
+    fs::create_dir_all(parent).map_err(io_err)?;
+    let perms = fs::metadata(target).ok().map(|m| m.permissions());
+    let tmp = parent.join(format!(".rex-patch-{}.tmp", new_call_id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut f = options.open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        if let Some(p) = perms {
+            fs::set_permissions(&tmp, p)?;
+        }
+        fs::rename(&tmp, target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(io_err)
 }

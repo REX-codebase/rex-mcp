@@ -748,3 +748,39 @@ fn managed_model_worker_records_mode() {
     assert!(matches!(grant.worker, WorkerMode::ManagedModel { .. }));
     assert!(!grant.operator.is_agent());
 }
+
+#[test]
+fn apply_patch_needs_its_own_grant_and_every_path_in_scope() {
+    let c = ctx();
+    let ws = &c.workspace;
+    let patch = |body: &str| ToolRequest::ApplyPatch {
+        patch: format!("*** Begin Patch\n{body}\n*** End Patch"),
+    };
+    // Not granted: an edit_file grant does not silently cover apply_patch.
+    let no_patch = full_caps(ws);
+    assert!(no_patch.permits(&patch("*** Add File: a.txt\n+x")).is_err());
+    let with_patch = caps(
+        ws,
+        &["read_file", "edit_file", "apply_patch"],
+        &[ToolClass::Read, ToolClass::Write],
+    );
+    assert!(with_patch
+        .permits(&patch("*** Add File: a.txt\n+x"))
+        .is_ok());
+    // A move target or a later file outside the workspace refuses the whole patch.
+    assert!(with_patch
+        .permits(&patch(
+            "*** Update File: a.txt\n*** Move to: ../out.txt\n@@\n-x\n+y"
+        ))
+        .is_err());
+    assert!(with_patch
+        .permits(&patch(
+            "*** Add File: ok.txt\n+x\n*** Delete File: /etc/passwd"
+        ))
+        .is_err());
+    // Write class is required.
+    let read_only = caps(ws, &["apply_patch"], &[ToolClass::Read]);
+    assert!(read_only
+        .permits(&patch("*** Add File: a.txt\n+x"))
+        .is_err());
+}
