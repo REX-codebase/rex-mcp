@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { BackendBadge, TopBar } from "./components/TopBar";
 import { Composer } from "./components/Composer";
 import { StateRail } from "./components/StateRail";
+import { DesktopOnly, isDesktopRuntime } from "./components/DesktopOnly";
 import { SessionView } from "./components/SessionView";
 import { HistoryList } from "./components/HistoryList";
 import { SettingsView } from "./components/SettingsView";
@@ -644,6 +645,8 @@ export default function App() {
     setBrowserPhase("closed");
   };
 
+  const desktop = isDesktopRuntime();
+
   if (operatorMode === null) {
     return (
       <div className="harness-shell min-h-full">
@@ -676,14 +679,18 @@ export default function App() {
       <div className="fast-status" role="status" aria-live="polite"><span>FAST</span><b>{fast ? "TEMPO PROFILE ARMED" : "Fast preview off"}</b><small>Visual only · execution speed unchanged</small><i aria-hidden="true" /></div>
       <main className="main-spine mx-auto w-full max-w-[820px] px-5 pb-12 sm:px-8">
         {view === "terminal" ? (
-          <TerminalView />
+          desktop ? <TerminalView /> : <DesktopOnly feature="terminal" />
         ) : view === "editor" ? (
-          <WorkspaceEditor />
+          desktop ? <WorkspaceEditor /> : <DesktopOnly feature="editor" />
         ) : view === "git" ? (
-          <>
-            <GitPanel />
-            <CheckpointPanel />
-          </>
+          desktop ? (
+            <>
+              <GitPanel />
+              <CheckpointPanel />
+            </>
+          ) : (
+            <DesktopOnly feature="git" />
+          )
         ) : view === "settings" ? (
           <SettingsView
             motion={motion}
