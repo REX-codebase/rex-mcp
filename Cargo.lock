@@ -3495,6 +3495,7 @@ name = "rex-providers"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "regex",
  "rex-custody",
  "rex-mcp-ext",
  "rex-preview",
@@ -3504,6 +3505,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-normalization",
  "ureq",
  "url",
 ]

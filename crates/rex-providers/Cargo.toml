@@ -17,6 +17,8 @@ rex-search = { path = "../rex-search" }
 rex-preview = { path = "../rex-preview" }
 url = "2"
 base64 = { workspace = true }
+regex = "1"
+unicode-normalization = "0.1"
 
 
 [dev-dependencies]

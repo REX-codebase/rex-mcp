@@ -1030,3 +1030,32 @@ is shared it is noted in the module docs.
   the same run is not offered the tool and is refused. The edit child's
   tool list test now includes `read_output`. Hand mutation: 7/7 killed.
 - Gap left: none from round 18b. A child still keeps at most 4 outputs.
+
+## Round 23: a real injection check for workspace notes
+
+- Competitors: Hermes scans every memory entry with its strict threat
+  patterns before saving (`tools/memory_tool_store.py`
+  `_scan_memory_content`, `tools/threat_patterns.py`): override phrases,
+  hiding things from the user, role hijack, sending data to URLs, curl or
+  wget with secret variables, reading secret files, SSH keys, editing
+  agent config files, invisible unicode, after NFKC folding. opencode has
+  no agent-written memory to scan.
+- REX before: `remember` refused notes from a 14-phrase list checked by
+  plain substring (round 19/21's gap), so "disregard your earlier rules"
+  or a full-width "ｉｇｎｏｒｅ" got through.
+- REX now: REX's own 15 patterns in the same groups (override,
+  system_prompt, hide_from_user, approval_bypass, role_hijack,
+  forced_rule, send_out, secret_in_command, secret_files, agent_config)
+  run on NFKC-folded lowercase text, words in between allowed, plus a
+  zero-width/bidi character check. The refusal names the group. Notes in
+  a hand-edited file that fail the check or hold a secret are not loaded.
+  New dependencies are `regex` and `unicode-normalization`, both already
+  in Cargo.lock (no new downloads).
+- Tests: 25 payloads, each caught under the right group, and 9 plain
+  facts that must pass ("the previous maintainer kept rules in
+  docs/rules.md", "config lives in .env.example", "AGENTS.md describes the
+  crate layout", ...), plus a hand-edited file test. Hand mutation: 19/19
+  killed (each pattern deleted in turn, the hidden-character check,
+  folding, lowercasing, both load filters).
+- Gap left: cross-script look-alikes (Cyrillic letters) are not folded,
+  same as Hermes.
