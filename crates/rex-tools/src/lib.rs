@@ -2329,6 +2329,54 @@ mod tests {
     }
 
     #[test]
+    fn repair_tool_args_fixes_only_clear_slips() {
+        let mut a = json!({"path":"p","offset":" 3 ","limit":"null","max_results":7.0,"regex":"False","overwrite":"null","replace_all":"yes","timeout_ms":-1.0});
+        let mut fixed = repair_tool_args("read_file", &mut a);
+        fixed.sort();
+        assert_eq!(fixed, ["limit", "max_results", "offset", "regex"]);
+        assert_eq!(a["offset"], json!(3));
+        assert_eq!(a["limit"], Value::Null);
+        assert_eq!(a["max_results"], json!(7));
+        assert_eq!(a["regex"], json!(false));
+        // required flags keep "null"; unclear strings and negatives stay
+        assert_eq!(a["overwrite"], json!("null"));
+        assert_eq!(a["replace_all"], json!("yes"));
+        assert_eq!(a["timeout_ms"], json!(-1.0));
+        for bad in ["", "3.5", "-2", "1e3", "12a", "+5"] {
+            let mut v = json!({ "limit": bad });
+            assert!(repair_tool_args("read_file", &mut v).is_empty(), "{bad}");
+        }
+        let mut v = json!({"limit": 2.5, "path": "5"});
+        assert!(repair_tool_args("read_file", &mut v).is_empty());
+        let mut v = json!({"overwrite": "true", "replace_all": " FALSE "});
+        assert_eq!(repair_tool_args("edit_file", &mut v).len(), 2);
+        assert_eq!(v, json!({"overwrite": true, "replace_all": false}));
+    }
+
+    #[test]
+    fn repair_tool_args_decodes_argv_and_mcp_arguments_strings() {
+        let mut v = json!({"argv": " [\"git\", \"status\"]"});
+        assert_eq!(repair_tool_args("run_command", &mut v), ["argv"]);
+        assert_eq!(v["argv"], json!(["git", "status"]));
+        for bad in ["git status", "[]", "[1]", "[\"a\", 2]", "[oops"] {
+            let mut v = json!({ "argv": bad });
+            assert!(repair_tool_args("run_command", &mut v).is_empty(), "{bad}");
+        }
+        // only run_command's argv and mcp_call's arguments are decoded
+        let mut v = json!({"argv": "[\"a\"]", "arguments": "{\"k\":1}"});
+        assert!(repair_tool_args("read_file", &mut v).is_empty());
+        let mut v = json!({"arguments": "{\"k\":1}"});
+        assert_eq!(repair_tool_args("mcp_call", &mut v), ["arguments"]);
+        assert_eq!(v["arguments"], json!({"k": 1}));
+        for bad in ["[1]", "{bad", "k=1"] {
+            let mut v = json!({ "arguments": bad });
+            assert!(repair_tool_args("mcp_call", &mut v).is_empty(), "{bad}");
+        }
+        assert!(repair_tool_args("read_file", &mut json!("x")).is_empty());
+        assert_eq!(TOOL_NAMES.len(), 8);
+    }
+
+    #[test]
     fn journaled_runtime_undoes_agent_writes_but_keeps_user_edits() {
         let root = temp();
         let jdir = temp();
@@ -3481,6 +3529,89 @@ fn binary_error(len: u64) -> ToolError {
         ErrorKind::InvalidRequest,
         &format!("binary file ({len} bytes); it cannot be read as text"),
     )
+}
+
+/// Names of the tools decoded into [`ToolRequest`].
+pub const TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "create_file",
+    "edit_file",
+    "search_files",
+    "apply_patch",
+    "glob_files",
+    "run_command",
+    "mcp_call",
+];
+
+/// Repair common argument slips before a tool call is decoded: `"50"` or
+/// `50.0` for a count, `"true"` for a flag, `"null"` for an optional count or
+/// flag, a JSON-encoded array for `argv` and a JSON-encoded object for MCP
+/// `arguments`. Only fields whose type is known are touched, and a value is
+/// changed only when the repair is unambiguous; anything else is left for
+/// decoding to reject with its usual error. Returns the repaired field names.
+pub fn repair_tool_args(tool: &str, args: &mut Value) -> Vec<String> {
+    enum Kind {
+        Count,
+        Flag,
+        Argv,
+        Object,
+    }
+    let kind = |field: &str| match (tool, field) {
+        (_, "offset" | "limit" | "max_results" | "timeout_ms") => Some(Kind::Count),
+        (_, "overwrite" | "replace_all" | "regex") => Some(Kind::Flag),
+        ("run_command", "argv") => Some(Kind::Argv),
+        ("mcp_call", "arguments") => Some(Kind::Object),
+        _ => None,
+    };
+    let mut fixed = Vec::new();
+    let Some(map) = args.as_object_mut() else {
+        return fixed;
+    };
+    let optional = |field: &str| !matches!(field, "overwrite" | "replace_all");
+    let keys: Vec<String> = map.keys().cloned().collect();
+    for key in keys {
+        let Some(kind) = kind(&key) else { continue };
+        let value = &map[&key];
+        let repaired = match (&kind, value) {
+            (Kind::Count | Kind::Flag, Value::String(s))
+                if s.trim().eq_ignore_ascii_case("null") && optional(&key) =>
+            {
+                Some(Value::Null)
+            }
+            (Kind::Count, Value::String(s)) => {
+                let t = s.trim();
+                (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| t.parse::<u64>().ok())
+                    .flatten()
+                    .map(Value::from)
+            }
+            (Kind::Count, Value::Number(n)) if n.as_u64().is_none() => n
+                .as_f64()
+                .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f <= 9.0e15)
+                .map(|f| Value::from(f as u64)),
+            (Kind::Flag, Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            (Kind::Argv, Value::String(s)) if s.trim_start().starts_with('[') => {
+                serde_json::from_str::<Value>(s.trim()).ok().filter(|v| {
+                    v.as_array()
+                        .is_some_and(|a| !a.is_empty() && a.iter().all(Value::is_string))
+                })
+            }
+            (Kind::Object, Value::String(s)) if s.trim_start().starts_with('{') => {
+                // a JSON text that starts with `{` can only be an object
+                serde_json::from_str::<Value>(s.trim()).ok()
+            }
+            _ => None,
+        };
+        if let Some(v) = repaired {
+            map.insert(key.clone(), v);
+            fixed.push(key);
+        }
+    }
+    fixed
 }
 
 /// Every path a patch touches, including move destinations.

@@ -277,3 +277,29 @@ is shared it is noted in the module docs.
   REX decide") and an "Undo last file change" button on finished runs that
   wrote files. Covered by 2 vitest tests; rendered with the compiled theme
   and checked visually.
+
+## Round 10: repair slightly-off tool calls
+
+- Hermes coerces string arguments against each tool's schema before
+  dispatch (`tools/arg_coercion.py`, called from `model_tools.py:888`):
+  `"42"` to 42, `"true"` to true, JSON-encoded arrays and objects parsed.
+  opencode fixes a tool name that differs only by case and sends anything
+  else to an `invalid` tool that returns the error
+  (`session/llm.ts:296-311`, `tool/invalid.ts`). REX already returned bad
+  calls to the model as errors, but made no repairs, so `"max_results":"5"`
+  or `Read_File` cost a turn.
+- REX now repairs before decoding (`rex_tools::repair_tool_args`,
+  `canonical_call_name` in `autonomous.rs`), for Gemini, Anthropic and
+  OpenAI-style calls: counts given as `"5"` or `5.0`, flags given as
+  `"true"`/`"FALSE"`, `"null"` for optional counts and flags, `argv` sent
+  as a JSON-encoded string array, MCP `arguments` sent as a JSON-encoded
+  object, and tool names that differ by case, spaces or `-` for `_`.
+  Unclear values (`"yes"`, `"3.5"`, `"+5"`, `-1.0`, a bare `"git status"`
+  argv, `"null"` for a required flag) are left alone, so decoding still
+  rejects them with its usual error. Unlike Hermes, a bare string is not
+  wrapped into a one-item `argv`: `["git status"]` would name the wrong
+  program.
+- Tests: 3 new (2 unit, 1 decode across both call formats). Mutations: 12
+  tried, all fail the tests except one removed filter that could never
+  change a result, which I deleted.
+- Gap left: repairs are silent (not logged to the run journal).

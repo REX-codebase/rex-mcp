@@ -2503,6 +2503,8 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
             .get("name")
             .and_then(Value::as_str)
             .ok_or("functionCall missing name")?;
+        let name = canonical_call_name(name);
+        let name = name.as_str();
         let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
         match name {
             "update_plan" => {
@@ -2609,6 +2611,7 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     .as_object_mut()
                     .unwrap()
                     .insert("tool".into(), Value::String(name.into()));
+                rex_tools::repair_tool_args(name, &mut object);
                 match serde_json::from_value::<ToolRequest>(object) {
                     Ok(request) => calls.push((AgentCall::Tool { id, request }, raw)),
                     Err(e) => calls.push((
@@ -2641,12 +2644,39 @@ fn decode_provider_calls(
     }
 }
 
+/// Calls the loop handles itself rather than through [`ToolRequest`].
+const AGENT_CALL_NAMES: &[&str] = &[
+    "update_plan",
+    "web_search",
+    "web_fetch",
+    "ask_user",
+    "explore",
+    "complete_task",
+];
+
+/// Map a slightly-off tool name (`Read_File`, `read-file`, ` explore `) to the
+/// known name it clearly means. Unknown names come back unchanged so decoding
+/// reports them as usual.
+fn canonical_call_name(name: &str) -> String {
+    let fixed = name.trim().to_ascii_lowercase().replace('-', "_");
+    if fixed != name
+        && (AGENT_CALL_NAMES.contains(&fixed.as_str())
+            || rex_tools::TOOL_NAMES.contains(&fixed.as_str()))
+    {
+        fixed
+    } else {
+        name.to_string()
+    }
+}
+
 fn decode_named_call(
     name: &str,
     id: String,
     args: Value,
     raw: Value,
 ) -> (AgentCall, Option<Value>) {
+    let name = canonical_call_name(name);
+    let name = name.as_str();
     let bad = |error: String| {
         (
             AgentCall::BadCall {
@@ -2721,6 +2751,7 @@ fn decode_named_call(
                 .as_object_mut()
                 .unwrap()
                 .insert("tool".into(), Value::String(name.into()));
+            rex_tools::repair_tool_args(name, &mut object);
             match serde_json::from_value::<ToolRequest>(object) {
                 Ok(request) => (AgentCall::Tool { id, request }, Some(raw)),
                 Err(e) => bad(format!("invalid {name} request: {e}")),
@@ -6268,6 +6299,47 @@ mod tests {
         assert_eq!(svc.undo_to_write(&snap.id, 0).unwrap().len(), 1);
         assert!(!ws.join("x.txt").exists());
         assert!(svc.undo_to_write("no-such-run", 0).is_err());
+    }
+
+    #[test]
+    fn slightly_off_tool_calls_are_repaired_before_decoding() {
+        let got = decode_gemini_calls(&call_turn(vec![
+            json!({"functionCall":{"name":"Search_Files","args":{"query":"x","max_results":"5","regex":"TRUE"}}}),
+            json!({"functionCall":{"name":"read-file","args":{"path":"a.rs","limit":20.0}}}),
+            json!({"functionCall":{"name":"Explore","args":{"task":"q"}}}),
+            json!({"functionCall":{"name":"Frobnicate","args":{}}}),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            &got.calls[0].0,
+            AgentCall::Tool {
+                request: ToolRequest::SearchFiles {
+                    max_results: Some(5),
+                    regex: Some(true),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &got.calls[1].0,
+            AgentCall::Tool {
+                request: ToolRequest::ReadFile {
+                    limit: Some(20),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(&got.calls[2].0, AgentCall::Explore { .. }));
+        assert!(matches!(&got.calls[3].0, AgentCall::BadCall { name, .. } if name == "Frobnicate"));
+        let openai = json!({"choices":[{"message":{"tool_calls":[
+            {"id":"c1","function":{"name":"RUN_COMMAND","arguments":"{\"argv\":\"[\\\"ls\\\",\\\"-a\\\"]\",\"timeout_ms\":\"900\"}"}}
+        ]}}]}).to_string();
+        let got = decode_openai_calls(&openai).unwrap();
+        assert!(
+            matches!(&got.calls[0].0, AgentCall::Tool { request: ToolRequest::RunCommand { argv, timeout_ms: Some(900), .. }, .. } if argv == &["ls", "-a"])
+        );
     }
 
     #[test]
