@@ -1363,7 +1363,14 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         }
 
         // ---- dynamic context build ---------------------------------------
-        let state_msg = build_state_message(&ctx.brief, &cp, budgets, current_plan(&ctx.handle));
+        let project = rex_prompt::project::load(&ctx.workspace);
+        let state_msg = build_state_message(
+            &ctx.brief,
+            &cp,
+            budgets,
+            current_plan(&ctx.handle),
+            project.as_ref(),
+        );
         let request_body = build_request(
             protocol,
             &model,
@@ -1535,6 +1542,7 @@ fn build_state_message(
     cp: &Checkpoint,
     budgets: Budgets,
     plan: Vec<PlanItem>,
+    project: Option<&rex_prompt::project::ProjectInstructions>,
 ) -> String {
     let digest: Vec<&DigestEntry> = cp.digest.iter().rev().take(DIGEST_WINDOW).collect();
     let digest: Vec<&DigestEntry> = digest.into_iter().rev().collect();
@@ -1550,6 +1558,13 @@ fn build_state_message(
             "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
+        "project_instructions": project.map(|p| json!({
+            "source": p.source,
+            "sha256": p.sha256,
+            "truncated": p.truncated,
+            "precedence": rex_prompt::project::PRECEDENCE,
+            "text": p.text,
+        })),
         "budget": {
             "step": cp.step, "max_steps": budgets.max_steps,
             "tool_calls": cp.tool_calls, "max_tool_calls": budgets.max_tool_calls,
@@ -4173,6 +4188,47 @@ mod tests {
         // the worker keeps the full offering with no enforced allowlist
         let (_, worker_allow) = scoped_tools_for(Role::Worker);
         assert!(worker_allow.is_none());
+    }
+
+    #[test]
+    fn state_message_carries_repo_instructions_below_the_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("AGENTS.md"),
+            "Run `make check` before completing.",
+        )
+        .unwrap();
+        let project = rex_prompt::project::load(tmp.path());
+        let brief = TaskBrief {
+            id: "r1".into(),
+            task: "fix bug".into(),
+            provider: "gemini".into(),
+            budgets: Budgets::default(),
+            created_at_ms: 1,
+            prompt_version: legacy_prompt_marker(),
+            prompt_hash: legacy_prompt_marker(),
+            role: None,
+            allowed_tools: None,
+            plan_mode: false,
+            name: None,
+            continued_from: None,
+        };
+        let cp = Checkpoint::default();
+        let msg = build_state_message(&brief, &cp, Budgets::default(), vec![], project.as_ref());
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["project_instructions"]["source"], "AGENTS.md");
+        assert!(v["project_instructions"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("make check"));
+        assert!(v["project_instructions"]["precedence"]
+            .as_str()
+            .unwrap()
+            .contains("never override"));
+        // absent file -> null, and the system prompt identity is unaffected
+        let none = build_state_message(&brief, &cp, Budgets::default(), vec![], None);
+        let v: serde_json::Value = serde_json::from_str(&none).unwrap();
+        assert!(v["project_instructions"].is_null());
     }
 
     #[test]

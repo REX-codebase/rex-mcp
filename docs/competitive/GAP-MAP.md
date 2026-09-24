@@ -33,7 +33,7 @@ is shared it is noted in the module docs.
 
 - Project instruction files: opencode `session/instruction.ts` loads
   `AGENTS.md` / `CLAUDE.md`; Hermes `agent/coding_context.py` loads
-  `AGENTS.md`, `CLAUDE.md`, `.cursorrules`. REX loads none.
+  `AGENTS.md`, `CLAUDE.md`, `.cursorrules`. REX (round 2) loads the first of these at the workspace root into per-turn state, capped at 8k chars, symlinks refused. Gap left: no parent-dir walk or global file (opencode does both).
 - Sub-agent delegation: opencode `src/tool/task.ts`; Hermes
   `tools/delegate_tool.py`.
 - Context compaction of old turns: opencode `session/compaction.ts`; Hermes
