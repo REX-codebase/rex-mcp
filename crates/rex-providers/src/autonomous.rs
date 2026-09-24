@@ -7689,6 +7689,7 @@ mod tests {
                 "apply_patch",
                 "glob_files",
                 "run_command",
+                "read_output",
                 "complete_task"
             ]
         );
@@ -8037,6 +8038,110 @@ mod tests {
             .find(|p| p.contains("1501: test deep::child FAILED"))
             .unwrap_or_else(|| panic!("{:?}", posts.last()));
         assert!(found.contains(r#"\"matches\":1"#), "{found}");
+    }
+
+    #[test]
+    fn an_edit_child_can_read_its_own_clipped_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        let ws = root.join("runs").join("child-read-ws");
+        fs::create_dir_all(&ws).unwrap();
+        let log: Vec<String> = (1..=3000)
+            .map(|i| {
+                if i == 2200 {
+                    "test deep::own FAILED".to_string()
+                } else {
+                    format!("line {i} ok")
+                }
+            })
+            .collect();
+        fs::write(ws.join("log.txt"), log.join("\n")).unwrap();
+        let script = Script::new(vec![
+            call_turn(vec![json!({"functionCall":{"name":"explore","args":{
+                "task":"run the log","kind":"edit"}}})]),
+            call_turn(vec![json!({"functionCall":{"name":"run_command","args":{
+                "argv":["cat","log.txt"]}}})]),
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_output","args":{"call_id":"__LAST_TOOL_ID__","query":"FAILED"}}}),
+                json!({"functionCall":{"name":"read_output","args":{"call_id":"tool-999999","offset":1}}}),
+                json!({"functionCall":{"name":"read_output","args":{"call_id":"__LAST_TOOL_ID__","offset":2190}}}),
+            ]),
+            call_turn(vec![complete_call("R: line 2201 fails")]),
+            // an explorer asking for read_output is refused
+            call_turn(vec![json!({"functionCall":{"name":"explore","args":{
+                "task":"look around"}}})]),
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_output","args":{"call_id":"tool-1","offset":1}}}),
+            ]),
+            call_turn(vec![complete_call("E")]),
+            text_turn("done"),
+            text_turn("done"),
+            text_turn("done"),
+        ]);
+        let svc = Arc::new(service(&root, script));
+        let snap = svc
+            .begin_in_workspace_with_options(
+                "find the failing test",
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws),
+                Role::Worker,
+                RunOptions::default(),
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service.transport().seen();
+        // the edit child is offered read_output and told to use it
+        let child: Value = serde_json::from_str(&posts[1]).unwrap();
+        let names: Vec<&str> = child["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"read_output"), "{names:?}");
+        assert!(
+            posts[2].contains("page or search it with read_output"),
+            "{}",
+            posts[2]
+        );
+        // its own read finds the hidden line; an id it never kept is refused
+        let reply = &posts[3];
+        assert!(
+            reply.contains("2201: test deep::own FAILED"),
+            "{reply} {:?}",
+            done.events
+        );
+        assert!(reply.contains(r#"\"matches\":1"#), "{reply}");
+        assert!(reply.contains("you can read only your own"), "{reply}");
+        // paging works too: 200 lines from 2190
+        assert!(reply.contains("2389: line 2388 ok"), "{reply}");
+        assert!(reply.contains(r#"\"next_offset\":2390"#), "{reply}");
+        assert!(
+            reply.contains("no saved output for call_id tool-999999"),
+            "{reply}"
+        );
+        // the explorer has no read_output and is refused
+        let explorer = posts
+            .iter()
+            .position(|p| {
+                serde_json::from_str::<Value>(p).is_ok_and(|v| {
+                    v["systemInstruction"]["parts"][0]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("You are a REX explorer sub-agent"))
+                })
+            })
+            .expect("explorer child");
+        let ex: Value = serde_json::from_str(&posts[explorer]).unwrap();
+        assert!(!ex["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "read_output"));
+        assert!(posts[explorer + 1].contains("read_output is not available to the explorer"));
     }
 
     #[test]

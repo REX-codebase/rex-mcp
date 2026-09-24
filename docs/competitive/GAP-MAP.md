@@ -1007,3 +1007,26 @@ is shared it is noted in the module docs.
   argument tests, and the three-run test now replaces a note in run 1 and
   run 2 sees only the new text. Hand mutation: 12/12 killed.
 - Gap left: the instruction check is still a short phrase list.
+
+## Round 22: edit sub-agents can read their own clipped output
+
+- Competitors: opencode clips long tool output, saves the full text to a
+  file and tells the model to read it with its own read tool
+  (`src/tool/truncate.ts`), which task sub-agents have too. Hermes's
+  spillover note likewise points the agent at `read_file`
+  (`tools/tool_result_storage.py`).
+- REX before: an edit sub-agent whose command output was clipped could
+  only name the id in its report for the parent to read (round 18b); it
+  could not look at the middle of its own test log to fix the failure.
+- REX now: edit sub-agents have `read_output`, with the same page and
+  search replies as the parent's. A child reads only outputs it kept
+  itself, not the parent's or a sibling's; it counts toward the child's
+  tool-call budget and follows the run role's allowed tools. The clipped
+  result tells the child it can use it. Explore and research children
+  (which cannot run commands) still do not have it.
+- Tests: a scripted run where an edit child `cat`s a 3,000-line log,
+  searches its own saved output and finds the hidden failing line, pages
+  from line 2190, and is refused an id it never kept; an explorer child in
+  the same run is not offered the tool and is refused. The edit child's
+  tool list test now includes `read_output`. Hand mutation: 7/7 killed.
+- Gap left: none from round 18b. A child still keeps at most 4 outputs.
