@@ -4011,6 +4011,19 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     cp.tool_calls += outcome.tool_calls;
                     cp.total_denials += outcome.denials;
                     cancelled |= outcome.cancelled;
+                    // the child's clipped command outputs become readable
+                    // by this run's read_output
+                    let full_outputs: Vec<Value> = outcome
+                        .saved_outputs
+                        .iter()
+                        .map(|(call_id, text)| {
+                            let lines = cp.outputs.save(call_id, text);
+                            json!({
+                                "call_id": call_id, "lines": lines,
+                                "hint": "read_output with this call_id pages or searches the full text",
+                            })
+                        })
+                        .collect();
                     if !outcome.files_written.is_empty() {
                         out.mutating_success = true;
                         out.progress = true;
@@ -4074,6 +4087,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         "files_written": outcome.files_written,
                         "denials": outcome.denials,
                         "overlaps": outcome.overlaps,
+                        "full_outputs": full_outputs,
                         "turns": outcome.turns,
                         "tool_calls": outcome.tool_calls,
                         "error": outcome.error,
@@ -7666,6 +7680,71 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_childs_clipped_output_is_readable_by_the_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        let ws = root.join("runs").join("child-out-ws");
+        fs::create_dir_all(&ws).unwrap();
+        let log: Vec<String> = (1..=3000)
+            .map(|i| {
+                if i == 1500 {
+                    "test deep::child FAILED".to_string()
+                } else {
+                    format!("line {i} ok")
+                }
+            })
+            .collect();
+        fs::write(ws.join("log.txt"), log.join("\n")).unwrap();
+        let script = Script::new(vec![
+            call_turn(vec![json!({"functionCall":{"name":"explore","args":{
+                "task":"run the log","kind":"edit"}}})]),
+            call_turn(vec![json!({"functionCall":{"name":"run_command","args":{
+                "argv":["cat","log.txt"]}}})]),
+            call_turn(vec![complete_call("R")]),
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_output","args":{"call_id":"__LAST_TOOL_ID__","query":"failed"}}}),
+            ]),
+            text_turn("done"),
+            text_turn("done"),
+            text_turn("done"),
+        ]);
+        let svc = Arc::new(service(&root, script));
+        let snap = svc
+            .begin_in_workspace_with_options(
+                "find the failing test",
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws),
+                Role::Worker,
+                RunOptions::default(),
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service.transport().seen();
+        // the child saw the clipped log and the kept id
+        let child = posts
+            .iter()
+            .find(|p| p.contains("full output is kept as tool-"))
+            .unwrap_or_else(|| panic!("{posts:?} {:?}", done.events));
+        assert!(!child.contains("deep::child FAILED"));
+        // the batch result hands the id to the parent
+        let batch = posts
+            .iter()
+            .find(|p| p.contains("full_outputs"))
+            .expect("batch result");
+        assert!(batch.contains(r#"\"lines\":30"#), "{batch}");
+        // and the parent's read_output finds the hidden line
+        let found = posts
+            .iter()
+            .find(|p| p.contains("1501: test deep::child FAILED"))
+            .unwrap_or_else(|| panic!("{:?}", posts.last()));
+        assert!(found.contains(r#"\"matches\":1"#), "{found}");
+    }
+
+    #[test]
     fn a_file_a_command_creates_is_claimed_for_that_child() {
         let tmp = tempfile::tempdir().unwrap();
         let batch = json!({"functionCall":{"name":"explore","args":{
@@ -7717,6 +7796,34 @@ mod tests {
         .unwrap();
         let term: Value = serde_json::from_str(&term).unwrap();
         assert_eq!(term["files"], json!(["seed.txt", "made.txt"]), "{term}");
+    }
+
+    #[test]
+    fn a_child_keeps_at_most_four_clipped_outputs() {
+        use explore::{keep_output, ExploreOutcome, MAX_CHILD_SAVED_OUTPUTS};
+        let mut out = ExploreOutcome::default();
+        for i in 0..MAX_CHILD_SAVED_OUTPUTS + 2 {
+            let mut shown = format!("head {i}");
+            keep_output(
+                &mut out,
+                &format!("tool-{i}"),
+                &format!("full {i}"),
+                &mut shown,
+            );
+            if i < MAX_CHILD_SAVED_OUTPUTS {
+                assert!(shown.starts_with(&format!("head {i}\n[the middle was clipped")));
+                assert!(shown.contains(&format!("kept as tool-{i}:")), "{shown}");
+            } else {
+                // past the cap nothing is kept, so no id is promised
+                assert_eq!(shown, format!("head {i}"));
+            }
+        }
+        assert_eq!(MAX_CHILD_SAVED_OUTPUTS, 4);
+        assert_eq!(out.saved_outputs.len(), 4);
+        assert_eq!(
+            out.saved_outputs[3],
+            ("tool-3".to_string(), "full 3".to_string())
+        );
     }
 
     #[test]

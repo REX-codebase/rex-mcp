@@ -14,6 +14,8 @@ use super::*;
 pub(super) const EXPLORE_MAX_TURNS: usize = 8;
 pub(super) const EXPLORE_MAX_TOOL_CALLS: usize = 24;
 const EXPLORE_RESULT_CHARS: usize = 4_000;
+/// Clipped command outputs one child hands to the parent at most.
+pub(super) const MAX_CHILD_SAVED_OUTPUTS: usize = 4;
 pub(super) const EXPLORE_REPORT_CHARS: usize = 8_000;
 pub(super) const EXPLORE_TASK_CHARS: usize = 4_000;
 /// Most explorers one `explore` call may run at once.
@@ -163,6 +165,19 @@ pub(super) fn changed_since(
         .filter(|(path, _, print)| file_fingerprint(&root.join(path)) != *print)
         .map(|(path, owner, _)| (path.clone(), *owner))
         .collect()
+}
+
+/// Keep the full text of a clipped command output for the parent (up to
+/// MAX_CHILD_SAVED_OUTPUTS per child) and tell the child the id.
+pub(super) fn keep_output(out: &mut ExploreOutcome, call_id: &str, text: &str, shown: &mut String) {
+    if out.saved_outputs.len() >= MAX_CHILD_SAVED_OUTPUTS {
+        return;
+    }
+    out.saved_outputs
+        .push((call_id.to_string(), text.to_string()));
+    shown.push_str(&format!(
+        "\n[the middle was clipped; the full output is kept as {call_id}: name that id in your report so the parent can read it]"
+    ));
 }
 
 /// Size and modification time of every file under `root`, skipping VCS,
@@ -330,6 +345,10 @@ pub(super) struct ExploreOutcome {
     /// Files another edit child of the batch owns that changed while one of
     /// this child's commands ran, as "path (edit sub-agent N)" (capped at 32).
     pub overlaps: Vec<String>,
+    /// Full text of this child's clipped command outputs, as
+    /// (rex-tools call id, text), capped at MAX_CHILD_SAVED_OUTPUTS. The
+    /// parent keeps them for its read_output tool.
+    pub saved_outputs: Vec<(String, String)>,
     pub cancelled: bool,
     pub error: Option<String>,
 }
@@ -621,8 +640,11 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                                     (None, Some(e)) => e.detail.clone(),
                                     (None, None) => String::new(),
                                 };
-                                let (mut clipped, _) =
+                                let (mut clipped, was_clipped) =
                                     rex_tools::clip_middle(&text, EXPLORE_RESULT_CHARS);
+                                if was_clipped {
+                                    keep_output(&mut out, &r.call_id, &text, &mut clipped);
+                                }
                                 let changed = watch
                                     .map(|before| changed_since(tools.workspace_root(), &before))
                                     .unwrap_or_default();

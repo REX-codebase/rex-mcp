@@ -685,8 +685,8 @@ is shared it is noted in the module docs.
   boundary) and a scripted run. In that run `cat` of a 3,000-line log
   hides line 1,500, a search finds it, paging shows it in context, and an
   unknown id gets a readable error. Hand mutation: 13/13 killed.
-- Gap left: edit sub-agents' clipped command output is not kept. The
-  saved text is lost on resume.
+- Gap left: edit sub-agents' clipped command output is not kept (closed
+  in round 18b). The saved text is lost on resume.
 
 ## Round 16: recall earlier runs in the same workspace (`past_runs`)
 
@@ -881,4 +881,27 @@ is shared it is noted in the module docs.
 - Gap left: build output outside the skipped folders (for example
   `dist/`) is listed too, up to the 200-path cap; a change that keeps
   size and modified time is not seen.
+
+## Round 18b: an edit sub-agent's clipped command output
+
+- Competitors: opencode writes the full text of a truncated tool result
+  to a file and tells the model where it is, for any agent including
+  subagents (`packages/opencode/src/tool/truncate.ts`). Hermes spills
+  large tool results to storage (`tools/tool_result_storage.py`).
+- REX before: round 15's `read_output` kept the main agent's clipped
+  command output, but an edit sub-agent's clipped output was lost.
+- REX now: when an edit sub-agent's command output is clipped, the child
+  is told the id it is kept under, and the batch result hands the full
+  text to the parent: each entry has `full_outputs` (call id, line count,
+  hint). The parent stores them in its own output store, so its
+  `read_output` pages or searches them. Up to 4 per child; past that
+  nothing is kept and no id is promised. Still in memory only, for one
+  run; nothing is written to the workspace.
+- Tests: a scripted run (an edit child `cat`s a 3,000-line log; the
+  child sees the clipped text and the id, the batch result carries
+  `full_outputs` with the line count, and the parent's `read_output`
+  finds the hidden line 1501) and a cap unit test. Hand mutation: 7/7
+  killed.
+- Gap left: saved outputs are still lost on resume; children cannot call
+  `read_output` themselves.
 
