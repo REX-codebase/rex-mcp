@@ -1301,3 +1301,28 @@ is shared it is noted in the module docs.
   mutant (a rule without `/` can no longer cross a folder), so the Round
   24 survivor is closed.
 - Gap left: the global `core.excludesFile` is still not read.
+
+## Round 35: the API key store is saved whole and private
+
+- Competitors: Hermes saves credentials with `atomic_json_write(...,
+  mode=0o600)`: a temp file that is 0600 from creation, synced, then
+  swapped in (`utils.py`).
+- REX before: `FileSecretStore` wrote `secrets.json` in place and set
+  0600 afterwards. A crash mid-save left a broken file and every saved
+  API key became unreadable; an old store that had been made readable
+  kept that mode until the chmod ran. (The folder is 0700, which limits
+  who could reach the file.)
+- REX now: keys go to a temp file opened 0600 (a leftover temp file from
+  a crash is reset to 0600 too), synced, and renamed over the store. A
+  failed save removes the temp file and leaves the old keys in place.
+- Tests: round trip of set/clear with a readable old store and a
+  readable leftover temp file (0600 after the first save, no temp left),
+  a failed rename cleans up, and a save into a folder that refuses new
+  files fails while the old keys stay readable. Hand mutation: 4/4
+  killed. Opening the temp file without the 0600 mode is not caught: the
+  mode is reset right after, so only a moment's difference remains.
+- Audit: the other plain writes in rex-providers are evidence files,
+  which nothing reads back, and saved command output
+  (`output_store.rs`), which a resumed run reloads for `read_output`; a
+  crash mid-write there costs only that one output's text, so both were
+  left as they are. Notes already save through a temp file.
