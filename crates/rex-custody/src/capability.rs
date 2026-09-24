@@ -69,7 +69,7 @@ impl CapabilitySet {
 
     fn tool_class(tool: &str) -> ToolClass {
         match tool {
-            "read_file" | "search_files" => ToolClass::Read,
+            "read_file" | "search_files" | "glob_files" => ToolClass::Read,
             "create_file" | "edit_file" => ToolClass::Write,
             _ => ToolClass::Execute,
         }
@@ -106,11 +106,14 @@ impl CapabilitySet {
     /// Full scope decision for one normalized tool request.
     pub fn permits(&self, request: &ToolRequest) -> Result<(), CapabilityDenial> {
         let (tool, paths): (&str, Vec<&str>) = match request {
-            ToolRequest::ReadFile { path } => ("read_file", vec![path]),
+            ToolRequest::ReadFile { path, .. } => ("read_file", vec![path]),
             ToolRequest::CreateFile { path, .. } => ("create_file", vec![path]),
             ToolRequest::EditFile { path, .. } => ("edit_file", vec![path]),
             ToolRequest::SearchFiles { path, .. } => {
                 ("search_files", path.as_deref().into_iter().collect())
+            }
+            ToolRequest::GlobFiles { path, .. } => {
+                ("glob_files", path.as_deref().into_iter().collect())
             }
             ToolRequest::RunCommand { cwd, .. } => {
                 ("run_command", cwd.as_deref().into_iter().collect())

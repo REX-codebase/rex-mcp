@@ -525,6 +525,8 @@ fn capability_escape_through_tools_quarantines() {
             &token,
             ToolRequest::ReadFile {
                 path: "note.txt".into(),
+                offset: None,
+                limit: None,
             },
             T0 + 1,
         )
@@ -562,14 +564,22 @@ fn path_escape_outside_workspace_is_escape() {
     let (token, _g) = offer_and_accept(&mut reg, "task-esc", agent(), full_caps(&c.workspace), T0);
     let grant = reg.grant(&token.grant_id).unwrap().clone();
     for p in ["../outside.txt", "/etc/passwd", "sub/../../outside.txt"] {
-        let req = ToolRequest::ReadFile { path: p.into() };
+        let req = ToolRequest::ReadFile {
+            path: p.into(),
+            offset: None,
+            limit: None,
+        };
         assert!(
             grant.capabilities.permits(&req).is_err(),
             "{p} must be refused"
         );
     }
     for p in ["note.txt", "sub/dir/file.rs", "./ok.txt"] {
-        let req = ToolRequest::ReadFile { path: p.into() };
+        let req = ToolRequest::ReadFile {
+            path: p.into(),
+            offset: None,
+            limit: None,
+        };
         assert!(
             grant.capabilities.permits(&req).is_ok(),
             "{p} must be allowed"
@@ -590,6 +600,8 @@ fn execute_after_release_is_refused() {
             &token,
             ToolRequest::ReadFile {
                 path: "note.txt".into(),
+                offset: None,
+                limit: None,
             },
             T0 + 1,
         )

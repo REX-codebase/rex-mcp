@@ -61,6 +61,9 @@ pub const DEFAULT_MAX_WALL_MS: u64 = 20 * 60 * 1000;
 pub const DEFAULT_MAX_TOKENS: u64 = 250_000;
 pub const MAX_GATE_ATTEMPTS: u8 = 3;
 pub const MAX_CONSEC_FAILURES: u32 = 3;
+/// Identical consecutive calls (beyond the first) after which the model is
+/// told it is looping. Termination stays with the no-progress budget.
+pub const DOOM_LOOP_REPEATS: u32 = 2;
 pub const MAX_STALL_TURNS: u32 = 3;
 pub const MAX_NO_PROGRESS_TURNS: u32 = 6;
 pub const MAX_DENIALS: u32 = 2;
@@ -344,6 +347,12 @@ struct Checkpoint {
     gate_attempts: u8,
     consec_fail: u32,
     last_failure_sig: Option<String>,
+    /// Signature of the previous tool call and how many times in a row it
+    /// has been repeated (success or failure), for doom-loop nudges.
+    #[serde(default)]
+    last_call_sig: Option<String>,
+    #[serde(default)]
+    same_call_repeats: u32,
     consec_stall: u32,
     turns_since_progress: u32,
     total_denials: u32,
@@ -1538,7 +1547,7 @@ fn build_state_message(
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "run_command", "web_search", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "run_command", "web_search", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
         "budget": {
@@ -1584,13 +1593,19 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "edit_file",
-            "Replace exact text in a workspace file.",
+            "Replace text in a workspace file; exact match first, then unique indentation/whitespace-tolerant match.",
             true,
             true,
         ),
         ToolSpec::new(
             "search_files",
-            "Search file contents inside the workspace.",
+            "Search file contents (literal or regex, optional include glob); skips build output and .gitignore.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "glob_files",
+            "Find workspace files by glob pattern, newest first.",
             false,
             false,
         ),
@@ -1745,10 +1760,11 @@ fn build_request(
 fn gemini_tool_definitions() -> Value {
     json!([{"functionDeclarations":[
         {"name":"update_plan","description":"Replace the visible todo plan. Keep 2-8 items; one in_progress at a time.","parameters":{"type":"OBJECT","properties":{"items":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"id":{"type":"STRING"},"title":{"type":"STRING"},"status":{"type":"STRING","enum":["pending","in_progress","done","blocked"]},"note":{"type":"STRING"}},"required":["id","title","status"]}}},"required":["items"]}},
-        {"name":"read_file","description":"Read a file inside the selected workspace.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"}},"required":["path"]}},
+        {"name":"read_file","description":"Read a file inside the selected workspace. Small files return exact text; large files, or any call with offset/limit, return numbered lines with a footer saying where to continue. A directory path returns its listing.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"offset":{"type":"INTEGER","description":"1-based first line"},"limit":{"type":"INTEGER","description":"max lines (default 2000)"}},"required":["path"]}},
         {"name":"create_file","description":"Create a file inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"content":{"type":"STRING"},"overwrite":{"type":"BOOLEAN"}},"required":["path","content","overwrite"]}},
-        {"name":"edit_file","description":"Replace exact text in a workspace file. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"expected":{"type":"STRING"},"replacement":{"type":"STRING"},"replace_all":{"type":"BOOLEAN"}},"required":["path","expected","replacement","replace_all"]}},
-        {"name":"search_files","description":"Search file contents inside the workspace.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
+        {"name":"edit_file","description":"Replace text in a workspace file. Copy `expected` from the file; exact match is tried first, then a unique indentation/whitespace-tolerant match, and a miss reports the closest region. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"expected":{"type":"STRING"},"replacement":{"type":"STRING"},"replace_all":{"type":"BOOLEAN"}},"required":["path","expected","replacement","replace_all"]}},
+        {"name":"search_files","description":"Search file contents inside the workspace. Literal case-insensitive by default; set regex=true for a regular expression. Skips .git, build output, node_modules and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"},"regex":{"type":"BOOLEAN"},"include":{"type":"STRING","description":"glob such as *.rs or src/**/*.{ts,tsx}"}},"required":["query"]}},
+        {"name":"glob_files","description":"Find workspace files by glob pattern (e.g. **/*.rs), newest first. Skips build output and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"pattern":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["pattern"]}},
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
@@ -2390,7 +2406,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                                     .map(|e| json!({
                                         "url": e.url,
                                         "title": e.title,
-                                        "excerpt": e.excerpt.as_deref().map(|x| &x[..x.len().min(300)]),
+                                        "excerpt": e.excerpt.as_deref().map(|x| &x[..rex_tools::floor_boundary(x, 300)]),
                                     }))
                                     .collect();
                                 (
@@ -2518,6 +2534,12 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     tool_name,
                     &serde_json::to_value(&request).unwrap_or_default(),
                 );
+                if cp.last_call_sig.as_deref() == Some(sig.as_str()) {
+                    cp.same_call_repeats += 1;
+                } else {
+                    cp.same_call_repeats = 0;
+                    cp.last_call_sig = Some(sig.clone());
+                }
                 let prepared = match tools.prepare(request.clone()) {
                     Ok(p) => p,
                     Err(e) => {
@@ -2622,19 +2644,41 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 }
 
                 let receipt = &result.receipt;
+                // Head+tail clipping on char boundaries: the old byte slice
+                // panicked on multi-byte output and dropped the tail, where
+                // build and test errors are. Failed commands carry their
+                // output in the error detail, so that is clipped too.
+                let (output, out_clipped) = result
+                    .output
+                    .as_deref()
+                    .map(|o| rex_tools::clip_middle(o, OUTCOME_CHARS))
+                    .map_or((None, false), |(o, c)| (Some(o), c));
+                let (error, err_clipped) = match &result.error {
+                    Some(e) => {
+                        let (detail, c) = rex_tools::clip_middle(&e.detail, OUTCOME_CHARS);
+                        (Some(json!({"kind": e.kind, "detail": detail})), c)
+                    }
+                    None => (None, false),
+                };
                 let mut content = serde_json::to_string(&json!({
                     "ok": result.ok,
-                    "output": result.output.as_deref().map(|o| &o[..o.len().min(OUTCOME_CHARS)]),
-                    "error": result.error,
+                    "output": output,
+                    "error": error,
                     "receipt": {
                         "bytes_read": receipt.bytes_read,
                         "bytes_written": receipt.bytes_written,
                         "duration_ms": receipt.duration_ms,
                         "exit_code": receipt.exit_code,
-                        "output_truncated": receipt.output_truncated,
+                        "output_truncated": receipt.output_truncated || out_clipped || err_clipped,
                     }
                 }))
                 .unwrap_or_else(|_| "{\"ok\":false}".into());
+                if cp.same_call_repeats >= DOOM_LOOP_REPEATS && result.ok {
+                    content.push_str(&format!(
+                        " warning: you have made this exact call {} times in a row and it returns the same kind of result; use what you already have or try a different step",
+                        cp.same_call_repeats + 1
+                    ));
+                }
                 if !result.ok && cp.consec_fail == 2 {
                     content.push_str(" warning: this exact call has failed twice; change approach instead of retrying it unchanged");
                 }
@@ -2702,6 +2746,7 @@ fn tool_name_of(request: &ToolRequest) -> &'static str {
         ToolRequest::CreateFile { .. } => "create_file",
         ToolRequest::EditFile { .. } => "edit_file",
         ToolRequest::SearchFiles { .. } => "search_files",
+        ToolRequest::GlobFiles { .. } => "glob_files",
         ToolRequest::RunCommand { .. } => "run_command",
         ToolRequest::McpCall { .. } => "mcp_call",
     }
@@ -2940,6 +2985,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                         ToolRequest::CreateFile { .. } => "create_file",
                         ToolRequest::EditFile { .. } => "edit_file",
                         ToolRequest::SearchFiles { .. } => "search_files",
+                        ToolRequest::GlobFiles { .. } => "glob_files",
                         ToolRequest::RunCommand { .. } => "run_command",
                         ToolRequest::McpCall { .. } => "mcp_call",
                     }

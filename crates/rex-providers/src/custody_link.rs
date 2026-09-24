@@ -88,6 +88,7 @@ pub fn ui_managed_request(
             "create_file",
             "edit_file",
             "search_files",
+            "glob_files",
             "run_command",
         ]
         .iter()
@@ -482,6 +483,7 @@ mod tests {
                 "create_file",
                 "edit_file",
                 "search_files",
+                "glob_files",
                 "run_command",
             ]
             .iter()

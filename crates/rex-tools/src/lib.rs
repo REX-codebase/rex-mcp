@@ -6,6 +6,7 @@
 
 pub mod fuzzy;
 pub mod sandbox;
+pub mod walk;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Files up to this size and `DEFAULT_READ_LINES` lines are returned raw
+/// (exact bytes, easy to copy into an edit). Larger files are paged.
+const RAW_READ_BYTES: u64 = 256 * 1024;
+const DEFAULT_READ_LINES: usize = 2000;
+const MAX_READ_LINES: usize = 5000;
+const MAX_LINE_CHARS: usize = 2000;
+const MAX_PAGED_READ_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LIST_ENTRIES: usize = 500;
 /// MCP tool output is capped so a chatty server cannot flood the model
 /// context; the truncation marker tells the model the output was cut.
 const MAX_MCP_OUTPUT: usize = 64 * 1024;
@@ -52,11 +61,50 @@ fn mcp_text(result: &Value) -> String {
 }
 
 fn truncate(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-    format!("{}…\n[output truncated at {max} bytes]", &text[..max])
+    clip_middle(text, max).0
 }
+
+/// Largest char boundary at or below `at`.
+pub fn floor_boundary(text: &str, at: usize) -> usize {
+    let mut i = at.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest char boundary at or above `at`.
+fn ceil_boundary(text: &str, at: usize) -> usize {
+    let mut i = at.min(text.len());
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Clip `text` to about `max` bytes keeping the head and the tail (where
+/// build errors, test failures and exit summaries usually are), with an
+/// explicit marker saying how much was omitted. Always cuts on char
+/// boundaries, so multi-byte output can never panic. Returns whether
+/// anything was cut.
+pub fn clip_middle(text: &str, max: usize) -> (String, bool) {
+    if text.len() <= max {
+        return (text.to_string(), false);
+    }
+    let head_end = floor_boundary(text, max * 3 / 5);
+    let tail_start = ceil_boundary(text, text.len() - (max - max * 3 / 5));
+    let tail_start = tail_start.max(head_end);
+    let omitted = tail_start - head_end;
+    (
+        format!(
+            "{}\n[... {omitted} bytes omitted from the middle; narrow the command or read a smaller range ...]\n{}",
+            &text[..head_end],
+            &text[tail_start..]
+        ),
+        true,
+    )
+}
+
 const MAX_WRITE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
@@ -77,6 +125,13 @@ pub enum RiskClass {
 pub enum ToolRequest {
     ReadFile {
         path: String,
+        /// 1-based first line to return. Setting `offset` or `limit` (or
+        /// reading a large file) switches to paged, line-numbered output.
+        #[serde(default)]
+        offset: Option<usize>,
+        /// Maximum lines to return in paged mode (default 2000, max 5000).
+        #[serde(default)]
+        limit: Option<usize>,
     },
     CreateFile {
         path: String,
@@ -91,6 +146,20 @@ pub enum ToolRequest {
     },
     SearchFiles {
         query: String,
+        path: Option<String>,
+        max_results: Option<usize>,
+        /// Treat `query` as a regular expression (default: literal,
+        /// case-insensitive substring).
+        #[serde(default)]
+        regex: Option<bool>,
+        /// Only search files whose path matches this glob, e.g. `*.rs` or
+        /// `src/**/*.{ts,tsx}`.
+        #[serde(default)]
+        include: Option<String>,
+    },
+    /// Find files by glob pattern, newest first.
+    GlobFiles {
+        pattern: String,
         path: Option<String>,
         max_results: Option<usize>,
     },
@@ -589,7 +658,11 @@ impl ToolRuntime {
 
     fn execute_inner(&self, request: &ToolRequest) -> Result<ExecData, ToolError> {
         match request {
-            ToolRequest::ReadFile { path } => self.read_file(path),
+            ToolRequest::ReadFile {
+                path,
+                offset,
+                limit,
+            } => self.read_file(path, *offset, *limit),
             ToolRequest::CreateFile {
                 path,
                 content,
@@ -605,7 +678,20 @@ impl ToolRuntime {
                 query,
                 path,
                 max_results,
-            } => self.search_files(query, path.as_deref(), max_results.unwrap_or(50)),
+                regex,
+                include,
+            } => self.search_files(
+                query,
+                path.as_deref(),
+                max_results.unwrap_or(50),
+                regex.unwrap_or(false),
+                include.as_deref(),
+            ),
+            ToolRequest::GlobFiles {
+                pattern,
+                path,
+                max_results,
+            } => self.glob_files(pattern, path.as_deref(), max_results.unwrap_or(100)),
             ToolRequest::RunCommand {
                 argv,
                 cwd,
@@ -652,33 +738,145 @@ impl ToolRuntime {
         Ok(exec(Some(truncate(&text, MAX_MCP_OUTPUT)), r))
     }
 
-    fn read_file(&self, path: &str) -> Result<ExecData, ToolError> {
-        let target = self.resolve_existing(path, false)?;
+    fn read_file(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<ExecData, ToolError> {
+        let target = self.resolve_existing(path, true)?;
         let meta = fs::metadata(&target).map_err(io_err)?;
+        if meta.is_dir() {
+            return self.list_dir_output(&target);
+        }
         if !meta.is_file() {
             return Err(err(
                 ErrorKind::InvalidRequest,
                 "target is not a regular file",
             ));
         }
-        if meta.len() > MAX_FILE_BYTES {
-            return Err(err(ErrorKind::TooLarge, "file exceeds 2 MiB read limit"));
+        let paged = offset.is_some() || limit.is_some() || meta.len() > RAW_READ_BYTES;
+        if !paged {
+            let mut bytes = Vec::with_capacity(meta.len() as usize);
+            File::open(&target)
+                .and_then(|mut f| f.read_to_end(&mut bytes))
+                .map_err(io_err)?;
+            if looks_binary(&bytes) {
+                return Err(binary_error(meta.len()));
+            }
+            let text = String::from_utf8(bytes).map_err(|_| {
+                err(
+                    ErrorKind::InvalidRequest,
+                    "binary or non-UTF-8 files are not supported",
+                )
+            })?;
+            let line_count = text.lines().count();
+            if line_count <= DEFAULT_READ_LINES {
+                self.note_seen(&target);
+                return Ok(exec(
+                    Some(text),
+                    receipt(&self.root, Some(&target), meta.len(), 0),
+                ));
+            }
         }
-        let mut bytes = Vec::with_capacity(meta.len() as usize);
-        File::open(&target)
-            .and_then(|mut f| f.read_to_end(&mut bytes))
+        if meta.len() > MAX_PAGED_READ_BYTES {
+            return Err(err(
+                ErrorKind::TooLarge,
+                "file exceeds 64 MiB paged read limit; use search_files to find the region",
+            ));
+        }
+        let start = offset.unwrap_or(1).max(1);
+        let want = limit.unwrap_or(DEFAULT_READ_LINES).clamp(1, MAX_READ_LINES);
+        let mut head = [0u8; 8192];
+        let n = File::open(&target)
+            .and_then(|mut f| f.read(&mut head))
             .map_err(io_err)?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            err(
+        if looks_binary(&head[..n]) {
+            return Err(binary_error(meta.len()));
+        }
+        let reader = BufReader::new(File::open(&target).map_err(io_err)?);
+        let mut out = String::new();
+        let mut total = 0usize;
+        let mut shown = 0usize;
+        let mut cut_lines = 0usize;
+        for line in reader.split(b'\n') {
+            let mut line = line.map_err(io_err)?;
+            total += 1;
+            if total < start || shown >= want {
+                continue;
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let text = String::from_utf8_lossy(&line);
+            let text = if text.chars().count() > MAX_LINE_CHARS {
+                cut_lines += 1;
+                let mut t: String = text.chars().take(MAX_LINE_CHARS).collect();
+                t.push_str(" … [line truncated]");
+                t
+            } else {
+                text.into_owned()
+            };
+            out.push_str(&format!("{total:>6}\t{text}\n"));
+            shown += 1;
+        }
+        if start > total.max(1) {
+            return Err(err(
                 ErrorKind::InvalidRequest,
-                "binary or non-UTF-8 files are not supported",
-            )
-        })?;
+                &format!("offset {start} is past the end of the file ({total} lines)"),
+            ));
+        }
+        let last = start + shown - 1;
+        if last < total {
+            out.push_str(&format!(
+                "[lines {start}-{last} of {total}; call read_file with offset={} to continue]",
+                last + 1
+            ));
+        } else {
+            out.push_str(&format!("[lines {start}-{last} of {total}; end of file]"));
+        }
+        if cut_lines > 0 {
+            out.push_str(&format!(
+                "\n[{cut_lines} line(s) longer than {MAX_LINE_CHARS} chars were cut]"
+            ));
+        }
         self.note_seen(&target);
-        Ok(exec(
-            Some(text),
-            receipt(&self.root, Some(&target), meta.len(), 0),
-        ))
+        let mut r = receipt(&self.root, Some(&target), meta.len(), 0);
+        r.output_truncated = last < total || cut_lines > 0;
+        Ok(exec(Some(out), r))
+    }
+
+    /// Directory listing for `read_file` on a directory: sorted, one entry
+    /// per line, directories suffixed with `/`, symlinks marked, capped.
+    fn list_dir_output(&self, dir: &Path) -> Result<ExecData, ToolError> {
+        let mut entries: Vec<String> = fs::read_dir(dir)
+            .map_err(io_err)?
+            .filter_map(Result::ok)
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                match e.file_type() {
+                    Ok(t) if t.is_symlink() => format!("{name}@"),
+                    Ok(t) if t.is_dir() => format!("{name}/"),
+                    _ => name,
+                }
+            })
+            .collect();
+        entries.sort();
+        let total = entries.len();
+        let mut out = entries
+            .into_iter()
+            .take(MAX_LIST_ENTRIES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if total > MAX_LIST_ENTRIES {
+            out.push_str(&format!(
+                "\n[{} more entries not shown; use glob_files with a pattern]",
+                total - MAX_LIST_ENTRIES
+            ));
+        }
+        let mut r = receipt(&self.root, Some(dir), 0, 0);
+        r.output_truncated = total > MAX_LIST_ENTRIES;
+        Ok(exec(Some(out), r))
     }
 
     fn create_file(
@@ -802,16 +1000,40 @@ impl ToolRuntime {
         query: &str,
         path: Option<&str>,
         max_results: usize,
+        regex: bool,
+        include: Option<&str>,
     ) -> Result<ExecData, ToolError> {
         let base = self.resolve_existing(path.unwrap_or("."), true)?;
         let limit = max_results.clamp(1, MAX_SEARCH_RESULTS);
-        let mut files = Vec::new();
-        collect_files(&base, &mut files, 0)?;
+        let matcher: Box<dyn Fn(&str) -> bool> = if regex {
+            let re = regex::RegexBuilder::new(query)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|e| err(ErrorKind::InvalidRequest, &format!("invalid regex: {e}")))?;
+            Box::new(move |line: &str| re.is_match(line))
+        } else {
+            let needle = query.to_lowercase();
+            Box::new(move |line: &str| line.to_lowercase().contains(&needle))
+        };
+        let include = match include.map(str::trim).filter(|g| !g.is_empty()) {
+            Some(g) => Some(walk::Glob::new(g).ok_or_else(|| {
+                err(
+                    ErrorKind::InvalidRequest,
+                    &format!("invalid include glob: {g}"),
+                )
+            })?),
+            None => None,
+        };
+        let ignore = walk::Ignore::load(&self.root);
+        let (files, capped) = walk::walk_files(&self.root, &base, &ignore, 20_000);
         let mut hits = Vec::new();
         let mut bytes_read = 0u64;
-        for file in files {
-            if hits.len() >= limit {
-                break;
+        let mut more = false;
+        'files: for file in files {
+            if let Some(g) = &include {
+                if !g.matches(&walk::rel_path(&base, &file)) {
+                    continue;
+                }
             }
             let meta = match fs::metadata(&file) {
                 Ok(m) => m,
@@ -820,33 +1042,93 @@ impl ToolRuntime {
             if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
                 continue;
             }
+            let Ok(bytes) = fs::read(&file) else { continue };
             bytes_read += meta.len();
-            let f = match File::open(&file) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            for (idx, line) in BufReader::new(f).lines().take(20_000).enumerate() {
-                let line = match line {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                if line.to_lowercase().contains(&query.to_lowercase()) {
+            if looks_binary(&bytes) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (idx, line) in text.lines().take(50_000).enumerate() {
+                if matcher(line) {
+                    if hits.len() >= limit {
+                        more = true;
+                        break 'files;
+                    }
+                    let shown: String = line.trim().chars().take(300).collect();
                     hits.push(format!(
                         "{}:{}:{}",
                         relative(&self.root, &file),
                         idx + 1,
-                        line.trim()
+                        shown
                     ));
-                    if hits.len() >= limit {
-                        break;
-                    }
                 }
             }
         }
-        Ok(exec(
-            Some(hits.join("\n")),
-            receipt(&self.root, Some(&base), bytes_read, 0),
-        ))
+        let mut out = hits.join("\n");
+        if hits.is_empty() {
+            out = "[no matches]".to_string();
+        }
+        if more {
+            out.push_str(&format!(
+                "\n[more than {limit} matches; narrow with path, include or a more specific query]"
+            ));
+        }
+        if capped {
+            out.push_str("\n[file walk stopped at 20000 files; narrow with path or include]");
+        }
+        let mut r = receipt(&self.root, Some(&base), bytes_read, 0);
+        r.output_truncated = more || capped;
+        Ok(exec(Some(out), r))
+    }
+
+    fn glob_files(
+        &self,
+        pattern: &str,
+        path: Option<&str>,
+        max_results: usize,
+    ) -> Result<ExecData, ToolError> {
+        let base = self.resolve_existing(path.unwrap_or("."), true)?;
+        let limit = max_results.clamp(1, MAX_SEARCH_RESULTS);
+        let glob = walk::Glob::new(pattern).ok_or_else(|| {
+            err(
+                ErrorKind::InvalidRequest,
+                &format!("invalid glob: {pattern}"),
+            )
+        })?;
+        let ignore = walk::Ignore::load(&self.root);
+        let (files, capped) = walk::walk_files(&self.root, &base, &ignore, 50_000);
+        let mut found: Vec<(SystemTime, String)> = files
+            .into_iter()
+            .filter(|f| glob.matches(&walk::rel_path(&base, f)))
+            .map(|f| {
+                let mtime = fs::metadata(&f)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (mtime, relative(&self.root, &f))
+            })
+            .collect();
+        // Newest first: the file the task is about is usually the one
+        // touched most recently. Ties break by path for determinism.
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let total = found.len();
+        let mut out = found
+            .into_iter()
+            .take(limit)
+            .map(|(_, p)| p)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if total == 0 {
+            out = "[no files match]".to_string();
+        }
+        if total > limit {
+            out.push_str(&format!("\n[{} more files not shown]", total - limit));
+        }
+        if capped {
+            out.push_str("\n[file walk stopped at 50000 files; narrow with path]");
+        }
+        let mut r = receipt(&self.root, Some(&base), 0, 0);
+        r.output_truncated = total > limit || capped;
+        Ok(exec(Some(out), r))
     }
 
     fn run_command(
@@ -1309,13 +1591,14 @@ fn tool_name(r: &ToolRequest) -> &'static str {
         ToolRequest::CreateFile { .. } => "create_file",
         ToolRequest::EditFile { .. } => "edit_file",
         ToolRequest::SearchFiles { .. } => "search_files",
+        ToolRequest::GlobFiles { .. } => "glob_files",
         ToolRequest::RunCommand { .. } => "run_command",
         ToolRequest::McpCall { .. } => "mcp_call",
     }
 }
 fn summarize(r: &ToolRequest) -> String {
     match r {
-        ToolRequest::ReadFile { path } => format!("Read {path}"),
+        ToolRequest::ReadFile { path, .. } => format!("Read {path}"),
         ToolRequest::CreateFile {
             path, overwrite, ..
         } => format!("{} {path}", if *overwrite { "Write" } else { "Create" }),
@@ -1324,6 +1607,11 @@ fn summarize(r: &ToolRequest) -> String {
             "Search {:?} for {:?}",
             path.as_deref().unwrap_or("."),
             query
+        ),
+        ToolRequest::GlobFiles { pattern, path, .. } => format!(
+            "Find files {:?} under {:?}",
+            pattern,
+            path.as_deref().unwrap_or(".")
         ),
         ToolRequest::RunCommand { argv, cwd, .. } => {
             format!("Run {:?} in {}", argv, cwd.as_deref().unwrap_or("."))
@@ -1365,7 +1653,9 @@ fn scoring_policy(argv: &[String], allowed: &[&str]) -> Result<(), ToolError> {
 
 fn classify(r: &ToolRequest) -> (RiskClass, &'static str) {
     match r {
-        ToolRequest::ReadFile { .. } | ToolRequest::SearchFiles { .. } => (
+        ToolRequest::ReadFile { .. }
+        | ToolRequest::SearchFiles { .. }
+        | ToolRequest::GlobFiles { .. } => (
             RiskClass::Read,
             "bounded read inside the selected workspace",
         ),
@@ -1388,7 +1678,7 @@ fn classify(r: &ToolRequest) -> (RiskClass, &'static str) {
 }
 fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
     match r {
-        ToolRequest::ReadFile { path }
+        ToolRequest::ReadFile { path, .. }
         | ToolRequest::CreateFile { path, .. }
         | ToolRequest::EditFile { path, .. }
             if path.trim().is_empty() =>
@@ -1397,6 +1687,9 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         }
         ToolRequest::SearchFiles { query, .. } if query.trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "search query is empty"))
+        }
+        ToolRequest::GlobFiles { pattern, .. } if pattern.trim().is_empty() => {
+            Err(err(ErrorKind::InvalidRequest, "glob pattern is empty"))
         }
         ToolRequest::RunCommand { argv, .. } if argv.is_empty() || argv[0].trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "command argv is empty"))
@@ -1670,44 +1963,44 @@ fn simple_diff(old: &str, new: &str, label: &str) -> String {
     }
     out
 }
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<(), ToolError> {
-    if depth > 20 || out.len() > 10_000 {
-        return Ok(());
-    }
-    let entries = fs::read_dir(dir).map_err(io_err)?;
-    for entry in entries {
-        let entry = entry.map_err(io_err)?;
-        let ft = entry.file_type().map_err(io_err)?;
-        if ft.is_symlink() {
-            continue;
-        }
-        let p = entry.path();
-        if ft.is_dir() {
-            collect_files(&p, out, depth + 1)?;
-        } else if ft.is_file() {
-            out.push(p);
-        }
-    }
-    Ok(())
-}
+/// Drain a pipe keeping the first `limit/2` and the last `limit/2` bytes,
+/// so a long build log keeps both its start and the final error. The
+/// reader is always drained to EOF so the child never blocks on a full
+/// pipe.
 fn read_capped<R: Read>(mut r: R, limit: usize) -> (Vec<u8>, bool) {
-    let mut out = Vec::new();
+    let head_cap = limit / 2;
+    let tail_cap = limit - head_cap;
+    let mut head = Vec::new();
+    let mut tail: VecDeque<u8> = VecDeque::new();
+    let mut dropped = 0usize;
     let mut buf = [0u8; 8192];
-    let mut truncated = false;
     loop {
         match r.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let room = limit.saturating_sub(out.len());
-                out.extend_from_slice(&buf[..n.min(room)]);
-                if n > room {
-                    truncated = true;
+                let mut chunk = &buf[..n];
+                if head.len() < head_cap {
+                    let take = chunk.len().min(head_cap - head.len());
+                    head.extend_from_slice(&chunk[..take]);
+                    chunk = &chunk[take..];
+                }
+                tail.extend(chunk.iter().copied());
+                while tail.len() > tail_cap {
+                    tail.pop_front();
+                    dropped += 1;
                 }
             }
             Err(_) => break,
         }
     }
-    (out, truncated)
+    let truncated = dropped > 0;
+    if truncated {
+        head.extend_from_slice(
+            format!("\n[... {dropped} bytes of output omitted ...]\n").as_bytes(),
+        );
+    }
+    head.extend(tail);
+    (head, truncated)
 }
 fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
@@ -1755,6 +2048,8 @@ mod tests {
         let p = rt
             .prepare(ToolRequest::ReadFile {
                 path: "../secret".into(),
+                offset: None,
+                limit: None,
             })
             .unwrap();
         let r = rt.execute(&p.call_id);
@@ -1975,6 +2270,8 @@ mod tests {
         let p = rt
             .prepare(ToolRequest::ReadFile {
                 path: "s.txt".into(),
+                offset: None,
+                limit: None,
             })
             .unwrap();
         assert!(rt.execute(&p.call_id).ok);
@@ -1988,6 +2285,8 @@ mod tests {
         let p = rt
             .prepare(ToolRequest::ReadFile {
                 path: "s.txt".into(),
+                offset: None,
+                limit: None,
             })
             .unwrap();
         assert!(rt.execute(&p.call_id).ok);
@@ -2007,6 +2306,8 @@ mod tests {
         let p = rt
             .prepare(ToolRequest::ReadFile {
                 path: "o.txt".into(),
+                offset: None,
+                limit: None,
             })
             .unwrap();
         assert!(rt.execute(&p.call_id).ok);
@@ -2037,6 +2338,208 @@ mod tests {
         let e = r.error.unwrap();
         assert_eq!(e.kind, ErrorKind::Conflict);
         assert!(e.detail.contains("line 2"), "{}", e.detail);
+    }
+    fn read(
+        rt: &ToolRuntime,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> ToolResult {
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: path.into(),
+                offset,
+                limit,
+            })
+            .unwrap();
+        rt.execute(&p.call_id)
+    }
+    #[test]
+    fn small_file_reads_raw_bytes() {
+        let root = temp();
+        fs::write(root.join("r.txt"), "a\n  b\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        assert_eq!(read(&rt, "r.txt", None, None).output.unwrap(), "a\n  b\n");
+    }
+    #[test]
+    fn paged_read_is_numbered_and_says_how_to_continue() {
+        let root = temp();
+        let body: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        fs::write(root.join("p.txt"), body).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = read(&rt, "p.txt", Some(4), Some(3));
+        let out = r.output.unwrap();
+        assert!(
+            out.starts_with("     4\tline4\n     5\tline5\n     6\tline6\n"),
+            "{out}"
+        );
+        assert!(out.contains("[lines 4-6 of 10; call read_file with offset=7 to continue]"));
+        assert!(r.receipt.output_truncated);
+        let tail = read(&rt, "p.txt", Some(9), None).output.unwrap();
+        assert!(tail.contains("end of file"), "{tail}");
+        let past = read(&rt, "p.txt", Some(50), None).error.unwrap();
+        assert_eq!(past.kind, ErrorKind::InvalidRequest);
+    }
+    #[test]
+    fn long_file_pages_by_default_instead_of_flooding_context() {
+        let root = temp();
+        let body: String = (1..=2500).map(|i| format!("{i}\n")).collect();
+        fs::write(root.join("big.txt"), body).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let out = read(&rt, "big.txt", None, None).output.unwrap();
+        assert!(
+            out.contains("[lines 1-2000 of 2500; call read_file with offset=2001"),
+            "{}",
+            &out[out.len() - 120..]
+        );
+    }
+    #[test]
+    fn file_over_old_2mib_cap_is_now_pageable() {
+        let root = temp();
+        let line = "x".repeat(99);
+        let body: String = (0..30_000).map(|_| format!("{line}\n")).collect();
+        assert!(body.len() > 2 * 1024 * 1024);
+        fs::write(root.join("huge.log"), body).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let out = read(&rt, "huge.log", Some(29_999), None).output.unwrap();
+        assert!(
+            out.contains("[lines 29999-30000 of 30000; end of file]"),
+            "{out}"
+        );
+    }
+    #[test]
+    fn binary_and_long_lines_are_handled() {
+        let root = temp();
+        fs::write(root.join("b.bin"), [0u8, 1, 2, 3]).unwrap();
+        fs::write(root.join("l.txt"), format!("{}\nshort\n", "y".repeat(5000))).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let e = read(&rt, "b.bin", None, None).error.unwrap();
+        assert!(e.detail.contains("binary file"));
+        let out = read(&rt, "l.txt", Some(1), None).output.unwrap();
+        assert!(out.contains("[line truncated]"));
+        assert!(out.contains("1 line(s) longer than 2000 chars were cut"));
+    }
+    #[test]
+    fn reading_a_directory_lists_it() {
+        let root = temp();
+        fs::create_dir_all(root.join("d/sub")).unwrap();
+        fs::write(root.join("d/z.txt"), "").unwrap();
+        fs::write(root.join("d/a.txt"), "").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        assert_eq!(
+            read(&rt, "d", None, None).output.unwrap(),
+            "a.txt\nsub/\nz.txt"
+        );
+    }
+    fn search(rt: &ToolRuntime, q: &str, regex: bool, include: Option<&str>) -> String {
+        let p = rt
+            .prepare(ToolRequest::SearchFiles {
+                query: q.into(),
+                path: None,
+                max_results: Some(3),
+                regex: Some(regex),
+                include: include.map(Into::into),
+            })
+            .unwrap();
+        let r = rt.execute(&p.call_id);
+        r.output.unwrap_or_else(|| format!("ERR {:?}", r.error))
+    }
+    fn search_repo() -> PathBuf {
+        let root = temp();
+        fs::create_dir_all(root.join("src/deep")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join("node_modules/x")).unwrap();
+        fs::create_dir_all(root.join("gen")).unwrap();
+        fs::write(root.join(".gitignore"), "gen/\n*.log\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "fn needle_one() {}\n").unwrap();
+        fs::write(root.join("src/deep/mod.ts"), "const needle_two = 2;\n").unwrap();
+        fs::write(root.join("target/debug/out.rs"), "fn needle_junk() {}\n").unwrap();
+        fs::write(root.join("node_modules/x/i.js"), "needle_junk\n").unwrap();
+        fs::write(root.join("gen/g.rs"), "needle_junk\n").unwrap();
+        fs::write(root.join("app.log"), "needle_junk\n").unwrap();
+        fs::write(root.join("blob.bin"), b"needle_junk\0\0").unwrap();
+        root
+    }
+    #[test]
+    fn search_skips_build_output_ignored_and_binary_files() {
+        let rt = ToolRuntime::new(search_repo()).unwrap();
+        let out = search(&rt, "needle", false, None);
+        assert!(out.contains("src/lib.rs:1:fn needle_one() {}"), "{out}");
+        assert!(out.contains("src/deep/mod.ts:1:"), "{out}");
+        assert!(!out.contains("junk"), "{out}");
+    }
+    #[test]
+    fn search_supports_regex_and_include_glob() {
+        let rt = ToolRuntime::new(search_repo()).unwrap();
+        let out = search(&rt, r"needle_(one|two)\b", true, Some("*.ts"));
+        assert_eq!(out, "src/deep/mod.ts:1:const needle_two = 2;");
+        let out = search(&rt, "needle", false, Some("src/**/*.{rs,ts}"));
+        assert!(out.contains("lib.rs") && out.contains("mod.ts"), "{out}");
+        assert!(search(&rt, "(", true, None).contains("invalid regex"));
+        assert_eq!(search(&rt, "zzz_absent", false, None), "[no matches]");
+    }
+    #[test]
+    fn search_says_when_results_were_cut() {
+        let root = temp();
+        fs::write(root.join("m.txt"), "hit\nhit\nhit\nhit\n").unwrap();
+        let rt = ToolRuntime::new(root).unwrap();
+        let out = search(&rt, "hit", false, None);
+        assert_eq!(out.lines().filter(|l| l.starts_with("m.txt:")).count(), 3);
+        assert!(out.contains("[more than 3 matches"), "{out}");
+    }
+    #[test]
+    fn glob_files_finds_by_pattern_and_respects_ignores() {
+        let rt = ToolRuntime::new(search_repo()).unwrap();
+        let p = rt
+            .prepare(ToolRequest::GlobFiles {
+                pattern: "**/*.rs".into(),
+                path: None,
+                max_results: None,
+            })
+            .unwrap();
+        assert!(!p.approval_required);
+        let out = rt.execute(&p.call_id).output.unwrap();
+        assert_eq!(out, "src/lib.rs");
+    }
+    #[test]
+    fn glob_translation_is_anchored_and_segment_aware() {
+        let g = walk::Glob::new("src/*.rs").unwrap();
+        assert!(g.matches("src/a.rs"));
+        assert!(!g.matches("src/x/a.rs"));
+        assert!(!g.matches("xsrc/a.rs"));
+        let g = walk::Glob::new("**/test_?.py").unwrap();
+        assert!(g.matches("test_a.py") && g.matches("a/b/test_b.py"));
+        assert!(walk::Glob::new("{a,b").is_none());
+        let g = walk::Glob::new("*.[ch]").unwrap();
+        assert!(g.matches("x/y.c") && g.matches("y.h") && !g.matches("y.o"));
+    }
+    #[test]
+    fn clip_middle_keeps_head_and_tail_on_char_boundaries() {
+        let text = format!("START{}é-END-ERROR", "é".repeat(5000));
+        let (clipped, cut) = clip_middle(&text, 1000);
+        assert!(cut);
+        assert!(clipped.starts_with("START"));
+        assert!(clipped.ends_with("-END-ERROR"));
+        assert!(clipped.contains("bytes omitted from the middle"));
+        assert!(clipped.len() < 1200);
+        for max in 0..40 {
+            let _ = clip_middle("ééééé€€€€€𝄞𝄞𝄞", max);
+        }
+        assert_eq!(clip_middle("short", 100), ("short".to_string(), false));
+        assert_eq!(floor_boundary("é", 1), 0);
+    }
+    #[test]
+    fn read_capped_keeps_the_final_error_line() {
+        let mut log = "compiling...\n".repeat(10_000);
+        log.push_str("error[E0308]: mismatched types\n");
+        let (bytes, cut) = read_capped(log.as_bytes(), 4096);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(cut);
+        assert!(text.starts_with("compiling..."));
+        assert!(text.ends_with("error[E0308]: mismatched types\n"));
+        assert!(text.contains("bytes of output omitted"));
+        let (small, cut) = read_capped(&b"ok\n"[..], 4096);
+        assert_eq!((small.as_slice(), cut), (&b"ok\n"[..], false));
     }
     #[test]
     fn shell_is_hard_denied() {
@@ -2238,6 +2741,8 @@ mod tests {
         let p = rt
             .prepare(ToolRequest::ReadFile {
                 path: "link/x".into(),
+                offset: None,
+                limit: None,
             })
             .unwrap();
         let r = rt.execute(&p.call_id);
@@ -2298,7 +2803,11 @@ mod diff_tests {
         let root = temp();
         let rt = ToolRuntime::new(root).unwrap();
         let p = rt
-            .prepare(ToolRequest::ReadFile { path: "x".into() })
+            .prepare(ToolRequest::ReadFile {
+                path: "x".into(),
+                offset: None,
+                limit: None,
+            })
             .unwrap();
         assert!(rt.pending_diff(&p.call_id).unwrap().is_none());
     }
@@ -2463,4 +2972,17 @@ fn plan_edit_checked(
             ),
         ),
     })
+}
+
+/// NUL bytes in the first 8 KiB mark a file as binary (the same heuristic
+/// git and grep use).
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8192).any(|b| *b == 0)
+}
+
+fn binary_error(len: u64) -> ToolError {
+    err(
+        ErrorKind::InvalidRequest,
+        &format!("binary file ({len} bytes); it cannot be read as text"),
+    )
 }

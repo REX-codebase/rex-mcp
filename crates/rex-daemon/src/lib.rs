@@ -455,7 +455,14 @@ impl HarnessDaemon {
 
     pub fn read(&self, req: ReadRequest) -> Result<ReadResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
-        let result = self.call_tool(&mut t, ToolRequest::ReadFile { path: req.path })?;
+        let result = self.call_tool(
+            &mut t,
+            ToolRequest::ReadFile {
+                path: req.path,
+                offset: None,
+                limit: None,
+            },
+        )?;
         let mut content = result.output.unwrap_or_default();
         if let Some((start, len)) = req.byte_range {
             let bytes = content.as_bytes();
@@ -508,6 +515,8 @@ impl HarnessDaemon {
                 query: req.query,
                 path: None,
                 max_results: req.max_results,
+                regex: None,
+                include: None,
             },
         )?;
         Ok(SearchResponse {
@@ -2219,6 +2228,7 @@ fn capability_set(workspace: &Path) -> CapabilitySet {
             "create_file",
             "edit_file",
             "search_files",
+            "glob_files",
             "run_command",
         ]
         .into_iter()
