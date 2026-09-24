@@ -42,5 +42,14 @@ is shared it is noted in the module docs.
   Hermes gives children the parent toolsets and a batch/parallel mode
   (`delegate_tool.py:6-8`).
 - Context compaction of old turns: opencode `session/compaction.ts`; Hermes
-  `agent/context_compressor.py`. REX keeps old evidence on disk and sends a
-  digest, which is a different design; to be compared on behaviour.
+  `agent/context_compressor.py`. Behaviour compared (round 2): both keep a
+  transcript and, near overflow, clear old tool output (opencode protects
+  the newest PRUNE_PROTECT=40k tokens of tool output, compaction.ts:28-29,
+  271-308; Hermes protects a token-budget tail and replaces old output with
+  a placeholder, context_compressor.py:2,798) and then LLM-summarise. REX
+  never overflows (fresh state + last exchange each turn) but used to lose
+  older tool results entirely. REX now keeps bounded working memory
+  (crates/rex-providers/src/memory.rs): newest tool-result excerpts under a
+  12k-char budget, oldest dropped first, and reads of files the run later
+  changed are dropped so the model never sees stale content. Gap left: no LLM summary of
+  very old history (REX relies on plan + digest + ledger instead).

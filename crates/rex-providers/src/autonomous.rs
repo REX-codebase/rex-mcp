@@ -376,6 +376,9 @@ struct Checkpoint {
     /// assumed).
     #[serde(default)]
     plan_approved: bool,
+    /// Bounded excerpts of older tool results (see `memory`).
+    #[serde(default)]
+    observations: Vec<crate::memory::Observation>,
     /// The run's workspace, as resolved at begin time. Resume restores it
     /// from here (re-validated under the runs root); legacy checkpoints
     /// without it fall back to `<run_dir>/workspace`.
@@ -1560,6 +1563,12 @@ fn build_state_message(
 ) -> String {
     let digest: Vec<&DigestEntry> = cp.digest.iter().rev().take(DIGEST_WINDOW).collect();
     let digest: Vec<&DigestEntry> = digest.into_iter().rev().collect();
+    let older = crate::memory::earlier(&cp.observations, cp.step);
+    let earlier_observations = if older.is_empty() {
+        Value::Null
+    } else {
+        json!({"note": crate::memory::MEMORY_NOTE, "items": older})
+    };
     let payload = json!({
         "contract": {
             "role": "You are REX, an autonomous agent inside a bounded workspace. Work the plan until the task is verifiably done.",
@@ -1587,6 +1596,7 @@ fn build_state_message(
         },
         "plan": plan,
         "recent_turns": digest,
+        "earlier_observations": earlier_observations,
         "note": if cp.consec_stall > 0 {
             "Your last turn produced no tool calls. Act on the plan: call the next tool, update the plan, or call complete_task when everything is verifiably done."
         } else {
@@ -2606,6 +2616,16 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     "error": outcome.error,
                 }))
                 .unwrap_or_default();
+                crate::memory::record(
+                    &mut cp.observations,
+                    crate::memory::Observation::new(
+                        cp.step,
+                        "explore",
+                        Some(preview.clone()),
+                        outcome.finished,
+                        &outcome.report,
+                    ),
+                );
                 out.progress = true;
                 out.digest_actions.push(DigestAction {
                     tool: "explore".into(),
@@ -2861,6 +2881,34 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         " warning: you have made this exact call {} times in a row and it returns the same kind of result; use what you already have or try a different step",
                         cp.same_call_repeats + 1
                     ));
+                }
+                {
+                    let text = match (&result.output, &result.error) {
+                        (Some(o), _) => o.as_str(),
+                        (None, Some(e)) => e.detail.as_str(),
+                        (None, None) => "",
+                    };
+                    let target = receipt
+                        .target
+                        .clone()
+                        .or(receipt.command.as_ref().map(|c| c.join(" ")));
+                    if result.ok {
+                        match &request {
+                            ToolRequest::CreateFile { .. } | ToolRequest::EditFile { .. } => {
+                                crate::memory::supersede(&mut cp.observations, target.as_deref())
+                            }
+                            ToolRequest::ApplyPatch { .. } => {
+                                crate::memory::supersede(&mut cp.observations, None)
+                            }
+                            _ => {}
+                        }
+                    }
+                    crate::memory::record(
+                        &mut cp.observations,
+                        crate::memory::Observation::new(
+                            cp.step, tool_name, target, result.ok, text,
+                        ),
+                    );
                 }
                 if !result.ok && cp.consec_fail == 2 {
                     content.push_str(" warning: this exact call has failed twice; change approach instead of retrying it unchanged");
@@ -4452,6 +4500,42 @@ mod tests {
             .or_else(|_| fs::read_to_string(run_dir.join("ledger.jsonl")))
             .unwrap_or_default();
         assert!(ledger.contains("\"kind\":\"explore\""), "{ledger}");
+    }
+
+    #[test]
+    fn older_tool_results_stay_visible_until_superseded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let glob = json!({"functionCall":{"name":"glob_files","args":{"pattern":"*"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("a.txt", "ALPHA-ONE")]),
+                call_turn(vec![read_call("a.txt")]),
+                call_turn(vec![glob]),
+                call_turn(vec![create_call("a.txt", "ALPHA-TWO")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("memory check", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service().transport().seen();
+        assert!(posts.len() >= 5, "{}", posts.len());
+        // turn 4's request: the turn-2 read is no longer in the exact
+        // exchange, but its excerpt is still in working memory
+        let state4 = posts[3].clone();
+        assert!(state4.contains("earlier_observations"));
+        assert!(state4.contains("ALPHA-ONE"), "{state4}");
+        // turn 5's request: a.txt was rewritten, so the stale read is gone
+        assert!(!posts[4].contains("ALPHA-ONE"), "{}", posts[4]);
+        // the first request has no memory yet
+        let first: Value = serde_json::from_str(&posts[0]).unwrap();
+        let state0: Value =
+            serde_json::from_str(first["contents"][0]["parts"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert!(state0["earlier_observations"].is_null());
     }
 
     #[test]
