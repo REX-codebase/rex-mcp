@@ -2214,7 +2214,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
         {"name":"web_fetch","description":"Read one public web page (http/https), e.g. docs or an issue you already have the URL for. HTML comes back as Markdown (headings, lists, absolute links, code blocks); format=text gives flat text. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"},"format":{"type":"STRING","enum":["markdown","text"],"description":"markdown (default) or text"}},"required":["url"]}},
-        {"name":"explore","description":"Delegate a focused question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob, or (kind edit) one self-contained change to a writing sub-agent. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"},"kind":{"type":"STRING","enum":["explore","research","edit"],"description":"explore (default): workspace only. research: workspace plus web_fetch of public pages, for questions that need docs or issue pages. edit: one self-contained change (single task only); the child can write and run commands, each needing the user's approval as usual, and reports files changed"}}}},
+        {"name":"explore","description":"Delegate a focused question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob, or (kind edit) one self-contained change to a writing sub-agent. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"},"kind":{"type":"STRING","enum":["explore","research","edit"],"description":"explore (default): workspace only. research: workspace plus web_fetch of public pages, for questions that need docs or issue pages. edit: one self-contained change per task (up to 3 in parallel, each on different files); the child can write and run commands, each needing the user's approval as usual, and reports files changed"}}}},
         {"name":"ask_user","description":"Ask the user when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Pass one question, or up to 3 related questions at once in `questions` so the user answers them together. Give up to 4 short choices per question, best first; the user may also answer freely. At most 3 questions per run. Anything declined or unanswered in time means proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}},"questions":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}}}}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
     ]}])
@@ -2547,7 +2547,6 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
             },
             "explore" => match explore::parse_explore_tasks(&args)
                 .and_then(|t| explore::parse_explore_kind(&args).map(|k| (t, k)))
-                .and_then(|(t, k)| explore::check_explore_batch(t, k))
             {
                 Ok((tasks, kind)) => calls.push((AgentCall::Explore { id, tasks, kind }, raw)),
                 Err(error) => calls.push((
@@ -2665,7 +2664,6 @@ fn decode_named_call(
         },
         "explore" => match explore::parse_explore_tasks(&args)
             .and_then(|t| explore::parse_explore_kind(&args).map(|k| (t, k)))
-            .and_then(|(t, k)| explore::check_explore_batch(t, k))
         {
             Ok((tasks, kind)) => (AgentCall::Explore { id, tasks, kind }, Some(raw)),
             Err(e) => bad(e),
@@ -3212,13 +3210,31 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 let transport = ctx.service.transport();
                 let allowed = ctx.brief.allowed_tools.as_deref();
                 // An edit child's writes and commands wait on the same trusted
-                // UI decision as the parent's own calls.
-                let approve = |p: &PreparedCall| match wait_for_decision(ctx, p, started) {
-                    Decision::Approved => explore::ChildApproval::Approved,
-                    Decision::Denied => explore::ChildApproval::Denied,
-                    Decision::Timeout | Decision::Cancelled => explore::ChildApproval::Stop,
+                // UI decision as the parent's own calls. There is one approval
+                // slot per run, so parallel children take turns at it.
+                let approval_turn = std::sync::Mutex::new(());
+                let run_handle: &RunHandle = &ctx.handle;
+                let approve = |p: &PreparedCall| {
+                    let _turn = approval_turn.lock().unwrap_or_else(|e| e.into_inner());
+                    if run_handle.cancel.load(Ordering::SeqCst) {
+                        return explore::ChildApproval::Stop;
+                    }
+                    match wait_for_decision_on(run_handle, p) {
+                        Decision::Approved => explore::ChildApproval::Approved,
+                        Decision::Denied => explore::ChildApproval::Denied,
+                        Decision::Timeout | Decision::Cancelled => explore::ChildApproval::Stop,
+                    }
                 };
+                // paths each edit child has written, so two children in one
+                // batch never change the same file
+                let claims = std::sync::Mutex::new(std::collections::HashMap::new());
                 let outcomes: Vec<ExploreOutcome> = if tasks.len() == 1 {
+                    let gate = explore::ChildGate {
+                        allowed,
+                        approve: &approve,
+                        claims: &claims,
+                        index: 0,
+                    };
                     vec![run_explore(
                         transport,
                         link,
@@ -3226,29 +3242,24 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         tools,
                         &tasks[0],
                         limits,
-                        allowed,
-                        &approve,
+                        &gate,
                     )]
                 } else {
                     std::thread::scope(|scope| {
                         let workers: Vec<_> = tasks
                             .iter()
-                            .map(|task| {
+                            .enumerate()
+                            .map(|(index, task)| {
                                 let handle = &ctx.handle;
-                                // parallel batches are never edit children
-                                // (check_explore_batch), so nothing here
-                                // can wait on an approval
+                                let (approve, claims) = (&approve, &claims);
                                 scope.spawn(move || {
-                                    run_explore(
-                                        transport,
-                                        link,
-                                        handle,
-                                        tools,
-                                        task,
-                                        limits,
+                                    let gate = explore::ChildGate {
                                         allowed,
-                                        &|_: &PreparedCall| explore::ChildApproval::Stop,
-                                    )
+                                        approve,
+                                        claims,
+                                        index,
+                                    };
+                                    run_explore(transport, link, handle, tools, task, limits, &gate)
                                 })
                             })
                             .collect();
@@ -3730,8 +3741,14 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
     call: &PreparedCall,
     _started: Instant,
 ) -> Decision {
+    wait_for_decision_on(&ctx.handle, call)
+}
+
+/// The approval wait itself; needs only the run handle, so edit children
+/// on worker threads can use it too.
+fn wait_for_decision_on(handle: &RunHandle, call: &PreparedCall) -> Decision {
     {
-        let mut s = match ctx.handle.shared.lock() {
+        let mut s = match handle.shared.lock() {
             Ok(s) => s,
             Err(_) => return Decision::Cancelled,
         };
@@ -3740,12 +3757,12 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
         push_locked(&mut s, AgentEvent::ApprovalRequired { call: call.clone() });
     }
     let deadline = Instant::now() + Duration::from_millis(APPROVAL_WAIT_MS);
-    let mut guard = match ctx.handle.shared.lock() {
+    let mut guard = match handle.shared.lock() {
         Ok(g) => g,
         Err(_) => return Decision::Cancelled,
     };
     loop {
-        if ctx.handle.cancel.load(Ordering::SeqCst) {
+        if handle.cancel.load(Ordering::SeqCst) {
             guard.status = AgentStatus::Running;
             guard.pending_approval = None;
             return Decision::Cancelled;
@@ -3765,8 +3782,7 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
             guard.pending_approval = None;
             return Decision::Timeout;
         }
-        let (g, _timeout) = ctx
-            .handle
+        let (g, _timeout) = handle
             .cond
             .wait_timeout(guard, remaining.min(Duration::from_secs(5)))
             .expect("run state poisoned");
@@ -5600,7 +5616,72 @@ mod tests {
     }
 
     #[test]
-    fn edit_child_takes_one_task_and_respects_the_role() {
+    fn parallel_edit_children_take_turns_at_approval_and_never_share_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clash = json!({"functionCall":{"name":"explore","args":{
+            "tasks":["write same.txt","also write same.txt"],"kind":"edit"}}});
+        let split = json!({"functionCall":{"name":"explore","args":{
+            "tasks":["write a.txt","write b.txt"],"kind":"edit"}}});
+        let script = Script::new(vec![
+            call_turn(vec![clash]),
+            // both children try the same file in their only turn
+            call_turn(vec![create_call("same.txt", "S"), complete_call("R")]),
+            call_turn(vec![create_call("./same.txt", "S"), complete_call("R")]),
+            call_turn(vec![split]),
+            call_turn(vec![create_call("a.txt", "A"), complete_call("R")]),
+            call_turn(vec![create_call("b.txt", "B"), complete_call("R")]),
+            call_turn(vec![complete_call("done")]),
+        ]);
+        script.post_delay_ms.store(300, Ordering::SeqCst);
+        let svc = Arc::new(service(tmp.path(), script));
+        let snap = svc
+            .begin("parallel edits", "gemini", Some(budgets()))
+            .unwrap();
+        let (svc2, id2) = (svc.clone(), snap.id.clone());
+        let decided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = decided.clone();
+        std::thread::spawn(move || loop {
+            let s = svc2.snapshot(&id2).expect("snapshot");
+            if s.terminal_reason.is_some() {
+                return;
+            }
+            if s.status == AgentStatus::AwaitingApproval && s.pending_approval.is_some() {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let _ = svc2.decide(&id2, true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        // one approval for the clash (the loser is refused before asking),
+        // two for the split batch, one at a time
+        assert_eq!(decided.load(Ordering::SeqCst), 3, "{:?}", done.events);
+        assert_eq!(
+            svc.service()
+                .transport()
+                .max_in_flight
+                .load(Ordering::SeqCst),
+            2
+        );
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("same.txt")).unwrap(), "S");
+        assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(ws.join("b.txt")).unwrap(), "B");
+        let posts = svc.service().transport().seen();
+        let wrote = |p: &str, f: &str| p.matches(&format!("\\\"files_written\\\":[{f}]")).count();
+        let same = &posts[3];
+        assert_eq!(
+            wrote(same, "\\\"same.txt\\\"") + wrote(same, "\\\"./same.txt\\\""),
+            1,
+            "{same}"
+        );
+        assert_eq!(wrote(same, ""), 1, "{same}");
+        let split = &posts[6];
+        assert_eq!(wrote(split, "\\\"a.txt\\\""), 1, "{split}");
+        assert_eq!(wrote(split, "\\\"b.txt\\\""), 1, "{split}");
+    }
+
+    #[test]
+    fn edit_children_can_run_as_a_batch() {
         use explore::ExplorerKind;
         assert_eq!(
             explore::parse_explore_kind(&json!({"kind":"edit"})),
@@ -5611,26 +5692,10 @@ mod tests {
             &json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"explore","args":{"tasks":["a","b"],"kind":"edit"}}}]}}]}).to_string(),
         )
         .unwrap();
-        assert!(
-            matches!(&two.calls[0].0, AgentCall::BadCall { error, .. } if error.contains("one task"))
-        );
-        let one = decode_provider_calls(
-            ProviderProtocol::Gemini,
-            &json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"explore","args":{"tasks":["a"],"kind":"edit"}}}]}}]}).to_string(),
-        )
-        .unwrap();
         assert!(matches!(
-            &one.calls[0].0,
-            AgentCall::Explore {
-                kind: ExplorerKind::Edit,
-                ..
-            }
+            &two.calls[0].0,
+            AgentCall::Explore { kind: ExplorerKind::Edit, tasks, .. } if tasks.len() == 2
         ));
-        // research batches are still allowed
-        assert!(
-            explore::check_explore_batch(vec!["a".into(), "b".into()], ExplorerKind::Research)
-                .is_ok()
-        );
     }
 
     #[test]

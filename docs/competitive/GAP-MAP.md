@@ -195,8 +195,22 @@ is shared it is noted in the module docs.
   refusal; 5 of 6 mutations fail a test directly, and the per-tool role
   check (defence in depth, no current role reaches it) fails only together
   with the role gate.
-- Gap left: the edit child is sequential. opencode and Hermes can run
-  several writing children at once; REX keeps one approval slot per run.
+- Round 9: edit children run in parallel (up to 3 per call, budgets
+  split). They take turns at the single approval slot (a lock around
+  `wait_for_decision_on`), and each file a child writes is claimed for
+  it: another child of the same batch that tries to create or edit that
+  path (`./x` and `x` are the same) is refused and told to report the
+  overlap. Compare: Hermes runs batch children with the parent's toolsets
+  minus blocked tools (`tools/delegate_tool.py:6,202,441-528`), and no
+  file-overlap check turned up in `tools/delegate_tool*.py`. opencode
+  serialises concurrent edits of one file with a per-path semaphore
+  (`src/tool/edit.ts:35-43`) but lets a second agent edit it afterwards.
+  Test: one batch where two children hit the same file (one approval, one
+  write, one refusal), then one batch on separate files (two approvals,
+  both writes, 2 requests in flight). 3 mutations fail it: no claim, no
+  `./` normalisation, no approval lock (the run hangs until timeout).
+- Gap left: claims cover create_file/edit_file only; apply_patch and
+  run_command from parallel children are not checked for overlap.
 
 ## Round 5: YAML/TOML checks and app panels
 
