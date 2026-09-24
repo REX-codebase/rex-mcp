@@ -16,6 +16,7 @@ export type AgentStatus =
   | "running"
   | "awaiting_approval"
   | "awaiting_plan"
+  | "awaiting_answer"
   | "verifying"
   | "completed"
   | "blocked"
@@ -85,18 +86,27 @@ export interface AgentSnapshot {
   elapsed_ms: number;
   max_wall_ms: number;
   pending_approval: PreparedCall | null;
+  /** Open ask_user question; absent on older sidecars. */
+  pending_question?: PendingQuestion | null;
   events: AgentEvent[];
   preview: AgentPreview | null;
   completion_summary: string | null;
   error: string | null;
 }
 
-export type AgentPhase = "working" | "approval" | "plan" | "verifying" | "completed" | "stopped";
+export interface PendingQuestion {
+  call_id: string;
+  question: string;
+  choices: string[];
+}
+
+export type AgentPhase = "working" | "approval" | "plan" | "question" | "verifying" | "completed" | "stopped";
 
 export function phaseOf(snap: AgentSnapshot | null): AgentPhase {
   if (!snap) return "working";
   if (snap.status === "awaiting_approval") return "approval";
   if (snap.status === "awaiting_plan") return "plan";
+  if (snap.status === "awaiting_answer") return "question";
   if (snap.status === "verifying") return "verifying";
   if (snap.status === "completed") return "completed";
   if (

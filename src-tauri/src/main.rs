@@ -1261,6 +1261,16 @@ fn agent_undo(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<serde_json
     })
 }
 
+/// Answer (or, with `None`, decline) the run's open ask_user question.
+#[tauri::command]
+fn agent_answer(
+    agent: State<'_, Arc<Agent>>,
+    run_id: String,
+    answer: Option<String>,
+) -> Result<AgentSnapshot, String> {
+    agent.answer(&run_id, answer.as_deref())
+}
+
 #[tauri::command]
 fn agent_preview_action(
     agent: State<'_, Arc<Agent>>,
@@ -1513,6 +1523,7 @@ fn main() {
             agent_cancel,
             agent_resume,
             agent_undo,
+            agent_answer,
             agent_preview_action,
             agent_capture,
             agent_teardown,

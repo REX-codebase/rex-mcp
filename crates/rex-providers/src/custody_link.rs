@@ -849,6 +849,7 @@ mod tests {
             elapsed_ms: 5,
             max_wall_ms: 1_800_000,
             pending_approval: None,
+            pending_question: None,
             prompt_version: "test".into(),
             prompt_hash: "hash".into(),
             events: vec![],

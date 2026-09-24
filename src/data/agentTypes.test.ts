@@ -40,6 +40,7 @@ describe("agent snapshot view model", () => {
     expect(phaseOf(snap({ status: "planning" }))).toBe("working");
     expect(phaseOf(snap({ status: "running" }))).toBe("working");
     expect(phaseOf(snap({ status: "awaiting_approval" }))).toBe("approval");
+    expect(phaseOf(snap({ status: "awaiting_answer" }))).toBe("question");
     expect(phaseOf(snap({ status: "verifying" }))).toBe("verifying");
     expect(phaseOf(snap({ status: "completed" }))).toBe("completed");
     expect(phaseOf(snap({ status: "blocked" }))).toBe("stopped");

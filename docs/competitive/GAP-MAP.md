@@ -101,3 +101,21 @@ is shared it is noted in the module docs.
   `agentUndo()` in `src/data/agentRun.ts`. Gap left: no UI button yet
   (Tauri shell not compiled on the build box), and no undo to an arbitrary
   step in one call.
+
+## Round 4: ask the user (`ask_user`)
+
+- opencode: `question` tool asks one or more questions and returns answers
+  (`src/tool/question.ts`). Hermes: `clarify` with up to 4 choices plus
+  free text; on timeout it tells the model to use its best judgement
+  (`tools/clarify_tool.py:9-15`).
+- REX now: `ask_user` {question, choices<=4}. The run parks as
+  `awaiting_answer` with `pending_question` in the snapshot; only the
+  trusted UI path `AutonomousRunService::answer` (sidecar
+  `POST /api/agent/runs/:id/answer`, Tauri `agent_answer`, `agentAnswer()`)
+  can reply. Decline, blank or a 30-min timeout tell the model to decide
+  and state the assumption; the run never dies from a missed question.
+  Cap of 3 questions per run (durable in the checkpoint). Cancel while
+  parked ends the run. Explorer children cannot ask. Headless `rex exec`
+  declines automatically and prints the question.
+- Gap left: no UI panel renders the question yet (the phase `question` and
+  types exist); one question per call (opencode/Hermes batch several).

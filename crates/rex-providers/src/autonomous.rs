@@ -68,6 +68,16 @@ pub const MAX_STALL_TURNS: u32 = 3;
 pub const MAX_NO_PROGRESS_TURNS: u32 = 6;
 pub const MAX_DENIALS: u32 = 2;
 pub const APPROVAL_WAIT_MS: u64 = 60 * 60 * 1000;
+/// How long `ask_user` waits for the trusted UI before telling the model to
+/// proceed on its own judgement. A missed question never ends the run.
+pub const ANSWER_WAIT_MS: u64 = 30 * 60 * 1000;
+/// Questions one run may ask; past this the model is told to decide.
+pub const MAX_QUESTIONS_PER_RUN: u32 = 3;
+const QUESTION_CHARS: usize = 500;
+const CHOICE_CHARS: usize = 120;
+const MAX_CHOICES: usize = 4;
+/// Longest answer text passed back to the model.
+pub const ANSWER_CHARS: usize = 2000;
 const MAX_ACTIVE_RUNS: usize = 4;
 const MAX_EVENTS: usize = 200;
 const PROVIDER_RETRIES: u32 = 3;
@@ -143,6 +153,9 @@ pub enum AgentStatus {
     /// Plan mode: the model produced a plan and the run is parked until the
     /// trusted UI approves or rejects it. No tool has run yet.
     AwaitingPlan,
+    /// The model asked the user a question (`ask_user`) and the run is
+    /// parked until the trusted UI answers or declines.
+    AwaitingAnswer,
     Verifying,
     Completed,
     Blocked,
@@ -217,6 +230,13 @@ pub enum AgentEvent {
     PlanApprovalResolved {
         approved: bool,
     },
+    QuestionAsked {
+        question: PendingQuestion,
+    },
+    QuestionResolved {
+        call_id: String,
+        answered: bool,
+    },
     GateResult {
         attempt: u8,
         passed: bool,
@@ -229,6 +249,15 @@ pub enum AgentEvent {
     Info {
         message: String,
     },
+}
+
+/// A question the model put to the user through `ask_user`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub call_id: String,
+    pub question: String,
+    /// Suggested answers, best first; the user may still type anything.
+    pub choices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,6 +287,7 @@ pub struct AgentSnapshot {
     pub elapsed_ms: u64,
     pub max_wall_ms: u64,
     pub pending_approval: Option<PreparedCall>,
+    pub pending_question: Option<PendingQuestion>,
     /// Prompt-architecture identity this run is executing under.
     pub prompt_version: String,
     pub prompt_hash: String,
@@ -378,6 +408,9 @@ struct Checkpoint {
     /// assumed).
     #[serde(default)]
     plan_approved: bool,
+    /// `ask_user` calls made so far (capped by MAX_QUESTIONS_PER_RUN).
+    #[serde(default)]
+    questions_asked: u32,
     /// Bounded excerpts of older tool results (see `memory`).
     #[serde(default)]
     observations: Vec<crate::memory::Observation>,
@@ -395,6 +428,9 @@ struct RunShared {
     events: VecDeque<AgentEvent>,
     pending_approval: Option<PreparedCall>,
     decision: Option<bool>,
+    pending_question: Option<PendingQuestion>,
+    /// Trusted UI reply to `pending_question`: `Some(None)` = declined.
+    answer: Option<Option<String>>,
     step: usize,
     tool_calls: usize,
     tokens_used: u64,
@@ -464,6 +500,45 @@ enum AgentCall {
         id: String,
         task: String,
     },
+    /// Ask the user a blocking question through the trusted UI.
+    AskUser {
+        id: String,
+        question: String,
+        choices: Vec<String>,
+    },
+}
+
+/// Decode `ask_user` args. Choices may arrive as strings or as objects with
+/// a label-like field; blanks are dropped and everything is length-capped.
+fn parse_ask_user(args: &Value) -> Result<(String, Vec<String>), String> {
+    let question = args
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if question.is_empty() {
+        return Err("ask_user missing question".into());
+    }
+    let choices = args
+        .get("choices")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| match c {
+                    Value::String(t) => Some(t.trim().to_string()),
+                    Value::Object(o) => ["label", "text", "title", "description"]
+                        .iter()
+                        .find_map(|k| o.get(*k).and_then(Value::as_str))
+                        .map(|t| t.trim().to_string()),
+                    _ => None,
+                })
+                .filter(|t| !t.is_empty())
+                .map(|t| t.chars().take(CHOICE_CHARS).collect::<String>())
+                .take(MAX_CHOICES)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((question.chars().take(QUESTION_CHARS).collect(), choices))
 }
 
 pub struct AutonomousRunService<S: SecretStore + 'static, T: Transport + 'static> {
@@ -523,6 +598,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             elapsed_ms: state.elapsed_ms,
             max_wall_ms: brief.as_ref().map(|b| b.budgets.max_wall_ms).unwrap_or(0),
             pending_approval: state.pending_approval.clone(),
+            pending_question: state.pending_question.clone(),
             prompt_version: brief
                 .as_ref()
                 .map(|b| b.prompt_version.clone())
@@ -700,6 +776,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 events: VecDeque::new(),
                 pending_approval: None,
                 decision: None,
+                pending_question: None,
+                answer: None,
                 step: 0,
                 tool_calls: 0,
                 tokens_used: 0,
@@ -796,6 +874,37 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             }
             state.decision = Some(approved);
             push_locked(&mut state, AgentEvent::PlanApprovalResolved { approved });
+        }
+        handle.cond.notify_all();
+        Ok(self.snapshot_of(run_id, handle))
+    }
+
+    /// Trusted UI reply to an `ask_user` question. `None` declines, which
+    /// tells the model to proceed on its own judgement. Blank text counts as
+    /// declining; long text is capped at ANSWER_CHARS.
+    pub fn answer(&self, run_id: &str, text: Option<&str>) -> Result<AgentSnapshot, String> {
+        let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+        let handle = runs.get(run_id).ok_or("unknown run")?;
+        {
+            let mut state = handle.shared.lock().map_err(|_| "run state poisoned")?;
+            if state.status != AgentStatus::AwaitingAnswer || state.pending_question.is_none() {
+                return Err("run is not waiting for an answer".into());
+            }
+            let reply = text
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| t.chars().take(ANSWER_CHARS).collect::<String>());
+            let answered = reply.is_some();
+            state.answer = Some(reply);
+            let call_id = state
+                .pending_question
+                .as_ref()
+                .map(|q| q.call_id.clone())
+                .unwrap_or_default();
+            push_locked(
+                &mut state,
+                AgentEvent::QuestionResolved { call_id, answered },
+            );
         }
         handle.cond.notify_all();
         Ok(self.snapshot_of(run_id, handle))
@@ -925,6 +1034,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 events: VecDeque::new(),
                 pending_approval: None,
                 decision: None,
+                pending_question: None,
+                answer: None,
                 step: checkpoint.step,
                 tool_calls: checkpoint.tool_calls,
                 tokens_used: checkpoint.tokens_used,
@@ -1635,10 +1746,11 @@ fn build_state_message(
             "rules": [
                 "Maintain the todo plan with update_plan: mark the active step in_progress, mark steps done only when actually done.",
                 "Use read_file/search_files/web_search to ground yourself before writing. Writes and commands pause for trusted human approval; a denial is information - replan, never retry the identical denied call.",
+                "Use ask_user only when a choice blocks progress and cannot be settled from the workspace or the brief; otherwise decide, and state the assumption in your completion summary.",
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "explore", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "explore", "ask_user", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
         "project_instructions": project.map(|p| json!({
@@ -1735,6 +1847,12 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "explore",
             "Delegate a read-only workspace question to an explorer sub-agent; returns one findings report.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "ask_user",
+            "Ask the user one blocking question through the trusted UI; returns their answer or tells you to decide.",
             false,
             false,
         ),
@@ -1887,6 +2005,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
         {"name":"web_fetch","description":"Read one public web page (http/https) as plain text, e.g. docs or an issue you already have the URL for. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"}},"required":["url"]}},
         {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"}},"required":["task"]}},
+        {"name":"ask_user","description":"Ask the user one question when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Give up to 4 short choices, best first; the user may also answer freely. If they decline or do not answer in time, you are told to proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
     ]}])
 }
@@ -2202,6 +2321,24 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     raw,
                 )),
             },
+            "ask_user" => match parse_ask_user(&args) {
+                Ok((question, choices)) => calls.push((
+                    AgentCall::AskUser {
+                        id,
+                        question,
+                        choices,
+                    },
+                    raw,
+                )),
+                Err(error) => calls.push((
+                    AgentCall::BadCall {
+                        name: "ask_user".into(),
+                        id,
+                        error,
+                    },
+                    raw,
+                )),
+            },
             "explore" => match args.get("task").and_then(Value::as_str) {
                 Some(task) if !task.trim().is_empty() => calls.push((
                     AgentCall::Explore {
@@ -2316,6 +2453,17 @@ fn decode_named_call(
                 Some(raw),
             ),
             None => bad("web_fetch missing url".into()),
+        },
+        "ask_user" => match parse_ask_user(&args) {
+            Ok((question, choices)) => (
+                AgentCall::AskUser {
+                    id,
+                    question,
+                    choices,
+                },
+                Some(raw),
+            ),
+            Err(e) => bad(e),
         },
         "explore" => match args.get("task").and_then(Value::as_str) {
             Some(task) if !task.trim().is_empty() => (
@@ -2620,6 +2768,82 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     json!({"functionCall":{"name":"web_search","args":{"query": query}}}),
                 );
                 response_parts.push(function_response(protocol, "web_search", &id, ok, &content));
+            }
+            AgentCall::AskUser {
+                id,
+                question,
+                choices,
+            } => {
+                let allowed = ctx
+                    .brief
+                    .allowed_tools
+                    .as_ref()
+                    .is_none_or(|a| a.iter().any(|t| t == "ask_user"));
+                let (ok, content, asked) = if !allowed {
+                    (
+                        false,
+                        "tool ask_user is not enabled for this run's role; decide yourself and state the assumption".to_string(),
+                        false,
+                    )
+                } else if cp.questions_asked >= MAX_QUESTIONS_PER_RUN {
+                    (
+                        false,
+                        format!("question limit reached ({MAX_QUESTIONS_PER_RUN} per run); decide yourself and state the assumption in your completion summary"),
+                        false,
+                    )
+                } else {
+                    cp.questions_asked += 1;
+                    let pending = PendingQuestion {
+                        call_id: if id.is_empty() {
+                            format!("ask-{}", cp.questions_asked)
+                        } else {
+                            id.clone()
+                        },
+                        question: question.clone(),
+                        choices: choices.clone(),
+                    };
+                    // Parked runs are resumable: persist before blocking.
+                    let _ = write_json(&ctx.state_dir.join("checkpoint.json"), &*cp);
+                    match wait_for_answer(ctx, &pending) {
+                        UserAnswer::Text(text) => (
+                            true,
+                            json!({"user_answer": text}).to_string(),
+                            true,
+                        ),
+                        UserAnswer::Declined => (
+                            true,
+                            "The user declined to answer. Proceed on your own judgement and state the assumption in your completion summary.".to_string(),
+                            true,
+                        ),
+                        UserAnswer::Timeout => (
+                            true,
+                            "No answer arrived in time. Proceed on your own judgement and state the assumption in your completion summary.".to_string(),
+                            true,
+                        ),
+                        UserAnswer::Cancelled => {
+                            out.fatal = Some(TerminalReason::Cancelled);
+                            return out;
+                        }
+                    }
+                };
+                if let Some(l) = ledger.as_mut() {
+                    l.append(
+                        "ask_user",
+                        json!({"question": question, "choices": choices, "asked": asked, "ok": ok, "reply": content}),
+                    );
+                }
+                out.digest_actions.push(DigestAction {
+                    tool: "ask_user".into(),
+                    ok,
+                    target: Some(question.chars().take(160).collect()),
+                    error_kind: (!ok).then(|| "question_refused".to_string()),
+                });
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"ask_user","args":{"question": question, "choices": choices}}}),
+                );
+                response_parts.push(function_response(protocol, "ask_user", &id, ok, &content));
             }
             AgentCall::WebFetch { id, url, offset } => {
                 let allowed = ctx
@@ -3185,6 +3409,76 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
     }
 }
 
+enum UserAnswer {
+    Text(String),
+    Declined,
+    Timeout,
+    Cancelled,
+}
+
+/// Park the loop thread until the trusted UI answers an `ask_user`
+/// question. Only `AutonomousRunService::answer` supplies the reply.
+fn wait_for_answer<S: SecretStore + 'static, T: Transport + 'static>(
+    ctx: &LoopCtx<S, T>,
+    question: &PendingQuestion,
+) -> UserAnswer {
+    {
+        let mut s = match ctx.handle.shared.lock() {
+            Ok(s) => s,
+            Err(_) => return UserAnswer::Cancelled,
+        };
+        s.status = AgentStatus::AwaitingAnswer;
+        s.pending_question = Some(question.clone());
+        s.answer = None;
+        push_locked(
+            &mut s,
+            AgentEvent::QuestionAsked {
+                question: question.clone(),
+            },
+        );
+    }
+    let deadline = Instant::now() + Duration::from_millis(ANSWER_WAIT_MS);
+    let mut guard = match ctx.handle.shared.lock() {
+        Ok(g) => g,
+        Err(_) => return UserAnswer::Cancelled,
+    };
+    loop {
+        if ctx.handle.cancel.load(Ordering::SeqCst) {
+            guard.status = AgentStatus::Running;
+            guard.pending_question = None;
+            return UserAnswer::Cancelled;
+        }
+        if let Some(reply) = guard.answer.take() {
+            guard.status = AgentStatus::Running;
+            guard.pending_question = None;
+            return match reply {
+                Some(text) => UserAnswer::Text(text),
+                None => UserAnswer::Declined,
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            guard.status = AgentStatus::Running;
+            guard.pending_question = None;
+            let call_id = question.call_id.clone();
+            push_locked(
+                &mut guard,
+                AgentEvent::QuestionResolved {
+                    call_id,
+                    answered: false,
+                },
+            );
+            return UserAnswer::Timeout;
+        }
+        let (g, _timeout) = ctx
+            .handle
+            .cond
+            .wait_timeout(guard, remaining.min(Duration::from_secs(5)))
+            .expect("run state poisoned");
+        guard = g;
+    }
+}
+
 /// Plan mode: the instruction appended to the plan turn. The request itself
 /// declares ONLY `update_plan`, so the model structurally cannot reach any
 /// other tool before the human approves the plan.
@@ -3370,6 +3664,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                 AgentCall::CompleteTask { .. } => Some("complete_task".to_string()),
                 AgentCall::Explore { .. } => Some("explore".to_string()),
                 AgentCall::WebFetch { .. } => Some("web_fetch".to_string()),
+                AgentCall::AskUser { .. } => Some("ask_user".to_string()),
             };
             if let Some(name) = name {
                 disallowed.push(name);
@@ -4705,6 +5000,125 @@ mod tests {
             .0
             .iter()
             .any(|s| s.name == "web_fetch"));
+    }
+
+    fn answer_questions(svc: Arc<Svc>, id: String, reply: Option<&'static str>) {
+        std::thread::spawn(move || loop {
+            let snap = svc.snapshot(&id).expect("snapshot");
+            if snap.terminal_reason.is_some() {
+                return;
+            }
+            if snap.status == AgentStatus::AwaitingAnswer && snap.pending_question.is_some() {
+                let _ = svc.answer(&id, reply);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+    }
+
+    #[test]
+    fn ask_user_parks_the_run_and_returns_the_trusted_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = json!({"functionCall":{"name":"ask_user","args":{
+            "question":"Which database should the service use?",
+            "choices":["Postgres", {"label":"SQLite"}, "  "]}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("ask check", "gemini", Some(budgets())).unwrap();
+        // not waiting yet (or already past): a stray answer is refused
+        assert!(svc.answer("no-such-run", Some("x")).is_err());
+        answer_questions(svc.clone(), snap.id.clone(), Some("SQLite, it is a demo"));
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        // the gates judge the (empty) work; the question flow itself is what matters here
+        assert!(done.terminal_reason.is_some());
+        assert!(done.pending_question.is_none());
+        let asked = done.events.iter().find_map(|e| match e {
+            AgentEvent::QuestionAsked { question } => Some(question.clone()),
+            _ => None,
+        });
+        let asked = asked.expect("question event");
+        assert_eq!(asked.question, "Which database should the service use?");
+        assert_eq!(asked.choices, ["Postgres", "SQLite"]);
+        assert!(done
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::QuestionResolved { answered: true, .. })));
+        let posts = svc.service().transport().seen();
+        assert!(posts[1].contains("user_answer"), "{}", posts[1]);
+        assert!(posts[1].contains("SQLite, it is a demo"), "{}", posts[1]);
+        let run_dir = tmp.path().join("runs").join(&snap.id);
+        let ledger = fs::read_to_string(run_dir.join("state").join("ledger.jsonl"))
+            .or_else(|_| fs::read_to_string(run_dir.join("ledger.jsonl")))
+            .unwrap_or_default();
+        assert!(ledger.contains("\"kind\":\"ask_user\""), "{ledger}");
+    }
+
+    #[test]
+    fn ask_user_is_capped_per_run_and_a_decline_means_decide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = |n: u32| json!({"functionCall":{"name":"ask_user","args":{"question": format!("question {n}?")}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask(1), ask(2), ask(3), ask(4)]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("cap check", "gemini", Some(budgets())).unwrap();
+        answer_questions(svc.clone(), snap.id.clone(), None);
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        // the gates judge the (empty) work; the question flow itself is what matters here
+        assert!(done.terminal_reason.is_some());
+        let asked = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::QuestionAsked { .. }))
+            .count();
+        assert_eq!(asked, MAX_QUESTIONS_PER_RUN as usize);
+        let posts = svc.service().transport().seen();
+        assert!(posts[1].contains("declined to answer"), "{}", posts[1]);
+        assert!(posts[1].contains("question limit reached"), "{}", posts[1]);
+    }
+
+    #[test]
+    fn cancelling_while_a_question_is_open_ends_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = json!({"functionCall":{"name":"ask_user","args":{"question":"ok?"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("cancel check", "gemini", Some(budgets()))
+            .unwrap();
+        let t0 = Instant::now();
+        while svc.snapshot(&snap.id).unwrap().status != AgentStatus::AwaitingAnswer {
+            assert!(t0.elapsed() < Duration::from_secs(30), "never asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        svc.cancel(&snap.id).unwrap();
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert_eq!(done.status, AgentStatus::Cancelled);
+        assert!(svc.answer(&snap.id, Some("late")).is_err());
+    }
+
+    #[test]
+    fn ask_user_args_are_normalised_and_capped() {
+        assert!(parse_ask_user(&json!({})).is_err());
+        assert!(parse_ask_user(&json!({"question":"   "})).is_err());
+        let long = "q".repeat(QUESTION_CHARS + 50);
+        let (q, c) = parse_ask_user(&json!({"question": long, "choices":
+            ["a", {"text":"b"}, 7, "", "c", "d", "e"]}))
+        .unwrap();
+        assert_eq!(q.chars().count(), QUESTION_CHARS);
+        assert_eq!(c, ["a", "b", "c", "d"]);
     }
 
     #[test]

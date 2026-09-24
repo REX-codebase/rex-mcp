@@ -488,6 +488,20 @@ fn route(
                 ),
             }
         }
+        ("POST", ["api", "agent", "runs", id, "answer"]) => {
+            // {"answer": "text"} answers an ask_user question; null, a
+            // missing field or blank text declines it.
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let text = parsed.get("answer").and_then(|a| a.as_str());
+            match agent.answer(id, text) {
+                Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
         ("POST", ["api", "agent", "runs", id, "cancel"]) => match agent.cancel(id) {
             Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
             Err(detail) => json_response(

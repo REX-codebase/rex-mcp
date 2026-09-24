@@ -404,6 +404,20 @@ fn drive(
                     ));
                 }
             }
+            AgentStatus::AwaitingAnswer => {
+                // Headless runs have nobody to ask: decline, which tells the
+                // model to proceed on its own judgement and state the
+                // assumption. The question stays visible in the run log.
+                if let Some(q) = snap.pending_question.as_ref() {
+                    if !opts.json {
+                        eprintln!("rex: model asked: {}", q.question);
+                        eprintln!("rex: no interactive answer channel; told it to decide");
+                    }
+                }
+                agent
+                    .answer(run_id, None)
+                    .map_err(|e| ExecError::internal(format!("answer failed: {e}")))?;
+            }
             AgentStatus::Completed
             | AgentStatus::Blocked
             | AgentStatus::Denied

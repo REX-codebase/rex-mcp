@@ -311,6 +311,14 @@ pub(super) fn run_explore<T: Transport>(
                     "explorers cannot start other explorers".into(),
                     false,
                 ),
+                AgentCall::AskUser { id, .. } => (
+                    "ask_user".into(),
+                    id,
+                    json!({}),
+                    "ask_user is not available to the explorer; report the open question instead"
+                        .into(),
+                    false,
+                ),
             };
             let mut part = raw.unwrap_or_else(|| fallback_part(protocol, &name, &id, &args));
             if first && protocol == ProviderProtocol::Gemini {
