@@ -52,7 +52,7 @@ fn read_one(path: &Path, source: String) -> Option<ProjectInstructions> {
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
     file.take(MAX_READ_BYTES).read_to_end(&mut bytes).ok()?;
-    let text = String::from_utf8(bytes).ok()?;
+    let text = crate::skills::decode_prefix(bytes)?;
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -162,6 +162,17 @@ mod tests {
         ));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_large_file_cut_inside_a_character_still_loads() {
+        let d = dir();
+        let mut text = "ab".to_string();
+        text.push_str(&"\u{20ac}".repeat(MAX_READ_BYTES as usize / 3 + 10));
+        fs::write(d.join("AGENTS.md"), &text).unwrap();
+        let p = load(&d).expect("loaded despite the cut character");
+        assert!(p.truncated);
+        assert!(p.text.starts_with("ab\u{20ac}"));
     }
 
     #[test]

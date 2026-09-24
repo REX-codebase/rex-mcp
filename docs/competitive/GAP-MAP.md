@@ -801,5 +801,36 @@ is shared it is noted in the module docs.
   first pass).
 - Gap left: no nested skill folders (opencode globs `skills/**`), no
   remote skill sources, and `read_file` cannot open files of a
-  user-level skill (they are outside the workspace).
+  user-level skill (they are outside the workspace; closed in 17b).
+
+## Round 17b: read a skill's own files; UTF-8 cut at the byte cap
+
+- Competitors: opencode's skill reply names the skill folder and says
+  relative paths in the skill are relative to it; its `read` tool then
+  opens them, asking first when the folder is outside the project
+  (`src/tool/skill.ts`, `src/tool/external-directory.ts`).
+- REX before: `load_skill` listed a skill's files but nothing could open
+  them when the skill was user-level (`read_file` stays in the
+  workspace).
+- REX now:
+  - `load_skill {name, file}` reads one text file inside that skill's
+    folder. The path must be relative, at most two levels deep, with no
+    `..`, hidden or empty parts, and not SKILL.md. Every part is checked
+    without following links, so a symlinked file or folder is refused.
+    Non-UTF-8 files are refused. Up to 16,000 characters, marked when
+    cut. The event, ledger entry and model part name the file.
+  - Bug fixed while testing: a file over the 64 KiB read cap whose cap
+    fell inside a multi-byte character was treated as non-UTF-8 and
+    dropped. That hit SKILL.md and also `AGENTS.md`-style project
+    instructions (`project.rs`, rounds 2 and 5). Now only the cut last character
+    is dropped.
+- Tests: `load_file` (plain read, `./` prefix, a file over the cap cut
+  inside a character, 12 refused paths with their reasons, unknown skill)
+  and symlinked file and folder refused; a `decode_prefix` unit test; a
+  large SKILL.md and a large `AGENTS.md` cut inside a character still
+  load; the scripted run reads `ship.sh` and refuses `../../../x`. Hand
+  mutation: 17/17 killed. The first pass left 4 survivors: two overlapping
+  checks (I removed the redundant symlink check) and two tests whose
+  byte cap happened to land on a character boundary (fixed).
+- Gap left: no nested skill folders and no remote skill sources.
 

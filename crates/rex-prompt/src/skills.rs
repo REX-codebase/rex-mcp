@@ -81,7 +81,7 @@ fn read_skill(path: &Path) -> Option<(String, String, String, bool)> {
         .take(MAX_READ_BYTES)
         .read_to_end(&mut bytes)
         .ok()?;
-    let text = String::from_utf8(bytes).ok()?;
+    let text = decode_prefix(bytes)?;
     let over = meta.len() > MAX_READ_BYTES;
     let (front, body) = split_front_matter(&text)?;
     let (mut name, mut description) = (None, None);
@@ -100,6 +100,19 @@ fn read_skill(path: &Path) -> Option<(String, String, String, bool)> {
     let description = description.filter(|d| !d.is_empty())?;
     let description = clip(&description, MAX_DESCRIPTION_CHARS).0;
     Some((name, description, body.trim().to_string(), over))
+}
+
+/// UTF-8 text from bytes read up to the cap: a character cut in half at
+/// the very end (the cap fell inside it) is dropped; any other invalid
+/// byte means the file is not text.
+pub(crate) fn decode_prefix(mut bytes: Vec<u8>) -> Option<String> {
+    if let Err(e) = std::str::from_utf8(&bytes) {
+        if e.error_len().is_some() {
+            return None;
+        }
+        bytes.truncate(e.valid_up_to());
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// `---` front matter at the very start, closed by a `---` line.
@@ -255,9 +268,17 @@ fn skill_files(dir: &Path) -> (Vec<String>, bool) {
     (found, over)
 }
 
-/// Load the body of the skill called `name` from `skills`. The error names
-/// the skills that do exist.
-pub fn load(skills: &[SkillInfo], name: &str) -> Result<SkillBody, String> {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SkillFile {
+    pub name: String,
+    /// Path relative to the skill folder.
+    pub file: String,
+    pub truncated: bool,
+    pub text: String,
+}
+
+/// Find `name` in `skills`; the error names the skills that do exist.
+fn find<'a>(skills: &'a [SkillInfo], name: &str) -> Result<&'a SkillInfo, String> {
     let Some(info) = skills.iter().find(|s| s.name == name.trim()) else {
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         return Err(format!(
@@ -270,6 +291,13 @@ pub fn load(skills: &[SkillInfo], name: &str) -> Result<SkillBody, String> {
             }
         ));
     };
+    Ok(info)
+}
+
+/// Load the body of the skill called `name` from `skills`. The error names
+/// the skills that do exist.
+pub fn load(skills: &[SkillInfo], name: &str) -> Result<SkillBody, String> {
+    let info = find(skills, name)?;
     let (_, _, body, over) =
         read_skill(&info.path).ok_or_else(|| format!("skill {:?} could not be read", info.name))?;
     let (mut text, clipped) = clip(&body, MAX_BODY_CHARS);
@@ -284,6 +312,65 @@ pub fn load(skills: &[SkillInfo], name: &str) -> Result<SkillBody, String> {
         text,
         files,
         files_truncated,
+    })
+}
+
+/// Read one text file inside the skill folder of `name`, such as a
+/// reference or script its SKILL.md mentions. The path must be relative,
+/// at most two levels deep, with no `..`, hidden parts or symlinks, and
+/// must not be SKILL.md itself (use [`load`]). Non-UTF-8 files are refused.
+pub fn load_file(skills: &[SkillInfo], name: &str, file: &str) -> Result<SkillFile, String> {
+    let info = find(skills, name)?;
+    let dir = info
+        .path
+        .parent()
+        .ok_or_else(|| format!("skill {:?} has no folder", info.name))?;
+    let rel = file.trim().trim_start_matches("./");
+    let parts: Vec<&str> = rel.split('/').collect();
+    let bad = |why: &str| Err(format!("skill file {rel:?} refused: {why}"));
+    if rel.is_empty() || rel.starts_with('/') || rel.contains('\\') {
+        return bad("give a path relative to the skill folder");
+    }
+    if parts.iter().any(|p| p.is_empty() || p.starts_with('.')) {
+        return bad("no `..`, hidden or empty path parts");
+    }
+    if parts.len() > 2 {
+        return bad("at most two levels deep");
+    }
+    if rel == "SKILL.md" {
+        return bad("SKILL.md is returned by load_skill without file");
+    }
+    let mut path = dir.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        path.push(part);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return bad("not found in the skill folder");
+        };
+        let last = i + 1 == parts.len();
+        // symlink_metadata never follows the link, so a symlink is
+        // neither a file nor a directory here
+        if (last && !meta.is_file()) || (!last && !meta.is_dir()) {
+            return bad("not a regular file in the skill folder");
+        }
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(&path)
+        .and_then(|f| f.take(MAX_READ_BYTES).read_to_end(&mut bytes))
+        .map_err(|e| format!("skill file {rel:?} could not be read: {e}"))?;
+    let Some(text) = decode_prefix(bytes) else {
+        return bad("not UTF-8 text");
+    };
+    // a file over the byte cap is always over the character cap too
+    // (64 KiB holds at least 16,384 characters), so `clip` marks it
+    let (mut text, clipped) = clip(&text, MAX_BODY_CHARS);
+    if clipped {
+        text.push_str("\n[... file truncated]");
+    }
+    Ok(SkillFile {
+        name: info.name.clone(),
+        file: rel.to_string(),
+        truncated: clipped,
+        text,
     })
 }
 
@@ -312,6 +399,22 @@ mod tests {
 
     fn md(name: &str, desc: &str, body: &str) -> String {
         format!("---\nname: {name}\ndescription: {desc}\n---\n{body}\n")
+    }
+
+    #[test]
+    fn decode_prefix_drops_only_a_cut_last_character() {
+        let euro = "\u{20ac}".as_bytes().to_vec();
+        let mut cut = b"ok".to_vec();
+        cut.extend_from_slice(&euro[..2]);
+        assert_eq!(decode_prefix(cut).as_deref(), Some("ok"));
+        assert_eq!(decode_prefix(b"ok".to_vec()).as_deref(), Some("ok"));
+        let mut bad = vec![0xff];
+        bad.extend_from_slice(b"ok");
+        assert_eq!(decode_prefix(bad), None);
+        let mut mid = b"a".to_vec();
+        mid.extend_from_slice(&euro[..2]);
+        mid.extend_from_slice(b"b");
+        assert_eq!(decode_prefix(mid), None);
     }
 
     #[test]
@@ -445,8 +548,16 @@ mod tests {
         for i in 0..MAX_SKILL_FILES + 2 {
             fs::write(ws.join(format!(".agents/skills/big/f{i:02}.txt")), "").unwrap();
         }
+        // a SKILL.md over the byte cap whose cap falls inside a character
+        let front = "---\nname: huge\ndescription: d\n---\nx";
+        assert_ne!((MAX_READ_BYTES as usize - front.len()) % 3, 0);
+        let huge = format!("{front}{}", "\u{20ac}".repeat(MAX_READ_BYTES as usize / 3));
+        skill(&ws, ".agents/skills", "huge", &huge);
         let skills = discover_with(&ws, None, None);
         let body = load(&skills, " deploy ").unwrap();
+        let h = load(&skills, "huge").expect("huge SKILL.md still loads");
+        assert!(h.truncated);
+        assert!(h.text.starts_with("x\u{20ac}"));
         assert_eq!(body.text, "# Steps\nrun ./ship.sh");
         assert!(!body.truncated);
         assert_eq!(body.files, vec!["ref/a.md", "ship.sh"]);
@@ -482,5 +593,80 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         std::os::unix::fs::symlink(outside.join("SKILL.md"), d.join("SKILL.md")).unwrap();
         assert!(discover_with(&ws, None, None).is_empty());
+    }
+
+    #[test]
+    fn load_file_reads_only_plain_files_inside_the_skill() {
+        let ws = dir();
+        skill(
+            &ws,
+            ".rex/skills",
+            "deploy",
+            &md("deploy", "ship", "see ref/steps.md"),
+        );
+        let d = ws.join(".rex/skills/deploy");
+        fs::create_dir_all(d.join("ref/deep")).unwrap();
+        fs::write(d.join("ref/steps.md"), "1. build\n2. ship").unwrap();
+        fs::write(d.join("ref/deep/x.md"), "x").unwrap();
+        fs::write(d.join(".env"), "SECRET=1").unwrap();
+        fs::write(d.join("bin.dat"), [0xff, 0xfe, 0x00]).unwrap();
+        fs::write(d.join("big.txt"), "z".repeat(MAX_BODY_CHARS + 9)).unwrap();
+        fs::write(ws.join("outside.txt"), "outside").unwrap();
+        // over the byte cap, with the cap landing inside a 3-byte character
+        let mut huge = "ab".to_string();
+        huge.push_str(&"\u{20ac}".repeat(MAX_READ_BYTES as usize / 3 + 10));
+        fs::write(d.join("huge.md"), &huge).unwrap();
+        let skills = discover_with(&ws, None, None);
+        let got = load_file(&skills, "deploy", "./ref/steps.md").unwrap();
+        assert_eq!(got.text, "1. build\n2. ship");
+        assert_eq!(got.file, "ref/steps.md");
+        assert!(!got.truncated);
+        let h = load_file(&skills, "deploy", "huge.md").unwrap();
+        assert!(h.truncated);
+        assert!(h.text.starts_with("ab\u{20ac}\u{20ac}"));
+        let big = load_file(&skills, "deploy", "big.txt").unwrap();
+        assert!(big.truncated);
+        assert!(big.text.ends_with("[... file truncated]"));
+        assert_eq!(
+            big.text.chars().count(),
+            MAX_BODY_CHARS + "\n[... file truncated]".chars().count()
+        );
+        for (f, why) in [
+            ("", "relative"),
+            ("/etc/passwd", "relative"),
+            ("ref\\steps.md", "relative"),
+            ("../../../outside.txt", "hidden"),
+            ("ref/../SKILL.md", "hidden"),
+            (".env", "hidden"),
+            ("ref//steps.md", "empty"),
+            ("ref/deep/x.md", "two levels"),
+            ("SKILL.md", "without file"),
+            ("missing.md", "not found"),
+            ("ref", "not a regular file"),
+            ("bin.dat", "UTF-8"),
+        ] {
+            let err = load_file(&skills, "deploy", f).unwrap_err();
+            assert!(err.contains(why), "{f}: {err}");
+        }
+        assert!(load_file(&skills, "nope", "ref/steps.md")
+            .unwrap_err()
+            .contains("available: deploy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_file_refuses_symlinks() {
+        let ws = dir();
+        let outside = dir();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        skill(&ws, ".rex/skills", "s", &md("s", "d", "x"));
+        let d = ws.join(".rex/skills/s");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), d.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("linkdir")).unwrap();
+        let skills = discover_with(&ws, None, None);
+        for f in ["link.txt", "linkdir/secret.txt"] {
+            let err = load_file(&skills, "s", f).unwrap_err();
+            assert!(err.contains("not a regular file"), "{f}: {err}");
+        }
     }
 }
