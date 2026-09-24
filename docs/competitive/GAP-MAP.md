@@ -987,3 +987,23 @@ is shared it is noted in the module docs.
   dir-only rule's name are reported. Hand mutation: 6/6 killed.
 - Gap left: nested `.gitignore` files and `!` re-includes are not read
   (the matcher then keeps only directory rules, as in search).
+
+## Round 21: `remember` can replace a note
+
+- Competitors: Hermes's memory tool has `replace`: `old_text` finds one
+  entry and the new content replaces the whole entry, after the same
+  content scan as add (`tools/memory_tool_store.py`, `replace`,
+  `_locate`). opencode has no agent-written memory.
+- REX before: fixing an outdated note took a remove and an add, and the
+  fixed note moved to the end (round 19's gap).
+- REX now: `remember` takes `action: "replace"` with `old` (a piece of
+  the note) and `text` (the new note). The note keeps its place. The new
+  text goes through the same secret, instruction, empty and length
+  checks; the total-size check counts the new text instead of the old;
+  a replace that would duplicate another note is refused. Finding the
+  note is shared with remove (case-insensitive, exactly one match).
+- Tests: a replace unit test (in place, the checks, missing and
+  ambiguous matches, duplicate, self-replace, size accounting), wider
+  argument tests, and the three-run test now replaces a note in run 1 and
+  run 2 sees only the new text. Hand mutation: 12/12 killed.
+- Gap left: the instruction check is still a short phrase list.

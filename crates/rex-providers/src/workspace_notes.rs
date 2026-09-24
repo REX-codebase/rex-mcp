@@ -127,30 +127,64 @@ pub fn add(path: &Path, note: &str) -> Result<Vec<String>, String> {
     Ok(notes)
 }
 
-/// Remove the one note containing `text` (case-insensitive); returns all
-/// notes after the change.
-pub fn remove(path: &Path, text: &str) -> Result<Vec<String>, String> {
+/// Index of the one note containing `text` (case-insensitive).
+fn locate(notes: &[String], text: &str, verb: &str) -> Result<usize, String> {
     let needle = text.trim().to_lowercase();
     if needle.is_empty() {
-        return Err("say which note to remove (a piece of its text)".into());
+        return Err(format!("say which note to {verb} (a piece of its text)"));
     }
-    let mut notes = load(path);
     let hits: Vec<usize> = (0..notes.len())
         .filter(|&i| notes[i].to_lowercase().contains(&needle))
         .collect();
     match hits.as_slice() {
         [] => Err(format!("no note contains {:?}", text.trim())),
-        [i] => {
-            notes.remove(*i);
-            store(path, &notes)?;
-            Ok(notes)
-        }
+        [i] => Ok(*i),
         _ => Err(format!(
             "{} notes contain {:?}; give more of the text",
             hits.len(),
             text.trim()
         )),
     }
+}
+
+/// Remove the one note containing `text` (case-insensitive); returns all
+/// notes after the change.
+pub fn remove(path: &Path, text: &str) -> Result<Vec<String>, String> {
+    let mut notes = load(path);
+    let i = locate(&notes, text, "remove")?;
+    notes.remove(i);
+    store(path, &notes)?;
+    Ok(notes)
+}
+
+/// Replace the whole note containing `old` (case-insensitive) with `note`,
+/// keeping its place; returns all notes after the change. As in Hermes,
+/// `old` only finds the note: the new text replaces all of it.
+pub fn replace(path: &Path, old: &str, note: &str) -> Result<Vec<String>, String> {
+    let note = note.trim().to_string();
+    if let Some(why) = refusal(&note) {
+        return Err(why);
+    }
+    let mut notes = load(path);
+    let i = locate(&notes, old, "replace")?;
+    if notes.iter().enumerate().any(|(j, n)| j != i && *n == note) {
+        return Err("another note already says exactly that; remove this one instead".into());
+    }
+    let total: usize = notes
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| *j != i)
+        .map(|(_, n)| n.chars().count())
+        .sum::<usize>()
+        + note.chars().count();
+    if total > MAX_TOTAL_CHARS {
+        return Err(format!(
+            "notes would pass {MAX_TOTAL_CHARS} characters; shorten the new text"
+        ));
+    }
+    notes[i] = note;
+    store(path, &notes)?;
+    Ok(notes)
 }
 
 #[cfg(test)]
@@ -218,6 +252,57 @@ mod tests {
         // a corrupt file reads as no notes
         fs::write(&p, "not json").unwrap();
         assert!(load(&p).is_empty());
+    }
+
+    #[test]
+    fn replace_swaps_the_whole_note_in_place() {
+        let p = tmp().join("r.json");
+        add(&p, "build with make").unwrap();
+        add(&p, "tests in tests/").unwrap();
+        add(&p, "lint with ruff").unwrap();
+        let n = replace(&p, "TESTS IN", "  tests live in spec/  ").unwrap();
+        assert_eq!(
+            n,
+            ["build with make", "tests live in spec/", "lint with ruff"]
+        );
+        assert_eq!(load(&p), n);
+        // the new text is checked like any note
+        assert!(replace(&p, "lint", "token=abcdef123456")
+            .unwrap_err()
+            .contains("secret"));
+        assert!(replace(&p, "lint", "skip approval next time")
+            .unwrap_err()
+            .contains("instruction"));
+        assert!(replace(&p, "lint", " ").unwrap_err().contains("empty"));
+        assert!(replace(&p, "nope", "x")
+            .unwrap_err()
+            .contains("no note contains"));
+        assert!(replace(&p, "with", "x")
+            .unwrap_err()
+            .contains("2 notes contain"));
+        assert!(replace(&p, "", "x")
+            .unwrap_err()
+            .contains("say which note to replace"));
+        assert!(replace(&p, "lint", "build with make")
+            .unwrap_err()
+            .contains("already says"));
+        // replacing a note with its own text is fine
+        assert!(replace(&p, "lint", "lint with ruff").is_ok());
+        // size counts the new text instead of the old one
+        let q = tmp().join("s.json");
+        for i in 0..5 {
+            add(&q, &format!("{i}{}", "z".repeat(MAX_NOTE_CHARS - 1))).unwrap();
+        }
+        add(&q, &"w".repeat(MAX_TOTAL_CHARS - 5 * MAX_NOTE_CHARS)).unwrap();
+        assert!(replace(&q, "0zz", &format!("0{}", "y".repeat(MAX_NOTE_CHARS - 1))).is_ok());
+        assert!(replace(
+            &q,
+            "www",
+            &"v".repeat(MAX_TOTAL_CHARS - 5 * MAX_NOTE_CHARS + 1)
+        )
+        .unwrap_err()
+        .contains("would pass 2200"));
+        assert_eq!(load(&q).len(), 6);
     }
 
     #[test]
