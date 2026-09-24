@@ -737,5 +737,5 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 /* Narrow windows (Tauri minWidth is 360): brand on its own row, then the
    tab strip full width; the strip scrolls sideways instead of pushing the
    Fast and Ultra controls off screen. */
-@media(max-width:560px){.top-shell{flex-wrap:wrap;row-gap:12px}.top-actions{flex-shrink:1;min-width:0;width:100%;flex-wrap:nowrap!important;justify-content:space-between}.view-tabs{min-width:0;overflow-x:auto;scrollbar-width:none}.view-tabs::-webkit-scrollbar{display:none}.brand-name{display:inline!important}.fast-control,.ultra-control{flex-shrink:0}}
+@media(max-width:560px){.top-shell{flex-wrap:wrap;row-gap:12px}.top-actions{flex-shrink:1;min-width:0;width:100%;flex-wrap:nowrap!important;justify-content:space-between}.view-tabs{position:relative;min-width:0;overflow-x:auto;scrollbar-width:none}.view-tabs::-webkit-scrollbar{display:none}.brand-name{display:inline!important}.fast-control,.ultra-control{flex-shrink:0}}
 @media(max-width:520px){.task-controls{flex-wrap:wrap;row-gap:10px;padding-top:10px;padding-bottom:10px}.task-controls>:first-child{flex-basis:100%}.task-controls>:last-child{margin-left:auto}}

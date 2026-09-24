@@ -1,6 +1,17 @@
+import { useEffect, useRef } from "react";
 import rexLogo from "../assets/rex-logo.svg";
 
 export function TopBar({ view, onView, ultra, onUltra, fast, onFast }: { view: "task" | "settings" | "terminal" | "editor" | "git"; onView: (v: "task" | "settings" | "terminal" | "editor" | "git") => void; ultra: boolean; onUltra: () => void; fast: boolean; onFast: () => void }) {
+  const tabsRef = useRef<HTMLElement>(null);
+  // In a narrow window the tab strip scrolls; keep the current tab visible
+  // when the view changes from a shortcut or a link, not just a click.
+  // Only the strip scrolls sideways; the page itself never moves.
+  useEffect(() => {
+    const nav = tabsRef.current;
+    const current = nav?.querySelector<HTMLElement>(".is-current");
+    if (!nav || !current || nav.scrollWidth <= nav.clientWidth) return;
+    nav.scrollLeft = tabScrollLeft(nav.scrollLeft, nav.clientWidth, current.offsetLeft, current.offsetWidth);
+  }, [view]);
   return (
     <header className="top-shell mx-auto flex w-full max-w-[820px] items-center justify-between px-5 py-5 sm:px-8 sm:py-7">
       <div className="brand-lockup flex min-w-0 items-center gap-3">
@@ -8,7 +19,7 @@ export function TopBar({ view, onView, ultra, onUltra, fast, onFast }: { view: "
         <span className="brand-name truncate text-sm font-medium tracking-[-0.01em] text-text">Harness</span>
       </div>
       <div className="top-actions flex shrink-0 items-center gap-2 sm:gap-4">
-        <nav className="view-tabs" aria-label="View">
+        <nav ref={tabsRef} className="view-tabs" aria-label="View">
           <button type="button" aria-current={view === "task" ? "page" : undefined} className={view === "task" ? "is-current" : ""} onClick={() => onView("task")}>Task</button>
           <button type="button" aria-current={view === "terminal" ? "page" : undefined} className={view === "terminal" ? "is-current" : ""} onClick={() => onView("terminal")}>Terminal</button>
           <button type="button" aria-current={view === "editor" ? "page" : undefined} className={view === "editor" ? "is-current" : ""} onClick={() => onView("editor")}>Editor</button>
@@ -27,6 +38,13 @@ export function TopBar({ view, onView, ultra, onUltra, fast, onFast }: { view: "
       </div>
     </header>
   );
+}
+
+// Smallest horizontal scroll that shows the whole tab, with a little room.
+export function tabScrollLeft(scrollLeft: number, width: number, tabLeft: number, tabWidth: number, pad = 8): number {
+  if (tabLeft - pad < scrollLeft) return Math.max(0, tabLeft - pad);
+  if (tabLeft + tabWidth + pad > scrollLeft + width) return tabLeft + tabWidth + pad - width;
+  return scrollLeft;
 }
 
 // Transport x provenance: `live` only means a backend transport (Tauri or
