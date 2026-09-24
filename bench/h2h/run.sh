@@ -1,8 +1,8 @@
 #!/bin/sh
 # run.sh TOOL TASK OUTDIR: one attempt of one tool on one task in a fresh copy
 # of tasks/TASK/repo. The Gemini key must already be in the environment
-# (GEMINI_API_KEY for Hermes, GOOGLE_GENERATIVE_AI_API_KEY for opencode) or
-# REX's 0600 store; this script never reads or prints it.
+# (GEMINI_API_KEY for Hermes, GOOGLE_GENERATIVE_AI_API_KEY for opencode,
+# REX_GEMINI_API_KEY or the 0600 store for REX); this script never reads or prints it.
 # Writes OUTDIR/TOOL-TASK.json with pass/fail, exit code and wall seconds.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -22,8 +22,13 @@ case $tool in
     (cd "$work" && timeout "$limit" hermes chat --provider gemini --model "$model" \
       --oneshot --yolo -q "$prompt") >"$log" 2>&1 ;;
   rex)
-    (cd "$work" && timeout "$limit" rex-agent --provider gemini --model "$model" \
-      --workspace "$work" --auto-approve-in-workspace "$prompt") >"$log" 2>&1 ;;
+    # rex exec works on a copy; the receipt's "workspace" is where it wrote
+    timeout "$limit" rex exec --json --yes --provider gemini --model "$model" \
+      --workspace "$work" --task "$prompt" >"$out/$tool-$task.receipt.json" 2>"$log"
+    code=$?
+    copy=$(jq -r '.workspace // empty' "$out/$tool-$task.receipt.json" 2>/dev/null)
+    [ -n "$copy" ] && work=$copy
+    (exit $code) ;;
   *) echo "unknown tool $tool" >&2; exit 2 ;;
 esac
 code=$?

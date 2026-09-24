@@ -31,5 +31,5 @@ and exits, and `--yolo` skips its approval prompts
 permission prompts is to be confirmed at run time.
 
 Status: the run is waiting on the owner's approval of where and how the key
-is used. `run.sh` names each tool's headless entry point; the REX line
-(`rex-agent`) is a placeholder until a headless REX agent binary exists.
+is used. `run.sh` uses each tool's headless entry point: `opencode run`,
+`hermes chat -q --oneshot`, and `rex exec --json --yes` (crates/rex-cli).
