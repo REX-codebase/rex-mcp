@@ -413,15 +413,16 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 }
 .agent-cancel {
   margin-left: auto;
-  border: 1px solid rgba(0, 0, 0, 0.14);
+  /* theme tokens, not black alphas: rgba(0,0,0,.14) vanished on the dark canvas */
+  border: 1px solid color-mix(in srgb, var(--color-muted, #aaa3b2) 45%, transparent);
   background: transparent;
-  color: inherit;
+  color: var(--color-text, #f0edf3);
   border-radius: 999px;
   padding: 4px 14px;
   font-size: 12px;
   cursor: pointer;
 }
-.agent-cancel:hover { border-color: rgba(0, 0, 0, 0.32); }
+.agent-cancel:hover { border-color: var(--color-text, #f0edf3); }
 .agent-cancel:disabled { opacity: 0.5; cursor: default; }
 .plan-toggle{display:inline-flex;align-items:center;gap:7px;font-size:11px;color:var(--color-muted);cursor:pointer;user-select:none}
 .plan-toggle input{accent-color:#6aa8ff;width:13px;height:13px;cursor:pointer}
@@ -438,12 +439,12 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
   list-style: none;
   margin: 12px 0;
   padding: 12px 14px;
-  border: 1px solid rgba(0, 0, 0, 0.09);
+  border: 1px solid var(--color-line, #28232e);
   border-radius: 14px;
   display: flex;
   flex-direction: column;
   gap: 7px;
-  background: rgba(0, 0, 0, 0.015);
+  background: color-mix(in srgb, var(--color-surface, #121015) 70%, transparent);
 }
 .agent-plan-item {
   display: flex;
