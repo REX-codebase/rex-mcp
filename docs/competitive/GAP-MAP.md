@@ -37,10 +37,11 @@ is shared it is noted in the module docs.
 - Sub-agent delegation: opencode `src/tool/task.ts`; Hermes
   `tools/delegate_tool.py`. REX (round 2): `explore` tool starts a read-only
   explorer sub-agent (read/search/glob only, no recursion, inside the parent's
-  remaining budgets, honours cancel) and returns one report. Gap left: no
-  writing/parallel sub-agents: opencode picks agent types (`task.ts:46,131`);
-  Hermes gives children the parent toolsets and a batch/parallel mode
-  (`delegate_tool.py:6-8`).
+  remaining budgets, honours cancel) and returns one report. opencode picks
+  agent types (`task.ts:46,131`); Hermes gives children the parent toolsets
+  and a batch/parallel mode (`delegate_tool.py:6-8`). Parallel explorers
+  shipped in round 4, research children in round 6, writing (edit)
+  children in round 8 and parallel edit children in round 9 (see below).
 - Context compaction of old turns: opencode `session/compaction.ts`; Hermes
   `agent/context_compressor.py`. Behaviour compared (round 2): both keep a
   transcript and, near overflow, clear old tool output (opencode protects
@@ -92,9 +93,9 @@ is shared it is noted in the module docs.
   decoding before commit. Fixed alongside: flat-text extraction pushed each
   UTF-8 byte as its own character ("Ã©" for "é") in every search result.
   Gap left: no raw `html` format (not offered, to keep pages small).
-- Found while wiring this: `web_search` in the autonomous loop sends
-  `seeds: []`, so with the built-in keyless REX provider it has no seeds to
-  crawl. Not changed yet.
+- Found while wiring this: `web_search` in the autonomous loop sent
+  `seeds: []`, so the keyless REX provider had nothing to crawl. Fixed in
+  round 4 (seeds from `sites` and real domains in the query; see below).
 - Checkpoint/undo. Hermes snapshots into a shadow git store before
   mutating calls (`tools/checkpoint_manager.py:1-9`); opencode keeps git
   snapshots with `restore`/`revert` (`src/snapshot/index.ts:36-42`). REX
