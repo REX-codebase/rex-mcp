@@ -384,7 +384,12 @@ pub(super) fn run_explore<T: Transport>(
                     "web_search is not available to the explorer".into(),
                     false,
                 ),
-                AgentCall::WebFetch { id, url, offset } => {
+                AgentCall::WebFetch {
+                    id,
+                    url,
+                    offset,
+                    text,
+                } => {
                     let args = json!({"url": url, "offset": offset});
                     if limits.kind != ExplorerKind::Research {
                         let c = "web_fetch is not available to the explorer; start a research child for web pages".to_string();
@@ -398,7 +403,7 @@ pub(super) fn run_explore<T: Transport>(
                         let (ok, text) = match super::fetch::vet_url(&url) {
                             Err(reason) => (false, format!("refused: {reason}")),
                             Ok(parsed) => {
-                                super::fetch::render(&super::fetch::fetch(&parsed), offset)
+                                super::fetch::render(&super::fetch::fetch(&parsed, text), offset)
                             }
                         };
                         if ok && !out.urls_fetched.contains(&url) && out.urls_fetched.len() < 32 {

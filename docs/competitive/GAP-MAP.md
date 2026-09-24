@@ -81,7 +81,17 @@ is shared it is noted in the module docs.
   query over 256 chars, encoded-looking runs over 64 chars, embedded
   credentials. Long pages are paged by char offset. Live smoke test
   (ignored test `live_fetch_example_dot_com`) fetched example.com.
-  Gap left: no markdown/html output format.
+  Round 7: HTML comes back as Markdown by default (REX's own converter in
+  `crates/rex-search/src/markdown.rs`: headings, paragraphs, nested lists,
+  absolute links, code blocks, inline code, table rows; scripts, styles,
+  head, SVG dropped; `javascript:`/`data:` links keep only their text);
+  `format: "text"` gives flat text. opencode defaults to markdown too
+  (`tool/webfetch.ts:15-17`). Live smoke test fetched the Rust Book
+  closures chapter with headings, code blocks and absolute links. A
+  generated hostile-input test caught a UTF-8 slicing panic in entity
+  decoding before commit. Fixed alongside: flat-text extraction pushed each
+  UTF-8 byte as its own character ("Ã©" for "é") in every search result.
+  Gap left: no raw `html` format (not offered, to keep pages small).
 - Found while wiring this: `web_search` in the autonomous loop sends
   `seeds: []`, so with the built-in keyless REX provider it has no seeds to
   crawl. Not changed yet.

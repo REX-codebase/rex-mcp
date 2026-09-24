@@ -53,9 +53,11 @@ pub(super) fn vet_url(raw: &str) -> Result<url::Url, String> {
 }
 
 /// Fetch through REX-search: one page, no link following or discovery.
-pub(super) fn fetch(url: &url::Url) -> SearchResponse {
+/// HTML comes back as Markdown unless `text` asks for flat text.
+pub(super) fn fetch(url: &url::Url, text: bool) -> SearchResponse {
     let engine = SearchEngine::new(SearchConfig {
         max_content_chars: 60_000,
+        markdown: !text,
         ..SearchConfig::default()
     });
     engine.search(SearchRequest {
@@ -168,7 +170,7 @@ mod tests {
     #[test]
     fn private_destinations_are_refused_without_network() {
         let url = vet_url("http://127.0.0.1:9/secret").unwrap();
-        let r = fetch(&url);
+        let r = fetch(&url, false);
         let (ok, text) = render(&r, 0);
         assert!(!ok);
         assert!(text.contains("unsafe_address"), "{text}");
@@ -190,12 +192,30 @@ mod tests {
         assert!(!ok && text.contains("robots_denied"));
     }
 
+    /// Live smoke test (network): a real docs page comes back as Markdown.
+    #[test]
+    #[ignore]
+    fn live_fetch_docs_page_as_markdown() {
+        let url = vet_url("https://doc.rust-lang.org/book/ch13-01-closures.html").unwrap();
+        let (ok, text) = render(&fetch(&url, false), 0);
+        assert!(ok, "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let md = v["content"].as_str().unwrap();
+        eprintln!("{}", &md[..md.floor_char_boundary(1500)]);
+        assert!(md.contains("\n## "), "no headings");
+        assert!(md.contains("```"), "no code block");
+        assert!(
+            md.contains("](https://doc.rust-lang.org/"),
+            "no absolute links"
+        );
+    }
+
     /// Live smoke test (network): `cargo test -p rex-providers live_fetch -- --ignored`.
     #[test]
     #[ignore]
     fn live_fetch_example_dot_com() {
         let url = vet_url("https://example.com/").unwrap();
-        let (ok, text) = render(&fetch(&url), 0);
+        let (ok, text) = render(&fetch(&url, false), 0);
         eprintln!("{}", &text[..text.len().min(600)]);
         assert!(ok, "{text}");
         assert!(text.contains("Example Domain"));

@@ -503,6 +503,8 @@ enum AgentCall {
         id: String,
         url: String,
         offset: usize,
+        /// Flat text instead of the default Markdown (`format: "text"`).
+        text: bool,
     },
     /// Hand a focused read-only question to an explorer sub-agent.
     /// One task, or up to `explore::EXPLORE_MAX_PARALLEL` run concurrently.
@@ -2147,7 +2149,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"glob_files","description":"Find workspace files by glob pattern (e.g. **/*.rs), newest first. Skips build output and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"pattern":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["pattern"]}},
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
-        {"name":"web_fetch","description":"Read one public web page (http/https) as plain text, e.g. docs or an issue you already have the URL for. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"}},"required":["url"]}},
+        {"name":"web_fetch","description":"Read one public web page (http/https), e.g. docs or an issue you already have the URL for. HTML comes back as Markdown (headings, lists, absolute links, code blocks); format=text gives flat text. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"},"format":{"type":"STRING","enum":["markdown","text"],"description":"markdown (default) or text"}},"required":["url"]}},
         {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"},"kind":{"type":"STRING","enum":["explore","research"],"description":"explore (default): workspace only. research: workspace plus web_fetch of public pages, for questions that need docs or issue pages"}}}},
         {"name":"ask_user","description":"Ask the user when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Pass one question, or up to 3 related questions at once in `questions` so the user answers them together. Give up to 4 short choices per question, best first; the user may also answer freely. At most 3 questions per run. Anything declined or unanswered in time means proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}},"questions":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}}}}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
@@ -2455,6 +2457,7 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                         id,
                         url: url.into(),
                         offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
+                        text: args.get("format").and_then(Value::as_str) == Some("text"),
                     },
                     raw,
                 )),
@@ -2585,6 +2588,7 @@ fn decode_named_call(
                     id,
                     url: url.into(),
                     offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    text: args.get("format").and_then(Value::as_str) == Some("text"),
                 },
                 Some(raw),
             ),
@@ -3003,7 +3007,12 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 );
                 response_parts.push(function_response(protocol, "ask_user", &id, ok, &content));
             }
-            AgentCall::WebFetch { id, url, offset } => {
+            AgentCall::WebFetch {
+                id,
+                url,
+                offset,
+                text,
+            } => {
                 let allowed = ctx
                     .brief
                     .allowed_tools
@@ -3018,7 +3027,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     match fetch::vet_url(&url) {
                         Err(reason) => (false, format!("refused: {reason}")),
                         Ok(parsed) => {
-                            let resp = fetch::fetch(&parsed);
+                            let resp = fetch::fetch(&parsed, text);
                             fetch::render(&resp, offset)
                         }
                     }
@@ -3046,7 +3055,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 push_model_part(
                     &mut model_parts,
                     raw,
-                    json!({"functionCall":{"name":"web_fetch","args":{"url": url, "offset": offset}}}),
+                    json!({"functionCall":{"name":"web_fetch","args":{"url": url, "offset": offset, "format": if text { "text" } else { "markdown" }}}}),
                 );
                 response_parts.push(function_response(protocol, "web_fetch", &id, ok, &content));
             }
