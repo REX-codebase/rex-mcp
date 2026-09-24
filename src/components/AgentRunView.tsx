@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ToolApproval, ToolReceiptCard } from "./ToolApproval";
 import {
   agentAnswer,
+  agentAnswerMany,
   agentCapture,
   agentPreviewAction,
   agentUndo,
@@ -98,6 +99,7 @@ export function AgentRunView({
   const runId = run.id;
   const previewLive = run.preview != null;
   const [answerText, setAnswerText] = useState("");
+  const [batchAnswers, setBatchAnswers] = useState<string[]>([]);
   const [answering, setAnswering] = useState(false);
   const [answerError, setAnswerError] = useState<string | null>(null);
   const [undoing, setUndoing] = useState(false);
@@ -107,6 +109,7 @@ export function AgentRunView({
   useEffect(() => {
     // a new question starts with an empty box
     setAnswerText("");
+    setBatchAnswers([]);
     setAnswerError(null);
   }, [questionId]);
 
@@ -124,6 +127,23 @@ export function AgentRunView({
     },
     [runId]
   );
+
+  const sendBatch = useCallback(
+    async (answers: (string | null)[]) => {
+      setAnswering(true);
+      setAnswerError(null);
+      try {
+        await agentAnswerMany(runId, answers);
+      } catch (err) {
+        setAnswerError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setAnswering(false);
+      }
+    },
+    [runId]
+  );
+  const batch = run.pending_question?.batch ?? [];
+  const showBatchForm = batch.length > 1 && (run.pending_question?.batch_index ?? 1) === 1;
 
   const undoLast = useCallback(async () => {
     setUndoing(true);
@@ -266,7 +286,59 @@ export function AgentRunView({
         </section>
       )}
 
-      {phase === "question" && run.pending_question && (
+      {phase === "question" && run.pending_question && showBatchForm && (
+        <section className="plan-approval question-panel" role="alertdialog" aria-labelledby="batch-title">
+          <div className="tool-approval-head">
+            <span className="approval-shield" aria-hidden="true">?</span>
+            <div>
+              <p className="eyebrow">REX is asking</p>
+              <h3 id="batch-title">{batch.length} questions</h3>
+            </div>
+          </div>
+          {batch.map((q, i) => (
+            <div key={i} className="question-batch-item">
+              <p className="question-batch-text">{`${i + 1}. ${q.question}`}</p>
+              {q.choices.length > 0 && (
+                <div className="question-choices">
+                  {q.choices.map((choice) => (
+                    <button
+                      key={choice}
+                      type="button"
+                      aria-pressed={batchAnswers[i] === choice}
+                      disabled={answering}
+                      onClick={() => setBatchAnswers((prev) => { const next = [...prev]; next[i] = choice; return next; })}
+                    >
+                      {choice}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <textarea
+                className="question-input"
+                aria-label={`Answer ${i + 1}`}
+                value={batchAnswers[i] ?? ""}
+                maxLength={2000}
+                onChange={(e) => { const v = e.target.value; setBatchAnswers((prev) => { const next = [...prev]; next[i] = v; return next; }); }}
+                placeholder="Pick a choice, type an answer, or leave blank to let REX decide"
+              />
+            </div>
+          ))}
+          {answerError && <p className="approval-note">{answerError}</p>}
+          <div className="approval-actions">
+            <button type="button" disabled={answering} onClick={() => void sendBatch(batch.map(() => null))} className="approval-deny">Let REX decide all</button>
+            <button
+              type="button"
+              disabled={answering || !batch.some((_, i) => (batchAnswers[i] ?? "").trim())}
+              onClick={() => void sendBatch(batch.map((_, i) => ((batchAnswers[i] ?? "").trim() ? batchAnswers[i] : null)))}
+              className="approval-allow"
+            >
+              {answering ? "Sending…" : "Send answers"}
+            </button>
+          </div>
+        </section>
+      )}
+
+      {phase === "question" && run.pending_question && !showBatchForm && (
         <section className="plan-approval question-panel" role="alertdialog" aria-labelledby="question-title">
           <div className="tool-approval-head">
             <span className="approval-shield" aria-hidden="true">?</span>

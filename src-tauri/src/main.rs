@@ -1262,13 +1262,18 @@ fn agent_undo(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<serde_json
 }
 
 /// Answer (or, with `None`, decline) the run's open ask_user question.
+/// `answers` answers the open question and the rest of its batch at once.
 #[tauri::command]
 fn agent_answer(
     agent: State<'_, Arc<Agent>>,
     run_id: String,
     answer: Option<String>,
+    answers: Option<Vec<Option<String>>>,
 ) -> Result<AgentSnapshot, String> {
-    agent.answer(&run_id, answer.as_deref())
+    match answers {
+        Some(list) => agent.answer_many(&run_id, &list),
+        None => agent.answer(&run_id, answer.as_deref()),
+    }
 }
 
 #[tauri::command]

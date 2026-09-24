@@ -2,10 +2,14 @@
 import { fireEvent, render, screen, waitFor, cleanup } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi, afterEach } from "vitest";
 
-const calls = vi.hoisted(() => ({ answer: [] as unknown[][], undo: [] as unknown[][] }));
+const calls = vi.hoisted(() => ({ answer: [] as unknown[][], many: [] as unknown[][], undo: [] as unknown[][] }));
 vi.mock("../data/agentRun", () => ({
   agentAnswer: (...args: unknown[]) => {
     calls.answer.push(args);
+    return Promise.resolve({});
+  },
+  agentAnswerMany: (...args: unknown[]) => {
+    calls.many.push(args);
     return Promise.resolve({});
   },
   agentUndo: (...args: unknown[]) => {
@@ -51,7 +55,39 @@ describe("AgentRunView ask_user and undo", () => {
   afterEach(cleanup);
   beforeEach(() => {
     calls.answer.length = 0;
+    calls.many.length = 0;
     calls.undo.length = 0;
+  });
+
+  it("shows a whole batch on one form and sends every answer together", async () => {
+    const batch = [
+      { question: "Which database?", choices: ["Postgres", "SQLite"] },
+      { question: "Which port?", choices: [] },
+      { question: "Auth?", choices: ["none", "token"] },
+    ];
+    render(
+      <AgentRunView
+        run={snap({
+          status: "awaiting_answer",
+          pending_question: { call_id: "c#1", question: batch[0].question, choices: batch[0].choices, batch_index: 1, batch_total: 3, batch },
+        })}
+        deciding={false}
+        cancelling={false}
+        onDecide={noop}
+        onCancel={noop}
+      />
+    );
+    expect(screen.getByRole("heading", { name: "3 questions" })).toBeTruthy();
+    const send = screen.getByRole("button", { name: "Send answers" }) as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "SQLite" }));
+    fireEvent.change(screen.getByLabelText("Answer 2"), { target: { value: "8080" } });
+    expect((screen.getByLabelText("Answer 1") as HTMLTextAreaElement).value).toBe("SQLite");
+    fireEvent.click(send);
+    await waitFor(() => expect(calls.many).toEqual([["run-1", ["SQLite", "8080", null]]]));
+    fireEvent.click(screen.getByRole("button", { name: "Let REX decide all" }));
+    await waitFor(() => expect(calls.many[1]).toEqual(["run-1", [null, null, null]]));
+    expect(calls.answer).toEqual([]);
   });
 
   it("labels a question that is part of a batch", () => {

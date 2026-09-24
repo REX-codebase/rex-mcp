@@ -131,8 +131,15 @@ is shared it is noted in the module docs.
   text, "Let REX decide"). Round 6: `ask_user` takes `questions` (up to 3
   in one call) and returns every answer in one response with a status
   each (answered / declined / timeout / not_asked past the 3-per-run cap).
-- Gap left: the UI shows batched questions one after another ("question
-  2 of 3"), not on one form as opencode's question tool does.
+- Round 7: batched questions show on one form (choices fill each answer,
+  blanks mean "let REX decide", one "Send answers"). The snapshot carries
+  the whole `batch`; `answer_many` answers the open question and queues
+  the rest, which resolve without parking again; the queue is cleared when
+  the call ends so answers never leak into a later ask_user. Exposed on the
+  `agent_answer` Tauri command (`answers`) and the sidecar `/answer` route.
+  Caveat: the Tauri crate cannot be compiled on this build box (no GTK),
+  so that 4-line change is checked by review only; the sidecar route and
+  service are compiled and tested.
 
 ## Round 4: web_search with the keyless engine
 

@@ -103,6 +103,8 @@ export interface PendingQuestion {
   /** 1-based position when REX asked several questions in one call. */
   batch_index?: number;
   batch_total?: number;
+  /** Every question of a batched call, for the one-form view. */
+  batch?: { question: string; choices: string[] }[];
 }
 
 export type AgentPhase = "working" | "approval" | "plan" | "question" | "verifying" | "completed" | "stopped";

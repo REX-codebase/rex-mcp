@@ -391,6 +391,10 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .question-choices{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
 .question-choices button{border:1px solid var(--color-line);border-radius:999px;padding:6px 14px;background:var(--color-surface);cursor:pointer}
 .question-input{width:100%;min-height:64px;margin:8px 0;border:1px solid var(--color-line);border-radius:10px;padding:8px;font:inherit;background:var(--color-surface);color:inherit}
+.question-batch-item{margin-top:14px;padding-top:12px;border-top:1px solid var(--color-line)}
+.question-batch-item:first-of-type{border-top:0;padding-top:0}
+.question-batch-text{margin:0;font-weight:600}
+.question-choices button[aria-pressed="true"]{border-color:var(--color-accent);color:var(--color-accent);background:color-mix(in srgb,var(--color-accent) 12%,var(--color-surface))}
 .agent-undo{display:flex;align-items:center;gap:12px;margin:12px 0}
 .agent-undo button{border:1px solid var(--color-line);border-radius:10px;padding:6px 12px;font-size:13px;background:var(--color-surface);cursor:pointer}
 .agent-undo-note{font-size:.9em;opacity:.8}

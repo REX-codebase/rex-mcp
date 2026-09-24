@@ -493,8 +493,21 @@ fn route(
             // missing field or blank text declines it.
             let parsed: serde_json::Value =
                 serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            // {"answers": ["a", null, "c"]} answers a whole ask_user batch.
             let text = parsed.get("answer").and_then(|a| a.as_str());
-            match agent.answer(id, text) {
+            let many: Option<Vec<Option<String>>> = parsed
+                .get("answers")
+                .and_then(|a| a.as_array())
+                .map(|list| {
+                    list.iter()
+                        .map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                });
+            let result = match many {
+                Some(list) => agent.answer_many(id, &list),
+                None => agent.answer(id, text),
+            };
+            match result {
                 Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
                 Err(detail) => json_response(
                     200,

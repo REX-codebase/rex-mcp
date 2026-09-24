@@ -73,6 +73,9 @@ export const agentResume = (runId: string) =>
   call<AgentSnapshot>("agent_resume", `/runs/${runId}/resume`, { runId });
 export const agentAnswer = (runId: string, answer: string | null) =>
   call<AgentSnapshot>("agent_answer", `/runs/${runId}/answer`, { runId, answer });
+/** Answer every question of an ask_user batch at once (null declines one). */
+export const agentAnswerMany = (runId: string, answers: (string | null)[]) =>
+  call<AgentSnapshot>("agent_answer", `/runs/${runId}/answer`, { runId, answer: null, answers });
 export const agentUndo = (runId: string) =>
   call<{ ok: boolean; call_id: string; tool: string; files: string[] }>("agent_undo", `/runs/${runId}/undo`, { runId });
 export const agentPreviewAction = (runId: string, action: PreviewPointerAction) =>

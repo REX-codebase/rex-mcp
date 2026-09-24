@@ -264,6 +264,17 @@ pub struct PendingQuestion {
     /// Number of questions in that call; `None` for a single question.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_total: Option<usize>,
+    /// Every question of a batched call, so the UI can show them on one
+    /// form and answer them together with `answer_many`. Empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub batch: Vec<BatchQuestion>,
+}
+
+/// One question of a batched `ask_user` call.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BatchQuestion {
+    pub question: String,
+    pub choices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -437,6 +448,9 @@ struct RunShared {
     pending_question: Option<PendingQuestion>,
     /// Trusted UI reply to `pending_question`: `Some(None)` = declined.
     answer: Option<Option<String>>,
+    /// Replies for the later questions of the current batch, given
+    /// together through `answer_many`. Cleared when the batch ends.
+    queued_answers: VecDeque<Option<String>>,
     step: usize,
     tool_calls: usize,
     tokens_used: u64,
@@ -914,6 +928,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 decision: None,
                 pending_question: None,
                 answer: None,
+                queued_answers: VecDeque::new(),
                 step: 0,
                 tool_calls: 0,
                 tokens_used: 0,
@@ -1046,6 +1061,54 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         Ok(self.snapshot_of(run_id, handle))
     }
 
+    /// Answer the open question and the rest of its batch in one go (the
+    /// batch form). `answers[0]` answers the open question; later entries
+    /// are used, in order, for the batch's remaining questions. Extra
+    /// entries past the batch are ignored. `None` or blank declines one.
+    pub fn answer_many(
+        &self,
+        run_id: &str,
+        answers: &[Option<String>],
+    ) -> Result<AgentSnapshot, String> {
+        let Some((first, rest)) = answers.split_first() else {
+            return Err("no answers given".into());
+        };
+        let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+        let handle = runs.get(run_id).ok_or("unknown run")?;
+        {
+            let mut state = handle.shared.lock().map_err(|_| "run state poisoned")?;
+            let Some(q) = state.pending_question.clone() else {
+                return Err("run is not waiting for an answer".into());
+            };
+            if state.status != AgentStatus::AwaitingAnswer {
+                return Err("run is not waiting for an answer".into());
+            }
+            let clean = |a: &Option<String>| {
+                a.as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.chars().take(ANSWER_CHARS).collect::<String>())
+            };
+            let left = q
+                .batch_total
+                .zip(q.batch_index)
+                .map_or(0, |(t, i)| t.saturating_sub(i));
+            state.queued_answers = rest.iter().take(left).map(clean).collect();
+            let reply = clean(first);
+            let answered = reply.is_some();
+            state.answer = Some(reply);
+            push_locked(
+                &mut state,
+                AgentEvent::QuestionResolved {
+                    call_id: q.call_id,
+                    answered,
+                },
+            );
+        }
+        handle.cond.notify_all();
+        Ok(self.snapshot_of(run_id, handle))
+    }
+
     pub fn cancel(&self, run_id: &str) -> Result<AgentSnapshot, String> {
         let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
         let handle = runs.get(run_id).ok_or("unknown run")?;
@@ -1172,6 +1235,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 decision: None,
                 pending_question: None,
                 answer: None,
+                queued_answers: VecDeque::new(),
                 step: checkpoint.step,
                 tool_calls: checkpoint.tool_calls,
                 tokens_used: checkpoint.tokens_used,
@@ -2941,6 +3005,17 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                             choices: choices.clone(),
                             batch_index: (!single).then_some(n + 1),
                             batch_total: (!single).then_some(questions.len()),
+                            batch: if single {
+                                Vec::new()
+                            } else {
+                                questions
+                                    .iter()
+                                    .map(|(q, c)| BatchQuestion {
+                                        question: q.clone(),
+                                        choices: c.clone(),
+                                    })
+                                    .collect()
+                            },
                         };
                         // Parked runs are resumable: persist before blocking.
                         let _ = write_json(&ctx.state_dir.join("checkpoint.json"), &*cp);
@@ -2957,6 +3032,9 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                             json!({"question": question, "status": status, "answer": answer}),
                         );
                     }
+                }
+                if let Ok(mut st) = ctx.handle.shared.lock() {
+                    st.queued_answers.clear();
                 }
                 let content = match single_content {
                     Some(c) => c,
@@ -3667,6 +3745,26 @@ fn wait_for_answer<S: SecretStore + 'static, T: Transport + 'static>(
             Ok(s) => s,
             Err(_) => return UserAnswer::Cancelled,
         };
+        if let Some(queued) = s.queued_answers.pop_front() {
+            // answered ahead of time on the batch form: no parking
+            push_locked(
+                &mut s,
+                AgentEvent::QuestionAsked {
+                    question: question.clone(),
+                },
+            );
+            push_locked(
+                &mut s,
+                AgentEvent::QuestionResolved {
+                    call_id: question.call_id.clone(),
+                    answered: queued.is_some(),
+                },
+            );
+            return match queued {
+                Some(text) => UserAnswer::Text(text),
+                None => UserAnswer::Declined,
+            };
+        }
         s.status = AgentStatus::AwaitingAnswer;
         s.pending_question = Some(question.clone());
         s.answer = None;
@@ -5606,6 +5704,61 @@ mod tests {
         assert!(posts[1].contains("port?"), "{}", posts[1]);
         assert!(posts[2].contains("not_asked"), "{}", posts[2]);
         assert!(posts[2].contains("cache?"), "{}", posts[2]);
+    }
+
+    #[test]
+    fn answer_many_answers_a_whole_batch_without_parking_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = json!({"functionCall":{"name":"ask_user","args":{"questions":[
+            {"question":"db?","choices":["pg"]},{"question":"port?"},{"question":"auth?"}]}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("batch form", "gemini", Some(budgets())).unwrap();
+        assert!(svc.answer_many(&snap.id, &[Some("x".into())]).is_err());
+        let t0 = Instant::now();
+        let parked = loop {
+            let s = svc.snapshot(&snap.id).unwrap();
+            if s.status == AgentStatus::AwaitingAnswer {
+                break s;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(30), "never asked");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let q = parked.pending_question.unwrap();
+        assert_eq!(q.batch.len(), 3);
+        assert_eq!(q.batch[0].choices, ["pg"]);
+        assert!(svc.answer_many(&snap.id, &[]).is_err());
+        // one extra entry past the batch is ignored
+        svc.answer_many(
+            &snap.id,
+            &[
+                Some("pg".into()),
+                Some("  ".into()),
+                Some("token".into()),
+                Some("extra".into()),
+            ],
+        )
+        .unwrap();
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(done.terminal_reason.is_some());
+        let parks = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::QuestionAsked { .. }))
+            .count();
+        assert_eq!(parks, 3);
+        let posts = svc.service().transport().seen();
+        let reply = &posts[1];
+        assert!(reply.contains(r#"\"answer\":\"pg\""#), "{reply}");
+        assert!(reply.contains(r#"\"status\":\"declined\""#), "{reply}");
+        assert!(reply.contains(r#"\"answer\":\"token\""#), "{reply}");
+        assert!(!reply.contains("extra"), "{reply}");
+        assert!(!reply.contains(r#"\"status\":\"timeout\""#), "{reply}");
     }
 
     #[test]
