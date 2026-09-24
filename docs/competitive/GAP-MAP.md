@@ -53,3 +53,21 @@ is shared it is noted in the module docs.
   12k-char budget, oldest dropped first, and reads of files the run later
   changed are dropped so the model never sees stale content. Gap left: no LLM summary of
   very old history (REX relies on plan + digest + ledger instead).
+
+## Round 3
+
+- Post-edit diagnostics. opencode returns LSP diagnostics with each edit
+  (`src/tool/edit.ts:198-200`); Hermes runs per-extension linters
+  (`python -m py_compile`, `node --check`, `rustfmt --check`, ...) plus
+  in-process JSON/YAML/TOML parses and reports only new errors
+  (`tools/file_operations_lint.py:17-22,111-116,172-193`). REX before: no
+  feedback. REX now (`crates/rex-tools/src/check.rs`): every create/edit/
+  patch result carries an in-process check with no subprocess and no
+  approval: JSON parse (JSON-with-comments tolerated), and a
+  lexer-aware delimiter/string/comment check for Rust, JS/TS/JSX/TSX, Go,
+  C-family, Python and CSS. Problems are labelled new vs pre-existing.
+  The check is advisory and never blocks a write. False-positive sweep
+  (ignored test `sweep_tree_for_false_positives`): 0 of 269 files in this repo,
+  2 of 3,824 in opencode and 1 of 11,046 in Hermes flagged; all 3 are JSX
+  prose like "1) item", and JSX notes are worded as possible. Gap left:
+  no semantic (type/LSP) diagnostics, and no YAML/TOML check.

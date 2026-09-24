@@ -4,6 +4,7 @@
 //! request is prepared against a canonical workspace, classified, and bound to
 //! an unguessable pending call. Risky calls require a separate user decision.
 
+pub mod check;
 pub mod fuzzy;
 pub mod patch;
 pub mod sandbox;
@@ -965,10 +966,15 @@ impl ToolRuntime {
             &relative(&self.root, &target),
         ));
         Ok(exec(
-            Some(format!(
-                "wrote {} bytes to {}",
-                content.len(),
-                relative(&self.root, &target)
+            Some(with_check(
+                format!(
+                    "wrote {} bytes to {}",
+                    content.len(),
+                    relative(&self.root, &target)
+                ),
+                &relative(&self.root, &target),
+                (!previous.is_empty()).then_some(previous.as_str()),
+                content,
             )),
             r,
         ))
@@ -1007,21 +1013,27 @@ impl ToolRuntime {
             new.len() as u64,
         );
         r.diff = Some(simple_diff(&old, &new, &relative(&self.root, &target)));
+        let rel = relative(&self.root, &target);
         Ok(exec(
-            Some(if plan.strategy == "exact" {
-                format!(
-                    "replaced {} occurrence(s) in {}",
-                    plan.replaced,
-                    relative(&self.root, &target)
-                )
-            } else {
-                format!(
+            Some(with_check(
+                if plan.strategy == "exact" {
+                    format!(
+                        "replaced {} occurrence(s) in {}",
+                        plan.replaced,
+                        relative(&self.root, &target)
+                    )
+                } else {
+                    format!(
                     "replaced {} occurrence(s) in {} (matched via {}; indentation taken from the file)",
                     plan.replaced,
                     relative(&self.root, &target),
                     plan.strategy
                 )
-            }),
+                },
+                &rel,
+                Some(&old),
+                &new,
+            )),
             r,
         ))
     }
@@ -1210,6 +1222,7 @@ impl ToolRuntime {
             ));
         }
         let mut summary = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         let mut diffs = String::new();
         let (mut read_bytes, mut written) = (0u64, 0u64);
         for (target, change) in &changes {
@@ -1224,6 +1237,9 @@ impl ToolRuntime {
                         if original.is_some() { "M" } else { "A" }
                     ));
                     let before = original.as_deref().unwrap_or("");
+                    if let Some(n) = check::delta_note(&rel, original.as_deref(), content) {
+                        notes.push(format!("{rel}: {n}"));
+                    }
                     read_bytes += before.len() as u64;
                     written += content.len() as u64;
                     diffs.push_str(&simple_diff(before, content, &rel));
@@ -1246,11 +1262,18 @@ impl ToolRuntime {
         );
         r.diff = Some(diffs);
         Ok(exec(
-            Some(format!(
-                "applied patch to {} file(s):\n{}",
-                summary.len(),
-                summary.join("\n")
-            )),
+            Some({
+                let mut msg = format!(
+                    "applied patch to {} file(s):\n{}",
+                    summary.len(),
+                    summary.join("\n")
+                );
+                for n in notes {
+                    msg.push('\n');
+                    msg.push_str(&n);
+                }
+                msg
+            }),
             r,
         ))
     }
@@ -2219,6 +2242,14 @@ fn redact(input: &str) -> (String, usize) {
     (text, total)
 }
 
+/// Append the post-write syntax note, if any, to a write result message.
+fn with_check(msg: String, rel: &str, before: Option<&str>, after: &str) -> String {
+    match check::delta_note(rel, before, after) {
+        Some(note) => format!("{msg}\n{note}"),
+        None => msg,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2228,6 +2259,67 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         p
     }
+    fn approved(rt: &ToolRuntime, req: ToolRequest) -> ToolResult {
+        let p = rt.prepare(req).unwrap();
+        if p.approval_required {
+            rt.resolve_approval(&p.call_id, true).unwrap();
+        }
+        rt.execute(&p.call_id)
+    }
+
+    #[test]
+    fn writes_report_syntax_breakage_but_never_block() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = approved(
+            &rt,
+            ToolRequest::CreateFile {
+                path: "src/a.rs".into(),
+                content: "fn a() {\n    let x = (1 + 2;\n}\n".into(),
+                overwrite: false,
+            },
+        );
+        assert!(r.ok);
+        let out = r.output.unwrap();
+        assert!(
+            out.contains("syntax check: this write left the file with: 3:1"),
+            "{out}"
+        );
+        assert!(root.join("src/a.rs").exists());
+        // fixing it: edit result is clean, no note
+        let r = approved(
+            &rt,
+            ToolRequest::EditFile {
+                path: "src/a.rs".into(),
+                expected: "(1 + 2;".into(),
+                replacement: "(1 + 2);".into(),
+                replace_all: false,
+            },
+        );
+        assert!(r.ok);
+        assert!(!r.output.unwrap().contains("syntax check"));
+        // a patch that breaks JSON is reported per file
+        let r = approved(
+            &rt,
+            ToolRequest::ApplyPatch {
+                patch: "*** Begin Patch\n*** Add File: cfg.json\n+{\"a\": \n*** End Patch".into(),
+            },
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.output.unwrap();
+        assert!(out.contains("cfg.json: syntax check"), "{out}");
+        // unchecked types stay silent
+        let r = approved(
+            &rt,
+            ToolRequest::CreateFile {
+                path: "notes.md".into(),
+                content: "((( unbalanced prose".into(),
+                overwrite: false,
+            },
+        );
+        assert!(!r.output.unwrap().contains("syntax check"));
+    }
+
     #[test]
     fn traversal_refused() {
         let rt = ToolRuntime::new(temp()).unwrap();
