@@ -1144,3 +1144,25 @@ is shared it is noted in the module docs.
   and the scripted run now checks the partial note. Hand mutation: 12/12
   killed.
 - Gap left: plain substring matching (no stemming), unlike FTS5.
+
+## Round 28: no blind whole-file overwrites
+
+- Competitors: Hermes refuses `write_file` over an existing file unless
+  the task has seen its current content (`full_write_baselines`,
+  `tools/file_tools.py`, `tools/file_tools_read_tracking.py`). opencode's
+  write tool relies on the diff shown for approval
+  (`src/tool/write.ts`).
+- REX before: `create_file` with `overwrite: true` replaced a file the
+  model had never read, as long as nobody changed it after a read;
+  unseen content was dropped (the stale check only covered files already
+  read).
+- REX now: overwriting an existing file needs a read (any page) or an
+  earlier write of that file in this run; otherwise the call fails with
+  a Conflict telling the model to read it or use `edit_file`. New files
+  and `edit_file`/`apply_patch` are unchanged (their expected text is the
+  check). The tool description says so.
+- Tests: an unread overwrite is refused and the file kept; a one-line
+  partial read then allows it; a file this run created can be rewritten;
+  edits need no read. Hand mutation: 3/3 killed.
+- Gap left: Hermes asks for a full read; REX accepts a partial one. The
+  check runs after approval, like the stale check.

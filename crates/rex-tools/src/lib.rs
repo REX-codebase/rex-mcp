@@ -479,6 +479,27 @@ impl ToolRuntime {
         Ok(())
     }
 
+    /// Refuse to overwrite a whole existing file this runtime never read
+    /// or wrote: replacing content the model has not seen would drop it
+    /// silently. Hermes asks for the same before `write_file` replaces a
+    /// file (`full_write_baselines`, `tools/file_tools.py`); opencode's
+    /// write relies on the diff shown for approval. `edit_file` and
+    /// `apply_patch` need no read: their expected text is the check.
+    fn check_seen_before_overwrite(&self, target: &Path) -> Result<(), ToolError> {
+        if self
+            .seen
+            .lock()
+            .expect("seen lock poisoned")
+            .contains_key(target)
+        {
+            return Ok(());
+        }
+        Err(err(
+            ErrorKind::Conflict,
+            "file exists and was not read in this run; read it first (or change it with edit_file) before overwriting the whole file",
+        ))
+    }
+
     pub fn workspace_root(&self) -> &Path {
         &self.root
     }
@@ -1067,6 +1088,7 @@ impl ToolRuntime {
                 return Err(err(ErrorKind::TooLarge, "existing file exceeds diff limit"));
             }
             self.check_not_stale(&target)?;
+            self.check_seen_before_overwrite(&target)?;
             fs::read_to_string(&target).map_err(io_err)?
         } else {
             String::new()
@@ -2923,6 +2945,56 @@ mod tests {
             fs::read_to_string(root.join("o.txt")).unwrap(),
             "v2 by user"
         );
+    }
+    #[test]
+    fn overwriting_a_file_never_read_is_refused() {
+        let root = temp();
+        fs::write(root.join("keep.txt"), "user notes").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let write = |path: &str, content: &str| {
+            let p = rt
+                .prepare(ToolRequest::CreateFile {
+                    path: path.into(),
+                    content: content.into(),
+                    overwrite: true,
+                })
+                .unwrap();
+            rt.resolve_approval(&p.call_id, true).unwrap();
+            rt.execute(&p.call_id)
+        };
+        let r = write("keep.txt", "replaced");
+        let e = r.error.unwrap();
+        assert_eq!(e.kind, ErrorKind::Conflict);
+        assert!(
+            e.detail.contains("was not read in this run"),
+            "{}",
+            e.detail
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("keep.txt")).unwrap(),
+            "user notes"
+        );
+        // a partial read is enough
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "keep.txt".into(),
+                offset: Some(1),
+                limit: Some(1),
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        assert!(write("keep.txt", "replaced").ok);
+        assert_eq!(
+            fs::read_to_string(root.join("keep.txt")).unwrap(),
+            "replaced"
+        );
+        // new files need no read, and a file this run wrote can be rewritten
+        assert!(write("new.txt", "a").ok);
+        assert!(write("new.txt", "b").ok);
+        assert_eq!(fs::read_to_string(root.join("new.txt")).unwrap(), "b");
+        // edits need no read: the expected text is the check
+        fs::write(root.join("e.txt"), "alpha\n").unwrap();
+        assert!(run_edit(&rt, "e.txt", "alpha", "beta").ok);
     }
     #[test]
     fn not_found_edit_tells_model_where_to_look() {
