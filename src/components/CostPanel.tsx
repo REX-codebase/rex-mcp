@@ -132,7 +132,7 @@ export function CostPanel() {
             placeholder="No limit"
           />
         </label>
-        <button type="button" className="approval-allow" onClick={saveBudget}>
+        <button type="button" className="reset-button" onClick={saveBudget}>
           Save
         </button>
       </div>
