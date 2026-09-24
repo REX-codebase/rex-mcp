@@ -108,9 +108,9 @@ is shared it is noted in the module docs.
   refuses (changing nothing) when a file changed after the agent wrote it,
   so user edits are never clobbered. No git needed. Exposed as Tauri command
   `agent_undo`, sidecar route `POST /api/agent/runs/:id/undo` and
-  `agentUndo()` in `src/data/agentRun.ts`. Gap left: no UI button yet
-  (Tauri shell not compiled on the build box), and no undo to an arbitrary
-  step in one call.
+  `agentUndo()` in `src/data/agentRun.ts`. The app shows "Undo last file
+  change" on finished runs that wrote files (round 5, c75d092). Gap left:
+  no undo to an arbitrary step in one call.
 
 ## Round 4: ask the user (`ask_user`)
 
