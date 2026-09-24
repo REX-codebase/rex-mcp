@@ -1826,6 +1826,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         }
     }
 
+    let mut images_rejected = false;
     loop {
         // ---- hard stops, checked at every turn boundary ------------------
         if ctx.handle.cancel.load(Ordering::SeqCst) {
@@ -1921,19 +1922,10 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             user_rules.as_ref(),
         );
         // Images read_file queued last turn ride on this turn only.
-        let (wire_images, evidence_images) = WireImage::from_reads(&tools.take_images());
-        let request_body = build_request(
-            protocol,
-            &model,
-            &ctx.system_prompt,
-            &state_msg,
-            cp.last_pair.as_ref(),
-            &ctx.mcp_tools,
-            &wire_images,
-        );
-        let evidence_body = if wire_images.is_empty() {
-            request_body.clone()
-        } else {
+        let reads = tools.take_images();
+        let show = !images_rejected;
+        let (wire_images, evidence_images) = WireImage::from_reads(&reads, show);
+        let build = |images: &[WireImage]| {
             build_request(
                 protocol,
                 &model,
@@ -1941,27 +1933,56 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
                 &state_msg,
                 cp.last_pair.as_ref(),
                 &ctx.mcp_tools,
-                &evidence_images,
+                images,
             )
         };
+        let mut request_body = build(&wire_images);
+        let mut evidence_body = if show && !reads.is_empty() {
+            build(&evidence_images)
+        } else {
+            request_body.clone()
+        };
         let turn_no = cp.step + 1;
-        let _ = fs::write(
-            ctx.state_dir
-                .join("evidence")
-                .join(format!("turn-{turn_no}-request.json")),
-            &evidence_body,
-        );
+        let evidence_path = ctx
+            .state_dir
+            .join("evidence")
+            .join(format!("turn-{turn_no}-request.json"));
+        let _ = fs::write(&evidence_path, &evidence_body);
 
         // ---- provider turn with bounded retry/backoff --------------------
-        let response = match generate_with_retry(
-            ctx.service.transport(),
-            protocol,
-            &base_url,
-            &key,
-            &model,
-            &request_body,
-            &ctx.handle,
-        ) {
+        let send = |body: &str| {
+            generate_with_retry(
+                ctx.service.transport(),
+                protocol,
+                &base_url,
+                &key,
+                &model,
+                body,
+                &ctx.handle,
+            )
+        };
+        let mut attempt = send(&request_body);
+        if attempt.is_err() && show && !reads.is_empty() {
+            // A model without image input rejects the whole turn. Retry it
+            // once with each image replaced by a note, and describe later
+            // image reads the same way instead of failing again.
+            images_rejected = true;
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::Info {
+                    message: format!(
+                        "the model rejected a turn carrying {} image(s); retried without images",
+                        reads.len()
+                    ),
+                },
+            );
+            let (hidden, _) = WireImage::from_reads(&reads, false);
+            request_body = build(&hidden);
+            evidence_body = request_body.clone();
+            let _ = fs::write(&evidence_path, &evidence_body);
+            attempt = send(&request_body);
+        }
+        let response = match attempt {
             Ok(r) => r,
             Err(detail) => {
                 finish(
@@ -2340,19 +2361,36 @@ struct WireImage {
     label: String,
     mime: &'static str,
     data: String,
+    /// False once the model has rejected image input this run: only the
+    /// label goes out, saying the image was not shown.
+    shown: bool,
 }
 
 impl WireImage {
     /// Wire form and evidence form (image bytes left out of evidence).
-    fn from_reads(reads: &[rex_tools::ImageRead]) -> (Vec<WireImage>, Vec<WireImage>) {
+    fn from_reads(reads: &[rex_tools::ImageRead], shown: bool) -> (Vec<WireImage>, Vec<WireImage>) {
         use base64::Engine as _;
-        let label = |r: &rex_tools::ImageRead| format!("Image from read_file {}:", r.path);
+        let label = |r: &rex_tools::ImageRead| {
+            if shown {
+                format!("Image from read_file {}:", r.path)
+            } else {
+                format!(
+                    "Image from read_file {} was not shown: this model rejected image input earlier in the run.",
+                    r.path
+                )
+            }
+        };
         let wire = reads
             .iter()
             .map(|r| WireImage {
                 label: label(r),
                 mime: r.mime,
-                data: base64::engine::general_purpose::STANDARD.encode(&r.bytes),
+                data: if shown {
+                    base64::engine::general_purpose::STANDARD.encode(&r.bytes)
+                } else {
+                    String::new()
+                },
+                shown,
             })
             .collect();
         let evidence = reads
@@ -2361,6 +2399,7 @@ impl WireImage {
                 label: label(r),
                 mime: r.mime,
                 data: format!("<{} image bytes omitted from evidence>", r.bytes.len()),
+                shown,
             })
             .collect();
         (wire, evidence)
@@ -2377,6 +2416,13 @@ fn user_content(protocol: ProviderProtocol, state_msg: &str, images: &[WireImage
         _ => json!({"type":"text","text": state_msg}),
     }];
     for img in images {
+        if !img.shown {
+            parts.push(match protocol {
+                ProviderProtocol::Gemini => json!({"text": img.label}),
+                _ => json!({"type":"text","text": img.label}),
+            });
+            continue;
+        }
         match protocol {
             ProviderProtocol::Gemini => {
                 parts.push(json!({"text": img.label}));
@@ -4930,6 +4976,8 @@ mod tests {
         post_delay_ms: std::sync::atomic::AtomicU64,
         in_flight: std::sync::atomic::AtomicUsize,
         max_in_flight: std::sync::atomic::AtomicUsize,
+        /// Act like a text-only model: 400 on any request carrying an image.
+        reject_images: std::sync::atomic::AtomicBool,
     }
 
     impl Script {
@@ -4941,6 +4989,7 @@ mod tests {
                 post_delay_ms: Default::default(),
                 in_flight: Default::default(),
                 max_in_flight: Default::default(),
+                reject_images: Default::default(),
             }
         }
         fn failing(turns: Vec<String>, count: u32, status: u16) -> Self {
@@ -4951,6 +5000,7 @@ mod tests {
                 post_delay_ms: Default::default(),
                 in_flight: Default::default(),
                 max_in_flight: Default::default(),
+                reject_images: Default::default(),
             }
         }
         fn seen(&self) -> Vec<String> {
@@ -4979,6 +5029,12 @@ mod tests {
                 self.max_in_flight.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(delay));
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            if self.reject_images.load(Ordering::SeqCst) && body.contains("\"inlineData\"") {
+                return Ok((
+                    400,
+                    r#"{"error":{"message":"image input is not supported by this model"}}"#.into(),
+                ));
             }
             {
                 let mut fail = self.fail_posts.lock().unwrap();
@@ -5499,7 +5555,7 @@ mod tests {
             mime: "image/png",
             bytes: vec![1, 2, 3],
         }];
-        let (wire, evidence) = WireImage::from_reads(&reads);
+        let (wire, evidence) = WireImage::from_reads(&reads, true);
         assert_eq!(wire[0].data, "AQID");
         assert!(evidence[0].data.contains("3 image bytes omitted"));
         let req = |p: ProviderProtocol, imgs: &[WireImage]| -> Value {
@@ -5614,6 +5670,79 @@ mod tests {
         assert!(evidence
             .iter()
             .any(|e| e.contains("15 image bytes omitted from evidence")));
+    }
+
+    #[test]
+    fn a_text_only_model_gets_the_turn_again_without_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        let ws = root.join("runs").join("img-ws");
+        fs::create_dir_all(&ws).unwrap();
+        let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8, 0, 0, 13, 7, 7, 7]].concat();
+        fs::write(ws.join("shot.png"), &png).unwrap();
+        let script = Script::new(vec![
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_file","args":{"path":"shot.png"}}}),
+            ]),
+            call_turn(vec![
+                json!({"functionCall":{"name":"read_file","args":{"path":"shot.png","limit":1}}}),
+            ]),
+            text_turn("done"),
+            text_turn("done"),
+            text_turn("done"),
+        ]);
+        script.reject_images.store(true, Ordering::SeqCst);
+        let svc = Arc::new(service(&root, script));
+        let snap = svc
+            .begin_in_workspace_with_options(
+                "look at the screenshot",
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws),
+                Role::Worker,
+                RunOptions::default(),
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 20_000);
+        assert!(
+            !matches!(
+                done.terminal_reason,
+                Some(TerminalReason::ProviderError { .. })
+            ),
+            "{:?}",
+            done.terminal_reason
+        );
+        let posts = svc.service.transport().seen();
+        let with_image: Vec<usize> = posts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.contains("\"inlineData\""))
+            .map(|(i, _)| i)
+            .collect();
+        // only the first image turn tries; after the rejection no image is sent
+        assert!(!with_image.is_empty());
+        let last_try = *with_image.last().unwrap();
+        let not_shown: Vec<usize> = posts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.contains("shot.png was not shown"))
+            .map(|(i, _)| i)
+            .collect();
+        // the retried turn (whose answer is the second read), then the
+        // turn right after that read, which describes the image instead
+        assert_eq!(not_shown.len(), 2, "{not_shown:?}");
+        assert_eq!(not_shown[0], last_try + 1);
+        assert_eq!(not_shown[1], not_shown[0] + 1);
+        assert_eq!(with_image.len(), 1, "no second image attempt");
+        let rejections = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Info { message } if message.contains("rejected a turn carrying 1 image")))
+            .count();
+        assert_eq!(rejections, 1);
     }
 
     #[test]

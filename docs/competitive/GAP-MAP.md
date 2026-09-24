@@ -632,4 +632,28 @@ is shared it is noted in the module docs.
   mutation: 12/12 killed.
 - Gap left: a model without image input will reject the request. REX
   does not yet know which models take images, so it cannot fall back to
-  text. SVG is not rasterised (Hermes does rasterise it).
+  text. SVG is not rasterised (Hermes does rasterise it). The text
+  fallback was added in round 14b.
+
+### Round 14b: text-only models get the turn again without images
+
+- Hermes (`agent/turn_recovery.py`, `recover_before_classification`;
+  `agent/message_sanitization.py`, `_looks_like_image_content_rejection`)
+  matches provider error phrases, records the model as rejecting images and
+  strips images from its later requests. opencode decides from its models.dev
+  modality data (`packages/opencode/src/provider/transform.ts`), which REX
+  cannot fetch offline.
+- REX now: when a turn carrying images fails after the normal retries, REX
+  sends it once more with each image replaced by a note ("Image from
+  read_file X was not shown: this model rejected image input earlier in the
+  run"). Later image reads in the run go out as that note, without another
+  failed attempt. One Info event records the rejection. REX does not rely on
+  error wording, so any final failure of an image turn gets the text-only
+  retry. The cost is at most one extra request per run.
+- Tests: a scripted text-only model (400 on any `inlineData`). The run
+  finishes without a provider error, only one request ever carries the
+  image, the retry and the next turn both carry the note, and the Info
+  event appears once. Hand mutation: 5/5 killed.
+- Gap left: SVG is not rasterised. REX still has no per-model capability
+  data, so the first image turn on a text-only model costs one failed
+  request.
