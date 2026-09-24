@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor, cleanup } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi, afterEach } from "vitest";
 
 const calls = vi.hoisted(() => ({ answer: [] as unknown[][], undo: [] as unknown[][] }));
 vi.mock("../data/agentRun", () => ({
@@ -48,9 +48,26 @@ function snap(partial: Partial<AgentSnapshot>): AgentSnapshot {
 const noop = () => undefined;
 
 describe("AgentRunView ask_user and undo", () => {
+  afterEach(cleanup);
   beforeEach(() => {
     calls.answer.length = 0;
     calls.undo.length = 0;
+  });
+
+  it("labels a question that is part of a batch", () => {
+    render(
+      <AgentRunView
+        run={snap({
+          status: "awaiting_answer",
+          pending_question: { call_id: "q#2", question: "Which port?", choices: [], batch_index: 2, batch_total: 3 },
+        })}
+        deciding={false}
+        cancelling={false}
+        onDecide={noop}
+        onCancel={noop}
+      />
+    );
+    expect(screen.getByText("REX is asking · question 2 of 3")).toBeTruthy();
   });
 
   it("shows the question, sends a choice, a typed answer or a decline", async () => {

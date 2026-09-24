@@ -258,6 +258,12 @@ pub struct PendingQuestion {
     pub question: String,
     /// Suggested answers, best first; the user may still type anything.
     pub choices: Vec<String>,
+    /// 1-based position when the model asked several questions in one call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<usize>,
+    /// Number of questions in that call; `None` for a single question.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_total: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -507,8 +513,8 @@ enum AgentCall {
     /// Ask the user a blocking question through the trusted UI.
     AskUser {
         id: String,
-        question: String,
-        choices: Vec<String>,
+        /// One or more (question, choices) pairs, asked in order.
+        questions: Vec<(String, Vec<String>)>,
     },
 }
 
@@ -611,9 +617,33 @@ fn search_seeds(query: &str, sites: &[String]) -> Vec<String> {
     out
 }
 
-/// Decode `ask_user` args. Choices may arrive as strings or as objects with
+/// Most questions accepted in one `ask_user` call.
+pub const MAX_BATCH_QUESTIONS: usize = 3;
+
+/// Decode `ask_user` args: either one `question` (+ `choices`) or a
+/// `questions` array of such objects, capped at MAX_BATCH_QUESTIONS.
+/// Items without a question are dropped; an empty batch is an error.
+fn parse_ask_user(args: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
+    if let Some(items) = args.get("questions").and_then(Value::as_array) {
+        let batch: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(q) => parse_one_question(&json!({ "question": q })).ok(),
+                other => parse_one_question(other).ok(),
+            })
+            .take(MAX_BATCH_QUESTIONS)
+            .collect();
+        if batch.is_empty() {
+            return Err("ask_user questions has no usable question".into());
+        }
+        return Ok(batch);
+    }
+    parse_one_question(args).map(|q| vec![q])
+}
+
+/// Decode one question. Choices may arrive as strings or as objects with
 /// a label-like field; blanks are dropped and everything is length-capped.
-fn parse_ask_user(args: &Value) -> Result<(String, Vec<String>), String> {
+fn parse_one_question(args: &Value) -> Result<(String, Vec<String>), String> {
     let question = args
         .get("question")
         .and_then(Value::as_str)
@@ -1965,7 +1995,7 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "ask_user",
-            "Ask the user one blocking question through the trusted UI; returns their answer or tells you to decide.",
+            "Ask the user one blocking question, or up to 3 related ones at once, through the trusted UI; returns their answers or tells you to decide.",
             false,
             false,
         ),
@@ -2118,7 +2148,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
         {"name":"web_fetch","description":"Read one public web page (http/https) as plain text, e.g. docs or an issue you already have the URL for. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"}},"required":["url"]}},
         {"name":"explore","description":"Delegate a focused read-only question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"}}}},
-        {"name":"ask_user","description":"Ask the user one question when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Give up to 4 short choices, best first; the user may also answer freely. If they decline or do not answer in time, you are told to proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}},
+        {"name":"ask_user","description":"Ask the user when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Pass one question, or up to 3 related questions at once in `questions` so the user answers them together. Give up to 4 short choices per question, best first; the user may also answer freely. At most 3 questions per run. Anything declined or unanswered in time means proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}},"questions":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}}}}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
     ]}])
 }
@@ -2437,14 +2467,7 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                 )),
             },
             "ask_user" => match parse_ask_user(&args) {
-                Ok((question, choices)) => calls.push((
-                    AgentCall::AskUser {
-                        id,
-                        question,
-                        choices,
-                    },
-                    raw,
-                )),
+                Ok(questions) => calls.push((AgentCall::AskUser { id, questions }, raw)),
                 Err(error) => calls.push((
                     AgentCall::BadCall {
                         name: "ask_user".into(),
@@ -2565,14 +2588,7 @@ fn decode_named_call(
             None => bad("web_fetch missing url".into()),
         },
         "ask_user" => match parse_ask_user(&args) {
-            Ok((question, choices)) => (
-                AgentCall::AskUser {
-                    id,
-                    question,
-                    choices,
-                },
-                Some(raw),
-            ),
+            Ok(questions) => (AgentCall::AskUser { id, questions }, Some(raw)),
             Err(e) => bad(e),
         },
         "explore" => match explore::parse_explore_tasks(&args) {
@@ -2881,79 +2897,104 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 );
                 response_parts.push(function_response(protocol, "web_search", &id, ok, &content));
             }
-            AgentCall::AskUser {
-                id,
-                question,
-                choices,
-            } => {
+            AgentCall::AskUser { id, questions } => {
                 let allowed = ctx
                     .brief
                     .allowed_tools
                     .as_ref()
                     .is_none_or(|a| a.iter().any(|t| t == "ask_user"));
-                let (ok, content, asked) = if !allowed {
-                    (
-                        false,
-                        "tool ask_user is not enabled for this run's role; decide yourself and state the assumption".to_string(),
-                        false,
-                    )
+                let single = questions.len() == 1;
+                let mut ok = true;
+                let mut asked_any = false;
+                let mut answers: Vec<Value> = Vec::new();
+                let mut single_content: Option<String> = None;
+                if !allowed {
+                    ok = false;
+                    single_content = Some("tool ask_user is not enabled for this run's role; decide yourself and state the assumption".to_string());
                 } else if cp.questions_asked >= MAX_QUESTIONS_PER_RUN {
-                    (
-                        false,
-                        format!("question limit reached ({MAX_QUESTIONS_PER_RUN} per run); decide yourself and state the assumption in your completion summary"),
-                        false,
-                    )
+                    ok = false;
+                    single_content = Some(format!("question limit reached ({MAX_QUESTIONS_PER_RUN} per run); decide yourself and state the assumption in your completion summary"));
                 } else {
-                    cp.questions_asked += 1;
-                    let pending = PendingQuestion {
-                        call_id: if id.is_empty() {
-                            format!("ask-{}", cp.questions_asked)
-                        } else {
-                            id.clone()
-                        },
-                        question: question.clone(),
-                        choices: choices.clone(),
-                    };
-                    // Parked runs are resumable: persist before blocking.
-                    let _ = write_json(&ctx.state_dir.join("checkpoint.json"), &*cp);
-                    match wait_for_answer(ctx, &pending) {
-                        UserAnswer::Text(text) => (
-                            true,
-                            json!({"user_answer": text}).to_string(),
-                            true,
-                        ),
-                        UserAnswer::Declined => (
-                            true,
-                            "The user declined to answer. Proceed on your own judgement and state the assumption in your completion summary.".to_string(),
-                            true,
-                        ),
-                        UserAnswer::Timeout => (
-                            true,
-                            "No answer arrived in time. Proceed on your own judgement and state the assumption in your completion summary.".to_string(),
-                            true,
-                        ),
-                        UserAnswer::Cancelled => {
-                            out.fatal = Some(TerminalReason::Cancelled);
-                            return out;
+                    for (n, (question, choices)) in questions.iter().enumerate() {
+                        if cp.questions_asked >= MAX_QUESTIONS_PER_RUN {
+                            answers.push(json!({"question": question, "status": "not_asked", "answer": null}));
+                            continue;
                         }
+                        cp.questions_asked += 1;
+                        asked_any = true;
+                        let pending = PendingQuestion {
+                            call_id: match (id.is_empty(), single) {
+                                (true, _) => format!("ask-{}", cp.questions_asked),
+                                (false, true) => id.clone(),
+                                (false, false) => format!("{id}#{}", n + 1),
+                            },
+                            question: question.clone(),
+                            choices: choices.clone(),
+                            batch_index: (!single).then_some(n + 1),
+                            batch_total: (!single).then_some(questions.len()),
+                        };
+                        // Parked runs are resumable: persist before blocking.
+                        let _ = write_json(&ctx.state_dir.join("checkpoint.json"), &*cp);
+                        let (status, answer) = match wait_for_answer(ctx, &pending) {
+                            UserAnswer::Text(text) => ("answered", Some(text)),
+                            UserAnswer::Declined => ("declined", None),
+                            UserAnswer::Timeout => ("timeout", None),
+                            UserAnswer::Cancelled => {
+                                out.fatal = Some(TerminalReason::Cancelled);
+                                return out;
+                            }
+                        };
+                        answers.push(
+                            json!({"question": question, "status": status, "answer": answer}),
+                        );
                     }
+                }
+                let content = match single_content {
+                    Some(c) => c,
+                    None if single => match answers[0]["status"].as_str() {
+                        Some("answered") => json!({"user_answer": answers[0]["answer"]}).to_string(),
+                        Some("declined") => "The user declined to answer. Proceed on your own judgement and state the assumption in your completion summary.".to_string(),
+                        _ => "No answer arrived in time. Proceed on your own judgement and state the assumption in your completion summary.".to_string(),
+                    },
+                    None => json!({
+                        "answers": answers,
+                        "note": format!("For any question not answered (declined, timeout, or not_asked because of the {MAX_QUESTIONS_PER_RUN}-per-run limit), proceed on your own judgement and state the assumption in your completion summary."),
+                    })
+                    .to_string(),
                 };
+                let summary: String = questions
+                    .iter()
+                    .map(|(q, _)| q.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+                    .chars()
+                    .take(160)
+                    .collect();
+                let questions_json: Vec<Value> = questions
+                    .iter()
+                    .map(|(q, c)| json!({"question": q, "choices": c}))
+                    .collect();
                 if let Some(l) = ledger.as_mut() {
                     l.append(
                         "ask_user",
-                        json!({"question": question, "choices": choices, "asked": asked, "ok": ok, "reply": content}),
+                        json!({"questions": questions_json, "asked": asked_any, "ok": ok, "reply": content}),
                     );
                 }
                 out.digest_actions.push(DigestAction {
                     tool: "ask_user".into(),
                     ok,
-                    target: Some(question.chars().take(160).collect()),
+                    target: Some(summary),
                     error_kind: (!ok).then(|| "question_refused".to_string()),
                 });
+                let args = if single {
+                    json!({"question": questions[0].0, "choices": questions[0].1})
+                } else {
+                    json!({"questions": questions_json})
+                };
                 push_model_part(
                     &mut model_parts,
                     raw,
-                    json!({"functionCall":{"name":"ask_user","args":{"question": question, "choices": choices}}}),
+                    json!({"functionCall":{"name":"ask_user","args": args}}),
                 );
                 response_parts.push(function_response(protocol, "ask_user", &id, ok, &content));
             }
@@ -5377,6 +5418,72 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_parses_a_batch_and_caps_it() {
+        let one = parse_ask_user(&json!({"question":" a? ","choices":["x"]})).unwrap();
+        assert_eq!(one, vec![("a?".to_string(), vec!["x".to_string()])]);
+        let batch = parse_ask_user(&json!({"questions":[
+            {"question":"db?","choices":["pg",{"label":"sqlite"}]},
+            {"question":"  "},
+            "port?",
+            {"question":"auth?"},
+            {"question":"extra?"}
+        ]}))
+        .unwrap();
+        let qs: Vec<&str> = batch.iter().map(|(q, _)| q.as_str()).collect();
+        assert_eq!(qs, ["db?", "port?", "auth?"]);
+        assert_eq!(batch[0].1, ["pg", "sqlite"]);
+        assert!(parse_ask_user(&json!({"questions":[{"question":""}]})).is_err());
+        assert!(parse_ask_user(&json!({})).is_err());
+    }
+
+    #[test]
+    fn ask_user_batch_returns_every_answer_in_one_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = |qs: Value| json!({"functionCall":{"name":"ask_user","args":{"questions": qs}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask(json!([{"question":"db?"},{"question":"port?"}]))]),
+                // 2 of 3 used; this batch of 2 gets one asked, one not_asked
+                call_turn(vec![ask(
+                    json!([{"question":"auth?"},{"question":"cache?"}]),
+                )]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("batch check", "gemini", Some(budgets())).unwrap();
+        answer_questions(svc.clone(), snap.id.clone(), Some("yes"));
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(done.terminal_reason.is_some());
+        let asked: Vec<String> = done
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::QuestionAsked { question } => Some(question.question.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, ["db?", "port?", "auth?"]);
+        let first_asked = done.events.iter().find_map(|e| match e {
+            AgentEvent::QuestionAsked { question } => Some(question.clone()),
+            _ => None,
+        });
+        let first_asked = first_asked.unwrap();
+        assert_eq!(
+            (first_asked.batch_index, first_asked.batch_total),
+            (Some(1), Some(2))
+        );
+        let posts = svc.service().transport().seen();
+        let first: Vec<_> = posts[1]
+            .match_indices(r#"\"status\":\"answered\""#)
+            .collect();
+        assert_eq!(first.len(), 2, "{}", posts[1]);
+        assert!(posts[1].contains("port?"), "{}", posts[1]);
+        assert!(posts[2].contains("not_asked"), "{}", posts[2]);
+        assert!(posts[2].contains("cache?"), "{}", posts[2]);
+    }
+
+    #[test]
     fn cancelling_while_a_question_is_open_ends_the_run() {
         let tmp = tempfile::tempdir().unwrap();
         let ask = json!({"functionCall":{"name":"ask_user","args":{"question":"ok?"}}});
@@ -5473,7 +5580,7 @@ mod tests {
         assert!(parse_ask_user(&json!({})).is_err());
         assert!(parse_ask_user(&json!({"question":"   "})).is_err());
         let long = "q".repeat(QUESTION_CHARS + 50);
-        let (q, c) = parse_ask_user(&json!({"question": long, "choices":
+        let (q, c) = parse_one_question(&json!({"question": long, "choices":
             ["a", {"text":"b"}, 7, "", "c", "d", "e"]}))
         .unwrap();
         assert_eq!(q.chars().count(), QUESTION_CHARS);

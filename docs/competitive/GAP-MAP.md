@@ -117,8 +117,12 @@ is shared it is noted in the module docs.
   Cap of 3 questions per run (durable in the checkpoint). Cancel while
   parked ends the run. Explorer children cannot ask. Headless `rex exec`
   declines automatically and prints the question.
-- Gap left: no UI panel renders the question yet (the phase `question` and
-  types exist); one question per call (opencode/Hermes batch several).
+- Round 5 (c75d092): the app renders the question panel (choices, free
+  text, "Let REX decide"). Round 6: `ask_user` takes `questions` (up to 3
+  in one call) and returns every answer in one response with a status
+  each (answered / declined / timeout / not_asked past the 3-per-run cap).
+- Gap left: the UI shows batched questions one after another ("question
+  2 of 3"), not on one form as opencode's question tool does.
 
 ## Round 4: web_search with the keyless engine
 

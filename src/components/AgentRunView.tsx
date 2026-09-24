@@ -271,7 +271,11 @@ export function AgentRunView({
           <div className="tool-approval-head">
             <span className="approval-shield" aria-hidden="true">?</span>
             <div>
-              <p className="eyebrow">REX is asking</p>
+              <p className="eyebrow">
+                {run.pending_question.batch_total && run.pending_question.batch_total > 1
+                  ? `REX is asking · question ${run.pending_question.batch_index ?? 1} of ${run.pending_question.batch_total}`
+                  : "REX is asking"}
+              </p>
               <h3 id="question-title">{run.pending_question.question}</h3>
             </div>
           </div>
