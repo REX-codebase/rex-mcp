@@ -1166,3 +1166,28 @@ is shared it is noted in the module docs.
   edits need no read. Hand mutation: 3/3 killed.
 - Gap left: Hermes asks for a full read; REX accepts a partial one. The
   check runs after approval, like the stale check.
+
+## Round 29: repeated identical reads are refused
+
+- Competitors: Hermes counts identical consecutive read/search calls per
+  task, warns at the 3rd and refuses the 4th read without running it
+  (`tools/file_tools.py`, `_bump_consecutive` in
+  `tools/file_tools_read_tracking.py`); its warnings are a JSON field,
+  not text after the JSON. opencode asks permission (`doom_loop`) after
+  3 identical calls (`src/session/processor.ts`).
+- REX before: identical calls only got a warning, and it was text
+  appended after the JSON tool result, so the result no longer parsed as
+  one object. The same read could run any number of times.
+- REX now: the 4th identical `read_file`, `search_files` or `glob_files`
+  in a row is refused without running (nothing in the run changed in
+  between). Commands and MCP calls still run, since they may poll
+  changing state. The repeat warning and the failed-twice warning are
+  now a `warning` field inside the result JSON.
+- Tests: scripted run (2nd read no warning, 3rd read warns in a
+  parseable field, 4th refused and shows no content, a different call
+  resets the count, one refusal event); a 4th identical command still
+  runs; unit test of which calls count as read-only. Hand mutation:
+  10/10 killed (one more mutant was rejected by the compiler and is not
+  counted).
+- Gap left: counting is per exact call; a read with a shifted offset or
+  a reworded search is not caught.

@@ -64,6 +64,10 @@ pub const MAX_CONSEC_FAILURES: u32 = 3;
 /// Identical consecutive calls (beyond the first) after which the model is
 /// told it is looping. Termination stays with the no-progress budget.
 pub const DOOM_LOOP_REPEATS: u32 = 2;
+/// Identical consecutive read-only calls (beyond the first) after which the
+/// call is refused without running: nothing in the run changed in between,
+/// so the answer is the one the model already has.
+pub const REPEAT_BLOCK_REPEATS: u32 = 3;
 pub const MAX_STALL_TURNS: u32 = 3;
 pub const MAX_NO_PROGRESS_TURNS: u32 = 6;
 pub const MAX_DENIALS: u32 = 2;
@@ -4384,6 +4388,32 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     cp.same_call_repeats = 0;
                     cp.last_call_sig = Some(sig.clone());
                 }
+                if cp.same_call_repeats >= REPEAT_BLOCK_REPEATS && is_read_only(&request) {
+                    let content = format!(
+                        "blocked: this is the same {tool_name} call {} times in a row and nothing changed in between; the result is what you already have, so use it or take a different step",
+                        cp.same_call_repeats + 1
+                    );
+                    RunHandle::push_event(
+                        &ctx.handle.shared,
+                        AgentEvent::Info {
+                            message: format!("refused repeated identical {tool_name} call"),
+                        },
+                    );
+                    out.digest_actions.push(DigestAction {
+                        tool: tool_name.into(),
+                        ok: false,
+                        target: None,
+                        error_kind: Some("repeat_blocked".into()),
+                    });
+                    push_model_part(
+                        &mut model_parts,
+                        raw,
+                        json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}),
+                    );
+                    response_parts
+                        .push(function_response(protocol, tool_name, &id, false, &content));
+                    continue;
+                }
                 let prepared = match tools.prepare(request.clone()) {
                     Ok(p) => p,
                     Err(e) => {
@@ -4544,8 +4574,21 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 } else {
                     None
                 };
-                let mut content = serde_json::to_string(&json!({
+                // Warnings are a field, not text after the JSON, so the tool
+                // result stays one parseable object.
+                let warning = if cp.same_call_repeats >= DOOM_LOOP_REPEATS && result.ok {
+                    Some(format!(
+                        "you have made this exact call {} times in a row and it returns the same kind of result; use what you already have or try a different step",
+                        cp.same_call_repeats + 1
+                    ))
+                } else if !result.ok && cp.consec_fail == 2 {
+                    Some("this exact call has failed twice; change approach instead of retrying it unchanged".to_string())
+                } else {
+                    None
+                };
+                let content = serde_json::to_string(&json!({
                     "ok": result.ok,
+                    "warning": warning,
                     "output": output,
                     "error": error,
                     "full_output": full_output,
@@ -4558,12 +4601,6 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     }
                 }))
                 .unwrap_or_else(|_| "{\"ok\":false}".into());
-                if cp.same_call_repeats >= DOOM_LOOP_REPEATS && result.ok {
-                    content.push_str(&format!(
-                        " warning: you have made this exact call {} times in a row and it returns the same kind of result; use what you already have or try a different step",
-                        cp.same_call_repeats + 1
-                    ));
-                }
                 {
                     let text = match (&result.output, &result.error) {
                         (Some(o), _) => o.as_str(),
@@ -4597,9 +4634,6 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                             cp.step, tool_name, target, result.ok, text,
                         ),
                     );
-                }
-                if !result.ok && cp.consec_fail == 2 {
-                    content.push_str(" warning: this exact call has failed twice; change approach instead of retrying it unchanged");
                 }
                 if result.ok {
                     for f in written_paths(tool_name, receipt.target.as_deref()) {
@@ -4662,6 +4696,17 @@ fn function_response(
             json!({"role":"tool","tool_call_id":id,"content":content})
         }
     }
+}
+
+/// Calls that only look: repeating one with nothing in between cannot give a
+/// new answer. Commands and MCP calls may poll changing state, so they run.
+fn is_read_only(request: &ToolRequest) -> bool {
+    matches!(
+        request,
+        ToolRequest::ReadFile { .. }
+            | ToolRequest::SearchFiles { .. }
+            | ToolRequest::GlobFiles { .. }
+    )
 }
 
 fn tool_name_of(request: &ToolRequest) -> &'static str {
@@ -8485,6 +8530,148 @@ mod tests {
             .collect();
         let err = parse_explore_tasks(&json!({"tasks": too_many})).unwrap_err();
         assert!(err.contains("at most"), "{err}");
+    }
+
+    /// Every functionResponse content string in one provider request.
+    fn response_contents(post: &str) -> Vec<String> {
+        fn walk(v: &Value, out: &mut Vec<String>) {
+            match v {
+                Value::Object(m) => {
+                    if let Some(c) = m
+                        .get("functionResponse")
+                        .and_then(|f| f["response"]["content"].as_str())
+                    {
+                        out.push(c.to_string());
+                    }
+                    m.values().for_each(|x| walk(x, out));
+                }
+                Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&serde_json::from_str(post).unwrap(), &mut out);
+        out
+    }
+
+    #[test]
+    fn fourth_identical_read_is_refused_and_warnings_stay_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let glob = json!({"functionCall":{"name":"glob_files","args":{"pattern":"*"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("a.txt", "ALPHA")]),
+                call_turn(vec![read_call("a.txt")]),
+                call_turn(vec![read_call("a.txt")]),
+                call_turn(vec![read_call("a.txt")]),
+                call_turn(vec![read_call("a.txt")]),
+                call_turn(vec![glob]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("loop check", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service().transport().seen();
+        assert!(
+            posts.len() >= 7,
+            "{} {:?}",
+            posts.len(),
+            done.terminal_reason
+        );
+        let last = |i: usize| response_contents(&posts[i]).last().cloned().unwrap();
+        // 2nd read: no warning yet
+        let second: Value = serde_json::from_str(&last(3)).unwrap();
+        assert!(second["warning"].is_null(), "{second}");
+        // 3rd read ran; the warning is a field and the result still parses
+        let third: Value = serde_json::from_str(&last(4)).unwrap();
+        assert_eq!(third["ok"], true);
+        assert!(third["warning"]
+            .as_str()
+            .unwrap()
+            .contains("3 times in a row"));
+        assert!(third["output"].as_str().unwrap().contains("ALPHA"));
+        // 4th read did not run
+        let fourth = last(5);
+        assert!(
+            fourth.starts_with("blocked: this is the same read_file call 4 times"),
+            "{fourth}"
+        );
+        assert!(!fourth.contains("ALPHA"));
+        // a different call resets the count
+        let glob1: Value = serde_json::from_str(&last(6)).unwrap();
+        assert_eq!(glob1["ok"], true);
+        assert!(glob1["warning"].is_null(), "{glob1}");
+        let refused = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Info { message } if message == "refused repeated identical read_file call"))
+            .count();
+        assert_eq!(refused, 1);
+    }
+
+    #[test]
+    fn fourth_identical_command_still_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = json!({"functionCall":{"name":"run_command","args":{"argv":["cat","a.txt"]}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("a.txt", "ALPHA")]),
+                call_turn(vec![cat.clone()]),
+                call_turn(vec![cat.clone()]),
+                call_turn(vec![cat.clone()]),
+                call_turn(vec![cat]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("poll check", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service().transport().seen();
+        assert!(
+            posts.len() >= 6,
+            "{} {:?}",
+            posts.len(),
+            done.terminal_reason
+        );
+        let fourth = response_contents(&posts[5]).last().cloned().unwrap();
+        let fourth: Value = serde_json::from_str(&fourth).unwrap();
+        assert_eq!(fourth["ok"], true, "{fourth}");
+        assert!(fourth["output"].as_str().unwrap().contains("ALPHA"));
+    }
+
+    #[test]
+    fn only_looking_calls_count_as_read_only() {
+        let read = ToolRequest::ReadFile {
+            path: "a".into(),
+            offset: None,
+            limit: None,
+        };
+        let glob = ToolRequest::GlobFiles {
+            pattern: "*".into(),
+            path: None,
+            max_results: None,
+        };
+        let run = ToolRequest::RunCommand {
+            argv: vec!["echo".into()],
+            cwd: None,
+            timeout_ms: None,
+        };
+        let patch = ToolRequest::ApplyPatch {
+            patch: String::new(),
+        };
+        let mcp = ToolRequest::McpCall {
+            server: "s".into(),
+            name: "n".into(),
+            arguments: json!({}),
+        };
+        assert!(is_read_only(&read));
+        assert!(is_read_only(&glob));
+        assert!(!is_read_only(&run));
+        assert!(!is_read_only(&patch));
+        assert!(!is_read_only(&mcp));
     }
 
     #[test]
