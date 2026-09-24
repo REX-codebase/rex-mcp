@@ -110,22 +110,42 @@ pub(super) struct ChildGate<'a, A> {
     pub index: usize,
 }
 
-/// Claim `path` for child `index`. Returns the other child's index when
-/// a different child in the batch already owns it.
-fn claim_path(
+/// Claim every path in `paths` for child `index`, all or none. Returns
+/// the first path another child of the batch already owns, with its index.
+pub(super) fn claim_paths(
     claims: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
-    path: &str,
+    paths: &[String],
     index: usize,
-) -> Option<usize> {
-    let key = path.trim().trim_start_matches("./").to_string();
+) -> Option<(String, usize)> {
+    let keys: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim().trim_start_matches("./").to_string())
+        .collect();
     let mut map = claims.lock().unwrap_or_else(|e| e.into_inner());
-    match map.get(&key) {
-        Some(&owner) if owner != index => Some(owner),
-        Some(_) => None,
-        None => {
-            map.insert(key, index);
-            None
+    for (key, path) in keys.iter().zip(paths) {
+        if let Some(&owner) = map.get(key) {
+            if owner != index {
+                return Some((path.clone(), owner));
+            }
         }
+    }
+    for key in keys {
+        map.entry(key).or_insert(index);
+    }
+    None
+}
+
+/// Paths a write request touches (a patch that does not parse touches
+/// none here; the tool rejects it anyway).
+pub(super) fn written_paths(request: &ToolRequest) -> Vec<String> {
+    match request {
+        ToolRequest::CreateFile { path, .. } | ToolRequest::EditFile { path, .. } => {
+            vec![path.clone()]
+        }
+        ToolRequest::ApplyPatch { patch } => rex_tools::patch::parse(patch)
+            .map(|ops| rex_tools::patch_paths(&ops))
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 
@@ -400,14 +420,10 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                     } else if gate.allowed.is_some_and(|a| !a.iter().any(|t| t == &name)) {
                         let c = format!("{name} is not enabled for this run's role");
                         (name, id, args, c, false)
-                    } else if let Some((path, other)) = match (&request, limits.kind) {
-                        (
-                            ToolRequest::CreateFile { path, .. }
-                            | ToolRequest::EditFile { path, .. },
-                            ExplorerKind::Edit,
-                        ) => claim_path(gate.claims, path, gate.index).map(|o| (path.clone(), o)),
-                        _ => None,
-                    } {
+                    } else if let Some((path, other)) = (limits.kind == ExplorerKind::Edit)
+                        .then(|| claim_paths(gate.claims, &written_paths(&request), gate.index))
+                        .flatten()
+                    {
                         let c = format!(
                             "refused: {path} is being changed by edit sub-agent {} in this batch; leave that file to it and mention the overlap in your report",
                             other + 1

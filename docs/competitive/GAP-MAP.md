@@ -209,8 +209,12 @@ is shared it is noted in the module docs.
   write, one refusal), then one batch on separate files (two approvals,
   both writes, 2 requests in flight). 3 mutations fail it: no claim, no
   `./` normalisation, no approval lock (the run hangs until timeout).
-- Gap left: claims cover create_file/edit_file only; apply_patch and
-  run_command from parallel children are not checked for overlap.
+- Claims also cover every path an `apply_patch` touches (added, updated,
+  deleted and move targets), all or none: a patch that hits one claimed
+  path claims nothing. Unit test plus 4 mutations (partial claim, no patch
+  paths, no owner check, no insert), each failing it.
+- Gap left: `run_command` from parallel edit children is not checked for
+  file overlap (a command's writes are not known before it runs).
 
 ## Round 5: YAML/TOML checks and app panels
 

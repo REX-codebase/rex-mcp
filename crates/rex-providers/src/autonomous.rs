@@ -5681,6 +5681,33 @@ mod tests {
     }
 
     #[test]
+    fn edit_claims_cover_patch_paths_all_or_none() {
+        use explore::{claim_paths, written_paths};
+        let claims = Mutex::new(std::collections::HashMap::new());
+        let patch = ToolRequest::ApplyPatch {
+            patch: "*** Begin Patch\n*** Update File: a.txt\n*** Move to: moved.txt\n@@\n-x\n+y\n*** Add File: c.txt\n+c\n*** End Patch".into(),
+        };
+        assert_eq!(written_paths(&patch), ["a.txt", "moved.txt", "c.txt"]);
+        assert!(written_paths(&ToolRequest::ApplyPatch {
+            patch: "not a patch".into()
+        })
+        .is_empty());
+        assert_eq!(claim_paths(&claims, &["./a.txt".into()], 0), None);
+        // child 1's patch touches a.txt, so nothing in it is claimed
+        assert_eq!(
+            claim_paths(&claims, &written_paths(&patch), 1),
+            Some(("a.txt".into(), 0))
+        );
+        assert_eq!(claim_paths(&claims, &["c.txt".into()], 1), None);
+        assert_eq!(
+            claim_paths(&claims, &["moved.txt".into(), "c.txt".into()], 0),
+            Some(("c.txt".into(), 1))
+        );
+        // re-claiming your own path is fine
+        assert_eq!(claim_paths(&claims, &["a.txt".into()], 0), None);
+    }
+
+    #[test]
     fn edit_children_can_run_as_a_batch() {
         use explore::ExplorerKind;
         assert_eq!(
