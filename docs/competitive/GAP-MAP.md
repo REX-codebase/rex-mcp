@@ -375,3 +375,35 @@ is shared it is noted in the module docs.
   1440px. 2 vitest tests.
 - Gap left: REX summarises dropped tool results, not the whole conversation, because
   its loop sends fresh state each turn instead of a growing transcript.
+
+### Round 12b: full Rust syntax check after writes
+
+- Before: `.rs` writes got only the delimiter/string/comment check, so
+  `let x = 1 +;` or `struct S { a: u8 b: u8 }` passed silently.
+- Hermes: `rustfmt --check {file}` per write
+  (`tools/file_operations_lint.py:22`). Its own comment calls this
+  style-only and skips it when an LSP server claims the file
+  (`tools/file_operations_lint.py:26-29`), and it needs a Rust toolchain.
+  opencode: LSP diagnostics with each edit (`src/tool/edit.ts:198-200`),
+  which need rust-analyzer running.
+- REX now (`crates/rex-tools/src/check.rs`, `check_rust_parse`): when the
+  delimiter check is clean, the file is parsed with `syn` (already in the
+  lockfile through serde; `span-locations` added to `proc-macro2`). The
+  first syntax error is reported with line and column, and goes through
+  the same new vs already-there labelling. No subprocess, no toolchain,
+  and formatting is never flagged. Files nested more than 128 brackets deep
+  are skipped and the parse runs on a thread with a 64 MB stack; without
+  this, a deep file in the cargo registry overflowed the stack and
+  aborted the process during the sweep.
+- Tests: 2 new unit tests. Hand mutation: 11/11 killed.
+- False-alarm sweep: this repo 0 of 317; opencode unchanged (2 of 3,926,
+  both older JSX notes); Hermes 1 new of 11,586: `contributors/emails/d@rko.rs`,
+  a one-word text file with a `.rs` name (not Rust). Cargo registry: 4 new
+  of 11,067: syn's own negative test input (`syn-1.0.109/tests/test_item.rs`),
+  erased-serde's deliberately broken `features_check/error.rs`, dbus
+  `methoddisp.rs` (inner attribute after a doc comment, which rustc also
+  rejects; the file is marked unused), and one false alarm:
+  `serial-core-0.4.0/src/lib.rs:495`, 2015-edition syntax that `syn`
+  does not accept. Pre-existing errors in edited files are still labelled
+  as already there.
+- Gap left: no type or borrow errors (needs rustc or an LSP).

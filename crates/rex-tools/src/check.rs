@@ -69,11 +69,76 @@ pub fn check(path: &str, content: &str) -> Option<Vec<Finding>> {
         Lang::Json => check_json(content),
         Lang::Toml => check_toml(content),
         Lang::Yaml => check_yaml(content),
+        Lang::Rust => {
+            let found = check_delimiters(content, Lang::Rust, false);
+            if found.is_empty() {
+                check_rust_parse(content)
+            } else {
+                found
+            }
+        }
         other => {
             let jsx = path.ends_with(".jsx") || path.ends_with(".tsx");
             check_delimiters(content, other, jsx)
         }
     })
+}
+
+/// Full Rust parse (syn), run only when the delimiter check is clean so a
+/// broken bracket is still reported in its own words. Reports the first
+/// syntax error with its position. Hermes shells out to `rustfmt --check`
+/// for `.rs` (`tools/file_operations_lint.py:22`), which also fails on
+/// formatting; this reports syntax only and needs no toolchain.
+fn check_rust_parse(content: &str) -> Vec<Finding> {
+    // syn recurses per nesting level; a deeply nested (often generated) file
+    // can overflow a small stack, and a stack overflow aborts the process.
+    // Skip very deep inputs (size is capped by check) and parse on a thread
+    // with a big stack.
+    if nesting_depth(content) > RUST_PARSE_MAX_DEPTH {
+        return Vec::new();
+    }
+    let owned = content.to_string();
+    let worker = std::thread::Builder::new()
+        .stack_size(RUST_PARSE_STACK)
+        .spawn(move || rust_parse_findings(&owned));
+    match worker {
+        Ok(handle) => handle.join().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+const RUST_PARSE_MAX_DEPTH: usize = 128;
+const RUST_PARSE_STACK: usize = 64 * 1024 * 1024;
+
+/// Upper bound on bracket nesting (ignores strings and comments, so it can
+/// over-count; that only makes the skip more cautious).
+fn nesting_depth(content: &str) -> usize {
+    let (mut depth, mut max) = (0usize, 0usize);
+    for b in content.bytes() {
+        match b {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
+fn rust_parse_findings(content: &str) -> Vec<Finding> {
+    match syn::parse_file(content) {
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            let start = e.span().start();
+            vec![Finding {
+                line: start.line.max(1),
+                col: start.column + 1,
+                message: format!("Rust syntax error: {e}"),
+            }]
+        }
+    }
 }
 
 fn check_json(content: &str) -> Vec<Finding> {
@@ -1123,6 +1188,61 @@ mod tests {
             f.iter().any(|f| f.message.contains(needle)),
             "{path}: wanted {needle}, got {f:?}"
         );
+    }
+
+    #[test]
+    fn rust_syntax_errors_past_balanced_brackets_are_caught() {
+        clean(
+            "a.rs",
+            "fn main() { let x = vec![1, 2]; println!(\"{x:?}\"); }\n",
+        );
+        clean("a.rs", "use std::io;\nimpl<T: Clone> Foo<T> where T: Send { fn f(&self) -> io::Result<()> { Ok(()) } }\n");
+        let f = check("a.rs", "fn main() {\n    let x = 1 +;\n}\n").unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.starts_with("Rust syntax error"), "{f:?}");
+        assert_eq!((f[0].line, f[0].col), (2, 16), "{f:?}");
+        dirty("a.rs", "fn f() { let }\n", "Rust syntax error");
+        dirty("a.rs", "struct S { a: u8 b: u8 }\n", "Rust syntax error");
+        // an unbalanced file keeps the delimiter message, not a parse error
+        let f = check("a.rs", "fn f() {\n").unwrap();
+        assert!(
+            f.iter().all(|f| !f.message.contains("Rust syntax")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn rust_parse_skips_deep_input_without_crashing() {
+        let deep = format!("fn f() {{ {}{} }}\n", "(".repeat(5000), ")".repeat(5000));
+        assert!(nesting_depth(&deep) > RUST_PARSE_MAX_DEPTH);
+        clean("a.rs", &deep);
+        let edge = format!("const A: u8 = {}1{};\n", "(".repeat(120), ")".repeat(120));
+        assert_eq!(nesting_depth(&edge), 120);
+        clean("a.rs", &edge);
+        let bad_edge = format!("const A: u8 = {}1 +{};\n", "(".repeat(120), ")".repeat(120));
+        dirty("a.rs", &bad_edge, "Rust syntax error");
+        assert_eq!(nesting_depth("a)(b"), 1);
+        assert_eq!(nesting_depth("[{}]"), 2);
+        assert_eq!(nesting_depth("(())()"), 2);
+        assert_eq!(nesting_depth("{}{}{}"), 1);
+        // too deep: the parse is skipped, so even a real error is not reported
+        let deep_bad = format!(
+            "fn f() {{ let x = 1 +; {}{} }}\n",
+            "(".repeat(300),
+            ")".repeat(300)
+        );
+        clean("a.rs", &deep_bad);
+        // exactly at the limit still parses
+        let limit = RUST_PARSE_MAX_DEPTH - 1; // the fn body brace adds one
+        let at_limit = format!(
+            "fn f() {{ let x = {}1 +{}; }}\n",
+            "(".repeat(limit),
+            ")".repeat(limit)
+        );
+        assert_eq!(nesting_depth(&at_limit), RUST_PARSE_MAX_DEPTH);
+        dirty("a.rs", &at_limit, "Rust syntax error");
+        let under = format!("fn f() {{ let x = 1 +; }}\n{}", "// pad\n".repeat(1000));
+        dirty("a.rs", &under, "Rust syntax error");
     }
 
     #[test]
