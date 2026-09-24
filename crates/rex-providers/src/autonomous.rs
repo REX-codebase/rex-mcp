@@ -1870,6 +1870,14 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
                 AgentEvent::ModelText { text: text.clone() },
             );
         }
+        for note in &decoded.repairs {
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::Info {
+                    message: format!("repaired call: {note}"),
+                },
+            );
+        }
 
         // ---- execute the turn's calls ------------------------------------
         let out = execute_turn(
@@ -2463,9 +2471,13 @@ struct DecodedCalls {
     /// Gemini 2.5 thinking models sign the model turn; the signature must be
     /// echoed back with the next request's function calls.
     thought_signature: Option<String>,
+    /// Slips fixed before decoding (tool name or argument types), one note
+    /// each, so the run's events show what was changed.
+    repairs: Vec<String>,
 }
 
 fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
+    let mut repairs = Vec::new();
     let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
     let parts = value
         .get("candidates")
@@ -2503,8 +2515,9 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
             .get("name")
             .and_then(Value::as_str)
             .ok_or("functionCall missing name")?;
-        let name = canonical_call_name(name);
-        let name = name.as_str();
+        let fixed_name = canonical_call_name(name);
+        note_name_repair(name, &fixed_name, &mut repairs);
+        let name = fixed_name.as_str();
         let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
         match name {
             "update_plan" => {
@@ -2611,7 +2624,11 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     .as_object_mut()
                     .unwrap()
                     .insert("tool".into(), Value::String(name.into()));
-                rex_tools::repair_tool_args(name, &mut object);
+                note_arg_repair(
+                    name,
+                    rex_tools::repair_tool_args(name, &mut object),
+                    &mut repairs,
+                );
                 match serde_json::from_value::<ToolRequest>(object) {
                     Ok(request) => calls.push((AgentCall::Tool { id, request }, raw)),
                     Err(e) => calls.push((
@@ -2630,6 +2647,7 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
         texts,
         calls,
         thought_signature,
+        repairs,
     })
 }
 
@@ -2669,14 +2687,31 @@ fn canonical_call_name(name: &str) -> String {
     }
 }
 
+fn note_name_repair(original: &str, fixed: &str, repairs: &mut Vec<String>) {
+    if original != fixed {
+        repairs.push(format!("tool name '{original}' read as '{fixed}'"));
+    }
+}
+
+fn note_arg_repair(tool: &str, fields: Vec<String>, repairs: &mut Vec<String>) {
+    if !fields.is_empty() {
+        repairs.push(format!(
+            "{tool}: fixed argument types for {}",
+            fields.join(", ")
+        ));
+    }
+}
+
 fn decode_named_call(
     name: &str,
     id: String,
     args: Value,
     raw: Value,
+    repairs: &mut Vec<String>,
 ) -> (AgentCall, Option<Value>) {
-    let name = canonical_call_name(name);
-    let name = name.as_str();
+    let fixed_name = canonical_call_name(name);
+    note_name_repair(name, &fixed_name, repairs);
+    let name = fixed_name.as_str();
     let bad = |error: String| {
         (
             AgentCall::BadCall {
@@ -2751,7 +2786,11 @@ fn decode_named_call(
                 .as_object_mut()
                 .unwrap()
                 .insert("tool".into(), Value::String(name.into()));
-            rex_tools::repair_tool_args(name, &mut object);
+            note_arg_repair(
+                name,
+                rex_tools::repair_tool_args(name, &mut object),
+                repairs,
+            );
             match serde_json::from_value::<ToolRequest>(object) {
                 Ok(request) => (AgentCall::Tool { id, request }, Some(raw)),
                 Err(e) => bad(format!("invalid {name} request: {e}")),
@@ -2761,6 +2800,7 @@ fn decode_named_call(
 }
 
 fn decode_anthropic_calls(response: &str) -> Result<DecodedCalls, String> {
+    let mut repairs = Vec::new();
     let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
     let blocks = value
         .get("content")
@@ -2794,6 +2834,7 @@ fn decode_anthropic_calls(response: &str) -> Result<DecodedCalls, String> {
                     id,
                     block.get("input").cloned().unwrap_or_else(|| json!({})),
                     block.clone(),
+                    &mut repairs,
                 ));
             }
             _ => {}
@@ -2803,10 +2844,12 @@ fn decode_anthropic_calls(response: &str) -> Result<DecodedCalls, String> {
         texts,
         calls,
         thought_signature: None,
+        repairs,
     })
 }
 
 fn decode_openai_calls(response: &str) -> Result<DecodedCalls, String> {
+    let mut repairs = Vec::new();
     let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
     let msg = value
         .pointer("/choices/0/message")
@@ -2839,12 +2882,19 @@ fn decode_openai_calls(response: &str) -> Result<DecodedCalls, String> {
             .and_then(Value::as_str)
             .ok_or("tool call missing arguments")?;
         let args = serde_json::from_str(raw).map_err(|e| format!("invalid tool arguments: {e}"))?;
-        calls.push(decode_named_call(name, id, args, call.clone()));
+        calls.push(decode_named_call(
+            name,
+            id,
+            args,
+            call.clone(),
+            &mut repairs,
+        ));
     }
     Ok(DecodedCalls {
         texts,
         calls,
         thought_signature: None,
+        repairs,
     })
 }
 
@@ -4102,6 +4152,14 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                 AgentEvent::ModelText { text: text.clone() },
             );
         }
+        for note in &decoded.repairs {
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::Info {
+                    message: format!("repaired call: {note}"),
+                },
+            );
+        }
         // Fail closed: the plan turn offers only update_plan, but the
         // generic decoder turns any tool-shaped part into an executable
         // AgentCall::Tool. Verify every decoded call here, before
@@ -4896,6 +4954,45 @@ mod tests {
     }
 
     #[test]
+    fn repaired_calls_run_and_show_in_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![
+                    json!({"functionCall":{"name":"Create_File","args":{"path":"r.txt","content":"x","overwrite":"TRUE"}}}),
+                ]),
+                text_turn("done"),
+                text_turn("done"),
+                text_turn("done"),
+            ]),
+        ));
+        let snap = svc.begin("repair", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 20_000);
+        let infos: Vec<&str> = done
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Info { message } if message.starts_with("repaired call: ") => {
+                    Some(message.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            infos,
+            [
+                "repaired call: tool name 'Create_File' read as 'create_file'",
+                "repaired call: create_file: fixed argument types for overwrite",
+            ]
+        );
+        assert!(done.events.iter().any(
+            |e| matches!(e, AgentEvent::ToolFinished { result } if result.ok && result.tool == "create_file")
+        ));
+    }
+
+    #[test]
     fn stalled_model_terminates_and_was_nudged() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = Arc::new(service(
@@ -5259,6 +5356,7 @@ mod tests {
             "call-1".into(),
             serde_json::json!({"server": "fake", "name": "echo", "arguments": {"text": "hi"}}),
             serde_json::json!({}),
+            &mut Vec::new(),
         );
         match call {
             AgentCall::Tool { id, request } => {
@@ -6333,6 +6431,16 @@ mod tests {
         ));
         assert!(matches!(&got.calls[2].0, AgentCall::Explore { .. }));
         assert!(matches!(&got.calls[3].0, AgentCall::BadCall { name, .. } if name == "Frobnicate"));
+        assert_eq!(
+            got.repairs,
+            [
+                "tool name 'Search_Files' read as 'search_files'",
+                "search_files: fixed argument types for max_results, regex",
+                "tool name 'read-file' read as 'read_file'",
+                "read_file: fixed argument types for limit",
+                "tool name 'Explore' read as 'explore'",
+            ]
+        );
         let openai = json!({"choices":[{"message":{"tool_calls":[
             {"id":"c1","function":{"name":"RUN_COMMAND","arguments":"{\"argv\":\"[\\\"ls\\\",\\\"-a\\\"]\",\"timeout_ms\":\"900\"}"}}
         ]}}]}).to_string();
@@ -6340,6 +6448,19 @@ mod tests {
         assert!(
             matches!(&got.calls[0].0, AgentCall::Tool { request: ToolRequest::RunCommand { argv, timeout_ms: Some(900), .. }, .. } if argv == &["ls", "-a"])
         );
+        assert_eq!(got.repairs.len(), 2);
+        let anthropic = json!({"content":[{"type":"tool_use","id":"t1","name":"Glob_Files","input":{"pattern":"*.rs"}}]}).to_string();
+        let got = decode_anthropic_calls(&anthropic).unwrap();
+        assert!(matches!(
+            &got.calls[0].0,
+            AgentCall::Tool {
+                request: ToolRequest::GlobFiles { .. },
+                ..
+            }
+        ));
+        assert_eq!(got.repairs, ["tool name 'Glob_Files' read as 'glob_files'"]);
+        let clean = decode_anthropic_calls(&json!({"content":[{"type":"tool_use","id":"t2","name":"glob_files","input":{"pattern":"*"}}]}).to_string()).unwrap();
+        assert!(clean.repairs.is_empty());
     }
 
     #[test]
