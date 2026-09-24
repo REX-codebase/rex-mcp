@@ -148,9 +148,18 @@ pub struct Ignore {
 }
 
 impl Ignore {
+    /// Rules of the repository's `.git/info/exclude` (local ignores that
+    /// are not committed) followed by the root `.gitignore`. Later rules
+    /// win, so `.gitignore` files override `info/exclude`, as in git.
+    /// A `.git` that is a file (a worktree or submodule link) is not
+    /// followed.
     pub fn load(root: &Path) -> Self {
+        let exclude =
+            fs::read_to_string(root.join(".git").join("info").join("exclude")).unwrap_or_default();
         let text = fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
-        Self::parse(&text)
+        let mut rules = Self::parse(&exclude).rules;
+        rules.extend(Self::parse(&text).rules);
+        Self { rules }
     }
 
     pub fn parse(text: &str) -> Self {
@@ -442,6 +451,22 @@ mod tests {
         let ig = Ignore::parse("!x.txt\n");
         assert!(!ig.is_ignored("x.txt", false));
         assert!(!ig.is_ignored("y.txt", false));
+    }
+
+    #[test]
+    fn git_info_exclude_counts_below_gitignore() {
+        let t = tree(&[
+            (".git/info/exclude", "# local\nscratch/\n*.bak\nnotes.md\n"),
+            (".gitignore", "!notes.md\n"),
+            ("scratch/a.rs", "x"),
+            ("sub/old.bak", "x"),
+            ("notes.md", "x"),
+            ("main.rs", "x"),
+        ]);
+        assert_eq!(listed(t.path()), [".gitignore", "main.rs", "notes.md"]);
+        // no .git folder: only .gitignore
+        let t = tree(&[(".gitignore", "*.bak\n"), ("a.bak", "x"), ("b.rs", "x")]);
+        assert_eq!(listed(t.path()), [".gitignore", "b.rs"]);
     }
 
     #[test]

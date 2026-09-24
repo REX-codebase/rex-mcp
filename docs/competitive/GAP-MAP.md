@@ -1107,3 +1107,19 @@ is shared it is noted in the module docs.
   ignored parent folder, and a lone negation. Hand mutation: 5/5 killed.
 - Gap left: `.git/info/exclude` and the global excludes file are not
   read.
+
+## Round 26: .git/info/exclude
+
+- Competitors: ripgrep (behind opencode's glob/grep and Hermes's search)
+  also honours the repository's `.git/info/exclude`, where people keep
+  local ignores they do not commit.
+- REX before: only `.gitignore` files were read (round 25's gap).
+- REX now: `Ignore::load` reads `.git/info/exclude` first, then the root
+  `.gitignore`; since the last matching rule wins, `.gitignore` files
+  override it, as in git. A `.git` file (worktree or submodule link) is
+  not followed. Search, glob and the change snapshot all use it.
+- Tests: a walker test (exclude hides a folder, a glob and a file; the
+  root `.gitignore` re-includes the file; no `.git` means `.gitignore`
+  only). Hand mutation: 3/3 killed.
+- Gap left: the global excludes file (`core.excludesFile`) and a
+  worktree's real git folder are not read.
