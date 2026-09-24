@@ -169,6 +169,8 @@ mod tests {
                 provider_call_id: "r".into(),
                 request: ToolRequest::ReadFile {
                     path: "a.txt".into(),
+                    offset: None,
+                    limit: None,
                 },
             }],
             finished: false,

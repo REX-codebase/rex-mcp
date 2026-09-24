@@ -4,7 +4,12 @@
 //! request is prepared against a canonical workspace, classified, and bound to
 //! an unguessable pending call. Risky calls require a separate user decision.
 
+pub mod check;
+pub mod fuzzy;
+pub mod journal;
+pub mod patch;
 pub mod sandbox;
+pub mod walk;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -19,6 +24,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Files up to this size and `DEFAULT_READ_LINES` lines are returned raw
+/// (exact bytes, easy to copy into an edit). Larger files are paged.
+const RAW_READ_BYTES: u64 = 256 * 1024;
+const DEFAULT_READ_LINES: usize = 2000;
+const MAX_READ_LINES: usize = 5000;
+const MAX_LINE_CHARS: usize = 2000;
+const MAX_PAGED_READ_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LIST_ENTRIES: usize = 500;
 /// MCP tool output is capped so a chatty server cannot flood the model
 /// context; the truncation marker tells the model the output was cut.
 const MAX_MCP_OUTPUT: usize = 64 * 1024;
@@ -51,11 +64,50 @@ fn mcp_text(result: &Value) -> String {
 }
 
 fn truncate(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-    format!("{}…\n[output truncated at {max} bytes]", &text[..max])
+    clip_middle(text, max).0
 }
+
+/// Largest char boundary at or below `at`.
+pub fn floor_boundary(text: &str, at: usize) -> usize {
+    let mut i = at.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest char boundary at or above `at`.
+fn ceil_boundary(text: &str, at: usize) -> usize {
+    let mut i = at.min(text.len());
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Clip `text` to about `max` bytes keeping the head and the tail (where
+/// build errors, test failures and exit summaries usually are), with an
+/// explicit marker saying how much was omitted. Always cuts on char
+/// boundaries, so multi-byte output can never panic. Returns whether
+/// anything was cut.
+pub fn clip_middle(text: &str, max: usize) -> (String, bool) {
+    if text.len() <= max {
+        return (text.to_string(), false);
+    }
+    let head_end = floor_boundary(text, max * 3 / 5);
+    let tail_start = ceil_boundary(text, text.len() - (max - max * 3 / 5));
+    let tail_start = tail_start.max(head_end);
+    let omitted = tail_start - head_end;
+    (
+        format!(
+            "{}\n[... {omitted} bytes omitted from the middle; narrow the command or read a smaller range ...]\n{}",
+            &text[..head_end],
+            &text[tail_start..]
+        ),
+        true,
+    )
+}
+
 const MAX_WRITE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
@@ -76,6 +128,13 @@ pub enum RiskClass {
 pub enum ToolRequest {
     ReadFile {
         path: String,
+        /// 1-based first line to return. Setting `offset` or `limit` (or
+        /// reading a large file) switches to paged, line-numbered output.
+        #[serde(default)]
+        offset: Option<usize>,
+        /// Maximum lines to return in paged mode (default 2000, max 5000).
+        #[serde(default)]
+        limit: Option<usize>,
     },
     CreateFile {
         path: String,
@@ -90,6 +149,23 @@ pub enum ToolRequest {
     },
     SearchFiles {
         query: String,
+        path: Option<String>,
+        max_results: Option<usize>,
+        /// Treat `query` as a regular expression (default: literal,
+        /// case-insensitive substring).
+        #[serde(default)]
+        regex: Option<bool>,
+        /// Only search files whose path matches this glob, e.g. `*.rs` or
+        /// `src/**/*.{ts,tsx}`.
+        #[serde(default)]
+        include: Option<String>,
+    },
+    /// Atomic multi-file patch (`*** Begin Patch` envelope): add, update,
+    /// move and delete files; every hunk must apply or nothing is written.
+    ApplyPatch { patch: String },
+    /// Find files by glob pattern, newest first.
+    GlobFiles {
+        pattern: String,
         path: Option<String>,
         max_results: Option<usize>,
     },
@@ -205,6 +281,13 @@ pub struct ToolRuntime {
     pending: Arc<Mutex<HashMap<String, Pending>>>,
     order: Arc<Mutex<VecDeque<String>>>,
     mcp: Option<Arc<dyn McpCaller>>,
+    /// Content fingerprint of each file as this runtime last read or wrote
+    /// it. A write to a file whose bytes changed since then (another
+    /// process, the user, a concurrent run) is refused as stale, so a model
+    /// never overwrites edits it has not seen.
+    seen: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    /// Optional on-disk write journal enabling undo (see `journal`).
+    journal: Option<Arc<journal::Journal>>,
 }
 
 /// How a run reaches third-party MCP servers. Implemented by the run host
@@ -236,6 +319,8 @@ impl ToolRuntime {
             pending: Default::default(),
             order: Default::default(),
             mcp: None,
+            seen: Arc::new(Mutex::new(HashMap::new())),
+            journal: None,
         })
     }
 
@@ -244,6 +329,93 @@ impl ToolRuntime {
     pub fn with_mcp_caller(mut self, caller: Arc<dyn McpCaller>) -> Self {
         self.mcp = Some(caller);
         self
+    }
+
+    /// Journal every successful file write under `dir` so it can be undone
+    /// with [`ToolRuntime::undo_last_write`] or [`journal::Journal::undo_last`].
+    pub fn with_journal(mut self, dir: impl Into<PathBuf>) -> Result<Self, ToolError> {
+        self.journal = Some(Arc::new(journal::Journal::open(dir).map_err(io_err)?));
+        Ok(self)
+    }
+
+    /// Undo the newest journaled write. Refuses (changing nothing) if a
+    /// touched file changed after the agent wrote it.
+    pub fn undo_last_write(&self) -> Result<journal::JournalEntry, ToolError> {
+        let j = self.journal.as_ref().ok_or_else(|| {
+            err(
+                ErrorKind::InvalidRequest,
+                "no write journal for this runtime",
+            )
+        })?;
+        let entry = j
+            .undo_last(&self.root)
+            .map_err(|e| err(ErrorKind::Conflict, &e))?;
+        for f in &entry.files {
+            self.note_seen(&self.root.join(&f.path));
+        }
+        Ok(entry)
+    }
+
+    /// Workspace-relative paths a write request will touch, for journaling.
+    fn write_targets(&self, request: &ToolRequest) -> Option<Vec<String>> {
+        let rels = match request {
+            ToolRequest::CreateFile { path, .. } => {
+                vec![relative(&self.root, &self.resolve_for_write(path).ok()?)]
+            }
+            ToolRequest::EditFile { path, .. } => {
+                vec![relative(
+                    &self.root,
+                    &self.resolve_existing(path, false).ok()?,
+                )]
+            }
+            ToolRequest::ApplyPatch { patch } => self
+                .plan_patch(patch)
+                .ok()?
+                .iter()
+                .map(|(t, _)| relative(&self.root, t))
+                .collect(),
+            _ => return None,
+        };
+        Some(rels)
+    }
+
+    fn fingerprint(bytes: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    }
+
+    /// Record the current on-disk bytes of `target` as seen by the model.
+    fn note_seen(&self, target: &Path) {
+        if let Ok(bytes) = fs::read(target) {
+            self.seen
+                .lock()
+                .expect("seen lock poisoned")
+                .insert(target.to_path_buf(), Self::fingerprint(&bytes));
+        }
+    }
+
+    /// Refuse a write when the file changed on disk since this runtime last
+    /// read or wrote it. Files never read are allowed: an edit's expected
+    /// text is itself a check, and creating new files needs no read.
+    fn check_not_stale(&self, target: &Path) -> Result<(), ToolError> {
+        let known = self
+            .seen
+            .lock()
+            .expect("seen lock poisoned")
+            .get(target)
+            .copied();
+        if let Some(fp) = known {
+            let now = fs::read(target).map(|b| Self::fingerprint(&b)).ok();
+            if now != Some(fp) {
+                return Err(err(
+                    ErrorKind::Conflict,
+                    "file changed on disk since it was last read; read it again before writing",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -320,6 +492,32 @@ impl ToolRuntime {
                     modified: content.clone(),
                 }))
             }
+            ToolRequest::ApplyPatch { patch } => {
+                let changes = self.plan_patch(patch)?;
+                let mut original = String::new();
+                let mut modified = String::new();
+                let mut names = Vec::new();
+                for (_, change) in &changes {
+                    let (path, before, after) = match change {
+                        patch::Change::Write {
+                            path,
+                            original,
+                            content,
+                        } => (path, original.clone().unwrap_or_default(), content.clone()),
+                        patch::Change::Delete { path, original } => {
+                            (path, original.clone(), String::new())
+                        }
+                    };
+                    names.push(path.clone());
+                    original.push_str(&format!("=== {path} ===\n{before}\n"));
+                    modified.push_str(&format!("=== {path} ===\n{after}\n"));
+                }
+                Ok(Some(FileDiff {
+                    path: names.join(", "),
+                    original,
+                    modified,
+                }))
+            }
             ToolRequest::EditFile {
                 path,
                 expected,
@@ -333,11 +531,9 @@ impl ToolRuntime {
                 }
                 // Apply the edit in memory (same logic as edit_file, without
                 // writing) to produce the proposed content.
-                let new = if *replace_all {
-                    old.replace(expected, replacement)
-                } else {
-                    old.replacen(expected, replacement, 1)
-                };
+                // Same planner as execution, so the approved diff is exactly
+                // what would be written if the file is unchanged.
+                let new = plan_edit_checked(&old, expected, replacement, *replace_all)?.new_content;
                 Ok(Some(FileDiff {
                     path: path.clone(),
                     original: old,
@@ -513,7 +709,16 @@ impl ToolRuntime {
                 }
             }
         };
+        let before = match &self.journal {
+            Some(_) => self
+                .write_targets(&call.request)
+                .map(|rels| journal::Pending::capture(&self.root, &rels)),
+            None => None,
+        };
         let outcome = self.execute_inner(&call.request);
+        if let (Ok(_), Some(j), Some(pending)) = (&outcome, &self.journal, before) {
+            let _ = j.record(&self.root, call_id, &call.prepared.tool, pending);
+        }
         match outcome {
             Ok(mut data) => {
                 let (clean, redactions) = redact(&data.output.unwrap_or_default());
@@ -545,7 +750,11 @@ impl ToolRuntime {
 
     fn execute_inner(&self, request: &ToolRequest) -> Result<ExecData, ToolError> {
         match request {
-            ToolRequest::ReadFile { path } => self.read_file(path),
+            ToolRequest::ReadFile {
+                path,
+                offset,
+                limit,
+            } => self.read_file(path, *offset, *limit),
             ToolRequest::CreateFile {
                 path,
                 content,
@@ -561,7 +770,21 @@ impl ToolRuntime {
                 query,
                 path,
                 max_results,
-            } => self.search_files(query, path.as_deref(), max_results.unwrap_or(50)),
+                regex,
+                include,
+            } => self.search_files(
+                query,
+                path.as_deref(),
+                max_results.unwrap_or(50),
+                regex.unwrap_or(false),
+                include.as_deref(),
+            ),
+            ToolRequest::ApplyPatch { patch } => self.apply_patch(patch),
+            ToolRequest::GlobFiles {
+                pattern,
+                path,
+                max_results,
+            } => self.glob_files(pattern, path.as_deref(), max_results.unwrap_or(100)),
             ToolRequest::RunCommand {
                 argv,
                 cwd,
@@ -608,32 +831,145 @@ impl ToolRuntime {
         Ok(exec(Some(truncate(&text, MAX_MCP_OUTPUT)), r))
     }
 
-    fn read_file(&self, path: &str) -> Result<ExecData, ToolError> {
-        let target = self.resolve_existing(path, false)?;
+    fn read_file(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<ExecData, ToolError> {
+        let target = self.resolve_existing(path, true)?;
         let meta = fs::metadata(&target).map_err(io_err)?;
+        if meta.is_dir() {
+            return self.list_dir_output(&target);
+        }
         if !meta.is_file() {
             return Err(err(
                 ErrorKind::InvalidRequest,
                 "target is not a regular file",
             ));
         }
-        if meta.len() > MAX_FILE_BYTES {
-            return Err(err(ErrorKind::TooLarge, "file exceeds 2 MiB read limit"));
+        let paged = offset.is_some() || limit.is_some() || meta.len() > RAW_READ_BYTES;
+        if !paged {
+            let mut bytes = Vec::with_capacity(meta.len() as usize);
+            File::open(&target)
+                .and_then(|mut f| f.read_to_end(&mut bytes))
+                .map_err(io_err)?;
+            if looks_binary(&bytes) {
+                return Err(binary_error(meta.len()));
+            }
+            let text = String::from_utf8(bytes).map_err(|_| {
+                err(
+                    ErrorKind::InvalidRequest,
+                    "binary or non-UTF-8 files are not supported",
+                )
+            })?;
+            let line_count = text.lines().count();
+            if line_count <= DEFAULT_READ_LINES {
+                self.note_seen(&target);
+                return Ok(exec(
+                    Some(text),
+                    receipt(&self.root, Some(&target), meta.len(), 0),
+                ));
+            }
         }
-        let mut bytes = Vec::with_capacity(meta.len() as usize);
-        File::open(&target)
-            .and_then(|mut f| f.read_to_end(&mut bytes))
+        if meta.len() > MAX_PAGED_READ_BYTES {
+            return Err(err(
+                ErrorKind::TooLarge,
+                "file exceeds 64 MiB paged read limit; use search_files to find the region",
+            ));
+        }
+        let start = offset.unwrap_or(1).max(1);
+        let want = limit.unwrap_or(DEFAULT_READ_LINES).clamp(1, MAX_READ_LINES);
+        let mut head = [0u8; 8192];
+        let n = File::open(&target)
+            .and_then(|mut f| f.read(&mut head))
             .map_err(io_err)?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            err(
+        if looks_binary(&head[..n]) {
+            return Err(binary_error(meta.len()));
+        }
+        let reader = BufReader::new(File::open(&target).map_err(io_err)?);
+        let mut out = String::new();
+        let mut total = 0usize;
+        let mut shown = 0usize;
+        let mut cut_lines = 0usize;
+        for line in reader.split(b'\n') {
+            let mut line = line.map_err(io_err)?;
+            total += 1;
+            if total < start || shown >= want {
+                continue;
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let text = String::from_utf8_lossy(&line);
+            let text = if text.chars().count() > MAX_LINE_CHARS {
+                cut_lines += 1;
+                let mut t: String = text.chars().take(MAX_LINE_CHARS).collect();
+                t.push_str(" … [line truncated]");
+                t
+            } else {
+                text.into_owned()
+            };
+            out.push_str(&format!("{total:>6}\t{text}\n"));
+            shown += 1;
+        }
+        if start > total.max(1) {
+            return Err(err(
                 ErrorKind::InvalidRequest,
-                "binary or non-UTF-8 files are not supported",
-            )
-        })?;
-        Ok(exec(
-            Some(text),
-            receipt(&self.root, Some(&target), meta.len(), 0),
-        ))
+                &format!("offset {start} is past the end of the file ({total} lines)"),
+            ));
+        }
+        let last = start + shown - 1;
+        if last < total {
+            out.push_str(&format!(
+                "[lines {start}-{last} of {total}; call read_file with offset={} to continue]",
+                last + 1
+            ));
+        } else {
+            out.push_str(&format!("[lines {start}-{last} of {total}; end of file]"));
+        }
+        if cut_lines > 0 {
+            out.push_str(&format!(
+                "\n[{cut_lines} line(s) longer than {MAX_LINE_CHARS} chars were cut]"
+            ));
+        }
+        self.note_seen(&target);
+        let mut r = receipt(&self.root, Some(&target), meta.len(), 0);
+        r.output_truncated = last < total || cut_lines > 0;
+        Ok(exec(Some(out), r))
+    }
+
+    /// Directory listing for `read_file` on a directory: sorted, one entry
+    /// per line, directories suffixed with `/`, symlinks marked, capped.
+    fn list_dir_output(&self, dir: &Path) -> Result<ExecData, ToolError> {
+        let mut entries: Vec<String> = fs::read_dir(dir)
+            .map_err(io_err)?
+            .filter_map(Result::ok)
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                match e.file_type() {
+                    Ok(t) if t.is_symlink() => format!("{name}@"),
+                    Ok(t) if t.is_dir() => format!("{name}/"),
+                    _ => name,
+                }
+            })
+            .collect();
+        entries.sort();
+        let total = entries.len();
+        let mut out = entries
+            .into_iter()
+            .take(MAX_LIST_ENTRIES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if total > MAX_LIST_ENTRIES {
+            out.push_str(&format!(
+                "\n[{} more entries not shown; use glob_files with a pattern]",
+                total - MAX_LIST_ENTRIES
+            ));
+        }
+        let mut r = receipt(&self.root, Some(dir), 0, 0);
+        r.output_truncated = total > MAX_LIST_ENTRIES;
+        Ok(exec(Some(out), r))
     }
 
     fn create_file(
@@ -661,6 +997,7 @@ impl ToolRuntime {
             if meta.len() > MAX_FILE_BYTES {
                 return Err(err(ErrorKind::TooLarge, "existing file exceeds diff limit"));
             }
+            self.check_not_stale(&target)?;
             fs::read_to_string(&target).map_err(io_err)?
         } else {
             String::new()
@@ -676,6 +1013,8 @@ impl ToolRuntime {
         file.write_all(content.as_bytes())
             .and_then(|_| file.sync_all())
             .map_err(io_err)?;
+        drop(file);
+        self.note_seen(&target);
         let mut r = receipt(
             &self.root,
             Some(&target),
@@ -688,10 +1027,15 @@ impl ToolRuntime {
             &relative(&self.root, &target),
         ));
         Ok(exec(
-            Some(format!(
-                "wrote {} bytes to {}",
-                content.len(),
-                relative(&self.root, &target)
+            Some(with_check(
+                format!(
+                    "wrote {} bytes to {}",
+                    content.len(),
+                    relative(&self.root, &target)
+                ),
+                &relative(&self.root, &target),
+                (!previous.is_empty()).then_some(previous.as_str()),
+                content,
             )),
             r,
         ))
@@ -715,28 +1059,14 @@ impl ToolRuntime {
         if old.len() > MAX_FILE_BYTES as usize {
             return Err(err(ErrorKind::TooLarge, "file exceeds 2 MiB edit limit"));
         }
-        let count = old.matches(expected).count();
-        if count == 0 {
-            return Err(err(
-                ErrorKind::Conflict,
-                "expected text was not found; file may have changed",
-            ));
-        }
-        if count > 1 && !replace_all {
-            return Err(err(
-                ErrorKind::Conflict,
-                "expected text is not unique; set replace_all explicitly",
-            ));
-        }
-        let new = if replace_all {
-            old.replace(expected, replacement)
-        } else {
-            old.replacen(expected, replacement, 1)
-        };
+        self.check_not_stale(&target)?;
+        let plan = plan_edit_checked(&old, expected, replacement, replace_all)?;
+        let new = plan.new_content;
         if new.len() > MAX_WRITE_BYTES {
             return Err(err(ErrorKind::TooLarge, "edited file exceeds 2 MiB limit"));
         }
         fs::write(&target, new.as_bytes()).map_err(io_err)?;
+        self.note_seen(&target);
         let mut r = receipt(
             &self.root,
             Some(&target),
@@ -744,11 +1074,26 @@ impl ToolRuntime {
             new.len() as u64,
         );
         r.diff = Some(simple_diff(&old, &new, &relative(&self.root, &target)));
+        let rel = relative(&self.root, &target);
         Ok(exec(
-            Some(format!(
-                "replaced {} occurrence(s) in {}",
-                if replace_all { count } else { 1 },
-                relative(&self.root, &target)
+            Some(with_check(
+                if plan.strategy == "exact" {
+                    format!(
+                        "replaced {} occurrence(s) in {}",
+                        plan.replaced,
+                        relative(&self.root, &target)
+                    )
+                } else {
+                    format!(
+                    "replaced {} occurrence(s) in {} (matched via {}; indentation taken from the file)",
+                    plan.replaced,
+                    relative(&self.root, &target),
+                    plan.strategy
+                )
+                },
+                &rel,
+                Some(&old),
+                &new,
             )),
             r,
         ))
@@ -759,16 +1104,40 @@ impl ToolRuntime {
         query: &str,
         path: Option<&str>,
         max_results: usize,
+        regex: bool,
+        include: Option<&str>,
     ) -> Result<ExecData, ToolError> {
         let base = self.resolve_existing(path.unwrap_or("."), true)?;
         let limit = max_results.clamp(1, MAX_SEARCH_RESULTS);
-        let mut files = Vec::new();
-        collect_files(&base, &mut files, 0)?;
+        let matcher: Box<dyn Fn(&str) -> bool> = if regex {
+            let re = regex::RegexBuilder::new(query)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|e| err(ErrorKind::InvalidRequest, &format!("invalid regex: {e}")))?;
+            Box::new(move |line: &str| re.is_match(line))
+        } else {
+            let needle = query.to_lowercase();
+            Box::new(move |line: &str| line.to_lowercase().contains(&needle))
+        };
+        let include = match include.map(str::trim).filter(|g| !g.is_empty()) {
+            Some(g) => Some(walk::Glob::new(g).ok_or_else(|| {
+                err(
+                    ErrorKind::InvalidRequest,
+                    &format!("invalid include glob: {g}"),
+                )
+            })?),
+            None => None,
+        };
+        let ignore = walk::Ignore::load(&self.root);
+        let (files, capped) = walk::walk_files(&self.root, &base, &ignore, 20_000);
         let mut hits = Vec::new();
         let mut bytes_read = 0u64;
-        for file in files {
-            if hits.len() >= limit {
-                break;
+        let mut more = false;
+        'files: for file in files {
+            if let Some(g) = &include {
+                if !g.matches(&walk::rel_path(&base, &file)) {
+                    continue;
+                }
             }
             let meta = match fs::metadata(&file) {
                 Ok(m) => m,
@@ -777,33 +1146,247 @@ impl ToolRuntime {
             if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
                 continue;
             }
+            let Ok(bytes) = fs::read(&file) else { continue };
             bytes_read += meta.len();
-            let f = match File::open(&file) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            for (idx, line) in BufReader::new(f).lines().take(20_000).enumerate() {
-                let line = match line {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                if line.to_lowercase().contains(&query.to_lowercase()) {
+            if looks_binary(&bytes) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (idx, line) in text.lines().take(50_000).enumerate() {
+                if matcher(line) {
+                    if hits.len() >= limit {
+                        more = true;
+                        break 'files;
+                    }
+                    let shown: String = line.trim().chars().take(300).collect();
                     hits.push(format!(
                         "{}:{}:{}",
                         relative(&self.root, &file),
                         idx + 1,
-                        line.trim()
+                        shown
                     ));
-                    if hits.len() >= limit {
-                        break;
-                    }
                 }
             }
         }
+        let mut out = hits.join("\n");
+        if hits.is_empty() {
+            out = "[no matches]".to_string();
+        }
+        if more {
+            out.push_str(&format!(
+                "\n[more than {limit} matches; narrow with path, include or a more specific query]"
+            ));
+        }
+        if capped {
+            out.push_str("\n[file walk stopped at 20000 files; narrow with path or include]");
+        }
+        let mut r = receipt(&self.root, Some(&base), bytes_read, 0);
+        r.output_truncated = more || capped;
+        Ok(exec(Some(out), r))
+    }
+
+    /// Parse and plan a patch against the workspace without writing.
+    fn plan_patch(&self, text: &str) -> Result<Vec<(PathBuf, patch::Change)>, ToolError> {
+        if text.len() > MAX_WRITE_BYTES {
+            return Err(err(ErrorKind::TooLarge, "patch exceeds 2 MiB limit"));
+        }
+        let ops = patch::parse(text).map_err(|e| err(ErrorKind::InvalidRequest, &e))?;
+        let mut tool_error: Option<ToolError> = None;
+        let planned = patch::plan(&ops, |p| {
+            let res = (|| {
+                let target = self.resolve_for_write(p)?;
+                if !target.exists() {
+                    return Ok(None);
+                }
+                let meta = fs::metadata(&target).map_err(io_err)?;
+                if !meta.is_file() {
+                    return Err(err(
+                        ErrorKind::InvalidRequest,
+                        "target is not a regular file",
+                    ));
+                }
+                if meta.len() > MAX_FILE_BYTES {
+                    return Err(err(ErrorKind::TooLarge, "file exceeds 2 MiB edit limit"));
+                }
+                fs::read_to_string(&target).map(Some).map_err(io_err)
+            })();
+            res.map_err(|e: ToolError| {
+                let msg = format!("{p}: {}", e.detail);
+                tool_error = Some(err(e.kind, &msg));
+                msg
+            })
+        });
+        let changes = match planned {
+            Ok(c) => c,
+            Err(e) => return Err(tool_error.unwrap_or_else(|| err(ErrorKind::Conflict, &e))),
+        };
+        let mut out = Vec::with_capacity(changes.len());
+        for change in changes {
+            let path = match &change {
+                patch::Change::Write { path, content, .. } => {
+                    if content.len() > MAX_WRITE_BYTES {
+                        return Err(err(ErrorKind::TooLarge, "patched file exceeds 2 MiB limit"));
+                    }
+                    path
+                }
+                patch::Change::Delete { path, .. } => path,
+            };
+            out.push((self.resolve_for_write(path)?, change));
+        }
+        Ok(out)
+    }
+
+    /// Apply a patch all-or-nothing: plan everything, refuse stale files,
+    /// then write each file via a temp file + rename; if any step fails,
+    /// already-applied files are restored to their original bytes.
+    fn apply_patch(&self, text: &str) -> Result<ExecData, ToolError> {
+        let changes = self.plan_patch(text)?;
+        if changes.is_empty() {
+            return Err(err(ErrorKind::InvalidRequest, "patch makes no changes"));
+        }
+        for (target, _) in &changes {
+            if target.exists() {
+                self.check_not_stale(target)?;
+            }
+        }
+        let mut applied: Vec<usize> = Vec::new();
+        let mut failure: Option<ToolError> = None;
+        for (idx, (target, change)) in changes.iter().enumerate() {
+            let step = match change {
+                patch::Change::Write { content, .. } => write_atomic(target, content),
+                patch::Change::Delete { .. } => fs::remove_file(target).map_err(io_err),
+            };
+            match step {
+                Ok(()) => applied.push(idx),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = failure {
+            for idx in applied.into_iter().rev() {
+                let (target, change) = &changes[idx];
+                let _ = match change {
+                    patch::Change::Write {
+                        original: Some(o), ..
+                    }
+                    | patch::Change::Delete { original: o, .. } => write_atomic(target, o),
+                    patch::Change::Write { original: None, .. } => {
+                        fs::remove_file(target).map_err(io_err)
+                    }
+                };
+            }
+            return Err(err(
+                e.kind,
+                &format!("patch rolled back, nothing changed: {}", e.detail),
+            ));
+        }
+        let mut summary = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let mut diffs = String::new();
+        let (mut read_bytes, mut written) = (0u64, 0u64);
+        for (target, change) in &changes {
+            let rel = relative(&self.root, target);
+            match change {
+                patch::Change::Write {
+                    original, content, ..
+                } => {
+                    self.note_seen(target);
+                    summary.push(format!(
+                        "{} {rel}",
+                        if original.is_some() { "M" } else { "A" }
+                    ));
+                    let before = original.as_deref().unwrap_or("");
+                    if let Some(n) = check::delta_note(&rel, original.as_deref(), content) {
+                        notes.push(format!("{rel}: {n}"));
+                    }
+                    read_bytes += before.len() as u64;
+                    written += content.len() as u64;
+                    diffs.push_str(&simple_diff(before, content, &rel));
+                }
+                patch::Change::Delete { original, .. } => {
+                    self.seen.lock().expect("seen lock poisoned").remove(target);
+                    summary.push(format!("D {rel}"));
+                    read_bytes += original.len() as u64;
+                    diffs.push_str(&simple_diff(original, "", &rel));
+                }
+            }
+        }
+        let mut r = receipt(&self.root, None, read_bytes, written);
+        r.target = Some(
+            summary
+                .iter()
+                .map(|s| s[2..].to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        r.diff = Some(diffs);
         Ok(exec(
-            Some(hits.join("\n")),
-            receipt(&self.root, Some(&base), bytes_read, 0),
+            Some({
+                let mut msg = format!(
+                    "applied patch to {} file(s):\n{}",
+                    summary.len(),
+                    summary.join("\n")
+                );
+                for n in notes {
+                    msg.push('\n');
+                    msg.push_str(&n);
+                }
+                msg
+            }),
+            r,
         ))
+    }
+
+    fn glob_files(
+        &self,
+        pattern: &str,
+        path: Option<&str>,
+        max_results: usize,
+    ) -> Result<ExecData, ToolError> {
+        let base = self.resolve_existing(path.unwrap_or("."), true)?;
+        let limit = max_results.clamp(1, MAX_SEARCH_RESULTS);
+        let glob = walk::Glob::new(pattern).ok_or_else(|| {
+            err(
+                ErrorKind::InvalidRequest,
+                &format!("invalid glob: {pattern}"),
+            )
+        })?;
+        let ignore = walk::Ignore::load(&self.root);
+        let (files, capped) = walk::walk_files(&self.root, &base, &ignore, 50_000);
+        let mut found: Vec<(SystemTime, String)> = files
+            .into_iter()
+            .filter(|f| glob.matches(&walk::rel_path(&base, f)))
+            .map(|f| {
+                let mtime = fs::metadata(&f)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (mtime, relative(&self.root, &f))
+            })
+            .collect();
+        // Newest first: the file the task is about is usually the one
+        // touched most recently. Ties break by path for determinism.
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let total = found.len();
+        let mut out = found
+            .into_iter()
+            .take(limit)
+            .map(|(_, p)| p)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if total == 0 {
+            out = "[no files match]".to_string();
+        }
+        if total > limit {
+            out.push_str(&format!("\n[{} more files not shown]", total - limit));
+        }
+        if capped {
+            out.push_str("\n[file walk stopped at 50000 files; narrow with path]");
+        }
+        let mut r = receipt(&self.root, Some(&base), 0, 0);
+        r.output_truncated = total > limit || capped;
+        Ok(exec(Some(out), r))
     }
 
     fn run_command(
@@ -1266,13 +1849,15 @@ fn tool_name(r: &ToolRequest) -> &'static str {
         ToolRequest::CreateFile { .. } => "create_file",
         ToolRequest::EditFile { .. } => "edit_file",
         ToolRequest::SearchFiles { .. } => "search_files",
+        ToolRequest::GlobFiles { .. } => "glob_files",
+        ToolRequest::ApplyPatch { .. } => "apply_patch",
         ToolRequest::RunCommand { .. } => "run_command",
         ToolRequest::McpCall { .. } => "mcp_call",
     }
 }
 fn summarize(r: &ToolRequest) -> String {
     match r {
-        ToolRequest::ReadFile { path } => format!("Read {path}"),
+        ToolRequest::ReadFile { path, .. } => format!("Read {path}"),
         ToolRequest::CreateFile {
             path, overwrite, ..
         } => format!("{} {path}", if *overwrite { "Write" } else { "Create" }),
@@ -1281,6 +1866,17 @@ fn summarize(r: &ToolRequest) -> String {
             "Search {:?} for {:?}",
             path.as_deref().unwrap_or("."),
             query
+        ),
+        ToolRequest::ApplyPatch { patch } => {
+            let files = patch::parse(patch)
+                .map(|ops| patch_paths(&ops).join(", "))
+                .unwrap_or_else(|_| "unparseable patch".into());
+            format!("Apply patch: {files}")
+        }
+        ToolRequest::GlobFiles { pattern, path, .. } => format!(
+            "Find files {:?} under {:?}",
+            pattern,
+            path.as_deref().unwrap_or(".")
         ),
         ToolRequest::RunCommand { argv, cwd, .. } => {
             format!("Run {:?} in {}", argv, cwd.as_deref().unwrap_or("."))
@@ -1322,11 +1918,15 @@ fn scoring_policy(argv: &[String], allowed: &[&str]) -> Result<(), ToolError> {
 
 fn classify(r: &ToolRequest) -> (RiskClass, &'static str) {
     match r {
-        ToolRequest::ReadFile { .. } | ToolRequest::SearchFiles { .. } => (
+        ToolRequest::ReadFile { .. }
+        | ToolRequest::SearchFiles { .. }
+        | ToolRequest::GlobFiles { .. } => (
             RiskClass::Read,
             "bounded read inside the selected workspace",
         ),
-        ToolRequest::CreateFile { .. } | ToolRequest::EditFile { .. } => (
+        ToolRequest::CreateFile { .. }
+        | ToolRequest::EditFile { .. }
+        | ToolRequest::ApplyPatch { .. } => (
             RiskClass::Write,
             "changes workspace files and requires user approval",
         ),
@@ -1345,7 +1945,7 @@ fn classify(r: &ToolRequest) -> (RiskClass, &'static str) {
 }
 fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
     match r {
-        ToolRequest::ReadFile { path }
+        ToolRequest::ReadFile { path, .. }
         | ToolRequest::CreateFile { path, .. }
         | ToolRequest::EditFile { path, .. }
             if path.trim().is_empty() =>
@@ -1354,6 +1954,12 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         }
         ToolRequest::SearchFiles { query, .. } if query.trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "search query is empty"))
+        }
+        ToolRequest::ApplyPatch { patch } if patch.trim().is_empty() => {
+            Err(err(ErrorKind::InvalidRequest, "patch is empty"))
+        }
+        ToolRequest::GlobFiles { pattern, .. } if pattern.trim().is_empty() => {
+            Err(err(ErrorKind::InvalidRequest, "glob pattern is empty"))
         }
         ToolRequest::RunCommand { argv, .. } if argv.is_empty() || argv[0].trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "command argv is empty"))
@@ -1627,44 +2233,44 @@ fn simple_diff(old: &str, new: &str, label: &str) -> String {
     }
     out
 }
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<(), ToolError> {
-    if depth > 20 || out.len() > 10_000 {
-        return Ok(());
-    }
-    let entries = fs::read_dir(dir).map_err(io_err)?;
-    for entry in entries {
-        let entry = entry.map_err(io_err)?;
-        let ft = entry.file_type().map_err(io_err)?;
-        if ft.is_symlink() {
-            continue;
-        }
-        let p = entry.path();
-        if ft.is_dir() {
-            collect_files(&p, out, depth + 1)?;
-        } else if ft.is_file() {
-            out.push(p);
-        }
-    }
-    Ok(())
-}
+/// Drain a pipe keeping the first `limit/2` and the last `limit/2` bytes,
+/// so a long build log keeps both its start and the final error. The
+/// reader is always drained to EOF so the child never blocks on a full
+/// pipe.
 fn read_capped<R: Read>(mut r: R, limit: usize) -> (Vec<u8>, bool) {
-    let mut out = Vec::new();
+    let head_cap = limit / 2;
+    let tail_cap = limit - head_cap;
+    let mut head = Vec::new();
+    let mut tail: VecDeque<u8> = VecDeque::new();
+    let mut dropped = 0usize;
     let mut buf = [0u8; 8192];
-    let mut truncated = false;
     loop {
         match r.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let room = limit.saturating_sub(out.len());
-                out.extend_from_slice(&buf[..n.min(room)]);
-                if n > room {
-                    truncated = true;
+                let mut chunk = &buf[..n];
+                if head.len() < head_cap {
+                    let take = chunk.len().min(head_cap - head.len());
+                    head.extend_from_slice(&chunk[..take]);
+                    chunk = &chunk[take..];
+                }
+                tail.extend(chunk.iter().copied());
+                while tail.len() > tail_cap {
+                    tail.pop_front();
+                    dropped += 1;
                 }
             }
             Err(_) => break,
         }
     }
-    (out, truncated)
+    let truncated = dropped > 0;
+    if truncated {
+        head.extend_from_slice(
+            format!("\n[... {dropped} bytes of output omitted ...]\n").as_bytes(),
+        );
+    }
+    head.extend(tail);
+    (head, truncated)
 }
 fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
@@ -1697,6 +2303,14 @@ fn redact(input: &str) -> (String, usize) {
     (text, total)
 }
 
+/// Append the post-write syntax note, if any, to a write result message.
+fn with_check(msg: String, rel: &str, before: Option<&str>, after: &str) -> String {
+    match check::delta_note(rel, before, after) {
+        Some(note) => format!("{msg}\n{note}"),
+        None => msg,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1706,12 +2320,173 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         p
     }
+    fn approved(rt: &ToolRuntime, req: ToolRequest) -> ToolResult {
+        let p = rt.prepare(req).unwrap();
+        if p.approval_required {
+            rt.resolve_approval(&p.call_id, true).unwrap();
+        }
+        rt.execute(&p.call_id)
+    }
+
+    #[test]
+    fn repair_tool_args_fixes_only_clear_slips() {
+        let mut a = json!({"path":"p","offset":" 3 ","limit":"null","max_results":7.0,"regex":"False","overwrite":"null","replace_all":"yes","timeout_ms":-1.0});
+        let mut fixed = repair_tool_args("read_file", &mut a);
+        fixed.sort();
+        assert_eq!(fixed, ["limit", "max_results", "offset", "regex"]);
+        assert_eq!(a["offset"], json!(3));
+        assert_eq!(a["limit"], Value::Null);
+        assert_eq!(a["max_results"], json!(7));
+        assert_eq!(a["regex"], json!(false));
+        // required flags keep "null"; unclear strings and negatives stay
+        assert_eq!(a["overwrite"], json!("null"));
+        assert_eq!(a["replace_all"], json!("yes"));
+        assert_eq!(a["timeout_ms"], json!(-1.0));
+        for bad in ["", "3.5", "-2", "1e3", "12a", "+5"] {
+            let mut v = json!({ "limit": bad });
+            assert!(repair_tool_args("read_file", &mut v).is_empty(), "{bad}");
+        }
+        let mut v = json!({"limit": 2.5, "path": "5"});
+        assert!(repair_tool_args("read_file", &mut v).is_empty());
+        let mut v = json!({"overwrite": "true", "replace_all": " FALSE "});
+        assert_eq!(repair_tool_args("edit_file", &mut v).len(), 2);
+        assert_eq!(v, json!({"overwrite": true, "replace_all": false}));
+    }
+
+    #[test]
+    fn repair_tool_args_decodes_argv_and_mcp_arguments_strings() {
+        let mut v = json!({"argv": " [\"git\", \"status\"]"});
+        assert_eq!(repair_tool_args("run_command", &mut v), ["argv"]);
+        assert_eq!(v["argv"], json!(["git", "status"]));
+        for bad in ["git status", "[]", "[1]", "[\"a\", 2]", "[oops"] {
+            let mut v = json!({ "argv": bad });
+            assert!(repair_tool_args("run_command", &mut v).is_empty(), "{bad}");
+        }
+        // only run_command's argv and mcp_call's arguments are decoded
+        let mut v = json!({"argv": "[\"a\"]", "arguments": "{\"k\":1}"});
+        assert!(repair_tool_args("read_file", &mut v).is_empty());
+        let mut v = json!({"arguments": "{\"k\":1}"});
+        assert_eq!(repair_tool_args("mcp_call", &mut v), ["arguments"]);
+        assert_eq!(v["arguments"], json!({"k": 1}));
+        for bad in ["[1]", "{bad", "k=1"] {
+            let mut v = json!({ "arguments": bad });
+            assert!(repair_tool_args("mcp_call", &mut v).is_empty(), "{bad}");
+        }
+        assert!(repair_tool_args("read_file", &mut json!("x")).is_empty());
+        assert_eq!(TOOL_NAMES.len(), 8);
+    }
+
+    #[test]
+    fn journaled_runtime_undoes_agent_writes_but_keeps_user_edits() {
+        let root = temp();
+        let jdir = temp();
+        let rt = ToolRuntime::new(&root)
+            .unwrap()
+            .with_journal(&jdir)
+            .unwrap();
+        fs::write(root.join("a.txt"), "orig\n").unwrap();
+        assert!(
+            approved(
+                &rt,
+                ToolRequest::EditFile {
+                    path: "a.txt".into(),
+                    expected: "orig".into(),
+                    replacement: "agent".into(),
+                    replace_all: false,
+                }
+            )
+            .ok
+        );
+        assert!(approved(&rt, ToolRequest::ApplyPatch {
+            patch: "*** Begin Patch\n*** Add File: b.txt\n+new\n*** Update File: a.txt\n@@\n-agent\n+agent2\n*** End Patch".into(),
+        }).ok);
+        // a failed write is not journaled
+        assert!(
+            !approved(
+                &rt,
+                ToolRequest::EditFile {
+                    path: "a.txt".into(),
+                    expected: "no such text".into(),
+                    replacement: "x".into(),
+                    replace_all: false,
+                }
+            )
+            .ok
+        );
+        assert_eq!(rt.undo_last_write().unwrap().tool, "apply_patch");
+        assert!(!root.join("b.txt").exists());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "agent\n");
+        // the runtime still accepts writes after undo (seen state updated)
+        fs::write(root.join("a.txt"), "user\n").unwrap();
+        let e = rt.undo_last_write().unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Conflict);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user\n");
+        // an un-journaled runtime says so
+        let plain = ToolRuntime::new(temp()).unwrap();
+        assert!(plain.undo_last_write().is_err());
+    }
+
+    #[test]
+    fn writes_report_syntax_breakage_but_never_block() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = approved(
+            &rt,
+            ToolRequest::CreateFile {
+                path: "src/a.rs".into(),
+                content: "fn a() {\n    let x = (1 + 2;\n}\n".into(),
+                overwrite: false,
+            },
+        );
+        assert!(r.ok);
+        let out = r.output.unwrap();
+        assert!(
+            out.contains("syntax check: this write left the file with: 3:1"),
+            "{out}"
+        );
+        assert!(root.join("src/a.rs").exists());
+        // fixing it: edit result is clean, no note
+        let r = approved(
+            &rt,
+            ToolRequest::EditFile {
+                path: "src/a.rs".into(),
+                expected: "(1 + 2;".into(),
+                replacement: "(1 + 2);".into(),
+                replace_all: false,
+            },
+        );
+        assert!(r.ok);
+        assert!(!r.output.unwrap().contains("syntax check"));
+        // a patch that breaks JSON is reported per file
+        let r = approved(
+            &rt,
+            ToolRequest::ApplyPatch {
+                patch: "*** Begin Patch\n*** Add File: cfg.json\n+{\"a\": \n*** End Patch".into(),
+            },
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.output.unwrap();
+        assert!(out.contains("cfg.json: syntax check"), "{out}");
+        // unchecked types stay silent
+        let r = approved(
+            &rt,
+            ToolRequest::CreateFile {
+                path: "notes.md".into(),
+                content: "((( unbalanced prose".into(),
+                overwrite: false,
+            },
+        );
+        assert!(!r.output.unwrap().contains("syntax check"));
+    }
+
     #[test]
     fn traversal_refused() {
         let rt = ToolRuntime::new(temp()).unwrap();
         let p = rt
             .prepare(ToolRequest::ReadFile {
                 path: "../secret".into(),
+                offset: None,
+                limit: None,
             })
             .unwrap();
         let r = rt.execute(&p.call_id);
@@ -1871,6 +2646,444 @@ mod tests {
             rt.execute(&p.call_id).error.unwrap().kind,
             ErrorKind::Conflict
         );
+    }
+    fn run_edit(rt: &ToolRuntime, path: &str, expected: &str, replacement: &str) -> ToolResult {
+        let p = rt
+            .prepare(ToolRequest::EditFile {
+                path: path.into(),
+                expected: expected.into(),
+                replacement: replacement.into(),
+                replace_all: false,
+            })
+            .unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        rt.execute(&p.call_id)
+    }
+    #[test]
+    fn fuzzy_edit_reports_strategy_and_keeps_indent() {
+        let root = temp();
+        fs::write(root.join("m.rs"), "fn f() {\n    let a = 1;\n}\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        // The model dropped the block's indentation.
+        let r = run_edit(
+            &rt,
+            "m.rs",
+            "fn f() {\nlet a = 1;\n}\n",
+            "fn f() {\nlet a = 2;\nlet b = 3;\n}\n",
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert!(r.output.unwrap().contains("matched via line_trimmed"));
+        assert_eq!(
+            fs::read_to_string(root.join("m.rs")).unwrap(),
+            "fn f() {\n    let a = 2;\n    let b = 3;\n}\n"
+        );
+    }
+    #[test]
+    fn approved_diff_equals_written_bytes_for_fuzzy_edit() {
+        let root = temp();
+        fs::write(root.join("d.txt"), "  alpha\n  beta\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::EditFile {
+                path: "d.txt".into(),
+                expected: "beta".into(),
+                replacement: "gamma".into(),
+                replace_all: false,
+            })
+            .unwrap();
+        let diff = rt.pending_diff(&p.call_id).unwrap().unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        assert_eq!(
+            fs::read_to_string(root.join("d.txt")).unwrap(),
+            diff.modified
+        );
+    }
+    #[test]
+    fn write_after_external_change_is_refused_as_stale() {
+        let root = temp();
+        fs::write(root.join("s.txt"), "one\ntwo\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "s.txt".into(),
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        // Someone else edits the file after the model read it.
+        fs::write(root.join("s.txt"), "one\ntwo\nthree\n").unwrap();
+        let r = run_edit(&rt, "s.txt", "two", "TWO");
+        let e = r.error.unwrap();
+        assert_eq!(e.kind, ErrorKind::Conflict);
+        assert!(e.detail.contains("changed on disk"));
+        // Re-reading clears the stale state.
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "s.txt".into(),
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        assert!(run_edit(&rt, "s.txt", "two", "TWO").ok);
+        // A second edit right after our own write is not stale.
+        assert!(run_edit(&rt, "s.txt", "three", "3").ok);
+        assert_eq!(
+            fs::read_to_string(root.join("s.txt")).unwrap(),
+            "one\nTWO\n3\n"
+        );
+    }
+    #[test]
+    fn overwrite_after_external_change_is_refused_as_stale() {
+        let root = temp();
+        fs::write(root.join("o.txt"), "v1").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "o.txt".into(),
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        fs::write(root.join("o.txt"), "v2 by user").unwrap();
+        let p = rt
+            .prepare(ToolRequest::CreateFile {
+                path: "o.txt".into(),
+                content: "v3".into(),
+                overwrite: true,
+            })
+            .unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        assert_eq!(
+            rt.execute(&p.call_id).error.unwrap().kind,
+            ErrorKind::Conflict
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("o.txt")).unwrap(),
+            "v2 by user"
+        );
+    }
+    #[test]
+    fn not_found_edit_tells_model_where_to_look() {
+        let root = temp();
+        fs::write(root.join("h.rs"), "fn alpha() {}\nfn compute(x: u8) {}\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = run_edit(&rt, "h.rs", "fn compute(x: u16) {}", "fn c() {}");
+        let e = r.error.unwrap();
+        assert_eq!(e.kind, ErrorKind::Conflict);
+        assert!(e.detail.contains("line 2"), "{}", e.detail);
+    }
+    fn read(
+        rt: &ToolRuntime,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> ToolResult {
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: path.into(),
+                offset,
+                limit,
+            })
+            .unwrap();
+        rt.execute(&p.call_id)
+    }
+    #[test]
+    fn small_file_reads_raw_bytes() {
+        let root = temp();
+        fs::write(root.join("r.txt"), "a\n  b\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        assert_eq!(read(&rt, "r.txt", None, None).output.unwrap(), "a\n  b\n");
+    }
+    #[test]
+    fn paged_read_is_numbered_and_says_how_to_continue() {
+        let root = temp();
+        let body: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        fs::write(root.join("p.txt"), body).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = read(&rt, "p.txt", Some(4), Some(3));
+        let out = r.output.unwrap();
+        assert!(
+            out.starts_with("     4\tline4\n     5\tline5\n     6\tline6\n"),
+            "{out}"
+        );
+        assert!(out.contains("[lines 4-6 of 10; call read_file with offset=7 to continue]"));
+        assert!(r.receipt.output_truncated);
+        let tail = read(&rt, "p.txt", Some(9), None).output.unwrap();
+        assert!(tail.contains("end of file"), "{tail}");
+        let past = read(&rt, "p.txt", Some(50), None).error.unwrap();
+        assert_eq!(past.kind, ErrorKind::InvalidRequest);
+    }
+    #[test]
+    fn long_file_pages_by_default_instead_of_flooding_context() {
+        let root = temp();
+        let body: String = (1..=2500).map(|i| format!("{i}\n")).collect();
+        fs::write(root.join("big.txt"), body).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let out = read(&rt, "big.txt", None, None).output.unwrap();
+        assert!(
+            out.contains("[lines 1-2000 of 2500; call read_file with offset=2001"),
+            "{}",
+            &out[out.len() - 120..]
+        );
+    }
+    #[test]
+    fn file_over_old_2mib_cap_is_now_pageable() {
+        let root = temp();
+        let line = "x".repeat(99);
+        let body: String = (0..30_000).map(|_| format!("{line}\n")).collect();
+        assert!(body.len() > 2 * 1024 * 1024);
+        fs::write(root.join("huge.log"), body).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let out = read(&rt, "huge.log", Some(29_999), None).output.unwrap();
+        assert!(
+            out.contains("[lines 29999-30000 of 30000; end of file]"),
+            "{out}"
+        );
+    }
+    #[test]
+    fn binary_and_long_lines_are_handled() {
+        let root = temp();
+        fs::write(root.join("b.bin"), [0u8, 1, 2, 3]).unwrap();
+        fs::write(root.join("l.txt"), format!("{}\nshort\n", "y".repeat(5000))).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let e = read(&rt, "b.bin", None, None).error.unwrap();
+        assert!(e.detail.contains("binary file"));
+        let out = read(&rt, "l.txt", Some(1), None).output.unwrap();
+        assert!(out.contains("[line truncated]"));
+        assert!(out.contains("1 line(s) longer than 2000 chars were cut"));
+    }
+    #[test]
+    fn reading_a_directory_lists_it() {
+        let root = temp();
+        fs::create_dir_all(root.join("d/sub")).unwrap();
+        fs::write(root.join("d/z.txt"), "").unwrap();
+        fs::write(root.join("d/a.txt"), "").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        assert_eq!(
+            read(&rt, "d", None, None).output.unwrap(),
+            "a.txt\nsub/\nz.txt"
+        );
+    }
+    fn search(rt: &ToolRuntime, q: &str, regex: bool, include: Option<&str>) -> String {
+        let p = rt
+            .prepare(ToolRequest::SearchFiles {
+                query: q.into(),
+                path: None,
+                max_results: Some(3),
+                regex: Some(regex),
+                include: include.map(Into::into),
+            })
+            .unwrap();
+        let r = rt.execute(&p.call_id);
+        r.output.unwrap_or_else(|| format!("ERR {:?}", r.error))
+    }
+    fn search_repo() -> PathBuf {
+        let root = temp();
+        fs::create_dir_all(root.join("src/deep")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join("node_modules/x")).unwrap();
+        fs::create_dir_all(root.join("gen")).unwrap();
+        fs::write(root.join(".gitignore"), "gen/\n*.log\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "fn needle_one() {}\n").unwrap();
+        fs::write(root.join("src/deep/mod.ts"), "const needle_two = 2;\n").unwrap();
+        fs::write(root.join("target/debug/out.rs"), "fn needle_junk() {}\n").unwrap();
+        fs::write(root.join("node_modules/x/i.js"), "needle_junk\n").unwrap();
+        fs::write(root.join("gen/g.rs"), "needle_junk\n").unwrap();
+        fs::write(root.join("app.log"), "needle_junk\n").unwrap();
+        fs::write(root.join("blob.bin"), b"needle_junk\0\0").unwrap();
+        root
+    }
+    #[test]
+    fn search_skips_build_output_ignored_and_binary_files() {
+        let rt = ToolRuntime::new(search_repo()).unwrap();
+        let out = search(&rt, "needle", false, None);
+        assert!(out.contains("src/lib.rs:1:fn needle_one() {}"), "{out}");
+        assert!(out.contains("src/deep/mod.ts:1:"), "{out}");
+        assert!(!out.contains("junk"), "{out}");
+    }
+    #[test]
+    fn search_supports_regex_and_include_glob() {
+        let rt = ToolRuntime::new(search_repo()).unwrap();
+        let out = search(&rt, r"needle_(one|two)\b", true, Some("*.ts"));
+        assert_eq!(out, "src/deep/mod.ts:1:const needle_two = 2;");
+        let out = search(&rt, "needle", false, Some("src/**/*.{rs,ts}"));
+        assert!(out.contains("lib.rs") && out.contains("mod.ts"), "{out}");
+        assert!(search(&rt, "(", true, None).contains("invalid regex"));
+        assert_eq!(search(&rt, "zzz_absent", false, None), "[no matches]");
+    }
+    #[test]
+    fn search_says_when_results_were_cut() {
+        let root = temp();
+        fs::write(root.join("m.txt"), "hit\nhit\nhit\nhit\n").unwrap();
+        let rt = ToolRuntime::new(root).unwrap();
+        let out = search(&rt, "hit", false, None);
+        assert_eq!(out.lines().filter(|l| l.starts_with("m.txt:")).count(), 3);
+        assert!(out.contains("[more than 3 matches"), "{out}");
+    }
+    #[test]
+    fn glob_files_finds_by_pattern_and_respects_ignores() {
+        let rt = ToolRuntime::new(search_repo()).unwrap();
+        let p = rt
+            .prepare(ToolRequest::GlobFiles {
+                pattern: "**/*.rs".into(),
+                path: None,
+                max_results: None,
+            })
+            .unwrap();
+        assert!(!p.approval_required);
+        let out = rt.execute(&p.call_id).output.unwrap();
+        assert_eq!(out, "src/lib.rs");
+    }
+    #[test]
+    fn glob_translation_is_anchored_and_segment_aware() {
+        let g = walk::Glob::new("src/*.rs").unwrap();
+        assert!(g.matches("src/a.rs"));
+        assert!(!g.matches("src/x/a.rs"));
+        assert!(!g.matches("xsrc/a.rs"));
+        let g = walk::Glob::new("**/test_?.py").unwrap();
+        assert!(g.matches("test_a.py") && g.matches("a/b/test_b.py"));
+        assert!(walk::Glob::new("{a,b").is_none());
+        let g = walk::Glob::new("*.[ch]").unwrap();
+        assert!(g.matches("x/y.c") && g.matches("y.h") && !g.matches("y.o"));
+    }
+    #[test]
+    fn clip_middle_keeps_head_and_tail_on_char_boundaries() {
+        let text = format!("START{}é-END-ERROR", "é".repeat(5000));
+        let (clipped, cut) = clip_middle(&text, 1000);
+        assert!(cut);
+        assert!(clipped.starts_with("START"));
+        assert!(clipped.ends_with("-END-ERROR"));
+        assert!(clipped.contains("bytes omitted from the middle"));
+        assert!(clipped.len() < 1200);
+        for max in 0..40 {
+            let _ = clip_middle("ééééé€€€€€𝄞𝄞𝄞", max);
+        }
+        assert_eq!(clip_middle("short", 100), ("short".to_string(), false));
+        assert_eq!(floor_boundary("é", 1), 0);
+    }
+    #[test]
+    fn read_capped_keeps_the_final_error_line() {
+        let mut log = "compiling...\n".repeat(10_000);
+        log.push_str("error[E0308]: mismatched types\n");
+        let (bytes, cut) = read_capped(log.as_bytes(), 4096);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(cut);
+        assert!(text.starts_with("compiling..."));
+        assert!(text.ends_with("error[E0308]: mismatched types\n"));
+        assert!(text.contains("bytes of output omitted"));
+        let (small, cut) = read_capped(&b"ok\n"[..], 4096);
+        assert_eq!((small.as_slice(), cut), (&b"ok\n"[..], false));
+    }
+    fn patch_call(rt: &ToolRuntime, patch: &str) -> ToolResult {
+        let p = rt
+            .prepare(ToolRequest::ApplyPatch {
+                patch: patch.into(),
+            })
+            .unwrap();
+        assert!(p.approval_required, "patches are writes");
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        rt.execute(&p.call_id)
+    }
+    #[test]
+    fn apply_patch_changes_several_files_at_once() {
+        let root = temp();
+        fs::write(root.join("a.rs"), "fn a() {\n    1\n}\n").unwrap();
+        fs::write(root.join("old.txt"), "bye\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = patch_call(
+            &rt,
+            "*** Begin Patch\n*** Update File: a.rs\n@@\n fn a() {\n-    1\n+    2\n }\n*** Add File: src/new.rs\n+pub fn n() {}\n*** Delete File: old.txt\n*** End Patch\n",
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(
+            fs::read_to_string(root.join("a.rs")).unwrap(),
+            "fn a() {\n    2\n}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/new.rs")).unwrap(),
+            "pub fn n() {}\n"
+        );
+        assert!(!root.join("old.txt").exists());
+        let out = r.output.unwrap();
+        assert!(
+            out.contains("M a.rs") && out.contains("A src/new.rs") && out.contains("D old.txt"),
+            "{out}"
+        );
+        assert!(r.receipt.diff.unwrap().contains("+    2"));
+    }
+    #[test]
+    fn apply_patch_rolls_back_when_a_later_write_fails() {
+        let root = temp();
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        fs::write(root.join("blocker"), "i am a file\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = patch_call(
+            &rt,
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+two\n*** Add File: blocker/x.txt\n+x\n*** End Patch",
+        );
+        let e = r.error.unwrap();
+        assert!(e.detail.contains("rolled back"), "{}", e.detail);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".rex-patch-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+    #[test]
+    fn apply_patch_refuses_escape_stale_and_bad_hunks_without_writing() {
+        let root = temp();
+        fs::write(root.join("s.txt"), "v1\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let r = patch_call(
+            &rt,
+            "*** Begin Patch\n*** Add File: ../evil.txt\n+x\n*** End Patch",
+        );
+        assert_eq!(r.error.unwrap().kind, ErrorKind::OutsideWorkspace);
+        let p = rt
+            .prepare(ToolRequest::ReadFile {
+                path: "s.txt".into(),
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        fs::write(root.join("s.txt"), "v1 edited by user\n").unwrap();
+        let r = patch_call(
+            &rt,
+            "*** Begin Patch\n*** Update File: s.txt\n@@\n-v1 edited by user\n+v2\n*** End Patch",
+        );
+        assert!(r.error.unwrap().detail.contains("changed on disk"));
+        let r = patch_call(&rt, "*** Begin Patch\n*** Add File: fresh.txt\n+ok\n*** Update File: s.txt\n@@\n-nope\n+v3\n*** End Patch");
+        assert_eq!(r.error.unwrap().kind, ErrorKind::Conflict);
+        assert!(!root.join("fresh.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("s.txt")).unwrap(),
+            "v1 edited by user\n"
+        );
+    }
+    #[test]
+    fn apply_patch_diff_preview_matches_result() {
+        let root = temp();
+        fs::write(root.join("p.txt"), "a\nb\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::ApplyPatch {
+                patch: "*** Begin Patch\n*** Update File: p.txt\n@@\n a\n-b\n+c\n*** End Patch"
+                    .into(),
+            })
+            .unwrap();
+        let d = rt.pending_diff(&p.call_id).unwrap().unwrap();
+        assert_eq!(d.path, "p.txt");
+        assert!(d.modified.contains("a\nc\n"));
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        assert!(rt.execute(&p.call_id).ok);
+        assert_eq!(fs::read_to_string(root.join("p.txt")).unwrap(), "a\nc\n");
     }
     #[test]
     fn shell_is_hard_denied() {
@@ -2072,6 +3285,8 @@ mod tests {
         let p = rt
             .prepare(ToolRequest::ReadFile {
                 path: "link/x".into(),
+                offset: None,
+                limit: None,
             })
             .unwrap();
         let r = rt.execute(&p.call_id);
@@ -2132,7 +3347,11 @@ mod diff_tests {
         let root = temp();
         let rt = ToolRuntime::new(root).unwrap();
         let p = rt
-            .prepare(ToolRequest::ReadFile { path: "x".into() })
+            .prepare(ToolRequest::ReadFile {
+                path: "x".into(),
+                offset: None,
+                limit: None,
+            })
             .unwrap();
         assert!(rt.pending_diff(&p.call_id).unwrap().is_none());
     }
@@ -2271,4 +3490,174 @@ mod git_tests {
         }
         assert_eq!(rebuilt.join("\n") + "\n", new, "diff:\n{d}");
     }
+}
+
+/// Plan an edit with the tolerant matcher and map failures to model-facing
+/// tool errors that say what to do next.
+fn plan_edit_checked(
+    old: &str,
+    expected: &str,
+    replacement: &str,
+    replace_all: bool,
+) -> Result<fuzzy::EditPlan, ToolError> {
+    fuzzy::plan_edit(old, expected, replacement, replace_all).map_err(|e| match e {
+        fuzzy::PlanError::NotFound { hint } => err(
+            ErrorKind::Conflict,
+            &format!("expected text was not found; {hint}"),
+        ),
+        fuzzy::PlanError::Ambiguous {
+            strategy,
+            count,
+            lines,
+        } => err(
+            ErrorKind::Conflict,
+            &format!(
+                "expected text is not unique: {count} matches ({strategy}) starting at lines {lines:?}; include more surrounding lines, or set replace_all explicitly"
+            ),
+        ),
+    })
+}
+
+/// NUL bytes in the first 8 KiB mark a file as binary (the same heuristic
+/// git and grep use).
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8192).any(|b| *b == 0)
+}
+
+fn binary_error(len: u64) -> ToolError {
+    err(
+        ErrorKind::InvalidRequest,
+        &format!("binary file ({len} bytes); it cannot be read as text"),
+    )
+}
+
+/// Names of the tools decoded into [`ToolRequest`].
+pub const TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "create_file",
+    "edit_file",
+    "search_files",
+    "apply_patch",
+    "glob_files",
+    "run_command",
+    "mcp_call",
+];
+
+/// Repair common argument slips before a tool call is decoded: `"50"` or
+/// `50.0` for a count, `"true"` for a flag, `"null"` for an optional count or
+/// flag, a JSON-encoded array for `argv` and a JSON-encoded object for MCP
+/// `arguments`. Only fields whose type is known are touched, and a value is
+/// changed only when the repair is unambiguous; anything else is left for
+/// decoding to reject with its usual error. Returns the repaired field names.
+pub fn repair_tool_args(tool: &str, args: &mut Value) -> Vec<String> {
+    enum Kind {
+        Count,
+        Flag,
+        Argv,
+        Object,
+    }
+    let kind = |field: &str| match (tool, field) {
+        (_, "offset" | "limit" | "max_results" | "timeout_ms") => Some(Kind::Count),
+        (_, "overwrite" | "replace_all" | "regex") => Some(Kind::Flag),
+        ("run_command", "argv") => Some(Kind::Argv),
+        ("mcp_call", "arguments") => Some(Kind::Object),
+        _ => None,
+    };
+    let mut fixed = Vec::new();
+    let Some(map) = args.as_object_mut() else {
+        return fixed;
+    };
+    let optional = |field: &str| !matches!(field, "overwrite" | "replace_all");
+    let keys: Vec<String> = map.keys().cloned().collect();
+    for key in keys {
+        let Some(kind) = kind(&key) else { continue };
+        let value = &map[&key];
+        let repaired = match (&kind, value) {
+            (Kind::Count | Kind::Flag, Value::String(s))
+                if s.trim().eq_ignore_ascii_case("null") && optional(&key) =>
+            {
+                Some(Value::Null)
+            }
+            (Kind::Count, Value::String(s)) => {
+                let t = s.trim();
+                (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| t.parse::<u64>().ok())
+                    .flatten()
+                    .map(Value::from)
+            }
+            (Kind::Count, Value::Number(n)) if n.as_u64().is_none() => n
+                .as_f64()
+                .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f <= 9.0e15)
+                .map(|f| Value::from(f as u64)),
+            (Kind::Flag, Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            (Kind::Argv, Value::String(s)) if s.trim_start().starts_with('[') => {
+                serde_json::from_str::<Value>(s.trim()).ok().filter(|v| {
+                    v.as_array()
+                        .is_some_and(|a| !a.is_empty() && a.iter().all(Value::is_string))
+                })
+            }
+            (Kind::Object, Value::String(s)) if s.trim_start().starts_with('{') => {
+                // a JSON text that starts with `{` can only be an object
+                serde_json::from_str::<Value>(s.trim()).ok()
+            }
+            _ => None,
+        };
+        if let Some(v) = repaired {
+            map.insert(key.clone(), v);
+            fixed.push(key);
+        }
+    }
+    fixed
+}
+
+/// Every path a patch touches, including move destinations.
+pub fn patch_paths(ops: &[patch::Op]) -> Vec<String> {
+    let mut out = Vec::new();
+    for op in ops {
+        match op {
+            patch::Op::Add { path, .. } | patch::Op::Delete { path } => out.push(path.clone()),
+            patch::Op::Update { path, move_to, .. } => {
+                out.push(path.clone());
+                if let Some(d) = move_to {
+                    out.push(d.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Write via a sibling temp file and rename, keeping an existing file's
+/// permissions (new files are 0600, like `create_file`).
+fn write_atomic(target: &Path, content: &str) -> Result<(), ToolError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| err(ErrorKind::InvalidRequest, "target has no parent"))?;
+    fs::create_dir_all(parent).map_err(io_err)?;
+    let perms = fs::metadata(target).ok().map(|m| m.permissions());
+    let tmp = parent.join(format!(".rex-patch-{}.tmp", new_call_id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut f = options.open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        if let Some(p) = perms {
+            fs::set_permissions(&tmp, p)?;
+        }
+        fs::rename(&tmp, target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(io_err)
 }

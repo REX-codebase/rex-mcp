@@ -16,6 +16,7 @@ export type AgentStatus =
   | "running"
   | "awaiting_approval"
   | "awaiting_plan"
+  | "awaiting_answer"
   | "verifying"
   | "completed"
   | "blocked"
@@ -47,6 +48,8 @@ export type AgentEvent =
   | { state: "approval_resolved"; call_id: string; approved: boolean }
   | { state: "plan_approval_required"; items: PlanItem[] }
   | { state: "plan_approval_resolved"; approved: boolean }
+  | { state: "question_asked"; question: PendingQuestion }
+  | { state: "question_resolved"; call_id: string; answered: boolean }
   | { state: "gate_result"; attempt: number; passed: boolean; failures: string[] }
   | { state: "retry"; attempt: number; reason: string }
   | { state: "info"; message: string };
@@ -85,18 +88,32 @@ export interface AgentSnapshot {
   elapsed_ms: number;
   max_wall_ms: number;
   pending_approval: PreparedCall | null;
+  /** Open ask_user question; absent on older sidecars. */
+  pending_question?: PendingQuestion | null;
   events: AgentEvent[];
   preview: AgentPreview | null;
   completion_summary: string | null;
   error: string | null;
 }
 
-export type AgentPhase = "working" | "approval" | "plan" | "verifying" | "completed" | "stopped";
+export interface PendingQuestion {
+  call_id: string;
+  question: string;
+  choices: string[];
+  /** 1-based position when REX asked several questions in one call. */
+  batch_index?: number;
+  batch_total?: number;
+  /** Every question of a batched call, for the one-form view. */
+  batch?: { question: string; choices: string[] }[];
+}
+
+export type AgentPhase = "working" | "approval" | "plan" | "question" | "verifying" | "completed" | "stopped";
 
 export function phaseOf(snap: AgentSnapshot | null): AgentPhase {
   if (!snap) return "working";
   if (snap.status === "awaiting_approval") return "approval";
   if (snap.status === "awaiting_plan") return "plan";
+  if (snap.status === "awaiting_answer") return "question";
   if (snap.status === "verifying") return "verifying";
   if (snap.status === "completed") return "completed";
   if (

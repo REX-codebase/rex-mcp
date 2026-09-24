@@ -23,6 +23,7 @@ pub mod constitution;
 pub mod epistemic;
 pub mod gate;
 pub mod history;
+pub mod project;
 pub mod roles;
 pub mod tools;
 pub mod twin;

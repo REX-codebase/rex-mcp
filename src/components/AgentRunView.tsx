@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ToolApproval, ToolReceiptCard } from "./ToolApproval";
 import {
+  agentAnswer,
+  agentAnswerMany,
   agentCapture,
   agentPreviewAction,
+  agentUndo,
   type AgentSnapshot,
 } from "../data/agentRun";
 import {
@@ -12,6 +15,8 @@ import {
   terminalLabel,
   type AgentEvent,
 } from "../data/agentTypes";
+
+const WRITE_TOOLS = ["create_file", "edit_file", "apply_patch"];
 
 const PAGE_W = 1280;
 
@@ -53,6 +58,10 @@ function EventLine({ event }: { event: AgentEvent }) {
       return <li className="agent-event agent-event-wait">Plan proposed · {event.items.length} step{event.items.length === 1 ? "" : "s"} awaiting your approval</li>;
     case "plan_approval_resolved":
       return <li className="agent-event agent-event-wait">{event.approved ? "Plan approved · executing" : "Plan rejected · run stopped before any tool ran"}</li>;
+    case "question_asked":
+      return <li className="agent-event agent-event-wait">Question for you · {event.question.question.length > 140 ? `${event.question.question.slice(0, 140)}…` : event.question.question}</li>;
+    case "question_resolved":
+      return <li className="agent-event agent-event-wait">{event.answered ? "You answered · continuing" : "No answer · REX decides and states its assumption"}</li>;
     case "gate_result":
       return (
         <li className={`agent-event ${event.passed ? "agent-event-ok" : "agent-event-err"}`}>
@@ -91,6 +100,84 @@ export function AgentRunView({
   const canvasRef = useRef<HTMLDivElement>(null);
   const runId = run.id;
   const previewLive = run.preview != null;
+  const [answerText, setAnswerText] = useState("");
+  const [batchAnswers, setBatchAnswers] = useState<string[]>([]);
+  const [answering, setAnswering] = useState(false);
+  const [answerError, setAnswerError] = useState<string | null>(null);
+  const [undoing, setUndoing] = useState(false);
+  const [undoNote, setUndoNote] = useState<string | null>(null);
+  // tool calls whose writes this view has undone (newest-first rewinds)
+  const [undoneCalls, setUndoneCalls] = useState<string[]>([]);
+  const questionId = run.pending_question?.call_id ?? null;
+
+  useEffect(() => {
+    // a new question starts with an empty box
+    setAnswerText("");
+    setBatchAnswers([]);
+    setAnswerError(null);
+  }, [questionId]);
+
+  const sendAnswer = useCallback(
+    async (text: string | null) => {
+      setAnswering(true);
+      setAnswerError(null);
+      try {
+        await agentAnswer(runId, text);
+      } catch (err) {
+        setAnswerError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setAnswering(false);
+      }
+    },
+    [runId]
+  );
+
+  const sendBatch = useCallback(
+    async (answers: (string | null)[]) => {
+      setAnswering(true);
+      setAnswerError(null);
+      try {
+        await agentAnswerMany(runId, answers);
+      } catch (err) {
+        setAnswerError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setAnswering(false);
+      }
+    },
+    [runId]
+  );
+  const batch = run.pending_question?.batch ?? [];
+  const showBatchForm = batch.length > 1 && (run.pending_question?.batch_index ?? 1) === 1;
+
+  const writes = run.events
+    .filter((e): e is Extract<AgentEvent, { state: "tool_finished" }> => e.state === "tool_finished")
+    .map((e) => e.result)
+    .filter((r) => r.ok && WRITE_TOOLS.includes(r.tool));
+  const liveWrites = writes.filter((w) => !undoneCalls.includes(w.call_id));
+
+  const undo = useCallback(
+    async (target?: { afterCall?: string; to?: number }) => {
+      setUndoing(true);
+      try {
+        const r = await agentUndo(runId, target);
+        const steps = r.undone?.length ?? 1;
+        // mark rows by the call ids the backend reports (edit sub-agent
+        // writes are journaled too but have no row here)
+        const gone = r.undone ? r.undone.map((u) => u.call_id) : r.call_id ? [r.call_id] : [];
+        setUndoneCalls((prev) => [...prev, ...gone]);
+        setUndoNote(
+          steps > 1
+            ? `Rewound ${steps} changes · ${r.files.join(", ")}`
+            : `Undid ${(r.tool ?? "change").replace(/_/g, " ")} · ${r.files.join(", ")}`
+        );
+      } catch (err) {
+        setUndoNote(`Undo refused · ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        setUndoing(false);
+      }
+    },
+    [runId]
+  );
 
   useEffect(() => {
     setShot(run.preview?.desktop_shot ?? null);
@@ -150,6 +237,8 @@ export function AgentRunView({
             ? terminalLabel(terminal)
             : phase === "approval"
               ? "Waiting on your approval"
+              : phase === "question"
+                ? "REX has a question for you"
               : phase === "plan"
                 ? "Plan proposed · waiting on your approval"
                 : phase === "verifying"
@@ -158,7 +247,7 @@ export function AgentRunView({
                     ? `${run.model} · step ${run.step}/${run.max_steps}`
                     : "Contacting the live model catalog…"}
         </span>
-        {(working || phase === "approval" || phase === "plan") && (
+        {(working || phase === "approval" || phase === "plan" || phase === "question") && (
           <button type="button" className="agent-cancel" onClick={onCancel} disabled={cancelling}>
             {cancelling ? "Cancelling…" : "Cancel"}
           </button>
@@ -219,6 +308,96 @@ export function AgentRunView({
         </section>
       )}
 
+      {phase === "question" && run.pending_question && showBatchForm && (
+        <section className="plan-approval question-panel" role="alertdialog" aria-labelledby="batch-title">
+          <div className="tool-approval-head">
+            <span className="approval-shield" aria-hidden="true">?</span>
+            <div>
+              <p className="eyebrow">REX is asking</p>
+              <h3 id="batch-title">{batch.length} questions</h3>
+            </div>
+          </div>
+          {batch.map((q, i) => (
+            <div key={i} className="question-batch-item">
+              <p className="question-batch-text">{`${i + 1}. ${q.question}`}</p>
+              {q.choices.length > 0 && (
+                <div className="question-choices">
+                  {q.choices.map((choice) => (
+                    <button
+                      key={choice}
+                      type="button"
+                      aria-pressed={batchAnswers[i] === choice}
+                      disabled={answering}
+                      onClick={() => setBatchAnswers((prev) => { const next = [...prev]; next[i] = choice; return next; })}
+                    >
+                      {choice}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <textarea
+                className="question-input"
+                aria-label={`Answer ${i + 1}`}
+                value={batchAnswers[i] ?? ""}
+                maxLength={2000}
+                onChange={(e) => { const v = e.target.value; setBatchAnswers((prev) => { const next = [...prev]; next[i] = v; return next; }); }}
+                placeholder="Pick a choice, type an answer, or leave blank to let REX decide"
+              />
+            </div>
+          ))}
+          {answerError && <p className="approval-note">{answerError}</p>}
+          <div className="approval-actions">
+            <button type="button" disabled={answering} onClick={() => void sendBatch(batch.map(() => null))} className="approval-deny">Let REX decide all</button>
+            <button
+              type="button"
+              disabled={answering || !batch.some((_, i) => (batchAnswers[i] ?? "").trim())}
+              onClick={() => void sendBatch(batch.map((_, i) => ((batchAnswers[i] ?? "").trim() ? batchAnswers[i] : null)))}
+              className="approval-allow"
+            >
+              {answering ? "Sending…" : "Send answers"}
+            </button>
+          </div>
+        </section>
+      )}
+
+      {phase === "question" && run.pending_question && !showBatchForm && (
+        <section className="plan-approval question-panel" role="alertdialog" aria-labelledby="question-title">
+          <div className="tool-approval-head">
+            <span className="approval-shield" aria-hidden="true">?</span>
+            <div>
+              <p className="eyebrow">
+                {run.pending_question.batch_total && run.pending_question.batch_total > 1
+                  ? `REX is asking · question ${run.pending_question.batch_index ?? 1} of ${run.pending_question.batch_total}`
+                  : "REX is asking"}
+              </p>
+              <h3 id="question-title">{run.pending_question.question}</h3>
+            </div>
+          </div>
+          {run.pending_question.choices.length > 0 && (
+            <div className="question-choices">
+              {run.pending_question.choices.map((choice) => (
+                <button key={choice} type="button" disabled={answering} onClick={() => void sendAnswer(choice)}>
+                  {choice}
+                </button>
+              ))}
+            </div>
+          )}
+          <textarea
+            className="question-input"
+            aria-label="Your answer"
+            value={answerText}
+            maxLength={2000}
+            onChange={(e) => setAnswerText(e.target.value)}
+            placeholder="Or type your own answer"
+          />
+          {answerError && <p className="approval-note">{answerError}</p>}
+          <div className="approval-actions">
+            <button type="button" disabled={answering} onClick={() => void sendAnswer(null)} className="approval-deny">Let REX decide</button>
+            <button type="button" disabled={answering || !answerText.trim()} onClick={() => void sendAnswer(answerText)} className="approval-allow">{answering ? "Sending…" : "Send answer"}</button>
+          </div>
+        </section>
+      )}
+
       <ul className="agent-events" aria-label="Run events">
         {run.events.slice(-8).map((event, i) => (
           <EventLine key={i} event={event} />
@@ -236,6 +415,50 @@ export function AgentRunView({
           </summary>
           <ToolReceiptCard result={lastReceipt} />
         </details>
+      )}
+
+      {terminal && writes.length > 0 && (
+        <div className="agent-undo">
+          <button type="button" disabled={undoing || liveWrites.length === 0} onClick={() => void undo()}>
+            {undoing ? "Undoing…" : "Undo last file change"}
+          </button>
+          {undoNote && <span className="agent-undo-note">{undoNote}</span>}
+          {writes.length > 1 && (
+            <details className="agent-rewind">
+              <summary>Rewind to an earlier step</summary>
+              <ol reversed>
+                {[...writes].reverse().map((w) => {
+                  const idx = liveWrites.findIndex((l) => l.call_id === w.call_id);
+                  const undone = idx < 0;
+                  const newest = idx === liveWrites.length - 1;
+                  return (
+                    <li key={w.call_id} className={undone ? "is-undone" : undefined}>
+                      <span className="agent-rewind-what">
+                        {w.tool.replace(/_/g, " ")}
+                        {w.receipt.target ? ` · ${w.receipt.target}` : ""}
+                      </span>
+                      {!undone && !newest && (
+                        <button
+                          type="button"
+                          disabled={undoing}
+                          onClick={() => void undo({ afterCall: w.call_id })}
+                        >
+                          Rewind to here
+                        </button>
+                      )}
+                      {undone && <span className="agent-rewind-state">undone</span>}
+                    </li>
+                  );
+                })}
+              </ol>
+              {liveWrites.length > 0 && (
+                <button type="button" className="agent-rewind-all" disabled={undoing} onClick={() => void undo({ to: 0 })}>
+                  Undo every change
+                </button>
+              )}
+            </details>
+          )}
+        </div>
       )}
 
       {phase === "completed" && run.completion_summary && (

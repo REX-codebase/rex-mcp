@@ -1247,6 +1247,66 @@ fn agent_resume(agent: State<'_, Arc<Agent>>, run_id: String) -> Result<AgentSna
     agent.resume(&run_id)
 }
 
+/// Undo the newest file write of a finished run (journal-backed; refused
+/// when the user changed a touched file afterwards).
+#[tauri::command]
+fn agent_undo(
+    agent: State<'_, Arc<Agent>>,
+    run_id: String,
+    to: Option<u64>,
+    after_call: Option<String>,
+) -> Result<serde_json::Value, String> {
+    // `after_call`: rewind to just after that call's write; `to`: rewind
+    // every write after journal entry N (0 = all). Both all or nothing.
+    let rewind = match (after_call, to) {
+        (Some(call), _) => Some(agent.undo_after_call(&run_id, &call)),
+        (None, Some(seq)) => Some(agent.undo_to_write(&run_id, seq)),
+        (None, None) => None,
+    };
+    if let Some(result) = rewind {
+        return result.map(|entries| {
+            let mut files: Vec<String> = Vec::new();
+            for e in &entries {
+                for f in &e.files {
+                    if !files.contains(&f.path) {
+                        files.push(f.path.clone());
+                    }
+                }
+            }
+            serde_json::json!({
+                "ok": true,
+                "call_id": entries.first().map(|e| e.call_id.clone()),
+                "tool": entries.first().map(|e| e.tool.clone()),
+                "files": files,
+                "undone": entries.iter().map(|e| serde_json::json!({"seq": e.seq, "tool": e.tool, "call_id": e.call_id})).collect::<Vec<_>>(),
+            })
+        });
+    }
+    agent.undo_last_write(&run_id).map(|entry| {
+        serde_json::json!({
+            "ok": true,
+            "call_id": entry.call_id,
+            "tool": entry.tool,
+            "files": entry.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        })
+    })
+}
+
+/// Answer (or, with `None`, decline) the run's open ask_user question.
+/// `answers` answers the open question and the rest of its batch at once.
+#[tauri::command]
+fn agent_answer(
+    agent: State<'_, Arc<Agent>>,
+    run_id: String,
+    answer: Option<String>,
+    answers: Option<Vec<Option<String>>>,
+) -> Result<AgentSnapshot, String> {
+    match answers {
+        Some(list) => agent.answer_many(&run_id, &list),
+        None => agent.answer(&run_id, answer.as_deref()),
+    }
+}
+
 #[tauri::command]
 fn agent_preview_action(
     agent: State<'_, Arc<Agent>>,
@@ -1498,6 +1558,8 @@ fn main() {
             agent_decide,
             agent_cancel,
             agent_resume,
+            agent_undo,
+            agent_answer,
             agent_preview_action,
             agent_capture,
             agent_teardown,

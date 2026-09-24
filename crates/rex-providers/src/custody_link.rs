@@ -87,7 +87,9 @@ pub fn ui_managed_request(
             "read_file",
             "create_file",
             "edit_file",
+            "apply_patch",
             "search_files",
+            "glob_files",
             "run_command",
         ]
         .iter()
@@ -481,7 +483,9 @@ mod tests {
                 "read_file",
                 "create_file",
                 "edit_file",
+                "apply_patch",
                 "search_files",
+                "glob_files",
                 "run_command",
             ]
             .iter()
@@ -845,6 +849,7 @@ mod tests {
             elapsed_ms: 5,
             max_wall_ms: 1_800_000,
             pending_approval: None,
+            pending_question: None,
             prompt_version: "test".into(),
             prompt_hash: "hash".into(),
             events: vec![],

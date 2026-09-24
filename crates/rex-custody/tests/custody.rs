@@ -525,6 +525,8 @@ fn capability_escape_through_tools_quarantines() {
             &token,
             ToolRequest::ReadFile {
                 path: "note.txt".into(),
+                offset: None,
+                limit: None,
             },
             T0 + 1,
         )
@@ -562,14 +564,22 @@ fn path_escape_outside_workspace_is_escape() {
     let (token, _g) = offer_and_accept(&mut reg, "task-esc", agent(), full_caps(&c.workspace), T0);
     let grant = reg.grant(&token.grant_id).unwrap().clone();
     for p in ["../outside.txt", "/etc/passwd", "sub/../../outside.txt"] {
-        let req = ToolRequest::ReadFile { path: p.into() };
+        let req = ToolRequest::ReadFile {
+            path: p.into(),
+            offset: None,
+            limit: None,
+        };
         assert!(
             grant.capabilities.permits(&req).is_err(),
             "{p} must be refused"
         );
     }
     for p in ["note.txt", "sub/dir/file.rs", "./ok.txt"] {
-        let req = ToolRequest::ReadFile { path: p.into() };
+        let req = ToolRequest::ReadFile {
+            path: p.into(),
+            offset: None,
+            limit: None,
+        };
         assert!(
             grant.capabilities.permits(&req).is_ok(),
             "{p} must be allowed"
@@ -590,6 +600,8 @@ fn execute_after_release_is_refused() {
             &token,
             ToolRequest::ReadFile {
                 path: "note.txt".into(),
+                offset: None,
+                limit: None,
             },
             T0 + 1,
         )
@@ -735,4 +747,40 @@ fn managed_model_worker_records_mode() {
     let (_token, grant) = reg.accept_for_human(&offer.offer_id, T0 + 1).unwrap();
     assert!(matches!(grant.worker, WorkerMode::ManagedModel { .. }));
     assert!(!grant.operator.is_agent());
+}
+
+#[test]
+fn apply_patch_needs_its_own_grant_and_every_path_in_scope() {
+    let c = ctx();
+    let ws = &c.workspace;
+    let patch = |body: &str| ToolRequest::ApplyPatch {
+        patch: format!("*** Begin Patch\n{body}\n*** End Patch"),
+    };
+    // Not granted: an edit_file grant does not silently cover apply_patch.
+    let no_patch = full_caps(ws);
+    assert!(no_patch.permits(&patch("*** Add File: a.txt\n+x")).is_err());
+    let with_patch = caps(
+        ws,
+        &["read_file", "edit_file", "apply_patch"],
+        &[ToolClass::Read, ToolClass::Write],
+    );
+    assert!(with_patch
+        .permits(&patch("*** Add File: a.txt\n+x"))
+        .is_ok());
+    // A move target or a later file outside the workspace refuses the whole patch.
+    assert!(with_patch
+        .permits(&patch(
+            "*** Update File: a.txt\n*** Move to: ../out.txt\n@@\n-x\n+y"
+        ))
+        .is_err());
+    assert!(with_patch
+        .permits(&patch(
+            "*** Add File: ok.txt\n+x\n*** Delete File: /etc/passwd"
+        ))
+        .is_err());
+    // Write class is required.
+    let read_only = caps(ws, &["apply_patch"], &[ToolClass::Read]);
+    assert!(read_only
+        .permits(&patch("*** Add File: a.txt\n+x"))
+        .is_err());
 }

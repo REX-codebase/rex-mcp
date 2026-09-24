@@ -14,6 +14,8 @@ fn read_search_write_and_receipts_share_one_protocol() {
     let read = rt
         .prepare(ToolRequest::ReadFile {
             path: "note.txt".into(),
+            offset: None,
+            limit: None,
         })
         .unwrap();
     assert!(!read.approval_required);
@@ -26,6 +28,8 @@ fn read_search_write_and_receipts_share_one_protocol() {
             query: "beta".into(),
             path: None,
             max_results: Some(5),
+            regex: None,
+            include: None,
         })
         .unwrap();
     assert!(rt

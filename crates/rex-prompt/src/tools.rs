@@ -31,7 +31,10 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "update_plan",
     "read_file",
     "search_files",
+    "glob_files",
     "web_search",
+    "web_fetch",
+    "explore",
     "complete_task",
 ];
 

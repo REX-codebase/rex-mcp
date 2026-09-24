@@ -488,6 +488,33 @@ fn route(
                 ),
             }
         }
+        ("POST", ["api", "agent", "runs", id, "answer"]) => {
+            // {"answer": "text"} answers an ask_user question; null, a
+            // missing field or blank text declines it.
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            // {"answers": ["a", null, "c"]} answers a whole ask_user batch.
+            let text = parsed.get("answer").and_then(|a| a.as_str());
+            let many: Option<Vec<Option<String>>> = parsed
+                .get("answers")
+                .and_then(|a| a.as_array())
+                .map(|list| {
+                    list.iter()
+                        .map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                });
+            let result = match many {
+                Some(list) => agent.answer_many(id, &list),
+                None => agent.answer(id, text),
+            };
+            match result {
+                Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
         ("POST", ["api", "agent", "runs", id, "cancel"]) => match agent.cancel(id) {
             Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
             Err(detail) => json_response(
@@ -497,6 +524,42 @@ fn route(
         },
         ("POST", ["api", "agent", "runs", id, "resume"]) => match agent.resume(id) {
             Ok(snapshot) => json_response(200, &serde_json::to_string(&snapshot).unwrap()),
+            Err(detail) => json_response(
+                200,
+                &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+            ),
+        },
+        // {"to": N} rewinds every write after journal entry N (0 = all);
+        // {"after_call": "tool-..."} rewinds to just after that call's
+        // write. Both are all or nothing; no body undoes the newest write.
+        ("POST", ["api", "agent", "runs", id, "undo"]) if undo_target(body).is_some() => {
+            let result = match undo_target(body) {
+                Some(UndoTarget::Seq(to)) => agent.undo_to_write(id, to),
+                Some(UndoTarget::AfterCall(call)) => agent.undo_after_call(id, &call),
+                None => Err("no undo target".into()),
+            };
+            match result {
+                Ok(entries) => json_response(
+                    200,
+                    &undo_json(serde_json::to_value(&entries).unwrap_or_default()).to_string(),
+                ),
+                Err(detail) => json_response(
+                    200,
+                    &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+                ),
+            }
+        }
+        ("POST", ["api", "agent", "runs", id, "undo"]) => match agent.undo_last_write(id) {
+            Ok(entry) => json_response(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "call_id": entry.call_id,
+                    "tool": entry.tool,
+                    "files": entry.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+                })
+                .to_string(),
+            ),
             Err(detail) => json_response(
                 200,
                 &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
@@ -853,9 +916,74 @@ fn read_proof_bundle(state_dir: &std::path::Path, task_id: &str) -> Result<Strin
     std::fs::read_to_string(&path).map_err(|_| format!("no proof bundle for task {task_id}"))
 }
 
+enum UndoTarget {
+    Seq(u64),
+    AfterCall(String),
+}
+
+/// The optional rewind target in an undo request body.
+fn undo_target(body: &str) -> Option<UndoTarget> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    // the app client sends Tauri-style camelCase args to both backends
+    if let Some(call) = v
+        .get("after_call")
+        .or_else(|| v.get("afterCall"))
+        .and_then(|c| c.as_str())
+    {
+        return Some(UndoTarget::AfterCall(call.to_string()));
+    }
+    v.get("to").and_then(|t| t.as_u64()).map(UndoTarget::Seq)
+}
+
+/// Response body for a multi-step undo: `entries` is the serialized list
+/// of undone journal entries, newest first.
+fn undo_json(entries: serde_json::Value) -> serde_json::Value {
+    let list = entries.as_array().cloned().unwrap_or_default();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    for e in &list {
+        for f in e["files"].as_array().into_iter().flatten() {
+            if !files.contains(&f["path"]) {
+                files.push(f["path"].clone());
+            }
+        }
+    }
+    serde_json::json!({
+        "ok": true,
+        "call_id": list.first().map(|e| e["call_id"].clone()),
+        "tool": list.first().map(|e| e["tool"].clone()),
+        "files": files,
+        "undone": list.iter().map(|e| serde_json::json!({"seq": e["seq"], "tool": e["tool"], "call_id": e["call_id"]})).collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::read_proof_bundle;
+    use super::{read_proof_bundle, undo_json, undo_target, UndoTarget};
+
+    #[test]
+    fn undo_target_reads_after_call_then_to() {
+        assert!(
+            matches!(undo_target(r#"{"after_call":"tool-1","to":0}"#), Some(UndoTarget::AfterCall(c)) if c == "tool-1")
+        );
+        assert!(matches!(
+            undo_target(r#"{"to":2}"#),
+            Some(UndoTarget::Seq(2))
+        ));
+        assert!(undo_target(r#"{"runId":"r"}"#).is_none());
+        assert!(undo_target("").is_none());
+    }
+
+    #[test]
+    fn undo_json_lists_each_file_once_newest_entry_first() {
+        let v = undo_json(serde_json::json!([
+            {"seq": 3, "call_id": "c3", "tool": "edit_file", "files": [{"path": "a.txt"}]},
+            {"seq": 2, "call_id": "c2", "tool": "apply_patch", "files": [{"path": "b.txt"}, {"path": "a.txt"}]},
+        ]));
+        assert_eq!(v["call_id"], "c3");
+        assert_eq!(v["files"], serde_json::json!(["a.txt", "b.txt"]));
+        assert_eq!(v["undone"][1]["seq"], 2);
+        assert_eq!(v["undone"][1]["call_id"], "c2");
+    }
 
     #[test]
     fn proof_bundle_reads_persisted_bundle_and_refuses_traversal() {

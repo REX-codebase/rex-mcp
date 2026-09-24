@@ -1,0 +1,1 @@
+Make Cache in cache.py a least-recently-used cache: it holds at most `capacity` items, get() and put() both count as a use, and putting a new key when full evicts the least recently used key. Also add len() support. capacity below 1 raises ValueError.

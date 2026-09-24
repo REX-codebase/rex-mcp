@@ -5,6 +5,8 @@
 //! HTML, follows a small number of same-origin links, extracts readable text,
 //! ranks it against the query, and returns evidence with explicit provenance.
 
+pub mod markdown;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -121,6 +123,9 @@ pub struct SearchConfig {
     pub max_redirects: usize,
     pub max_discovery_documents: usize,
     pub max_discovered_urls: usize,
+    /// Render HTML pages as Markdown (headings, lists, links, code) instead
+    /// of flat text. Used by `web_fetch`; search ranking keeps flat text.
+    pub markdown: bool,
 }
 impl Default for SearchConfig {
     fn default() -> Self {
@@ -133,6 +138,7 @@ impl Default for SearchConfig {
             max_redirects: 5,
             max_discovery_documents: 8,
             max_discovered_urls: 128,
+            markdown: false,
         }
     }
 }
@@ -729,7 +735,13 @@ impl SearchEngine {
                 .with_status(status)
             })?;
         let title = extract_title(&body);
-        let mut content = html_to_text(&body);
+        let is_html = !content_type.contains("text/plain");
+        let mut content = match (self.config.markdown, is_html) {
+            (true, true) => markdown::html_to_markdown(&body, &effective),
+            // plain text keeps its line breaks when a reader asked for structure
+            (true, false) => body.clone(),
+            (false, _) => html_to_text(&body),
+        };
         content.truncate(char_boundary(&content, self.config.max_content_chars));
         let links = extract_links(&body, &effective);
         let feeds = extract_feed_links(&body, &effective);
@@ -1450,7 +1462,11 @@ fn html_to_text(html: &str) -> String {
         } else if bytes[i] == b'>' {
             tag = false
         } else if !tag {
-            out.push(bytes[i] as char)
+            // push the whole UTF-8 character, not its first byte
+            let ch = html[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
         }
         i += 1
     }
@@ -1609,6 +1625,12 @@ mod tests {
             true
         ));
     }
+    #[test]
+    fn extraction_keeps_utf8_characters_whole() {
+        // each byte used to be pushed as its own char ("Ã©" for "é")
+        assert_eq!(html_to_text("<p>café – 日本 😀</p>"), "café – 日本 😀");
+    }
+
     #[test]
     fn extraction_removes_scripts() {
         let h="<html><head><title>A &amp; B</title><style>x</style></head><body>Hello <b>world</b><script>secret</script></body></html>";

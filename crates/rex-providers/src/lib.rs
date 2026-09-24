@@ -17,6 +17,7 @@ pub mod conversation;
 pub mod custody_link;
 pub mod error;
 pub mod http;
+mod memory;
 pub mod policy;
 mod provider_failure;
 pub mod providers;

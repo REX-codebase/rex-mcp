@@ -32,7 +32,7 @@
 use crate::http::Transport;
 use crate::provider_failure::structured_http_failure;
 use crate::providers::{find_spec, ProviderProtocol};
-use crate::search::SearchRouter;
+use crate::search::{SearchProvider, SearchRouter};
 use crate::secrets::SecretStore;
 use crate::service::ProviderService;
 use rex_preview::{
@@ -61,15 +61,34 @@ pub const DEFAULT_MAX_WALL_MS: u64 = 20 * 60 * 1000;
 pub const DEFAULT_MAX_TOKENS: u64 = 250_000;
 pub const MAX_GATE_ATTEMPTS: u8 = 3;
 pub const MAX_CONSEC_FAILURES: u32 = 3;
+/// Identical consecutive calls (beyond the first) after which the model is
+/// told it is looping. Termination stays with the no-progress budget.
+pub const DOOM_LOOP_REPEATS: u32 = 2;
 pub const MAX_STALL_TURNS: u32 = 3;
 pub const MAX_NO_PROGRESS_TURNS: u32 = 6;
 pub const MAX_DENIALS: u32 = 2;
 pub const APPROVAL_WAIT_MS: u64 = 60 * 60 * 1000;
+/// How long `ask_user` waits for the trusted UI before telling the model to
+/// proceed on its own judgement. A missed question never ends the run.
+pub const ANSWER_WAIT_MS: u64 = 30 * 60 * 1000;
+/// Questions one run may ask; past this the model is told to decide.
+pub const MAX_QUESTIONS_PER_RUN: u32 = 3;
+const QUESTION_CHARS: usize = 500;
+const CHOICE_CHARS: usize = 120;
+const MAX_CHOICES: usize = 4;
+/// Longest answer text passed back to the model.
+pub const ANSWER_CHARS: usize = 2000;
 const MAX_ACTIVE_RUNS: usize = 4;
 const MAX_EVENTS: usize = 200;
 const PROVIDER_RETRIES: u32 = 3;
 const DIGEST_WINDOW: usize = 6;
 const OUTCOME_CHARS: usize = 4_000;
+
+#[path = "explore.rs"]
+mod explore;
+#[path = "fetch.rs"]
+mod fetch;
+use explore::{run_explore, ExploreLimits, ExploreOutcome, ProviderLink};
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -134,6 +153,9 @@ pub enum AgentStatus {
     /// Plan mode: the model produced a plan and the run is parked until the
     /// trusted UI approves or rejects it. No tool has run yet.
     AwaitingPlan,
+    /// The model asked the user a question (`ask_user`) and the run is
+    /// parked until the trusted UI answers or declines.
+    AwaitingAnswer,
     Verifying,
     Completed,
     Blocked,
@@ -208,6 +230,13 @@ pub enum AgentEvent {
     PlanApprovalResolved {
         approved: bool,
     },
+    QuestionAsked {
+        question: PendingQuestion,
+    },
+    QuestionResolved {
+        call_id: String,
+        answered: bool,
+    },
     GateResult {
         attempt: u8,
         passed: bool,
@@ -220,6 +249,32 @@ pub enum AgentEvent {
     Info {
         message: String,
     },
+}
+
+/// A question the model put to the user through `ask_user`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub call_id: String,
+    pub question: String,
+    /// Suggested answers, best first; the user may still type anything.
+    pub choices: Vec<String>,
+    /// 1-based position when the model asked several questions in one call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<usize>,
+    /// Number of questions in that call; `None` for a single question.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_total: Option<usize>,
+    /// Every question of a batched call, so the UI can show them on one
+    /// form and answer them together with `answer_many`. Empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub batch: Vec<BatchQuestion>,
+}
+
+/// One question of a batched `ask_user` call.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BatchQuestion {
+    pub question: String,
+    pub choices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,6 +304,7 @@ pub struct AgentSnapshot {
     pub elapsed_ms: u64,
     pub max_wall_ms: u64,
     pub pending_approval: Option<PreparedCall>,
+    pub pending_question: Option<PendingQuestion>,
     /// Prompt-architecture identity this run is executing under.
     pub prompt_version: String,
     pub prompt_hash: String,
@@ -344,6 +400,12 @@ struct Checkpoint {
     gate_attempts: u8,
     consec_fail: u32,
     last_failure_sig: Option<String>,
+    /// Signature of the previous tool call and how many times in a row it
+    /// has been repeated (success or failure), for doom-loop nudges.
+    #[serde(default)]
+    last_call_sig: Option<String>,
+    #[serde(default)]
+    same_call_repeats: u32,
     consec_stall: u32,
     turns_since_progress: u32,
     total_denials: u32,
@@ -363,6 +425,12 @@ struct Checkpoint {
     /// assumed).
     #[serde(default)]
     plan_approved: bool,
+    /// `ask_user` calls made so far (capped by MAX_QUESTIONS_PER_RUN).
+    #[serde(default)]
+    questions_asked: u32,
+    /// Bounded excerpts of older tool results (see `memory`).
+    #[serde(default)]
+    observations: Vec<crate::memory::Observation>,
     /// The run's workspace, as resolved at begin time. Resume restores it
     /// from here (re-validated under the runs root); legacy checkpoints
     /// without it fall back to `<run_dir>/workspace`.
@@ -377,6 +445,12 @@ struct RunShared {
     events: VecDeque<AgentEvent>,
     pending_approval: Option<PreparedCall>,
     decision: Option<bool>,
+    pending_question: Option<PendingQuestion>,
+    /// Trusted UI reply to `pending_question`: `Some(None)` = declined.
+    answer: Option<Option<String>>,
+    /// Replies for the later questions of the current batch, given
+    /// together through `answer_many`. Cleared when the batch ends.
+    queued_answers: VecDeque<Option<String>>,
     step: usize,
     tool_calls: usize,
     tokens_used: u64,
@@ -431,10 +505,190 @@ enum AgentCall {
         id: String,
         query: String,
         max_results: usize,
+        /// Model-supplied sites (URLs or bare domains) to seed the keyless
+        /// engine; ignored by keyed providers.
+        sites: Vec<String>,
     },
     CompleteTask {
         summary: String,
     },
+    /// Read one public web page as text.
+    WebFetch {
+        id: String,
+        url: String,
+        offset: usize,
+        /// Flat text instead of the default Markdown (`format: "text"`).
+        text: bool,
+    },
+    /// Hand a focused read-only question to an explorer sub-agent.
+    /// One task, or up to `explore::EXPLORE_MAX_PARALLEL` run concurrently.
+    Explore {
+        id: String,
+        tasks: Vec<String>,
+        kind: explore::ExplorerKind,
+    },
+    /// Ask the user a blocking question through the trusted UI.
+    AskUser {
+        id: String,
+        /// One or more (question, choices) pairs, asked in order.
+        questions: Vec<(String, Vec<String>)>,
+    },
+}
+
+/// What the model hears when the keyless engine has nowhere to start.
+const NO_SEED_GUIDANCE: &str = "The keyless REX search crawls outward from seed sites and has no web-wide index. \
+    Call web_search again with `sites` (URLs or domains likely to hold the answer, e.g. docs.rs, developer.mozilla.org, \
+    the project's own site), or use web_fetch on a URL you already know.";
+const MAX_SEEDS: usize = 5;
+/// Domains in free query text only count with one of these endings, so
+/// file names like `main.rs` or `config.json` are not mistaken for sites.
+const QUERY_TLDS: &[&str] = &[
+    "com", "org", "net", "io", "dev", "app", "ai", "gov", "edu", "info", "co", "uk", "in", "de",
+];
+
+fn string_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|t| t.trim().chars().take(300).collect::<String>())
+                .filter(|t| !t.is_empty())
+                .take(MAX_SEEDS * 2)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A bare domain such as `docs.rs` -> `https://docs.rs/`. `strict` limits
+/// the ending to QUERY_TLDS (used for words pulled out of free text).
+fn domain_seed(token: &str, strict: bool) -> Option<String> {
+    let t = token.trim().trim_end_matches('/').to_ascii_lowercase();
+    if t.contains('@') || t.contains(':') || t.len() > 253 {
+        return None;
+    }
+    let labels: Vec<&str> = t.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|l| {
+            l.is_empty()
+                || l.len() > 63
+                || l.starts_with('-')
+                || !l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    {
+        return None;
+    }
+    let tld = labels[labels.len() - 1];
+    let tld_ok = if strict {
+        QUERY_TLDS.contains(&tld)
+    } else {
+        tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+    };
+    tld_ok.then(|| format!("https://{t}/"))
+}
+
+/// Seeds for the keyless engine: model-supplied sites first, then URLs and
+/// well-formed domains that appear in the query. Every seed passes the same
+/// URL vetting as web_fetch; duplicates are dropped and the list is capped.
+fn search_seeds(query: &str, sites: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let from_sites = sites.iter().map(|s| (s.as_str(), false));
+    let from_query = query
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| "()[]<>{},;\"'`".contains(c)))
+        .map(|w| (w, true));
+    for (token, strict) in from_sites.chain(from_query) {
+        let lower = token.to_ascii_lowercase();
+        let candidate = if lower.starts_with("http://") || lower.starts_with("https://") {
+            Some(token.to_string())
+        } else {
+            domain_seed(token, strict)
+        };
+        let Some(candidate) = candidate else { continue };
+        let Ok(url) = fetch::vet_url(&candidate) else {
+            continue;
+        };
+        // Seeds name public sites. IP literals and local names are refused
+        // here as well as at fetch time (which re-checks every hop).
+        let local = match url.host() {
+            Some(url::Host::Domain(d)) => {
+                let d = d.trim_end_matches('.');
+                d == "localhost"
+                    || [".localhost", ".local", ".internal", ".lan", ".home.arpa"]
+                        .iter()
+                        .any(|suffix| d.ends_with(suffix))
+            }
+            Some(_) | None => true,
+        };
+        if local {
+            continue;
+        }
+        let url = url.to_string();
+        if !out.contains(&url) {
+            out.push(url);
+        }
+        if out.len() >= MAX_SEEDS {
+            break;
+        }
+    }
+    out
+}
+
+/// Most questions accepted in one `ask_user` call.
+pub const MAX_BATCH_QUESTIONS: usize = 3;
+
+/// Decode `ask_user` args: either one `question` (+ `choices`) or a
+/// `questions` array of such objects, capped at MAX_BATCH_QUESTIONS.
+/// Items without a question are dropped; an empty batch is an error.
+fn parse_ask_user(args: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
+    if let Some(items) = args.get("questions").and_then(Value::as_array) {
+        let batch: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(q) => parse_one_question(&json!({ "question": q })).ok(),
+                other => parse_one_question(other).ok(),
+            })
+            .take(MAX_BATCH_QUESTIONS)
+            .collect();
+        if batch.is_empty() {
+            return Err("ask_user questions has no usable question".into());
+        }
+        return Ok(batch);
+    }
+    parse_one_question(args).map(|q| vec![q])
+}
+
+/// Decode one question. Choices may arrive as strings or as objects with
+/// a label-like field; blanks are dropped and everything is length-capped.
+fn parse_one_question(args: &Value) -> Result<(String, Vec<String>), String> {
+    let question = args
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if question.is_empty() {
+        return Err("ask_user missing question".into());
+    }
+    let choices = args
+        .get("choices")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| match c {
+                    Value::String(t) => Some(t.trim().to_string()),
+                    Value::Object(o) => ["label", "text", "title", "description"]
+                        .iter()
+                        .find_map(|k| o.get(*k).and_then(Value::as_str))
+                        .map(|t| t.trim().to_string()),
+                    _ => None,
+                })
+                .filter(|t| !t.is_empty())
+                .map(|t| t.chars().take(CHOICE_CHARS).collect::<String>())
+                .take(MAX_CHOICES)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((question.chars().take(QUESTION_CHARS).collect(), choices))
 }
 
 pub struct AutonomousRunService<S: SecretStore + 'static, T: Transport + 'static> {
@@ -494,6 +748,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             elapsed_ms: state.elapsed_ms,
             max_wall_ms: brief.as_ref().map(|b| b.budgets.max_wall_ms).unwrap_or(0),
             pending_approval: state.pending_approval.clone(),
+            pending_question: state.pending_question.clone(),
             prompt_version: brief
                 .as_ref()
                 .map(|b| b.prompt_version.clone())
@@ -671,6 +926,9 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 events: VecDeque::new(),
                 pending_approval: None,
                 decision: None,
+                pending_question: None,
+                answer: None,
+                queued_answers: VecDeque::new(),
                 step: 0,
                 tool_calls: 0,
                 tokens_used: 0,
@@ -772,6 +1030,85 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         Ok(self.snapshot_of(run_id, handle))
     }
 
+    /// Trusted UI reply to an `ask_user` question. `None` declines, which
+    /// tells the model to proceed on its own judgement. Blank text counts as
+    /// declining; long text is capped at ANSWER_CHARS.
+    pub fn answer(&self, run_id: &str, text: Option<&str>) -> Result<AgentSnapshot, String> {
+        let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+        let handle = runs.get(run_id).ok_or("unknown run")?;
+        {
+            let mut state = handle.shared.lock().map_err(|_| "run state poisoned")?;
+            if state.status != AgentStatus::AwaitingAnswer || state.pending_question.is_none() {
+                return Err("run is not waiting for an answer".into());
+            }
+            let reply = text
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| t.chars().take(ANSWER_CHARS).collect::<String>());
+            let answered = reply.is_some();
+            state.answer = Some(reply);
+            let call_id = state
+                .pending_question
+                .as_ref()
+                .map(|q| q.call_id.clone())
+                .unwrap_or_default();
+            push_locked(
+                &mut state,
+                AgentEvent::QuestionResolved { call_id, answered },
+            );
+        }
+        handle.cond.notify_all();
+        Ok(self.snapshot_of(run_id, handle))
+    }
+
+    /// Answer the open question and the rest of its batch in one go (the
+    /// batch form). `answers[0]` answers the open question; later entries
+    /// are used, in order, for the batch's remaining questions. Extra
+    /// entries past the batch are ignored. `None` or blank declines one.
+    pub fn answer_many(
+        &self,
+        run_id: &str,
+        answers: &[Option<String>],
+    ) -> Result<AgentSnapshot, String> {
+        let Some((first, rest)) = answers.split_first() else {
+            return Err("no answers given".into());
+        };
+        let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+        let handle = runs.get(run_id).ok_or("unknown run")?;
+        {
+            let mut state = handle.shared.lock().map_err(|_| "run state poisoned")?;
+            let Some(q) = state.pending_question.clone() else {
+                return Err("run is not waiting for an answer".into());
+            };
+            if state.status != AgentStatus::AwaitingAnswer {
+                return Err("run is not waiting for an answer".into());
+            }
+            let clean = |a: &Option<String>| {
+                a.as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.chars().take(ANSWER_CHARS).collect::<String>())
+            };
+            let left = q
+                .batch_total
+                .zip(q.batch_index)
+                .map_or(0, |(t, i)| t.saturating_sub(i));
+            state.queued_answers = rest.iter().take(left).map(clean).collect();
+            let reply = clean(first);
+            let answered = reply.is_some();
+            state.answer = Some(reply);
+            push_locked(
+                &mut state,
+                AgentEvent::QuestionResolved {
+                    call_id: q.call_id,
+                    answered,
+                },
+            );
+        }
+        handle.cond.notify_all();
+        Ok(self.snapshot_of(run_id, handle))
+    }
+
     pub fn cancel(&self, run_id: &str) -> Result<AgentSnapshot, String> {
         let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
         let handle = runs.get(run_id).ok_or("unknown run")?;
@@ -781,6 +1118,100 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         // a parked approval wait wakes immediately on the notify above.
         std::thread::sleep(Duration::from_millis(50));
         Ok(self.snapshot_of(run_id, handle))
+    }
+
+    /// Undo the newest file write a run made, from its on-disk journal.
+    /// Refused while the run is active, and refused (changing nothing) when
+    /// a touched file changed after the agent wrote it.
+    pub fn undo_last_write(
+        &self,
+        run_id: &str,
+    ) -> Result<rex_tools::journal::JournalEntry, String> {
+        let (journal, workspace) = self.finished_run_journal(run_id)?;
+        journal.undo_last(&workspace)
+    }
+
+    /// Undo every write after journal entry `seq` in one call (0 = the
+    /// whole run), newest first. All or nothing: if any step is blocked by
+    /// a later change to a file, no file is touched.
+    pub fn undo_to_write(
+        &self,
+        run_id: &str,
+        seq: u64,
+    ) -> Result<Vec<rex_tools::journal::JournalEntry>, String> {
+        let (journal, workspace) = self.finished_run_journal(run_id)?;
+        journal.undo_to(&workspace, seq)
+    }
+
+    /// Rewind a finished run to just after the write made by tool call
+    /// `call_id` (the id on its `ToolFinished` event), all or nothing.
+    pub fn undo_after_call(
+        &self,
+        run_id: &str,
+        call_id: &str,
+    ) -> Result<Vec<rex_tools::journal::JournalEntry>, String> {
+        let (journal, workspace) = self.finished_run_journal(run_id)?;
+        let seq = journal
+            .seq_of_call(call_id)
+            .ok_or_else(|| format!("no journaled write for call {call_id}"))?;
+        journal.undo_to(&workspace, seq)
+    }
+
+    /// The write journal and workspace of a run that is not active.
+    fn finished_run_journal(
+        &self,
+        run_id: &str,
+    ) -> Result<(rex_tools::journal::Journal, PathBuf), String> {
+        {
+            let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;
+            if let Some(handle) = runs.get(run_id) {
+                if handle
+                    .shared
+                    .lock()
+                    .map(|s| s.terminal.is_none())
+                    .unwrap_or(false)
+                {
+                    return Err("run is still active; cancel or wait for it before undoing".into());
+                }
+            }
+        }
+        let run_dir = self.run_dir(run_id);
+        let state_dir = run_dir.join("state");
+        let checkpoint = read_json::<Checkpoint>(&state_dir.join("checkpoint.json"))
+            .map_err(|_| "no checkpointed run with this id".to_string())?;
+        let workspace = self.checkpoint_workspace(&run_dir, &checkpoint)?;
+        let journal_dir = state_dir.join("journal");
+        if !journal_dir.join("journal.jsonl").exists() {
+            return Err("this run has no write journal".into());
+        }
+        let journal = rex_tools::journal::Journal::open(journal_dir).map_err(|e| e.to_string())?;
+        Ok((journal, workspace))
+    }
+
+    /// The run's workspace from its checkpoint, re-validated under the
+    /// runs root (a tampered checkpoint must not redirect a run or an undo).
+    fn checkpoint_workspace(
+        &self,
+        run_dir: &Path,
+        checkpoint: &Checkpoint,
+    ) -> Result<PathBuf, String> {
+        let runs_root_canon = self.runs_root.canonicalize().map_err(|e| e.to_string())?;
+        let workspace = match checkpoint.workspace.clone() {
+            Some(stored) => {
+                let canon = stored
+                    .canonicalize()
+                    .map_err(|_| "checkpointed workspace is missing".to_string())?;
+                if !canon.starts_with(&runs_root_canon) {
+                    return Err("checkpointed workspace escaped the runs root".into());
+                }
+                canon
+            }
+            None => run_dir.join("workspace"),
+        };
+        if !workspace.is_dir() {
+            return Err("checkpointed workspace is missing".into());
+        }
+        Ok(workspace)
     }
 
     /// Rehydrate a run from its on-disk checkpoint after a process restart
@@ -827,22 +1258,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         // back to the default `<run_dir>/workspace` layout. A stored path is
         // re-validated under the runs root: a tampered checkpoint must not
         // redirect the resumed run elsewhere.
-        let runs_root_canon = self.runs_root.canonicalize().map_err(|e| e.to_string())?;
-        let workspace = match checkpoint.workspace.clone() {
-            Some(stored) => {
-                let canon = stored
-                    .canonicalize()
-                    .map_err(|_| "checkpointed workspace is missing".to_string())?;
-                if !canon.starts_with(&runs_root_canon) {
-                    return Err("checkpointed workspace escaped the runs root".into());
-                }
-                canon
-            }
-            None => run_dir.join("workspace"),
-        };
-        if !workspace.is_dir() {
-            return Err("checkpointed workspace is missing".into());
-        }
+        let workspace = self.checkpoint_workspace(&run_dir, &checkpoint)?;
         let handle = Arc::new(RunHandle {
             shared: Mutex::new(RunShared {
                 status: AgentStatus::Running,
@@ -851,6 +1267,9 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
                 events: VecDeque::new(),
                 pending_approval: None,
                 decision: None,
+                pending_question: None,
+                answer: None,
+                queued_answers: VecDeque::new(),
                 step: checkpoint.step,
                 tool_calls: checkpoint.tool_calls,
                 tokens_used: checkpoint.tokens_used,
@@ -1134,10 +1553,17 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
     let started = Instant::now();
     let mut ledger = Ledger::open(&ctx.state_dir);
     let tools = match ToolRuntime::new(&ctx.workspace) {
-        Ok(t) => match &ctx.mcp_caller {
-            Some(caller) => t.with_mcp_caller(caller.clone()),
-            None => t,
-        },
+        Ok(t) => {
+            // Journal writes so a finished run can be undone; a journal
+            // failure leaves the run working, just without undo.
+            let t = ToolRuntime::new(&ctx.workspace)
+                .and_then(|j| j.with_journal(ctx.state_dir.join("journal")))
+                .unwrap_or(t);
+            match &ctx.mcp_caller {
+                Some(caller) => t.with_mcp_caller(caller.clone()),
+                None => t,
+            }
+        }
         Err(e) => {
             finish(
                 &ctx,
@@ -1354,7 +1780,16 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         }
 
         // ---- dynamic context build ---------------------------------------
-        let state_msg = build_state_message(&ctx.brief, &cp, budgets, current_plan(&ctx.handle));
+        let project = rex_prompt::project::load(&ctx.workspace);
+        let user_rules = rex_prompt::project::load_user();
+        let state_msg = build_state_message(
+            &ctx.brief,
+            &cp,
+            budgets,
+            current_plan(&ctx.handle),
+            project.as_ref(),
+            user_rules.as_ref(),
+        );
         let request_body = build_request(
             protocol,
             &model,
@@ -1435,13 +1870,26 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
                 AgentEvent::ModelText { text: text.clone() },
             );
         }
+        for note in &decoded.repairs {
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::Info {
+                    message: format!("repaired call: {note}"),
+                },
+            );
+        }
 
         // ---- execute the turn's calls ------------------------------------
         let out = execute_turn(
             &ctx,
             &tools,
             &mut ledger,
-            protocol,
+            &ProviderLink {
+                protocol,
+                base_url: &base_url,
+                key: &key,
+                model: &model,
+            },
             decoded.calls,
             decoded.thought_signature,
             &mut cp,
@@ -1526,21 +1974,44 @@ fn build_state_message(
     cp: &Checkpoint,
     budgets: Budgets,
     plan: Vec<PlanItem>,
+    project: Option<&rex_prompt::project::ProjectInstructions>,
+    user_rules: Option<&rex_prompt::project::ProjectInstructions>,
 ) -> String {
     let digest: Vec<&DigestEntry> = cp.digest.iter().rev().take(DIGEST_WINDOW).collect();
     let digest: Vec<&DigestEntry> = digest.into_iter().rev().collect();
+    let older = crate::memory::earlier(&cp.observations, cp.step);
+    let earlier_observations = if older.is_empty() {
+        Value::Null
+    } else {
+        json!({"note": crate::memory::MEMORY_NOTE, "items": older})
+    };
     let payload = json!({
         "contract": {
             "role": "You are REX, an autonomous agent inside a bounded workspace. Work the plan until the task is verifiably done.",
             "rules": [
                 "Maintain the todo plan with update_plan: mark the active step in_progress, mark steps done only when actually done.",
                 "Use read_file/search_files/web_search to ground yourself before writing. Writes and commands pause for trusted human approval; a denial is information - replan, never retry the identical denied call.",
+                "Use ask_user only when a choice blocks progress and cannot be settled from the workspace or the brief; otherwise decide, and state the assumption in your completion summary.",
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "run_command", "web_search", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "explore", "ask_user", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
+        "project_instructions": project.map(|p| json!({
+            "source": p.source,
+            "sha256": p.sha256,
+            "truncated": p.truncated,
+            "precedence": rex_prompt::project::PRECEDENCE,
+            "text": p.text,
+        })),
+        "user_instructions": user_rules.map(|u| json!({
+            "source": u.source,
+            "sha256": u.sha256,
+            "truncated": u.truncated,
+            "precedence": rex_prompt::project::USER_PRECEDENCE,
+            "text": u.text,
+        })),
         "budget": {
             "step": cp.step, "max_steps": budgets.max_steps,
             "tool_calls": cp.tool_calls, "max_tool_calls": budgets.max_tool_calls,
@@ -1549,6 +2020,7 @@ fn build_state_message(
         },
         "plan": plan,
         "recent_turns": digest,
+        "earlier_observations": earlier_observations,
         "note": if cp.consec_stall > 0 {
             "Your last turn produced no tool calls. Act on the plan: call the next tool, update the plan, or call complete_task when everything is verifiably done."
         } else {
@@ -1584,13 +2056,25 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "edit_file",
-            "Replace exact text in a workspace file.",
+            "Replace text in a workspace file; exact match first, then unique indentation/whitespace-tolerant match.",
             true,
             true,
         ),
         ToolSpec::new(
             "search_files",
-            "Search file contents inside the workspace.",
+            "Search file contents (literal or regex, optional include glob); skips build output and .gitignore.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "apply_patch",
+            "Apply an atomic multi-file patch (add/update/move/delete); all hunks apply or nothing is written.",
+            true,
+            true,
+        ),
+        ToolSpec::new(
+            "glob_files",
+            "Find workspace files by glob pattern, newest first.",
             false,
             false,
         ),
@@ -1603,6 +2087,24 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "web_search",
             "Search the public web for grounded facts.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "web_fetch",
+            "Read one public web page as text (robots-aware, private addresses refused).",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "explore",
+            "Delegate a read-only question to an explorer sub-agent (workspace only) or a research sub-agent (workspace plus web_fetch); returns one findings report.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "ask_user",
+            "Ask the user one blocking question, or up to 3 related ones at once, through the trusted UI; returns their answers or tells you to decide.",
             false,
             false,
         ),
@@ -1745,12 +2247,17 @@ fn build_request(
 fn gemini_tool_definitions() -> Value {
     json!([{"functionDeclarations":[
         {"name":"update_plan","description":"Replace the visible todo plan. Keep 2-8 items; one in_progress at a time.","parameters":{"type":"OBJECT","properties":{"items":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"id":{"type":"STRING"},"title":{"type":"STRING"},"status":{"type":"STRING","enum":["pending","in_progress","done","blocked"]},"note":{"type":"STRING"}},"required":["id","title","status"]}}},"required":["items"]}},
-        {"name":"read_file","description":"Read a file inside the selected workspace.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"}},"required":["path"]}},
+        {"name":"read_file","description":"Read a file inside the selected workspace. Small files return exact text; large files, or any call with offset/limit, return numbered lines with a footer saying where to continue. A directory path returns its listing.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"offset":{"type":"INTEGER","description":"1-based first line"},"limit":{"type":"INTEGER","description":"max lines (default 2000)"}},"required":["path"]}},
         {"name":"create_file","description":"Create a file inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"content":{"type":"STRING"},"overwrite":{"type":"BOOLEAN"}},"required":["path","content","overwrite"]}},
-        {"name":"edit_file","description":"Replace exact text in a workspace file. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"expected":{"type":"STRING"},"replacement":{"type":"STRING"},"replace_all":{"type":"BOOLEAN"}},"required":["path","expected","replacement","replace_all"]}},
-        {"name":"search_files","description":"Search file contents inside the workspace.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
+        {"name":"edit_file","description":"Replace text in a workspace file. Copy `expected` from the file; exact match is tried first, then a unique indentation/whitespace-tolerant match, and a miss reports the closest region. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"},"expected":{"type":"STRING"},"replacement":{"type":"STRING"},"replace_all":{"type":"BOOLEAN"}},"required":["path","expected","replacement","replace_all"]}},
+        {"name":"search_files","description":"Search file contents inside the workspace. Literal case-insensitive by default; set regex=true for a regular expression. Skips .git, build output, node_modules and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"},"regex":{"type":"BOOLEAN"},"include":{"type":"STRING","description":"glob such as *.rs or src/**/*.{ts,tsx}"}},"required":["query"]}},
+        {"name":"apply_patch","description":"Change several files at once, all-or-nothing. Format: '*** Begin Patch' then per file '*** Add File: path' (lines prefixed '+'), '*** Delete File: path', or '*** Update File: path' (optional '*** Move to: path') with '@@' hunks of ' ' context, '-' removed and '+' added lines; end with '*** End Patch'. Include enough context lines to make each hunk unique. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"patch":{"type":"STRING"}},"required":["patch"]}},
+        {"name":"glob_files","description":"Find workspace files by glob pattern (e.g. **/*.rs), newest first. Skips build output and .gitignore'd paths.","parameters":{"type":"OBJECT","properties":{"pattern":{"type":"STRING"},"path":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["pattern"]}},
         {"name":"run_command","description":"Run an allowed command inside the workspace. Requires trusted approval.","parameters":{"type":"OBJECT","properties":{"argv":{"type":"ARRAY","items":{"type":"STRING"}},"cwd":{"type":"STRING"},"timeout_ms":{"type":"INTEGER"}},"required":["argv"]}},
-        {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"}},"required":["query"]}},
+        {"name":"web_search","description":"Search the public web for grounded facts. Returns ranked results with URLs. With the keyless engine, pass `sites`: URLs or domains likely to hold the answer (it crawls outward from them).","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"},"max_results":{"type":"INTEGER"},"sites":{"type":"ARRAY","items":{"type":"STRING"},"description":"seed URLs or domains, e.g. docs.rs"}},"required":["query"]}},
+        {"name":"web_fetch","description":"Read one public web page (http/https), e.g. docs or an issue you already have the URL for. HTML comes back as Markdown (headings, lists, absolute links, code blocks); format=text gives flat text. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"},"format":{"type":"STRING","enum":["markdown","text"],"description":"markdown (default) or text"}},"required":["url"]}},
+        {"name":"explore","description":"Delegate a focused question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob, or (kind edit) one self-contained change to a writing sub-agent. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"},"kind":{"type":"STRING","enum":["explore","research","edit"],"description":"explore (default): workspace only. research: workspace plus web_fetch of public pages, for questions that need docs or issue pages. edit: one self-contained change per task (up to 3 in parallel, each on different files); the child can write and run commands, each needing the user's approval as usual, and reports files changed"}}}},
+        {"name":"ask_user","description":"Ask the user when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Pass one question, or up to 3 related questions at once in `questions` so the user answers them together. Give up to 4 short choices per question, best first; the user may also answer freely. At most 3 questions per run. Anything declined or unanswered in time means proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}},"questions":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}}}}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
     ]}])
 }
@@ -1964,9 +2471,13 @@ struct DecodedCalls {
     /// Gemini 2.5 thinking models sign the model turn; the signature must be
     /// echoed back with the next request's function calls.
     thought_signature: Option<String>,
+    /// Slips fixed before decoding (tool name or argument types), one note
+    /// each, so the run's events show what was changed.
+    repairs: Vec<String>,
 }
 
 fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
+    let mut repairs = Vec::new();
     let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
     let parts = value
         .get("candidates")
@@ -2004,6 +2515,9 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
             .get("name")
             .and_then(Value::as_str)
             .ok_or("functionCall missing name")?;
+        let fixed_name = canonical_call_name(name);
+        note_name_repair(name, &fixed_name, &mut repairs);
+        let name = fixed_name.as_str();
         let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
         match name {
             "update_plan" => {
@@ -2039,15 +2553,60 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     .map(|n| n as usize)
                     .unwrap_or(5)
                     .clamp(1, 8);
+                let sites = string_list(&args, "sites");
                 calls.push((
                     AgentCall::WebSearch {
                         id,
                         query,
                         max_results,
+                        sites,
                     },
                     raw,
                 ));
             }
+            "web_fetch" => match args.get("url").and_then(Value::as_str) {
+                Some(url) => calls.push((
+                    AgentCall::WebFetch {
+                        id,
+                        url: url.into(),
+                        offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
+                        text: args.get("format").and_then(Value::as_str) == Some("text"),
+                    },
+                    raw,
+                )),
+                None => calls.push((
+                    AgentCall::BadCall {
+                        name: "web_fetch".into(),
+                        id,
+                        error: "web_fetch missing url".into(),
+                    },
+                    raw,
+                )),
+            },
+            "ask_user" => match parse_ask_user(&args) {
+                Ok(questions) => calls.push((AgentCall::AskUser { id, questions }, raw)),
+                Err(error) => calls.push((
+                    AgentCall::BadCall {
+                        name: "ask_user".into(),
+                        id,
+                        error,
+                    },
+                    raw,
+                )),
+            },
+            "explore" => match explore::parse_explore_tasks(&args)
+                .and_then(|t| explore::parse_explore_kind(&args).map(|k| (t, k)))
+            {
+                Ok((tasks, kind)) => calls.push((AgentCall::Explore { id, tasks, kind }, raw)),
+                Err(error) => calls.push((
+                    AgentCall::BadCall {
+                        name: "explore".into(),
+                        id,
+                        error,
+                    },
+                    raw,
+                )),
+            },
             "complete_task" => {
                 let summary = args
                     .get("summary")
@@ -2065,6 +2624,11 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                     .as_object_mut()
                     .unwrap()
                     .insert("tool".into(), Value::String(name.into()));
+                note_arg_repair(
+                    name,
+                    rex_tools::repair_tool_args(name, &mut object),
+                    &mut repairs,
+                );
                 match serde_json::from_value::<ToolRequest>(object) {
                     Ok(request) => calls.push((AgentCall::Tool { id, request }, raw)),
                     Err(e) => calls.push((
@@ -2083,6 +2647,7 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
         texts,
         calls,
         thought_signature,
+        repairs,
     })
 }
 
@@ -2097,12 +2662,56 @@ fn decode_provider_calls(
     }
 }
 
+/// Calls the loop handles itself rather than through [`ToolRequest`].
+const AGENT_CALL_NAMES: &[&str] = &[
+    "update_plan",
+    "web_search",
+    "web_fetch",
+    "ask_user",
+    "explore",
+    "complete_task",
+];
+
+/// Map a slightly-off tool name (`Read_File`, `read-file`, ` explore `) to the
+/// known name it clearly means. Unknown names come back unchanged so decoding
+/// reports them as usual.
+fn canonical_call_name(name: &str) -> String {
+    let fixed = name.trim().to_ascii_lowercase().replace('-', "_");
+    if fixed != name
+        && (AGENT_CALL_NAMES.contains(&fixed.as_str())
+            || rex_tools::TOOL_NAMES.contains(&fixed.as_str()))
+    {
+        fixed
+    } else {
+        name.to_string()
+    }
+}
+
+fn note_name_repair(original: &str, fixed: &str, repairs: &mut Vec<String>) {
+    if original != fixed {
+        repairs.push(format!("tool name '{original}' read as '{fixed}'"));
+    }
+}
+
+fn note_arg_repair(tool: &str, fields: Vec<String>, repairs: &mut Vec<String>) {
+    if !fields.is_empty() {
+        repairs.push(format!(
+            "{tool}: fixed argument types for {}",
+            fields.join(", ")
+        ));
+    }
+}
+
 fn decode_named_call(
     name: &str,
     id: String,
     args: Value,
     raw: Value,
+    repairs: &mut Vec<String>,
 ) -> (AgentCall, Option<Value>) {
+    let fixed_name = canonical_call_name(name);
+    note_name_repair(name, &fixed_name, repairs);
+    let name = fixed_name.as_str();
     let bad = |error: String| {
         (
             AgentCall::BadCall {
@@ -2130,10 +2739,33 @@ fn decode_named_call(
                         .and_then(Value::as_u64)
                         .unwrap_or(5)
                         .clamp(1, 8) as usize,
+                    sites: string_list(&args, "sites"),
                 },
                 Some(raw),
             ),
             None => bad("web_search missing query".into()),
+        },
+        "web_fetch" => match args.get("url").and_then(Value::as_str) {
+            Some(url) => (
+                AgentCall::WebFetch {
+                    id,
+                    url: url.into(),
+                    offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    text: args.get("format").and_then(Value::as_str) == Some("text"),
+                },
+                Some(raw),
+            ),
+            None => bad("web_fetch missing url".into()),
+        },
+        "ask_user" => match parse_ask_user(&args) {
+            Ok(questions) => (AgentCall::AskUser { id, questions }, Some(raw)),
+            Err(e) => bad(e),
+        },
+        "explore" => match explore::parse_explore_tasks(&args)
+            .and_then(|t| explore::parse_explore_kind(&args).map(|k| (t, k)))
+        {
+            Ok((tasks, kind)) => (AgentCall::Explore { id, tasks, kind }, Some(raw)),
+            Err(e) => bad(e),
         },
         "complete_task" => (
             AgentCall::CompleteTask {
@@ -2154,6 +2786,11 @@ fn decode_named_call(
                 .as_object_mut()
                 .unwrap()
                 .insert("tool".into(), Value::String(name.into()));
+            note_arg_repair(
+                name,
+                rex_tools::repair_tool_args(name, &mut object),
+                repairs,
+            );
             match serde_json::from_value::<ToolRequest>(object) {
                 Ok(request) => (AgentCall::Tool { id, request }, Some(raw)),
                 Err(e) => bad(format!("invalid {name} request: {e}")),
@@ -2163,6 +2800,7 @@ fn decode_named_call(
 }
 
 fn decode_anthropic_calls(response: &str) -> Result<DecodedCalls, String> {
+    let mut repairs = Vec::new();
     let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
     let blocks = value
         .get("content")
@@ -2196,6 +2834,7 @@ fn decode_anthropic_calls(response: &str) -> Result<DecodedCalls, String> {
                     id,
                     block.get("input").cloned().unwrap_or_else(|| json!({})),
                     block.clone(),
+                    &mut repairs,
                 ));
             }
             _ => {}
@@ -2205,10 +2844,12 @@ fn decode_anthropic_calls(response: &str) -> Result<DecodedCalls, String> {
         texts,
         calls,
         thought_signature: None,
+        repairs,
     })
 }
 
 fn decode_openai_calls(response: &str) -> Result<DecodedCalls, String> {
+    let mut repairs = Vec::new();
     let value: Value = serde_json::from_str(response).map_err(|e| format!("invalid JSON: {e}"))?;
     let msg = value
         .pointer("/choices/0/message")
@@ -2241,12 +2882,19 @@ fn decode_openai_calls(response: &str) -> Result<DecodedCalls, String> {
             .and_then(Value::as_str)
             .ok_or("tool call missing arguments")?;
         let args = serde_json::from_str(raw).map_err(|e| format!("invalid tool arguments: {e}"))?;
-        calls.push(decode_named_call(name, id, args, call.clone()));
+        calls.push(decode_named_call(
+            name,
+            id,
+            args,
+            call.clone(),
+            &mut repairs,
+        ));
     }
     Ok(DecodedCalls {
         texts,
         calls,
         thought_signature: None,
+        repairs,
     })
 }
 
@@ -2265,12 +2913,13 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
     ctx: &LoopCtx<S, T>,
     tools: &ToolRuntime,
     ledger: &mut Option<Ledger>,
-    protocol: ProviderProtocol,
+    link: &ProviderLink<'_>,
     calls: Vec<(AgentCall, Option<Value>)>,
     thought_signature: Option<String>,
     cp: &mut Checkpoint,
     started: Instant,
 ) -> DriveOut {
+    let protocol = link.protocol;
     let mut out = DriveOut {
         pair: Some(TurnPair::default()),
         digest_actions: Vec::new(),
@@ -2363,11 +3012,16 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 id,
                 query,
                 max_results,
+                sites,
             } => {
+                let seeds = search_seeds(&query, &sites);
                 let (ok, content) = match &ctx.search {
+                    Some(router) if router.active() == SearchProvider::Rex && seeds.is_empty() => {
+                        (false, NO_SEED_GUIDANCE.to_string())
+                    }
                     Some(router) => {
                         let request: SearchRequest = match serde_json::from_value(json!({
-                            "query": query, "seeds": [], "max_results": max_results
+                            "query": query, "seeds": seeds, "max_results": max_results
                         })) {
                             Ok(r) => r,
                             Err(e) => {
@@ -2390,7 +3044,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                                     .map(|e| json!({
                                         "url": e.url,
                                         "title": e.title,
-                                        "excerpt": e.excerpt.as_deref().map(|x| &x[..x.len().min(300)]),
+                                        "excerpt": e.excerpt.as_deref().map(|x| &x[..rex_tools::floor_boundary(x, 300)]),
                                     }))
                                     .collect();
                                 (
@@ -2409,7 +3063,10 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     None => (false, "web search is not configured in this build".into()),
                 };
                 if let Some(l) = ledger.as_mut() {
-                    l.append("web_search", json!({"query": query, "ok": ok}));
+                    l.append(
+                        "web_search",
+                        json!({"query": query, "seeds": seeds, "ok": ok}),
+                    );
                 }
                 out.digest_actions.push(DigestAction {
                     tool: "web_search".into(),
@@ -2427,6 +3084,425 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     json!({"functionCall":{"name":"web_search","args":{"query": query}}}),
                 );
                 response_parts.push(function_response(protocol, "web_search", &id, ok, &content));
+            }
+            AgentCall::AskUser { id, questions } => {
+                let allowed = ctx
+                    .brief
+                    .allowed_tools
+                    .as_ref()
+                    .is_none_or(|a| a.iter().any(|t| t == "ask_user"));
+                let single = questions.len() == 1;
+                let mut ok = true;
+                let mut asked_any = false;
+                let mut answers: Vec<Value> = Vec::new();
+                let mut single_content: Option<String> = None;
+                if !allowed {
+                    ok = false;
+                    single_content = Some("tool ask_user is not enabled for this run's role; decide yourself and state the assumption".to_string());
+                } else if cp.questions_asked >= MAX_QUESTIONS_PER_RUN {
+                    ok = false;
+                    single_content = Some(format!("question limit reached ({MAX_QUESTIONS_PER_RUN} per run); decide yourself and state the assumption in your completion summary"));
+                } else {
+                    for (n, (question, choices)) in questions.iter().enumerate() {
+                        if cp.questions_asked >= MAX_QUESTIONS_PER_RUN {
+                            answers.push(json!({"question": question, "status": "not_asked", "answer": null}));
+                            continue;
+                        }
+                        cp.questions_asked += 1;
+                        asked_any = true;
+                        let pending = PendingQuestion {
+                            call_id: match (id.is_empty(), single) {
+                                (true, _) => format!("ask-{}", cp.questions_asked),
+                                (false, true) => id.clone(),
+                                (false, false) => format!("{id}#{}", n + 1),
+                            },
+                            question: question.clone(),
+                            choices: choices.clone(),
+                            batch_index: (!single).then_some(n + 1),
+                            batch_total: (!single).then_some(questions.len()),
+                            batch: if single {
+                                Vec::new()
+                            } else {
+                                questions
+                                    .iter()
+                                    .map(|(q, c)| BatchQuestion {
+                                        question: q.clone(),
+                                        choices: c.clone(),
+                                    })
+                                    .collect()
+                            },
+                        };
+                        // Parked runs are resumable: persist before blocking.
+                        let _ = write_json(&ctx.state_dir.join("checkpoint.json"), &*cp);
+                        let (status, answer) = match wait_for_answer(ctx, &pending) {
+                            UserAnswer::Text(text) => ("answered", Some(text)),
+                            UserAnswer::Declined => ("declined", None),
+                            UserAnswer::Timeout => ("timeout", None),
+                            UserAnswer::Cancelled => {
+                                out.fatal = Some(TerminalReason::Cancelled);
+                                return out;
+                            }
+                        };
+                        answers.push(
+                            json!({"question": question, "status": status, "answer": answer}),
+                        );
+                    }
+                }
+                if let Ok(mut st) = ctx.handle.shared.lock() {
+                    st.queued_answers.clear();
+                }
+                let content = match single_content {
+                    Some(c) => c,
+                    None if single => match answers[0]["status"].as_str() {
+                        Some("answered") => json!({"user_answer": answers[0]["answer"]}).to_string(),
+                        Some("declined") => "The user declined to answer. Proceed on your own judgement and state the assumption in your completion summary.".to_string(),
+                        _ => "No answer arrived in time. Proceed on your own judgement and state the assumption in your completion summary.".to_string(),
+                    },
+                    None => json!({
+                        "answers": answers,
+                        "note": format!("For any question not answered (declined, timeout, or not_asked because of the {MAX_QUESTIONS_PER_RUN}-per-run limit), proceed on your own judgement and state the assumption in your completion summary."),
+                    })
+                    .to_string(),
+                };
+                let summary: String = questions
+                    .iter()
+                    .map(|(q, _)| q.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+                    .chars()
+                    .take(160)
+                    .collect();
+                let questions_json: Vec<Value> = questions
+                    .iter()
+                    .map(|(q, c)| json!({"question": q, "choices": c}))
+                    .collect();
+                if let Some(l) = ledger.as_mut() {
+                    l.append(
+                        "ask_user",
+                        json!({"questions": questions_json, "asked": asked_any, "ok": ok, "reply": content}),
+                    );
+                }
+                out.digest_actions.push(DigestAction {
+                    tool: "ask_user".into(),
+                    ok,
+                    target: Some(summary),
+                    error_kind: (!ok).then(|| "question_refused".to_string()),
+                });
+                let args = if single {
+                    json!({"question": questions[0].0, "choices": questions[0].1})
+                } else {
+                    json!({"questions": questions_json})
+                };
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"ask_user","args": args}}),
+                );
+                response_parts.push(function_response(protocol, "ask_user", &id, ok, &content));
+            }
+            AgentCall::WebFetch {
+                id,
+                url,
+                offset,
+                text,
+            } => {
+                let allowed = ctx
+                    .brief
+                    .allowed_tools
+                    .as_ref()
+                    .is_none_or(|a| a.iter().any(|t| t == "web_fetch"));
+                let (ok, content) = if !allowed {
+                    (
+                        false,
+                        "tool web_fetch is not enabled for this run's role; use only the tools listed in your tool contract".to_string(),
+                    )
+                } else {
+                    match fetch::vet_url(&url) {
+                        Err(reason) => (false, format!("refused: {reason}")),
+                        Ok(parsed) => {
+                            let resp = fetch::fetch(&parsed, text);
+                            fetch::render(&resp, offset)
+                        }
+                    }
+                };
+                if let Some(l) = ledger.as_mut() {
+                    l.append("web_fetch", json!({"url": url, "offset": offset, "ok": ok}));
+                }
+                crate::memory::record(
+                    &mut cp.observations,
+                    crate::memory::Observation::new(
+                        cp.step,
+                        "web_fetch",
+                        Some(url.clone()),
+                        ok,
+                        &content,
+                    ),
+                );
+                out.progress |= ok;
+                out.digest_actions.push(DigestAction {
+                    tool: "web_fetch".into(),
+                    ok,
+                    target: Some(url.chars().take(160).collect()),
+                    error_kind: (!ok).then(|| "fetch_failed".to_string()),
+                });
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"web_fetch","args":{"url": url, "offset": offset, "format": if text { "text" } else { "markdown" }}}}),
+                );
+                response_parts.push(function_response(protocol, "web_fetch", &id, ok, &content));
+            }
+            AgentCall::Explore { id, tasks, kind } => {
+                let mut call_args = if tasks.len() == 1 {
+                    json!({"task": tasks[0]})
+                } else {
+                    json!({"tasks": tasks})
+                };
+                if kind != explore::ExplorerKind::Explore {
+                    call_args["kind"] = json!(kind.label());
+                }
+                if let Some(allowed) = &ctx.brief.allowed_tools {
+                    // A research child fetches web pages, so it needs the
+                    // parent's own web_fetch permission as well.
+                    let needs_fetch = kind == explore::ExplorerKind::Research;
+                    // An edit child writes, so a read-only role (which may
+                    // still explore) cannot start one.
+                    let needs_write = kind == explore::ExplorerKind::Edit;
+                    let can_write = allowed.iter().any(|t| {
+                        matches!(
+                            t.as_str(),
+                            "create_file" | "edit_file" | "apply_patch" | "run_command"
+                        )
+                    });
+                    if !allowed.iter().any(|t| t == "explore")
+                        || (needs_fetch && !allowed.iter().any(|t| t == "web_fetch"))
+                        || (needs_write && !can_write)
+                    {
+                        out.digest_actions.push(DigestAction {
+                            tool: "explore".into(),
+                            ok: false,
+                            target: None,
+                            error_kind: Some("out_of_scope".into()),
+                        });
+                        push_model_part(
+                            &mut model_parts,
+                            raw,
+                            json!({"functionCall":{"name":"explore","args": call_args}}),
+                        );
+                        response_parts.push(function_response(
+                            protocol,
+                            "explore",
+                            &id,
+                            false,
+                            "tool explore is not enabled for this run's role; use only the tools listed in your tool contract",
+                        ));
+                        continue;
+                    }
+                }
+                // The parent's remaining budgets are split evenly across the
+                // children, so a batch never spends more than one explorer
+                // could.
+                let budgets = ctx.brief.budgets;
+                let n = tasks.len().max(1);
+                let limits = ExploreLimits {
+                    max_turns: explore::EXPLORE_MAX_TURNS
+                        .min(budgets.max_steps.saturating_sub(cp.step).max(1)),
+                    max_tool_calls: explore::EXPLORE_MAX_TOOL_CALLS
+                        .min(budgets.max_tool_calls.saturating_sub(cp.tool_calls))
+                        / n,
+                    max_tokens: budgets.max_tokens.saturating_sub(cp.tokens_used) / n as u64,
+                    kind,
+                };
+                for task in &tasks {
+                    let preview: String = task.chars().take(120).collect();
+                    RunHandle::push_event(
+                        &ctx.handle.shared,
+                        AgentEvent::Info {
+                            message: format!("{} sub-agent started: {preview}", kind.label()),
+                        },
+                    );
+                }
+                let transport = ctx.service.transport();
+                let allowed = ctx.brief.allowed_tools.as_deref();
+                // An edit child's writes and commands wait on the same trusted
+                // UI decision as the parent's own calls. There is one approval
+                // slot per run, so parallel children take turns at it.
+                let approval_turn = std::sync::Mutex::new(());
+                let run_handle: &RunHandle = &ctx.handle;
+                let approve = |p: &PreparedCall| {
+                    let _turn = approval_turn.lock().unwrap_or_else(|e| e.into_inner());
+                    if run_handle.cancel.load(Ordering::SeqCst) {
+                        return explore::ChildApproval::Stop;
+                    }
+                    match wait_for_decision_on(run_handle, p) {
+                        Decision::Approved => explore::ChildApproval::Approved,
+                        Decision::Denied => explore::ChildApproval::Denied,
+                        Decision::Timeout | Decision::Cancelled => explore::ChildApproval::Stop,
+                    }
+                };
+                // paths each edit child has written, so two children in one
+                // batch never change the same file
+                let claims = std::sync::Mutex::new(std::collections::HashMap::new());
+                let outcomes: Vec<ExploreOutcome> = if tasks.len() == 1 {
+                    let gate = explore::ChildGate {
+                        allowed,
+                        approve: &approve,
+                        claims: &claims,
+                        index: 0,
+                    };
+                    vec![run_explore(
+                        transport,
+                        link,
+                        &ctx.handle,
+                        tools,
+                        &tasks[0],
+                        limits,
+                        &gate,
+                    )]
+                } else {
+                    std::thread::scope(|scope| {
+                        let workers: Vec<_> = tasks
+                            .iter()
+                            .enumerate()
+                            .map(|(index, task)| {
+                                let handle = &ctx.handle;
+                                let (approve, claims) = (&approve, &claims);
+                                scope.spawn(move || {
+                                    let gate = explore::ChildGate {
+                                        allowed,
+                                        approve,
+                                        claims,
+                                        index,
+                                    };
+                                    run_explore(transport, link, handle, tools, task, limits, &gate)
+                                })
+                            })
+                            .collect();
+                        workers
+                            .into_iter()
+                            .map(|w| {
+                                w.join().unwrap_or_else(|_| ExploreOutcome {
+                                    error: Some("explorer thread panicked".into()),
+                                    ..ExploreOutcome::default()
+                                })
+                            })
+                            .collect()
+                    })
+                };
+                let mut cancelled = false;
+                let mut entries: Vec<Value> = Vec::new();
+                for (task, outcome) in tasks.iter().zip(&outcomes) {
+                    cp.tokens_used += outcome.tokens;
+                    cp.tool_calls += outcome.tool_calls;
+                    cp.total_denials += outcome.denials;
+                    cancelled |= outcome.cancelled;
+                    if !outcome.files_written.is_empty() {
+                        out.mutating_success = true;
+                        out.progress = true;
+                    }
+                    if let Some(l) = ledger.as_mut() {
+                        l.append(
+                            "explore",
+                            json!({
+                                "task": task, "finished": outcome.finished,
+                                "turns": outcome.turns, "tool_calls": outcome.tool_calls,
+                                "tokens": outcome.tokens, "files_read": outcome.files_read,
+                                "urls_fetched": outcome.urls_fetched, "child_kind": kind.label(),
+                                "files_written": outcome.files_written, "denials": outcome.denials,
+                                "error": outcome.error, "batch": tasks.len(),
+                            }),
+                        );
+                    }
+                    if outcome.cancelled {
+                        continue;
+                    }
+                    RunHandle::push_event(
+                        &ctx.handle.shared,
+                        AgentEvent::Info {
+                            message: format!(
+                                "explorer sub-agent {} after {} turns and {} tool calls",
+                                if outcome.finished {
+                                    "reported"
+                                } else {
+                                    "stopped"
+                                },
+                                outcome.turns,
+                                outcome.tool_calls
+                            ),
+                        },
+                    );
+                    let preview: String = task.chars().take(120).collect();
+                    crate::memory::record(
+                        &mut cp.observations,
+                        crate::memory::Observation::new(
+                            cp.step,
+                            "explore",
+                            Some(preview),
+                            outcome.finished,
+                            &outcome.report,
+                        ),
+                    );
+                    let (report, clipped) =
+                        rex_tools::clip_middle(&outcome.report, explore::EXPLORE_REPORT_CHARS / n);
+                    entries.push(json!({
+                        "task": task,
+                        "finished": outcome.finished,
+                        "report": report,
+                        "report_truncated": clipped,
+                        "files_read": outcome.files_read,
+                        "urls_fetched": outcome.urls_fetched,
+                        "files_written": outcome.files_written,
+                        "denials": outcome.denials,
+                        "turns": outcome.turns,
+                        "tool_calls": outcome.tool_calls,
+                        "error": outcome.error,
+                    }));
+                }
+                if cancelled {
+                    out.fatal = Some(TerminalReason::Cancelled);
+                    return out;
+                }
+                // denials inside an edit child count toward the run's limit
+                if cp.total_denials >= MAX_DENIALS {
+                    out.fatal = Some(TerminalReason::Denied);
+                    return out;
+                }
+                let all_finished = outcomes.iter().all(|o| o.finished);
+                let content = if entries.len() == 1 {
+                    let mut single = entries.remove(0);
+                    if let Some(obj) = single.as_object_mut() {
+                        obj.remove("task");
+                    }
+                    single.to_string()
+                } else {
+                    json!({"explorers": entries}).to_string()
+                };
+                out.progress = true;
+                out.digest_actions.push(DigestAction {
+                    tool: "explore".into(),
+                    ok: all_finished,
+                    target: Some(format!(
+                        "{} explorer(s), {} tool calls",
+                        outcomes.len(),
+                        outcomes.iter().map(|o| o.tool_calls).sum::<usize>()
+                    )),
+                    error_kind: outcomes
+                        .iter()
+                        .any(|o| o.error.is_some())
+                        .then(|| "explorer_error".into()),
+                });
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"explore","args": call_args}}),
+                );
+                response_parts.push(function_response(
+                    protocol,
+                    "explore",
+                    &id,
+                    all_finished,
+                    &content,
+                ));
             }
             AgentCall::CompleteTask { summary } => {
                 cp.gate_attempts += 1;
@@ -2518,6 +3594,12 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     tool_name,
                     &serde_json::to_value(&request).unwrap_or_default(),
                 );
+                if cp.last_call_sig.as_deref() == Some(sig.as_str()) {
+                    cp.same_call_repeats += 1;
+                } else {
+                    cp.same_call_repeats = 0;
+                    cp.last_call_sig = Some(sig.clone());
+                }
                 let prepared = match tools.prepare(request.clone()) {
                     Ok(p) => p,
                     Err(e) => {
@@ -2601,6 +3683,7 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         request,
                         ToolRequest::CreateFile { .. }
                             | ToolRequest::EditFile { .. }
+                            | ToolRequest::ApplyPatch { .. }
                             | ToolRequest::RunCommand { .. }
                     ) {
                         out.mutating_success = true;
@@ -2622,19 +3705,69 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 }
 
                 let receipt = &result.receipt;
+                // Head+tail clipping on char boundaries: the old byte slice
+                // panicked on multi-byte output and dropped the tail, where
+                // build and test errors are. Failed commands carry their
+                // output in the error detail, so that is clipped too.
+                let (output, out_clipped) = result
+                    .output
+                    .as_deref()
+                    .map(|o| rex_tools::clip_middle(o, OUTCOME_CHARS))
+                    .map_or((None, false), |(o, c)| (Some(o), c));
+                let (error, err_clipped) = match &result.error {
+                    Some(e) => {
+                        let (detail, c) = rex_tools::clip_middle(&e.detail, OUTCOME_CHARS);
+                        (Some(json!({"kind": e.kind, "detail": detail})), c)
+                    }
+                    None => (None, false),
+                };
                 let mut content = serde_json::to_string(&json!({
                     "ok": result.ok,
-                    "output": result.output.as_deref().map(|o| &o[..o.len().min(OUTCOME_CHARS)]),
-                    "error": result.error,
+                    "output": output,
+                    "error": error,
                     "receipt": {
                         "bytes_read": receipt.bytes_read,
                         "bytes_written": receipt.bytes_written,
                         "duration_ms": receipt.duration_ms,
                         "exit_code": receipt.exit_code,
-                        "output_truncated": receipt.output_truncated,
+                        "output_truncated": receipt.output_truncated || out_clipped || err_clipped,
                     }
                 }))
                 .unwrap_or_else(|_| "{\"ok\":false}".into());
+                if cp.same_call_repeats >= DOOM_LOOP_REPEATS && result.ok {
+                    content.push_str(&format!(
+                        " warning: you have made this exact call {} times in a row and it returns the same kind of result; use what you already have or try a different step",
+                        cp.same_call_repeats + 1
+                    ));
+                }
+                {
+                    let text = match (&result.output, &result.error) {
+                        (Some(o), _) => o.as_str(),
+                        (None, Some(e)) => e.detail.as_str(),
+                        (None, None) => "",
+                    };
+                    let target = receipt
+                        .target
+                        .clone()
+                        .or(receipt.command.as_ref().map(|c| c.join(" ")));
+                    if result.ok {
+                        match &request {
+                            ToolRequest::CreateFile { .. } | ToolRequest::EditFile { .. } => {
+                                crate::memory::supersede(&mut cp.observations, target.as_deref())
+                            }
+                            ToolRequest::ApplyPatch { .. } => {
+                                crate::memory::supersede(&mut cp.observations, None)
+                            }
+                            _ => {}
+                        }
+                    }
+                    crate::memory::record(
+                        &mut cp.observations,
+                        crate::memory::Observation::new(
+                            cp.step, tool_name, target, result.ok, text,
+                        ),
+                    );
+                }
                 if !result.ok && cp.consec_fail == 2 {
                     content.push_str(" warning: this exact call has failed twice; change approach instead of retrying it unchanged");
                 }
@@ -2702,6 +3835,8 @@ fn tool_name_of(request: &ToolRequest) -> &'static str {
         ToolRequest::CreateFile { .. } => "create_file",
         ToolRequest::EditFile { .. } => "edit_file",
         ToolRequest::SearchFiles { .. } => "search_files",
+        ToolRequest::GlobFiles { .. } => "glob_files",
+        ToolRequest::ApplyPatch { .. } => "apply_patch",
         ToolRequest::RunCommand { .. } => "run_command",
         ToolRequest::McpCall { .. } => "mcp_call",
     }
@@ -2721,8 +3856,14 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
     call: &PreparedCall,
     _started: Instant,
 ) -> Decision {
+    wait_for_decision_on(&ctx.handle, call)
+}
+
+/// The approval wait itself; needs only the run handle, so edit children
+/// on worker threads can use it too.
+fn wait_for_decision_on(handle: &RunHandle, call: &PreparedCall) -> Decision {
     {
-        let mut s = match ctx.handle.shared.lock() {
+        let mut s = match handle.shared.lock() {
             Ok(s) => s,
             Err(_) => return Decision::Cancelled,
         };
@@ -2731,12 +3872,12 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
         push_locked(&mut s, AgentEvent::ApprovalRequired { call: call.clone() });
     }
     let deadline = Instant::now() + Duration::from_millis(APPROVAL_WAIT_MS);
-    let mut guard = match ctx.handle.shared.lock() {
+    let mut guard = match handle.shared.lock() {
         Ok(g) => g,
         Err(_) => return Decision::Cancelled,
     };
     loop {
-        if ctx.handle.cancel.load(Ordering::SeqCst) {
+        if handle.cancel.load(Ordering::SeqCst) {
             guard.status = AgentStatus::Running;
             guard.pending_approval = None;
             return Decision::Cancelled;
@@ -2755,6 +3896,95 @@ fn wait_for_decision<S: SecretStore + 'static, T: Transport + 'static>(
             guard.status = AgentStatus::Running;
             guard.pending_approval = None;
             return Decision::Timeout;
+        }
+        let (g, _timeout) = handle
+            .cond
+            .wait_timeout(guard, remaining.min(Duration::from_secs(5)))
+            .expect("run state poisoned");
+        guard = g;
+    }
+}
+
+enum UserAnswer {
+    Text(String),
+    Declined,
+    Timeout,
+    Cancelled,
+}
+
+/// Park the loop thread until the trusted UI answers an `ask_user`
+/// question. Only `AutonomousRunService::answer` supplies the reply.
+fn wait_for_answer<S: SecretStore + 'static, T: Transport + 'static>(
+    ctx: &LoopCtx<S, T>,
+    question: &PendingQuestion,
+) -> UserAnswer {
+    {
+        let mut s = match ctx.handle.shared.lock() {
+            Ok(s) => s,
+            Err(_) => return UserAnswer::Cancelled,
+        };
+        if let Some(queued) = s.queued_answers.pop_front() {
+            // answered ahead of time on the batch form: no parking
+            push_locked(
+                &mut s,
+                AgentEvent::QuestionAsked {
+                    question: question.clone(),
+                },
+            );
+            push_locked(
+                &mut s,
+                AgentEvent::QuestionResolved {
+                    call_id: question.call_id.clone(),
+                    answered: queued.is_some(),
+                },
+            );
+            return match queued {
+                Some(text) => UserAnswer::Text(text),
+                None => UserAnswer::Declined,
+            };
+        }
+        s.status = AgentStatus::AwaitingAnswer;
+        s.pending_question = Some(question.clone());
+        s.answer = None;
+        push_locked(
+            &mut s,
+            AgentEvent::QuestionAsked {
+                question: question.clone(),
+            },
+        );
+    }
+    let deadline = Instant::now() + Duration::from_millis(ANSWER_WAIT_MS);
+    let mut guard = match ctx.handle.shared.lock() {
+        Ok(g) => g,
+        Err(_) => return UserAnswer::Cancelled,
+    };
+    loop {
+        if ctx.handle.cancel.load(Ordering::SeqCst) {
+            guard.status = AgentStatus::Running;
+            guard.pending_question = None;
+            return UserAnswer::Cancelled;
+        }
+        if let Some(reply) = guard.answer.take() {
+            guard.status = AgentStatus::Running;
+            guard.pending_question = None;
+            return match reply {
+                Some(text) => UserAnswer::Text(text),
+                None => UserAnswer::Declined,
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            guard.status = AgentStatus::Running;
+            guard.pending_question = None;
+            let call_id = question.call_id.clone();
+            push_locked(
+                &mut guard,
+                AgentEvent::QuestionResolved {
+                    call_id,
+                    answered: false,
+                },
+            );
+            return UserAnswer::Timeout;
         }
         let (g, _timeout) = ctx
             .handle
@@ -2922,6 +4152,14 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                 AgentEvent::ModelText { text: text.clone() },
             );
         }
+        for note in &decoded.repairs {
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::Info {
+                    message: format!("repaired call: {note}"),
+                },
+            );
+        }
         // Fail closed: the plan turn offers only update_plan, but the
         // generic decoder turns any tool-shaped part into an executable
         // AgentCall::Tool. Verify every decoded call here, before
@@ -2940,12 +4178,17 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                         ToolRequest::CreateFile { .. } => "create_file",
                         ToolRequest::EditFile { .. } => "edit_file",
                         ToolRequest::SearchFiles { .. } => "search_files",
+                        ToolRequest::GlobFiles { .. } => "glob_files",
+                        ToolRequest::ApplyPatch { .. } => "apply_patch",
                         ToolRequest::RunCommand { .. } => "run_command",
                         ToolRequest::McpCall { .. } => "mcp_call",
                     }
                 )),
                 AgentCall::WebSearch { .. } => Some("web_search".to_string()),
                 AgentCall::CompleteTask { .. } => Some("complete_task".to_string()),
+                AgentCall::Explore { .. } => Some("explore".to_string()),
+                AgentCall::WebFetch { .. } => Some("web_fetch".to_string()),
+                AgentCall::AskUser { .. } => Some("ask_user".to_string()),
             };
             if let Some(name) = name {
                 disallowed.push(name);
@@ -2971,7 +4214,12 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
             ctx,
             tools,
             ledger,
-            protocol,
+            &ProviderLink {
+                protocol,
+                base_url,
+                key,
+                model,
+            },
             decoded.calls,
             decoded.thought_signature,
             cp,
@@ -3116,7 +4364,7 @@ fn verify_gates<S: SecretStore + 'static, T: Transport + 'static>(
     // inspection itself - so requiring one would make completion impossible.
     let role_can_mutate = match &ctx.brief.allowed_tools {
         None => true,
-        Some(allowed) => ["create_file", "edit_file", "run_command"]
+        Some(allowed) => ["create_file", "edit_file", "apply_patch", "run_command"]
             .iter()
             .any(|t| allowed.iter().any(|a| a == t)),
     };
@@ -3329,6 +4577,11 @@ mod tests {
         turns: Mutex<VecDeque<String>>,
         fail_posts: Mutex<(u32, u16)>,
         posts: Mutex<Vec<String>>,
+        /// Concurrency probe: each post sleeps `post_delay_ms` while
+        /// counted in flight; `max_in_flight` records the peak overlap.
+        post_delay_ms: std::sync::atomic::AtomicU64,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
     }
 
     impl Script {
@@ -3337,6 +4590,9 @@ mod tests {
                 turns: Mutex::new(turns.into()),
                 fail_posts: Mutex::new((0, 500)),
                 posts: Mutex::new(Vec::new()),
+                post_delay_ms: Default::default(),
+                in_flight: Default::default(),
+                max_in_flight: Default::default(),
             }
         }
         fn failing(turns: Vec<String>, count: u32, status: u16) -> Self {
@@ -3344,6 +4600,9 @@ mod tests {
                 turns: Mutex::new(turns.into()),
                 fail_posts: Mutex::new((count, status)),
                 posts: Mutex::new(Vec::new()),
+                post_delay_ms: Default::default(),
+                in_flight: Default::default(),
+                max_in_flight: Default::default(),
             }
         }
         fn seen(&self) -> Vec<String> {
@@ -3366,6 +4625,13 @@ mod tests {
             body: &str,
         ) -> Result<(u16, String), ProviderError> {
             self.posts.lock().unwrap().push(body.to_string());
+            let delay = self.post_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(delay));
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
             {
                 let mut fail = self.fail_posts.lock().unwrap();
                 if fail.0 > 0 {
@@ -3684,6 +4950,45 @@ mod tests {
         assert!(matches!(
             done.terminal_reason,
             Some(TerminalReason::NoProgress { .. })
+        ));
+    }
+
+    #[test]
+    fn repaired_calls_run_and_show_in_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![
+                    json!({"functionCall":{"name":"Create_File","args":{"path":"r.txt","content":"x","overwrite":"TRUE"}}}),
+                ]),
+                text_turn("done"),
+                text_turn("done"),
+                text_turn("done"),
+            ]),
+        ));
+        let snap = svc.begin("repair", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 20_000);
+        let infos: Vec<&str> = done
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Info { message } if message.starts_with("repaired call: ") => {
+                    Some(message.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            infos,
+            [
+                "repaired call: tool name 'Create_File' read as 'create_file'",
+                "repaired call: create_file: fixed argument types for overwrite",
+            ]
+        );
+        assert!(done.events.iter().any(
+            |e| matches!(e, AgentEvent::ToolFinished { result } if result.ok && result.tool == "create_file")
         ));
     }
 
@@ -4051,6 +5356,7 @@ mod tests {
             "call-1".into(),
             serde_json::json!({"server": "fake", "name": "echo", "arguments": {"text": "hi"}}),
             serde_json::json!({}),
+            &mut Vec::new(),
         );
         match call {
             AgentCall::Tool { id, request } => {
@@ -4117,6 +5423,1064 @@ mod tests {
         // the worker keeps the full offering with no enforced allowlist
         let (_, worker_allow) = scoped_tools_for(Role::Worker);
         assert!(worker_allow.is_none());
+    }
+
+    #[test]
+    fn state_message_carries_repo_instructions_below_the_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("AGENTS.md"),
+            "Run `make check` before completing.",
+        )
+        .unwrap();
+        let project = rex_prompt::project::load(tmp.path());
+        let brief = TaskBrief {
+            id: "r1".into(),
+            task: "fix bug".into(),
+            provider: "gemini".into(),
+            budgets: Budgets::default(),
+            created_at_ms: 1,
+            prompt_version: legacy_prompt_marker(),
+            prompt_hash: legacy_prompt_marker(),
+            role: None,
+            allowed_tools: None,
+            plan_mode: false,
+            name: None,
+            continued_from: None,
+        };
+        let cp = Checkpoint::default();
+        let msg = build_state_message(
+            &brief,
+            &cp,
+            Budgets::default(),
+            vec![],
+            project.as_ref(),
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["project_instructions"]["source"], "AGENTS.md");
+        assert!(v["project_instructions"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("make check"));
+        assert!(v["project_instructions"]["precedence"]
+            .as_str()
+            .unwrap()
+            .contains("never override"));
+        // absent file -> null, and the system prompt identity is unaffected
+        let none = build_state_message(&brief, &cp, Budgets::default(), vec![], None, None);
+        let v: serde_json::Value = serde_json::from_str(&none).unwrap();
+        assert!(v["project_instructions"].is_null());
+        assert!(v["user_instructions"].is_null());
+        // user-level file travels separately with its own label and rank
+        let cfg = tempfile::tempdir().unwrap();
+        fs::create_dir_all(cfg.path().join("rex")).unwrap();
+        fs::write(
+            cfg.path().join("rex").join("AGENTS.md"),
+            "prefer small diffs",
+        )
+        .unwrap();
+        let user = rex_prompt::project::load_user_from(cfg.path());
+        let both = build_state_message(
+            &brief,
+            &cp,
+            Budgets::default(),
+            vec![],
+            project.as_ref(),
+            user.as_ref(),
+        );
+        let v: serde_json::Value = serde_json::from_str(&both).unwrap();
+        assert_eq!(v["project_instructions"]["source"], "AGENTS.md");
+        assert_eq!(
+            v["user_instructions"]["source"],
+            rex_prompt::project::USER_SOURCE
+        );
+        assert_eq!(v["user_instructions"]["text"], "prefer small diffs");
+        assert!(v["user_instructions"]["precedence"]
+            .as_str()
+            .unwrap()
+            .contains("never override"));
+    }
+
+    #[test]
+    fn explorer_sub_agent_reads_only_and_hands_back_one_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let glob = json!({"functionCall":{"name":"glob_files","args":{"pattern":"**/*"}}});
+        let explore =
+            json!({"functionCall":{"name":"explore","args":{"task":"where is the entry point?"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                // parent turn 1: delegate
+                call_turn(vec![explore]),
+                // child turn 1: tries to write (refused) and globs
+                call_turn(vec![create_call("evil.txt", "x"), glob]),
+                // child turn 2: reports
+                call_turn(vec![complete_call("ENTRY-REPORT: no source files yet")]),
+                // parent turn 2
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("find the entry point", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(done.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Info { message } if message.contains("explorer sub-agent reported after 2 turns and 1 tool calls")
+        )), "{:?}", done.events);
+        let run_dir = tmp.path().join("runs").join(&snap.id);
+        assert!(!run_dir.join("workspace").join("evil.txt").exists());
+        let posts = svc.service().transport().seen();
+        // child requests carry the explorer prompt and only read tools
+        let child: Value = serde_json::from_str(&posts[1]).unwrap();
+        let sys = child["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sys.contains("explorer sub-agent"));
+        let names: Vec<&str> = child["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["read_file", "search_files", "glob_files", "complete_task"]
+        );
+        // the refused write reached the child as an error, not the workspace
+        assert!(posts[2].contains("create_file is not available to the explorer"));
+        // the parent sees the report, not the raw glob output
+        assert!(posts[3].contains("ENTRY-REPORT"));
+        let ledger = fs::read_to_string(run_dir.join("state").join("ledger.jsonl"))
+            .or_else(|_| fs::read_to_string(run_dir.join("ledger.jsonl")))
+            .unwrap_or_default();
+        assert!(ledger.contains("\"kind\":\"explore\""), "{ledger}");
+    }
+
+    #[test]
+    fn explore_kind_is_parsed_and_research_gets_web_fetch_only() {
+        use explore::ExplorerKind;
+        assert_eq!(
+            explore::parse_explore_kind(&json!({})),
+            Ok(ExplorerKind::Explore)
+        );
+        assert_eq!(
+            explore::parse_explore_kind(&json!({"kind":" research "})),
+            Ok(ExplorerKind::Research)
+        );
+        assert!(explore::parse_explore_kind(&json!({"kind":"writer"})).is_err());
+        let bad = decode_provider_calls(
+            ProviderProtocol::Gemini,
+            &json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"explore","args":{"task":"q","kind":"writer"}}}]}}]}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(&bad.calls[0].0, AgentCall::BadCall { .. }));
+    }
+
+    #[test]
+    fn research_child_fetches_through_vetting_and_explorer_cannot_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetch_local =
+            json!({"functionCall":{"name":"web_fetch","args":{"url":"http://127.0.0.1/secret"}}});
+        let research = json!({"functionCall":{"name":"explore","args":{
+            "task":"what does the upstream doc say?","kind":"research"}}});
+        let plain =
+            json!({"functionCall":{"name":"explore","args":{"task":"same, workspace only"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![research]),
+                // research child: a private address is refused by vetting
+                call_turn(vec![fetch_local.clone()]),
+                call_turn(vec![complete_call("RESEARCH-REPORT")]),
+                call_turn(vec![plain]),
+                // explore child: web_fetch is not one of its tools
+                call_turn(vec![fetch_local]),
+                call_turn(vec![complete_call("EXPLORE-REPORT")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("research check", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(
+            done.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Info { message } if message.starts_with("research sub-agent started")
+            )),
+            "{:?}",
+            done.events
+        );
+        let posts = svc.service().transport().seen();
+        let child: Value = serde_json::from_str(&posts[1]).unwrap();
+        assert!(child["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("research sub-agent"));
+        let names: Vec<&str> = child["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "read_file",
+                "search_files",
+                "glob_files",
+                "web_fetch",
+                "complete_task"
+            ]
+        );
+        // blocked by vetting or by the fetcher's own address check, never fetched
+        assert!(
+            posts[2].contains("refused:") || posts[2].contains("unsafe_address"),
+            "{}",
+            posts[2]
+        );
+        assert!(posts[3].contains("RESEARCH-REPORT"));
+        let explore_child: Value = serde_json::from_str(&posts[4]).unwrap();
+        let names: Vec<&str> = explore_child["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"web_fetch"));
+        assert!(
+            posts[5].contains("web_fetch is not available to the explorer"),
+            "{}",
+            posts[5]
+        );
+    }
+
+    #[test]
+    fn edit_child_writes_only_through_the_parents_approval_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edit = json!({"functionCall":{"name":"explore","args":{
+            "task":"add a.txt","kind":"edit"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![edit]),
+                // child: first write is approved, second is denied
+                call_turn(vec![create_call("a.txt", "A")]),
+                call_turn(vec![create_call("b.txt", "B")]),
+                call_turn(vec![complete_call("EDIT-REPORT")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("edit check", "gemini", Some(budgets())).unwrap();
+        // the trusted UI: approve the first pending call, deny the rest
+        let (svc2, id2) = (svc.clone(), snap.id.clone());
+        let decided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = decided.clone();
+        std::thread::spawn(move || loop {
+            let s = svc2.snapshot(&id2).expect("snapshot");
+            if s.terminal_reason.is_some() {
+                return;
+            }
+            if s.status == AgentStatus::AwaitingApproval && s.pending_approval.is_some() {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let _ = svc2.decide(&id2, n == 0);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert_eq!(decided.load(Ordering::SeqCst), 2, "{:?}", done.events);
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "A");
+        assert!(!ws.join("b.txt").exists());
+        let posts = svc.service().transport().seen();
+        let child: Value = serde_json::from_str(&posts[1]).unwrap();
+        assert!(child["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("edit sub-agent"));
+        let names: Vec<&str> = child["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "read_file",
+                "create_file",
+                "edit_file",
+                "search_files",
+                "apply_patch",
+                "glob_files",
+                "run_command",
+                "complete_task"
+            ]
+        );
+        assert!(names.contains(&"create_file") && names.contains(&"run_command"));
+        assert!(!names.contains(&"explore") && !names.contains(&"ask_user"));
+        assert!(!names.contains(&"web_fetch"));
+        // the parent gets the report plus what the child changed
+        let back = &posts[4];
+        assert!(back.contains("EDIT-REPORT"), "{back}");
+        assert!(back.contains("files_written"), "{back}");
+        assert!(
+            back.contains("\\\"files_written\\\":[\\\"a.txt\\\"]"),
+            "{back}"
+        );
+        assert!(back.contains("\\\"denials\\\":1"), "{back}");
+    }
+
+    #[test]
+    fn read_only_role_cannot_start_an_edit_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edit = json!({"functionCall":{"name":"explore","args":{
+            "task":"write x.txt","kind":"edit"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![edit]),
+                // if a child were started it would consume this write
+                call_turn(vec![create_call("x.txt", "X")]),
+                call_turn(vec![complete_call("done")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin_in_workspace_with_role(
+                "review only",
+                "gemini",
+                None,
+                Some(budgets()),
+                None,
+                Role::Adversary,
+                false,
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert!(!ws.join("x.txt").exists(), "{:?}", done.events);
+        assert!(!done.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Info { message } if message.starts_with("edit sub-agent started")
+        )));
+        let posts = svc.service().transport().seen();
+        assert!(
+            posts[1].contains("tool explore is not enabled for this run's role"),
+            "{}",
+            posts[1]
+        );
+    }
+
+    #[test]
+    fn parallel_edit_children_take_turns_at_approval_and_never_share_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clash = json!({"functionCall":{"name":"explore","args":{
+            "tasks":["write same.txt","also write same.txt"],"kind":"edit"}}});
+        let split = json!({"functionCall":{"name":"explore","args":{
+            "tasks":["write a.txt","write b.txt"],"kind":"edit"}}});
+        let script = Script::new(vec![
+            call_turn(vec![clash]),
+            // both children try the same file in their only turn
+            call_turn(vec![create_call("same.txt", "S"), complete_call("R")]),
+            call_turn(vec![create_call("./same.txt", "S"), complete_call("R")]),
+            call_turn(vec![split]),
+            call_turn(vec![create_call("a.txt", "A"), complete_call("R")]),
+            call_turn(vec![create_call("b.txt", "B"), complete_call("R")]),
+            call_turn(vec![complete_call("done")]),
+        ]);
+        script.post_delay_ms.store(300, Ordering::SeqCst);
+        let svc = Arc::new(service(tmp.path(), script));
+        let snap = svc
+            .begin("parallel edits", "gemini", Some(budgets()))
+            .unwrap();
+        let (svc2, id2) = (svc.clone(), snap.id.clone());
+        let decided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = decided.clone();
+        std::thread::spawn(move || loop {
+            let s = svc2.snapshot(&id2).expect("snapshot");
+            if s.terminal_reason.is_some() {
+                return;
+            }
+            if s.status == AgentStatus::AwaitingApproval && s.pending_approval.is_some() {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let _ = svc2.decide(&id2, true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        // one approval for the clash (the loser is refused before asking),
+        // two for the split batch, one at a time
+        assert_eq!(decided.load(Ordering::SeqCst), 3, "{:?}", done.events);
+        assert_eq!(
+            svc.service()
+                .transport()
+                .max_in_flight
+                .load(Ordering::SeqCst),
+            2
+        );
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("same.txt")).unwrap(), "S");
+        assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(ws.join("b.txt")).unwrap(), "B");
+        let posts = svc.service().transport().seen();
+        let wrote = |p: &str, f: &str| p.matches(&format!("\\\"files_written\\\":[{f}]")).count();
+        let same = &posts[3];
+        assert_eq!(
+            wrote(same, "\\\"same.txt\\\"") + wrote(same, "\\\"./same.txt\\\""),
+            1,
+            "{same}"
+        );
+        assert_eq!(wrote(same, ""), 1, "{same}");
+        let split = &posts[6];
+        assert_eq!(wrote(split, "\\\"a.txt\\\""), 1, "{split}");
+        assert_eq!(wrote(split, "\\\"b.txt\\\""), 1, "{split}");
+    }
+
+    #[test]
+    fn edit_claims_cover_patch_paths_all_or_none() {
+        use explore::{claim_paths, written_paths};
+        let claims = Mutex::new(std::collections::HashMap::new());
+        let patch = ToolRequest::ApplyPatch {
+            patch: "*** Begin Patch\n*** Update File: a.txt\n*** Move to: moved.txt\n@@\n-x\n+y\n*** Add File: c.txt\n+c\n*** End Patch".into(),
+        };
+        assert_eq!(written_paths(&patch), ["a.txt", "moved.txt", "c.txt"]);
+        assert!(written_paths(&ToolRequest::ApplyPatch {
+            patch: "not a patch".into()
+        })
+        .is_empty());
+        assert_eq!(claim_paths(&claims, &["./a.txt".into()], 0), None);
+        // child 1's patch touches a.txt, so nothing in it is claimed
+        assert_eq!(
+            claim_paths(&claims, &written_paths(&patch), 1),
+            Some(("a.txt".into(), 0))
+        );
+        assert_eq!(claim_paths(&claims, &["c.txt".into()], 1), None);
+        assert_eq!(
+            claim_paths(&claims, &["moved.txt".into(), "c.txt".into()], 0),
+            Some(("c.txt".into(), 1))
+        );
+        // re-claiming your own path is fine
+        assert_eq!(claim_paths(&claims, &["a.txt".into()], 0), None);
+    }
+
+    #[test]
+    fn edit_children_can_run_as_a_batch() {
+        use explore::ExplorerKind;
+        assert_eq!(
+            explore::parse_explore_kind(&json!({"kind":"edit"})),
+            Ok(ExplorerKind::Edit)
+        );
+        let two = decode_provider_calls(
+            ProviderProtocol::Gemini,
+            &json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"explore","args":{"tasks":["a","b"],"kind":"edit"}}}]}}]}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            &two.calls[0].0,
+            AgentCall::Explore { kind: ExplorerKind::Edit, tasks, .. } if tasks.len() == 2
+        ));
+    }
+
+    #[test]
+    fn explore_batch_runs_children_in_parallel_and_returns_every_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let batch = json!({"functionCall":{"name":"explore","args":{
+            "tasks":["where is the config loaded?","which module owns auth?"]}}});
+        let script = Script::new(vec![
+            call_turn(vec![batch]),
+            call_turn(vec![complete_call("REPORT-ONE")]),
+            call_turn(vec![complete_call("REPORT-TWO")]),
+            call_turn(vec![complete_call("done")]),
+        ]);
+        // every provider post takes 300ms while counted in flight; parent
+        // turns are sequential, so only concurrent children can overlap
+        script.post_delay_ms.store(300, Ordering::SeqCst);
+        let svc = Arc::new(service(tmp.path(), script));
+        let snap = svc
+            .begin("parallel explore", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let reported = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Info { message } if message.starts_with("explorer sub-agent reported")))
+            .count();
+        assert_eq!(reported, 2, "{:?}", done.events);
+        // both child requests were in flight at the same time
+        assert_eq!(
+            svc.service()
+                .transport()
+                .max_in_flight
+                .load(Ordering::SeqCst),
+            2
+        );
+        let posts = svc.service().transport().seen();
+        assert!(
+            posts[3].contains("REPORT-ONE") && posts[3].contains("REPORT-TWO"),
+            "{}",
+            posts[3]
+        );
+        assert!(posts[3].contains("explorers"));
+        let run_dir = tmp.path().join("runs").join(&snap.id);
+        let ledger = fs::read_to_string(run_dir.join("state").join("ledger.jsonl"))
+            .or_else(|_| fs::read_to_string(run_dir.join("ledger.jsonl")))
+            .unwrap_or_default();
+        assert_eq!(ledger.matches("\"batch\":2").count(), 2, "{ledger}");
+    }
+
+    #[test]
+    fn explore_task_lists_are_normalised_and_capped() {
+        use super::explore::{parse_explore_tasks, EXPLORE_MAX_PARALLEL};
+        assert!(parse_explore_tasks(&json!({})).is_err());
+        assert!(parse_explore_tasks(&json!({"tasks":["  ", ""]})).is_err());
+        assert_eq!(
+            parse_explore_tasks(&json!({"tasks":["a", "a", " b "], "task":"c"})).unwrap(),
+            ["a", "b", "c"]
+        );
+        let too_many: Vec<String> = (0..=EXPLORE_MAX_PARALLEL)
+            .map(|i| format!("q{i}"))
+            .collect();
+        let err = parse_explore_tasks(&json!({"tasks": too_many})).unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+    }
+
+    #[test]
+    fn older_tool_results_stay_visible_until_superseded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let glob = json!({"functionCall":{"name":"glob_files","args":{"pattern":"*"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("a.txt", "ALPHA-ONE")]),
+                call_turn(vec![read_call("a.txt")]),
+                call_turn(vec![glob]),
+                call_turn(vec![create_call("a.txt", "ALPHA-TWO")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("memory check", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service().transport().seen();
+        assert!(posts.len() >= 5, "{}", posts.len());
+        // turn 4's request: the turn-2 read is no longer in the exact
+        // exchange, but its excerpt is still in working memory
+        let state4 = posts[3].clone();
+        assert!(state4.contains("earlier_observations"));
+        assert!(state4.contains("ALPHA-ONE"), "{state4}");
+        // turn 5's request: a.txt was rewritten, so the stale read is gone
+        assert!(!posts[4].contains("ALPHA-ONE"), "{}", posts[4]);
+        // the first request has no memory yet
+        let first: Value = serde_json::from_str(&posts[0]).unwrap();
+        let state0: Value =
+            serde_json::from_str(first["contents"][0]["parts"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert!(state0["earlier_observations"].is_null());
+    }
+
+    #[test]
+    fn web_fetch_refuses_private_and_data_channel_urls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local =
+            json!({"functionCall":{"name":"web_fetch","args":{"url":"http://127.0.0.1:9/admin"}}});
+        let smuggle = json!({"functionCall":{"name":"web_fetch","args":{"url": format!("https://x.org/{}", "c2VjcmV0".repeat(12))}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![local, smuggle]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("fetch check", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service().transport().seen();
+        assert!(posts[1].contains("unsafe_address"), "{}", posts[1]);
+        assert!(posts[1].contains("possible data channel"), "{}", posts[1]);
+        assert!(scoped_tools_for(Role::Adversary)
+            .0
+            .iter()
+            .any(|s| s.name == "web_fetch"));
+    }
+
+    fn answer_questions(svc: Arc<Svc>, id: String, reply: Option<&'static str>) {
+        std::thread::spawn(move || loop {
+            let snap = svc.snapshot(&id).expect("snapshot");
+            if snap.terminal_reason.is_some() {
+                return;
+            }
+            if snap.status == AgentStatus::AwaitingAnswer && snap.pending_question.is_some() {
+                let _ = svc.answer(&id, reply);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+    }
+
+    #[test]
+    fn ask_user_parks_the_run_and_returns_the_trusted_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = json!({"functionCall":{"name":"ask_user","args":{
+            "question":"Which database should the service use?",
+            "choices":["Postgres", {"label":"SQLite"}, "  "]}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("ask check", "gemini", Some(budgets())).unwrap();
+        // not waiting yet (or already past): a stray answer is refused
+        assert!(svc.answer("no-such-run", Some("x")).is_err());
+        answer_questions(svc.clone(), snap.id.clone(), Some("SQLite, it is a demo"));
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        // the gates judge the (empty) work; the question flow itself is what matters here
+        assert!(done.terminal_reason.is_some());
+        assert!(done.pending_question.is_none());
+        let asked = done.events.iter().find_map(|e| match e {
+            AgentEvent::QuestionAsked { question } => Some(question.clone()),
+            _ => None,
+        });
+        let asked = asked.expect("question event");
+        assert_eq!(asked.question, "Which database should the service use?");
+        assert_eq!(asked.choices, ["Postgres", "SQLite"]);
+        assert!(done
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::QuestionResolved { answered: true, .. })));
+        let posts = svc.service().transport().seen();
+        assert!(posts[1].contains("user_answer"), "{}", posts[1]);
+        assert!(posts[1].contains("SQLite, it is a demo"), "{}", posts[1]);
+        let run_dir = tmp.path().join("runs").join(&snap.id);
+        let ledger = fs::read_to_string(run_dir.join("state").join("ledger.jsonl"))
+            .or_else(|_| fs::read_to_string(run_dir.join("ledger.jsonl")))
+            .unwrap_or_default();
+        assert!(ledger.contains("\"kind\":\"ask_user\""), "{ledger}");
+    }
+
+    #[test]
+    fn ask_user_is_capped_per_run_and_a_decline_means_decide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = |n: u32| json!({"functionCall":{"name":"ask_user","args":{"question": format!("question {n}?")}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask(1), ask(2), ask(3), ask(4)]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("cap check", "gemini", Some(budgets())).unwrap();
+        answer_questions(svc.clone(), snap.id.clone(), None);
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        // the gates judge the (empty) work; the question flow itself is what matters here
+        assert!(done.terminal_reason.is_some());
+        let asked = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::QuestionAsked { .. }))
+            .count();
+        assert_eq!(asked, MAX_QUESTIONS_PER_RUN as usize);
+        let posts = svc.service().transport().seen();
+        assert!(posts[1].contains("declined to answer"), "{}", posts[1]);
+        assert!(posts[1].contains("question limit reached"), "{}", posts[1]);
+    }
+
+    #[test]
+    fn ask_user_parses_a_batch_and_caps_it() {
+        let one = parse_ask_user(&json!({"question":" a? ","choices":["x"]})).unwrap();
+        assert_eq!(one, vec![("a?".to_string(), vec!["x".to_string()])]);
+        let batch = parse_ask_user(&json!({"questions":[
+            {"question":"db?","choices":["pg",{"label":"sqlite"}]},
+            {"question":"  "},
+            "port?",
+            {"question":"auth?"},
+            {"question":"extra?"}
+        ]}))
+        .unwrap();
+        let qs: Vec<&str> = batch.iter().map(|(q, _)| q.as_str()).collect();
+        assert_eq!(qs, ["db?", "port?", "auth?"]);
+        assert_eq!(batch[0].1, ["pg", "sqlite"]);
+        assert!(parse_ask_user(&json!({"questions":[{"question":""}]})).is_err());
+        assert!(parse_ask_user(&json!({})).is_err());
+    }
+
+    #[test]
+    fn ask_user_batch_returns_every_answer_in_one_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = |qs: Value| json!({"functionCall":{"name":"ask_user","args":{"questions": qs}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask(json!([{"question":"db?"},{"question":"port?"}]))]),
+                // 2 of 3 used; this batch of 2 gets one asked, one not_asked
+                call_turn(vec![ask(
+                    json!([{"question":"auth?"},{"question":"cache?"}]),
+                )]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("batch check", "gemini", Some(budgets())).unwrap();
+        answer_questions(svc.clone(), snap.id.clone(), Some("yes"));
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(done.terminal_reason.is_some());
+        let asked: Vec<String> = done
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::QuestionAsked { question } => Some(question.question.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, ["db?", "port?", "auth?"]);
+        let first_asked = done.events.iter().find_map(|e| match e {
+            AgentEvent::QuestionAsked { question } => Some(question.clone()),
+            _ => None,
+        });
+        let first_asked = first_asked.unwrap();
+        assert_eq!(
+            (first_asked.batch_index, first_asked.batch_total),
+            (Some(1), Some(2))
+        );
+        let posts = svc.service().transport().seen();
+        let first: Vec<_> = posts[1]
+            .match_indices(r#"\"status\":\"answered\""#)
+            .collect();
+        assert_eq!(first.len(), 2, "{}", posts[1]);
+        assert!(posts[1].contains("port?"), "{}", posts[1]);
+        assert!(posts[2].contains("not_asked"), "{}", posts[2]);
+        assert!(posts[2].contains("cache?"), "{}", posts[2]);
+    }
+
+    #[test]
+    fn answer_many_answers_a_whole_batch_without_parking_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = json!({"functionCall":{"name":"ask_user","args":{"questions":[
+            {"question":"db?","choices":["pg"]},{"question":"port?"},{"question":"auth?"}]}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("batch form", "gemini", Some(budgets())).unwrap();
+        assert!(svc.answer_many(&snap.id, &[Some("x".into())]).is_err());
+        let t0 = Instant::now();
+        let parked = loop {
+            let s = svc.snapshot(&snap.id).unwrap();
+            if s.status == AgentStatus::AwaitingAnswer {
+                break s;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(30), "never asked");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let q = parked.pending_question.unwrap();
+        assert_eq!(q.batch.len(), 3);
+        assert_eq!(q.batch[0].choices, ["pg"]);
+        assert!(svc.answer_many(&snap.id, &[]).is_err());
+        // one extra entry past the batch is ignored
+        svc.answer_many(
+            &snap.id,
+            &[
+                Some("pg".into()),
+                Some("  ".into()),
+                Some("token".into()),
+                Some("extra".into()),
+            ],
+        )
+        .unwrap();
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert!(done.terminal_reason.is_some());
+        let parks = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::QuestionAsked { .. }))
+            .count();
+        assert_eq!(parks, 3);
+        let posts = svc.service().transport().seen();
+        let reply = &posts[1];
+        assert!(reply.contains(r#"\"answer\":\"pg\""#), "{reply}");
+        assert!(reply.contains(r#"\"status\":\"declined\""#), "{reply}");
+        assert!(reply.contains(r#"\"answer\":\"token\""#), "{reply}");
+        assert!(!reply.contains("extra"), "{reply}");
+        assert!(!reply.contains(r#"\"status\":\"timeout\""#), "{reply}");
+    }
+
+    #[test]
+    fn cancelling_while_a_question_is_open_ends_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ask = json!({"functionCall":{"name":"ask_user","args":{"question":"ok?"}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![ask]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("cancel check", "gemini", Some(budgets()))
+            .unwrap();
+        let t0 = Instant::now();
+        while svc.snapshot(&snap.id).unwrap().status != AgentStatus::AwaitingAnswer {
+            assert!(t0.elapsed() < Duration::from_secs(30), "never asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        svc.cancel(&snap.id).unwrap();
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        assert_eq!(done.status, AgentStatus::Cancelled);
+        assert!(svc.answer(&snap.id, Some("late")).is_err());
+    }
+
+    #[test]
+    fn search_seeds_come_from_sites_and_real_domains_in_the_query() {
+        // model-supplied sites: bare domains and URLs, deduped
+        let s = search_seeds(
+            "tokio spawn blocking",
+            &[
+                "docs.rs".into(),
+                "https://docs.rs/".into(),
+                "https://tokio.rs/tokio/tutorial".into(),
+            ],
+        );
+        assert_eq!(s, ["https://docs.rs/", "https://tokio.rs/tokio/tutorial"]);
+        // domains in free text need a common ending; file names are not sites
+        let q = search_seeds(
+            "fix main.rs and config.json per developer.mozilla.org (see https://example.com/a)",
+            &[],
+        );
+        assert_eq!(
+            q,
+            ["https://developer.mozilla.org/", "https://example.com/a"]
+        );
+        // private and malformed targets never become seeds
+        let bad = search_seeds(
+            "x",
+            &[
+                "http://127.0.0.1/".into(),
+                "localhost".into(),
+                "e.g.".into(),
+                "a@b.com".into(),
+                "file:///etc/passwd".into(),
+            ],
+        );
+        assert!(bad.is_empty(), "{bad:?}");
+        // capped
+        let many: Vec<String> = (0..9).map(|i| format!("site{i}.org")).collect();
+        assert_eq!(search_seeds("q", &many).len(), MAX_SEEDS);
+        assert!(search_seeds("how do closures work", &[]).is_empty());
+    }
+
+    /// Live smoke test (network): the keyless REX engine, seeded the way
+    /// the agent seeds it, finds real pages on a public docs site.
+    /// `cargo test -p rex-providers live_seeded_search -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_seeded_search_on_public_docs() {
+        let seeds = search_seeds(
+            "rust closures capture environment doc.rust-lang.org",
+            &["https://doc.rust-lang.org/book/ch13-01-closures.html".into()],
+        );
+        assert!(!seeds.is_empty(), "no seeds");
+        let request: SearchRequest = serde_json::from_value(json!({
+            "query": "closures capture environment", "seeds": seeds, "max_results": 5
+        }))
+        .unwrap();
+        let resp = rex_search::SearchEngine::default().search(request);
+        for e in resp.evidence.iter().take(5) {
+            eprintln!("{} | {:?}", e.url, e.title);
+        }
+        eprintln!("coverage: {:?}", resp.coverage.disclaimer);
+        assert!(
+            resp.evidence
+                .iter()
+                .any(|e| e.url.contains("doc.rust-lang.org")),
+            "no evidence from the seeded site"
+        );
+    }
+
+    #[test]
+    fn ask_user_args_are_normalised_and_capped() {
+        assert!(parse_ask_user(&json!({})).is_err());
+        assert!(parse_ask_user(&json!({"question":"   "})).is_err());
+        let long = "q".repeat(QUESTION_CHARS + 50);
+        let (q, c) = parse_one_question(&json!({"question": long, "choices":
+            ["a", {"text":"b"}, 7, "", "c", "d", "e"]}))
+        .unwrap();
+        assert_eq!(q.chars().count(), QUESTION_CHARS);
+        assert_eq!(c, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn finished_run_writes_can_be_undone_from_the_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("x.txt", "agent text")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("write then finish", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        wait_terminal(&svc, &snap.id, 60_000);
+        let file = tmp
+            .path()
+            .join("runs")
+            .join(&snap.id)
+            .join("workspace")
+            .join("x.txt");
+        assert!(file.exists());
+        let undone = svc.undo_last_write(&snap.id).unwrap();
+        assert_eq!(undone.tool, "create_file");
+        assert!(!file.exists());
+        assert!(svc
+            .undo_last_write(&snap.id)
+            .unwrap_err()
+            .contains("nothing to undo"));
+        assert!(svc.undo_last_write("no-such-run").is_err());
+    }
+
+    #[test]
+    fn finished_run_can_be_rewound_in_one_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![create_call("x.txt", "one")]),
+                call_turn(vec![create_call("y.txt", "two")]),
+                call_turn(vec![create_call("x.txt", "three")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc
+            .begin("three writes", "gemini", Some(budgets()))
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        wait_terminal(&svc, &snap.id, 60_000);
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("x.txt")).unwrap(), "three");
+        let undone = svc.undo_to_write(&snap.id, 1).unwrap();
+        assert_eq!(undone.len(), 2);
+        assert_eq!(fs::read_to_string(ws.join("x.txt")).unwrap(), "one");
+        assert!(!ws.join("y.txt").exists());
+        assert!(svc
+            .undo_after_call(&snap.id, "no-such-call")
+            .unwrap_err()
+            .contains("no journaled write"));
+        // rewind to just after the first write, by its call id
+        let first = fs::read_to_string(
+            tmp.path()
+                .join("runs")
+                .join(&snap.id)
+                .join("state")
+                .join("journal")
+                .join("journal.jsonl"),
+        )
+        .unwrap();
+        let first: Value = serde_json::from_str(first.lines().next().unwrap()).unwrap();
+        assert!(svc
+            .undo_after_call(&snap.id, first["call_id"].as_str().unwrap())
+            .unwrap_err()
+            .contains("nothing to undo"));
+        assert_eq!(svc.undo_to_write(&snap.id, 0).unwrap().len(), 1);
+        assert!(!ws.join("x.txt").exists());
+        assert!(svc.undo_to_write("no-such-run", 0).is_err());
+    }
+
+    #[test]
+    fn slightly_off_tool_calls_are_repaired_before_decoding() {
+        let got = decode_gemini_calls(&call_turn(vec![
+            json!({"functionCall":{"name":"Search_Files","args":{"query":"x","max_results":"5","regex":"TRUE"}}}),
+            json!({"functionCall":{"name":"read-file","args":{"path":"a.rs","limit":20.0}}}),
+            json!({"functionCall":{"name":"Explore","args":{"task":"q"}}}),
+            json!({"functionCall":{"name":"Frobnicate","args":{}}}),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            &got.calls[0].0,
+            AgentCall::Tool {
+                request: ToolRequest::SearchFiles {
+                    max_results: Some(5),
+                    regex: Some(true),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &got.calls[1].0,
+            AgentCall::Tool {
+                request: ToolRequest::ReadFile {
+                    limit: Some(20),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(&got.calls[2].0, AgentCall::Explore { .. }));
+        assert!(matches!(&got.calls[3].0, AgentCall::BadCall { name, .. } if name == "Frobnicate"));
+        assert_eq!(
+            got.repairs,
+            [
+                "tool name 'Search_Files' read as 'search_files'",
+                "search_files: fixed argument types for max_results, regex",
+                "tool name 'read-file' read as 'read_file'",
+                "read_file: fixed argument types for limit",
+                "tool name 'Explore' read as 'explore'",
+            ]
+        );
+        let openai = json!({"choices":[{"message":{"tool_calls":[
+            {"id":"c1","function":{"name":"RUN_COMMAND","arguments":"{\"argv\":\"[\\\"ls\\\",\\\"-a\\\"]\",\"timeout_ms\":\"900\"}"}}
+        ]}}]}).to_string();
+        let got = decode_openai_calls(&openai).unwrap();
+        assert!(
+            matches!(&got.calls[0].0, AgentCall::Tool { request: ToolRequest::RunCommand { argv, timeout_ms: Some(900), .. }, .. } if argv == &["ls", "-a"])
+        );
+        assert_eq!(got.repairs.len(), 2);
+        let anthropic = json!({"content":[{"type":"tool_use","id":"t1","name":"Glob_Files","input":{"pattern":"*.rs"}}]}).to_string();
+        let got = decode_anthropic_calls(&anthropic).unwrap();
+        assert!(matches!(
+            &got.calls[0].0,
+            AgentCall::Tool {
+                request: ToolRequest::GlobFiles { .. },
+                ..
+            }
+        ));
+        assert_eq!(got.repairs, ["tool name 'Glob_Files' read as 'glob_files'"]);
+        let clean = decode_anthropic_calls(&json!({"content":[{"type":"tool_use","id":"t2","name":"glob_files","input":{"pattern":"*"}}]}).to_string()).unwrap();
+        assert!(clean.repairs.is_empty());
+    }
+
+    #[test]
+    fn explore_decodes_and_rejects_empty_task() {
+        let ok = decode_gemini_calls(&call_turn(vec![
+            json!({"functionCall":{"name":"explore","args":{"task":"q"}}}),
+        ]))
+        .unwrap();
+        assert!(matches!(&ok.calls[0].0, AgentCall::Explore { tasks, .. } if tasks == &["q"]));
+        let bad = decode_gemini_calls(&call_turn(vec![
+            json!({"functionCall":{"name":"explore","args":{"task":"  "}}}),
+        ]))
+        .unwrap();
+        assert!(matches!(&bad.calls[0].0, AgentCall::BadCall { .. }));
+        let (_, v, h) = assemble_run_prompt(Role::Adversary, &scoped_tools_for(Role::Adversary).0);
+        assert!(!v.is_empty() && !h.is_empty());
+        assert!(scoped_tools_for(Role::Adversary)
+            .0
+            .iter()
+            .any(|s| s.name == "explore"));
     }
 
     #[test]
