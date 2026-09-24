@@ -127,6 +127,14 @@ fn check_toml(content: &str) -> Vec<Finding> {
 /// value that *starts* a flow collection is tracked.
 fn check_yaml(content: &str) -> Vec<Finding> {
     let mut out = Vec::new();
+    // Duplicate keys in block mappings. Templated files (Helm/Jinja) can
+    // repeat a key under different branches, so they are not checked.
+    let templated = content.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("{{") || t.starts_with("{%")
+    });
+    // open block mappings: (key column, keys seen with their line)
+    let mut scopes: Vec<(usize, Vec<(String, usize)>)> = Vec::new();
     let mut block_indent: Option<usize> = None;
     // open flow brackets: (char, line, col)
     let mut flow: Vec<(char, usize, usize)> = Vec::new();
@@ -142,6 +150,9 @@ fn check_yaml(content: &str) -> Vec<Finding> {
         }
         if body.is_empty() || body.starts_with('#') {
             continue;
+        }
+        if flow.is_empty() && (body.starts_with("---") || body.starts_with("...")) {
+            scopes.clear();
         }
         if flow.is_empty() && raw[..indent].contains('\t') {
             out.push(Finding {
@@ -166,7 +177,39 @@ fn check_yaml(content: &str) -> Vec<Finding> {
                 }
                 break;
             }
-            let value_start = match find_mapping_colon(&chars[start.min(chars.len())..]) {
+            let key_at = find_mapping_colon(&chars[start.min(chars.len())..]);
+            if !templated && !raw[..indent].contains('\t') {
+                let col = indent + start;
+                let new_item = start > 0;
+                if let Some(c) = key_at {
+                    let key = yaml_key(&chars[start..start + c]);
+                    scopes.retain(|(k, _)| if new_item { *k < col } else { *k <= col });
+                    match scopes.last_mut() {
+                        Some((k, keys)) if *k == col => {
+                            if let Some(key) = key {
+                                if let Some((_, first)) = keys.iter().find(|(n, _)| *n == key) {
+                                    out.push(Finding {
+                                        line: line_no,
+                                        col: col + 1,
+                                        message: format!(
+                                            "duplicate key '{key}' (first on line {first})"
+                                        ),
+                                    });
+                                } else {
+                                    keys.push((key, line_no));
+                                }
+                            }
+                        }
+                        _ => {
+                            scopes.push((col, key.map(|k| vec![(k, line_no)]).unwrap_or_default()))
+                        }
+                    }
+                } else if new_item {
+                    // a bare `- value` item ends mappings nested deeper
+                    scopes.retain(|(k, _)| *k <= indent);
+                }
+            }
+            let value_start = match key_at {
                 Some(c) => {
                     let mut v = start + c + 1;
                     while chars.get(v) == Some(&' ') {
@@ -254,6 +297,24 @@ fn check_yaml(content: &str) -> Vec<Finding> {
         });
     }
     cap(out)
+}
+
+/// Normalised mapping key, or `None` for keys REX does not compare
+/// (merge keys, explicit `?` keys, aliases, empty keys).
+fn yaml_key(chars: &[char]) -> Option<String> {
+    let raw: String = chars.iter().collect();
+    let k = raw.trim();
+    if k.is_empty() || k == "<<" || k.starts_with('?') || k.starts_with('*') || k.starts_with('&') {
+        return None;
+    }
+    let unq = if k.len() >= 2
+        && ((k.starts_with('"') && k.ends_with('"')) || (k.starts_with('\'') && k.ends_with('\'')))
+    {
+        &k[1..k.len() - 1]
+    } else {
+        k
+    };
+    Some(unq.to_string())
 }
 
 /// Index of the `:` that ends a mapping key (followed by space or end of
@@ -825,6 +886,38 @@ mod tests {
         dirty("a.yaml", "a: {x: [1, 2}\n", "closed with");
         let f = check("a.yaml", "x: 1\na: [1, 2\n").unwrap();
         assert_eq!((f[0].line, f[0].col), (2, 4), "{f:?}");
+    }
+
+    #[test]
+    fn yaml_duplicate_keys_are_found_per_mapping() {
+        let f = check("a.yaml", "name: a\nimage: x\nname: b\n").unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].line, 3);
+        assert!(f[0]
+            .message
+            .contains("duplicate key 'name' (first on line 1)"));
+        dirty("a.yaml", "a:\n  b: 1\n  \"b\": 2\n", "duplicate key 'b'");
+        dirty(
+            "a.yml",
+            "steps:\n  - name: x\n    run: a\n    run: b\n",
+            "duplicate key 'run'",
+        );
+        // same key in sibling mappings, list items, documents: fine
+        clean(
+            "ci.yml",
+            "jobs:\n  a:\n    name: x\n    steps:\n      - name: s1\n        run: a\n      - name: s2\n        run: b\n  b:\n    name: y\n---\njobs: 1\n",
+        );
+        clean("a.yaml", "- name: a\n- name: b\nx:\n- name: c\n- name: d\n");
+        clean(
+            "a.yaml",
+            "base: &b\n  x: 1\nc:\n  <<: *b\n  <<: *b\n  x: 2\n",
+        );
+        clean("a.yaml", "text: |\n  name: a\n  name: b\nname2: c\n");
+        // Helm/Jinja templates repeat keys under branches
+        clean(
+            "values.yaml",
+            "{{- if .Values.a }}\nimage: a\n{{- else }}\nimage: b\n{{- end }}\n",
+        );
     }
 
     #[test]

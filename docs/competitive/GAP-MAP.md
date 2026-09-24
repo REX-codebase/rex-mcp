@@ -177,8 +177,14 @@ is shared it is noted in the module docs.
   brackets inside plain scalars such as `${{ x }}` are ignored). False-alarm
   sweep: 0 YAML/TOML files flagged across this repo, opencode, Hermes and
   the local cargo registry (630 YAML + 248 TOML files).
-- Gap left: YAML check is not a full parser (no duplicate-key or
-  indentation-structure errors); opencode's LSP route covers more.
+- Round 7: YAML duplicate keys in block mappings are flagged ("duplicate
+  key 'x' (first on line N)"), per mapping and per `---` document; merge
+  keys, aliases and `?` keys are skipped, and Helm/Jinja files (lines
+  starting `{{` or `{%`) are not checked. Sweep: 0 YAML files flagged in
+  this repo, opencode, Hermes and the cargo registry (748 YAML files; the
+  5 flags in the sweep are pre-existing JSX/Kotlin/C notes).
+- Gap left: YAML check is still not a full parser (no indentation-structure
+  errors); opencode's LSP route covers more.
 - App: AgentRunView shows the ask_user question (choices, free text, "Let
   REX decide") and an "Undo last file change" button on finished runs that
   wrote files. Covered by 2 vitest tests; rendered with the compiled theme
