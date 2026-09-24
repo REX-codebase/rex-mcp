@@ -16,6 +16,7 @@ pub mod catalog;
 pub mod conversation;
 pub mod custody_link;
 pub mod error;
+mod history;
 pub mod http;
 mod memory;
 pub mod policy;
@@ -32,7 +33,7 @@ pub mod oneshot;
 pub use agent_loop::{AgentLoop, LoopEvent, DEFAULT_MAX_STEPS, HARD_MAX_STEPS};
 pub use autonomous::{
     AgentEvent, AgentPreview, AgentSnapshot, AgentStatus, AutonomousRunService, Budgets, PlanItem,
-    PlanStatus, TerminalReason,
+    PlanStatus, RunOptions, TerminalReason,
 };
 pub use catalog::{CatalogSource, ModelCatalog, ModelInfo};
 pub use conversation::{

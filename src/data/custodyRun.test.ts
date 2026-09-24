@@ -44,6 +44,22 @@ describe("custody run bridge", () => {
     const body = JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
     expect(body.task).toBe("build a page");
     expect(body.provider).toBe("gemini");
+    expect(body.summarize_history).toBe(false);
+    expect(body.summarizeHistory).toBe(false);
+  });
+
+  it("sends the history-summary opt-in only when asked", async () => {
+    const fetchMock = sidecarFetch({
+      "/api/agent/custody/runs": { grant_id: "custody-2", snapshot: { id: "agent-2", status: "planning" } },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { custodyBegin } = await import("./custodyRun");
+    await custodyBegin("long task", false, true);
+    const call = fetchMock.mock.calls.find(([u]) => String(u).endsWith("/api/agent/custody/runs"));
+    const body = JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
+    expect(body.summarize_history).toBe(true);
+    expect(body.summarizeHistory).toBe(true);
+    expect(body.plan_mode).toBe(false);
   });
 
   it("surfaces backend refusals as errors, never as fake success", async () => {

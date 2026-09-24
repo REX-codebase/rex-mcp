@@ -691,13 +691,14 @@ fn custody_begin(
     provider: Option<String>,
     model: Option<String>,
     plan_mode: Option<bool>,
+    summarize_history: Option<bool>,
 ) -> Result<rex_providers::CustodiedRunView, String> {
     let task_id = format!("task-ui-{:x}", now_ms_u128());
     // The custodied workspace sits under the agent runs root: the run
     // service refuses explicit workspaces outside it.
     let workspace = config_dir().join("agent-runs").join(&task_id);
     std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
-    let req = rex_providers::ui_managed_request(
+    let mut req = rex_providers::ui_managed_request(
         task_id,
         task,
         rex_custody::OperatorIdentity::Human,
@@ -706,6 +707,8 @@ fn custody_begin(
         workspace,
         plan_mode.unwrap_or(false),
     );
+    // Opt-in; off unless the UI asks, because each summary spends tokens.
+    req.summarize_history = summarize_history.unwrap_or(false);
     let run = custody_runs.begin_managed_task(req)?;
     Ok(custody_runs.view_of(&run))
 }

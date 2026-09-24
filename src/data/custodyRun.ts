@@ -46,7 +46,10 @@ function selectedModel(): { provider: string; model?: string } {
   return { provider, model };
 }
 
-export const custodyBegin = (task: string, planMode = false) => {
+// `summarizeHistory` opts in to a model-written summary of tool results
+// that drop out of working memory. Off by default: each summary is an
+// extra model call on the user's key.
+export const custodyBegin = (task: string, planMode = false, summarizeHistory = false) => {
   const { provider, model } = selectedModel();
   // Tauri reads camelCase args, the sidecar snake_case; each transport
   // ignores the other's spelling.
@@ -56,6 +59,8 @@ export const custodyBegin = (task: string, planMode = false) => {
     model,
     planMode,
     plan_mode: planMode,
+    summarizeHistory,
+    summarize_history: summarizeHistory,
   });
 };
 

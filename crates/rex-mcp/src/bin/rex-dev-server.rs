@@ -610,6 +610,12 @@ fn route(
                 .get("plan_mode")
                 .and_then(|p| p.as_bool())
                 .unwrap_or(false);
+            // Opt-in history summary; it spends tokens, so only an explicit
+            // `true` turns it on.
+            let summarize_history = parsed
+                .get("summarize_history")
+                .and_then(|p| p.as_bool())
+                .unwrap_or(false);
             // The operator identity is the caller's declaration, recorded
             // for audit; custody decisions never trust the string.
             let operator = match parsed.get("operator").and_then(|o| o.as_str()) {
@@ -647,7 +653,7 @@ fn route(
                     &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
                 ),
                 Ok(ws) => {
-                    let req = rex_providers::custody_link::ui_managed_request(
+                    let mut req = rex_providers::custody_link::ui_managed_request(
                         task_id,
                         task.to_string(),
                         operator,
@@ -656,6 +662,7 @@ fn route(
                         ws,
                         plan_mode,
                     );
+                    req.summarize_history = summarize_history;
                     match custody_runs.begin_managed_task(req) {
                         Ok(run) => json_response(
                             200,

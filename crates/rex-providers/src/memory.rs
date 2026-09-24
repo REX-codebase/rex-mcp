@@ -45,16 +45,23 @@ impl Observation {
 
 /// Add an observation, then enforce the entry and character budgets by
 /// dropping the oldest entries.
+#[cfg(test)]
 pub fn record(list: &mut Vec<Observation>, obs: Observation) {
+    record_spill(list, &mut Vec::new(), obs);
+}
+
+/// [`record`], moving the entries it drops into `spill` (oldest first) so
+/// an opt-in history summary can fold them in later.
+pub fn record_spill(list: &mut Vec<Observation>, spill: &mut Vec<Observation>, obs: Observation) {
     if obs.excerpt.trim().is_empty() {
         return;
     }
     list.push(obs);
     while list.len() > OBS_MAX_ENTRIES {
-        list.remove(0);
+        spill.push(list.remove(0));
     }
     while list.len() > 1 && list.iter().map(Observation::cost).sum::<usize>() > OBS_BUDGET_CHARS {
-        list.remove(0);
+        spill.push(list.remove(0));
     }
 }
 
@@ -91,6 +98,34 @@ pub const MEMORY_NOTE: &str = "Clipped excerpts of older tool results, newest la
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spill_collects_every_dropped_entry_oldest_first() {
+        let (mut l, mut spill) = (Vec::new(), Vec::new());
+        for t in 0..30 {
+            record_spill(
+                &mut l,
+                &mut spill,
+                Observation::new(t, "glob_files", None, true, "a"),
+            );
+        }
+        assert_eq!(l.len(), OBS_MAX_ENTRIES);
+        let turns: Vec<usize> = spill.iter().map(|o| o.turn).collect();
+        assert_eq!(turns, (0..30 - OBS_MAX_ENTRIES).collect::<Vec<_>>());
+        let (mut l, mut spill) = (Vec::new(), Vec::new());
+        for t in 0..8 {
+            let obs = Observation::new(t, "read_file", None, true, &"x".repeat(OBS_EXCERPT_CHARS));
+            record_spill(&mut l, &mut spill, obs);
+        }
+        assert_eq!(l.len() + spill.len(), 8);
+        assert_eq!(spill[0].turn, 0);
+        record_spill(
+            &mut l,
+            &mut spill,
+            Observation::new(9, "read_file", None, true, " "),
+        );
+        assert_eq!(l.len() + spill.len(), 8, "blank results are not kept");
+    }
 
     #[test]
     fn budget_drops_oldest_first() {

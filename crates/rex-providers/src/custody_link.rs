@@ -50,6 +50,9 @@ pub struct ManagedTaskRequest {
     /// Plan mode: the run proposes a plan and waits for trusted approval
     /// before any tool executes.
     pub plan_mode: bool,
+    /// Opt-in model summary of tool results that drop out of working
+    /// memory. Off unless the caller asks; each summary spends tokens.
+    pub summarize_history: bool,
 }
 
 /// Flat view the shell returns when a custodied run starts or is polled:
@@ -122,6 +125,7 @@ pub fn ui_managed_request(
             max_claim_attempts: 1,
         },
         plan_mode,
+        summarize_history: false,
     }
 }
 
@@ -243,14 +247,17 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
             .unwrap_or_else(|| self.runs_workspace_hint(&grant.grant_id));
         let snapshot = self
             .runs
-            .begin_in_workspace_with_role(
+            .begin_in_workspace_with_options(
                 &req.task,
                 &req.provider,
                 req.model.as_deref(),
                 Some(budgets),
                 Some(workspace),
                 Role::Worker,
-                req.plan_mode,
+                crate::autonomous::RunOptions {
+                    plan_mode: req.plan_mode,
+                    summarize_history: req.summarize_history,
+                },
                 SessionMeta::default(),
             )
             .map_err(|e| {
@@ -556,6 +563,7 @@ mod tests {
             lease_terms: LeaseTerms::default(),
             contract,
             plan_mode: false,
+            summarize_history: false,
         }
     }
 

@@ -340,6 +340,11 @@ struct TaskBrief {
     /// before any tool executes. Legacy briefs (no field) run un-gated.
     #[serde(default)]
     plan_mode: bool,
+    /// Opt-in: fold tool results dropped from working memory into a
+    /// model-written summary (see `history`). Off by default and for every
+    /// legacy brief, because each summary spends tokens.
+    #[serde(default)]
+    summarize_history: bool,
     /// Human-given session label (`rex exec --name`). Purely cosmetic: it
     /// never changes what the run may do. Legacy briefs carry none.
     #[serde(default)]
@@ -431,6 +436,13 @@ struct Checkpoint {
     /// Bounded excerpts of older tool results (see `memory`).
     #[serde(default)]
     observations: Vec<crate::memory::Observation>,
+    /// Opt-in history summary: the current summary, and excerpts dropped
+    /// from `observations` that it has not folded in yet. Both stay empty
+    /// when `summarize_history` is off.
+    #[serde(default)]
+    history_summary: Option<String>,
+    #[serde(default)]
+    history_pending: Vec<crate::memory::Observation>,
     /// The run's workspace, as resolved at begin time. Resume restores it
     /// from here (re-validated under the runs root); legacy checkpoints
     /// without it fall back to `<run_dir>/workspace`.
@@ -691,6 +703,16 @@ fn parse_one_question(args: &Value) -> Result<(String, Vec<String>), String> {
     Ok((question.chars().take(QUESTION_CHARS).collect(), choices))
 }
 
+/// Switches a run starts with. Everything defaults off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Park at a plan-approval gate before any tool runs.
+    pub plan_mode: bool,
+    /// Fold tool results that drop out of working memory into a
+    /// model-written summary. Each summary is one extra model call.
+    pub summarize_history: bool,
+}
+
 pub struct AutonomousRunService<S: SecretStore + 'static, T: Transport + 'static> {
     service: Arc<ProviderService<S, T>>,
     search: Option<Arc<SearchRouter<S, T>>>,
@@ -838,6 +860,40 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         plan_mode: bool,
         session: SessionMeta,
     ) -> Result<AgentSnapshot, String> {
+        let opts = RunOptions {
+            plan_mode,
+            ..RunOptions::default()
+        };
+        self.begin_in_workspace_with_options(
+            task,
+            provider,
+            requested_model,
+            budgets,
+            workspace,
+            role,
+            opts,
+            session,
+        )
+    }
+
+    /// [`Self::begin_in_workspace_with_role`] with every run switch,
+    /// including the opt-in history summary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_in_workspace_with_options(
+        &self,
+        task: &str,
+        provider: &str,
+        requested_model: Option<&str>,
+        budgets: Option<Budgets>,
+        workspace: Option<PathBuf>,
+        role: Role,
+        opts: RunOptions,
+        session: SessionMeta,
+    ) -> Result<AgentSnapshot, String> {
+        let RunOptions {
+            plan_mode,
+            summarize_history,
+        } = opts;
         let task = task.trim();
         if task.is_empty() {
             return Err("task is empty".into());
@@ -912,6 +968,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
             role: Some(role.name().to_string()),
             allowed_tools,
             plan_mode,
+            summarize_history,
             name: session.name,
             continued_from: session.continued_from,
         };
@@ -1779,6 +1836,22 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             return;
         }
 
+        // ---- opt-in summary of history dropped from working memory -------
+        if ctx.brief.summarize_history {
+            summarize_history_step(
+                &ctx,
+                &mut ledger,
+                protocol,
+                &base_url,
+                &key,
+                &model,
+                budgets,
+                &mut cp,
+            );
+        } else {
+            cp.history_pending.clear();
+        }
+
         // ---- dynamic context build ---------------------------------------
         let project = rex_prompt::project::load(&ctx.workspace);
         let user_rules = rex_prompt::project::load_user();
@@ -2021,6 +2094,7 @@ fn build_state_message(
         "plan": plan,
         "recent_turns": digest,
         "earlier_observations": earlier_observations,
+        "history_summary": cp.history_summary.as_ref().map(|t| json!({"note": crate::history::SUMMARY_NOTE, "text": t})),
         "note": if cp.consec_stall > 0 {
             "Your last turn produced no tool calls. Act on the plan: call the next tool, update the plan, or call complete_task when everything is verifiably done."
         } else {
@@ -3228,8 +3302,9 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                 if let Some(l) = ledger.as_mut() {
                     l.append("web_fetch", json!({"url": url, "offset": offset, "ok": ok}));
                 }
-                crate::memory::record(
+                crate::memory::record_spill(
                     &mut cp.observations,
+                    &mut cp.history_pending,
                     crate::memory::Observation::new(
                         cp.step,
                         "web_fetch",
@@ -3432,8 +3507,9 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                         },
                     );
                     let preview: String = task.chars().take(120).collect();
-                    crate::memory::record(
+                    crate::memory::record_spill(
                         &mut cp.observations,
+                        &mut cp.history_pending,
                         crate::memory::Observation::new(
                             cp.step,
                             "explore",
@@ -3753,16 +3829,22 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     if result.ok {
                         match &request {
                             ToolRequest::CreateFile { .. } | ToolRequest::EditFile { .. } => {
-                                crate::memory::supersede(&mut cp.observations, target.as_deref())
+                                crate::memory::supersede(&mut cp.observations, target.as_deref());
+                                crate::memory::supersede(
+                                    &mut cp.history_pending,
+                                    target.as_deref(),
+                                );
                             }
                             ToolRequest::ApplyPatch { .. } => {
-                                crate::memory::supersede(&mut cp.observations, None)
+                                crate::memory::supersede(&mut cp.observations, None);
+                                crate::memory::supersede(&mut cp.history_pending, None);
                             }
                             _ => {}
                         }
                     }
-                    crate::memory::record(
+                    crate::memory::record_spill(
                         &mut cp.observations,
+                        &mut cp.history_pending,
                         crate::memory::Observation::new(
                             cp.step, tool_name, target, result.ok, text,
                         ),
@@ -4067,6 +4149,90 @@ fn build_plan_request(
             .to_string()
         }
     }
+}
+
+/// Fold excerpts dropped from working memory into the rolling history
+/// summary with one tool-free model call, when enough have piled up and
+/// the token budget has room. Any failure leaves the run going without a
+/// new summary; the pending excerpts are dropped so a broken provider is
+/// not asked again every turn.
+#[allow(clippy::too_many_arguments)]
+fn summarize_history_step<S: SecretStore + 'static, T: Transport + 'static>(
+    ctx: &LoopCtx<S, T>,
+    ledger: &mut Option<Ledger>,
+    protocol: ProviderProtocol,
+    base_url: &str,
+    key: &str,
+    model: &str,
+    budgets: Budgets,
+    cp: &mut Checkpoint,
+) {
+    crate::history::cap_pending(&mut cp.history_pending);
+    if !crate::history::should_summarize(&cp.history_pending) {
+        return;
+    }
+    let pending = std::mem::take(&mut cp.history_pending);
+    let prompt = crate::history::build_prompt(cp.history_summary.as_deref(), &pending);
+    let body = crate::history::build_request(protocol, model, &prompt);
+    let estimate = crate::history::estimated_tokens(&body);
+    if cp.tokens_used + estimate > budgets.max_tokens {
+        RunHandle::push_event(
+            &ctx.handle.shared,
+            AgentEvent::Info {
+                message: format!(
+                    "history summary skipped: about {estimate} tokens would pass the token budget"
+                ),
+            },
+        );
+        return;
+    }
+    let step = cp.step;
+    let evidence = ctx.state_dir.join("evidence");
+    let _ = fs::write(evidence.join(format!("summary-{step}-request.json")), &body);
+    let result = generate_with_retry(
+        ctx.service.transport(),
+        protocol,
+        base_url,
+        key,
+        model,
+        &body,
+        &ctx.handle,
+    );
+    let (message, usage) = match result {
+        Ok(response) => {
+            let _ = fs::write(
+                evidence.join(format!("summary-{step}-response.json")),
+                &response,
+            );
+            let usage = usage_tokens(protocol, &response);
+            cp.tokens_used += usage.unwrap_or((body.len() + response.len()) as u64 / 4);
+            let text = decode_provider_calls(protocol, &response)
+                .ok()
+                .and_then(|d| crate::history::clip_summary(&d.texts));
+            match text {
+                Some(t) => {
+                    cp.history_summary = Some(t);
+                    (
+                        format!("summarized {} older tool results", pending.len()),
+                        usage,
+                    )
+                }
+                None => (
+                    "history summary skipped: the model returned no text".into(),
+                    usage,
+                ),
+            }
+        }
+        Err(detail) => (format!("history summary skipped: {detail}"), None),
+    };
+    if let Some(l) = ledger.as_mut() {
+        l.append(
+            "history_summary",
+            json!({"step": step, "items": pending.len(), "usage_tokens": usage,
+                "stored": message.starts_with("summarized")}),
+        );
+    }
+    RunHandle::push_event(&ctx.handle.shared, AgentEvent::Info { message });
 }
 
 /// Plan gate: one model turn with only `update_plan` declared, then park in
@@ -4840,6 +5006,7 @@ mod tests {
             role: None,
             allowed_tools: None,
             plan_mode: false,
+            summarize_history: false,
             name: None,
             continued_from: None,
         };
@@ -4990,6 +5157,232 @@ mod tests {
         assert!(done.events.iter().any(
             |e| matches!(e, AgentEvent::ToolFinished { result } if result.ok && result.tool == "create_file")
         ));
+    }
+
+    /// Nine 2,100-char reads overflow working memory (12k chars), and the
+    /// dropped excerpts pass the 6,000-char summary trigger.
+    fn history_run(
+        summarize: bool,
+        max_tokens: u64,
+        turns: Vec<String>,
+    ) -> (Arc<Svc>, AgentSnapshot) {
+        history_run_with(summarize, max_tokens, 9, vec![], turns)
+    }
+
+    fn history_run_with(
+        summarize: bool,
+        max_tokens: u64,
+        n_reads: usize,
+        after_reads: Vec<Value>,
+        turns: Vec<String>,
+    ) -> (Arc<Svc>, AgentSnapshot) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        fs::create_dir_all(root.join("runs").join("hist-ws")).unwrap();
+        let ws = root.join("runs").join("hist-ws");
+        let mut reads = Vec::new();
+        for i in 1..=n_reads {
+            fs::write(ws.join(format!("f{i}.txt")), format!("{i}").repeat(2_100)).unwrap();
+            reads.push(
+                json!({"functionCall":{"name":"read_file","args":{"path": format!("f{i}.txt")}}}),
+            );
+        }
+        reads.extend(after_reads);
+        let mut script = vec![call_turn(reads)];
+        script.extend(turns);
+        let svc = Arc::new(service(&root, Script::new(script)));
+        let snap = svc
+            .begin_in_workspace_with_options(
+                "read everything",
+                "gemini",
+                None,
+                Some(Budgets {
+                    max_tokens,
+                    ..budgets()
+                }),
+                Some(ws),
+                Role::Worker,
+                RunOptions {
+                    summarize_history: summarize,
+                    ..RunOptions::default()
+                },
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 20_000);
+        (svc, done)
+    }
+
+    fn infos(done: &AgentSnapshot, prefix: &str) -> Vec<String> {
+        done.events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Info { message } if message.starts_with(prefix) => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn history_summary_is_off_by_default_and_makes_no_extra_call() {
+        let (svc, done) = history_run(false, 100_000, vec![text_turn("done"); 4]);
+        let posts = svc.service.transport().seen();
+        assert!(!posts
+            .iter()
+            .any(|p| p.contains(crate::history::SUMMARY_SYSTEM)));
+        assert!(infos(&done, "summarized").is_empty());
+        assert!(infos(&done, "history summary").is_empty());
+        assert!(!posts.iter().any(|p| p.contains("Model-written summary")));
+        let cp: Value = serde_json::from_str(
+            &fs::read_to_string(svc.run_dir(&done.id).join("state").join("checkpoint.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cp["history_pending"], json!([]), "nothing kept when off");
+        assert!(cp["history_summary"].is_null());
+    }
+
+    #[test]
+    fn history_summary_drops_all_pending_reads_after_a_patch() {
+        // a patch can touch any file, so every pending read may be stale
+        let (svc, done) = history_run_with(
+            true,
+            100_000,
+            10,
+            vec![
+                json!({"functionCall":{"name":"apply_patch","args":{"patch":"*** Begin Patch\n*** Add File: new.txt\n+n\n*** End Patch"}}}),
+            ],
+            vec![text_turn("done"); 4],
+        );
+        assert!(done.events.iter().any(
+            |e| matches!(e, AgentEvent::ToolFinished { result } if result.ok && result.tool == "apply_patch")
+        ));
+        let posts = svc.service.transport().seen();
+        assert!(!posts
+            .iter()
+            .any(|p| p.contains(crate::history::SUMMARY_SYSTEM)));
+    }
+
+    #[test]
+    fn history_summary_skips_reads_of_files_the_run_then_changed() {
+        let (svc, _) = history_run_with(
+            true,
+            100_000,
+            10,
+            vec![
+                json!({"functionCall":{"name":"create_file","args":{"path":"f1.txt","content":"new","overwrite":true}}}),
+            ],
+            vec![
+                text_turn("S"),
+                text_turn("done"),
+                text_turn("done"),
+                text_turn("done"),
+            ],
+        );
+        let posts = svc.service.transport().seen();
+        let req = posts
+            .iter()
+            .find(|p| p.contains(crate::history::SUMMARY_SYSTEM))
+            .expect("summary request made");
+        let req: Value = serde_json::from_str(req).unwrap();
+        let data: Value =
+            serde_json::from_str(req["contents"][0]["parts"][0]["text"].as_str().unwrap()).unwrap();
+        let targets: Vec<String> = data["tool_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["target"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(!targets.is_empty());
+        assert!(
+            targets
+                .iter()
+                .all(|t| !t.ends_with("/f1.txt") && t != "f1.txt"),
+            "stale read of f1 was summarized: {targets:?}"
+        );
+        assert!(targets[0].ends_with("f2.txt"), "{targets:?}");
+    }
+
+    #[test]
+    fn opt_in_history_summary_folds_dropped_results_into_later_turns() {
+        let (svc, done) = history_run(
+            true,
+            100_000,
+            vec![
+                text_turn("SUMMARY: f1-f3 hold repeated digits"),
+                text_turn("done"),
+                text_turn("done"),
+                text_turn("done"),
+            ],
+        );
+        let posts = svc.service.transport().seen();
+        let at = posts
+            .iter()
+            .position(|p| p.contains(crate::history::SUMMARY_SYSTEM))
+            .expect("summary request made");
+        assert_eq!(at, 1, "summary runs right after the turn that overflowed");
+        let req: Value = serde_json::from_str(&posts[at]).unwrap();
+        assert!(req.get("tools").is_none());
+        let user = req["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        let data: Value = serde_json::from_str(user).unwrap();
+        let targets: Vec<&str> = data["tool_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["target"].as_str().unwrap_or(""))
+            .collect();
+        // the oldest reads, in order (how many depends on excerpt framing)
+        let n = targets.len();
+        assert!((3..=5).contains(&n), "{targets:?}");
+        for (i, t) in targets.iter().enumerate() {
+            assert!(t.ends_with(&format!("f{}.txt", i + 1)), "{targets:?}");
+        }
+        let next: Value = serde_json::from_str(&posts[at + 1]).unwrap();
+        let state: Value = serde_json::from_str(
+            next["contents"][0]["parts"][0]["text"]
+                .as_str()
+                .expect("state message first"),
+        )
+        .expect("state message is JSON");
+        assert_eq!(
+            state["history_summary"]["text"],
+            "SUMMARY: f1-f3 hold repeated digits"
+        );
+        assert_eq!(
+            state["history_summary"]["note"],
+            crate::history::SUMMARY_NOTE
+        );
+        assert_eq!(
+            posts
+                .iter()
+                .filter(|p| p.contains(crate::history::SUMMARY_SYSTEM))
+                .count(),
+            1,
+            "nothing new dropped, so no second summary"
+        );
+        assert_eq!(
+            infos(&done, "summarized"),
+            [format!("summarized {n} older tool results")]
+        );
+        assert!(done.tokens_used >= 240 + 120 * 2);
+    }
+
+    #[test]
+    fn history_summary_respects_the_token_budget() {
+        // 2,000 tokens (the floor) leave no room for a ~2,500-token summary:
+        // it is skipped with a note, and the run goes on without one.
+        let (svc, done) = history_run(true, 2_000, vec![text_turn("done"); 4]);
+        let posts = svc.service.transport().seen();
+        assert!(!posts
+            .iter()
+            .any(|p| p.contains(crate::history::SUMMARY_SYSTEM)));
+        let skipped = infos(&done, "history summary skipped");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].contains("token budget"), "{skipped:?}");
+        assert!(posts.len() >= 2, "the run kept going");
     }
 
     #[test]
@@ -5445,6 +5838,7 @@ mod tests {
             role: None,
             allowed_tools: None,
             plan_mode: false,
+            summarize_history: false,
             name: None,
             continued_from: None,
         };

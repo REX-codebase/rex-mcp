@@ -54,6 +54,7 @@ is shared it is noted in the module docs.
   12k-char budget, oldest dropped first, and reads of files the run later
   changed are dropped so the model never sees stale content. Gap left: no LLM summary of
   very old history (REX relies on plan + digest + ledger instead).
+  Round 12 adds one as an opt-in; see below.
 
 ## Round 3
 
@@ -330,3 +331,42 @@ is shared it is noted in the module docs.
   tasks with hidden checks plus `run.sh` and `score.sh`, for running
   REX, opencode and Hermes on the same tasks. It has not been run (halted
   before any run), so this map still has no outcome numbers.
+
+## Round 12: opt-in summary of old history
+
+- opencode compacts automatically unless `compaction.auto` is false
+  (`session/overflow.ts:28`, `session/processor.ts:622`) and carries the
+  previous summary into the next one (`session/compaction.ts:366`).
+  Hermes compresses by default (`compression.enabled` defaults to true,
+  `hermes_cli/config.py:2936`) with one summary LLM call
+  (`agent/context_compressor.py`). Both summarise the transcript.
+- REX now has the same idea as a switch that is off by default, since
+  each summary is an extra model call on the user's key
+  (`crates/rex-providers/src/history.rs`). With `summarize_history` on,
+  the tool-result excerpts that working memory drops are kept aside.
+  Once they reach 6,000 characters, one tool-free call folds them and the
+  previous summary into a new summary (at most 2,000 characters). The
+  model sees it each turn under `history_summary`, marked as
+  model-written and possibly out of date. Reads of files the run later
+  changed are removed before summarising, the same rule working memory
+  uses. The call counts against the token budget and is skipped (with a
+  run event) when it would pass it. A provider error or empty answer
+  leaves the run going without a new summary. Each summary shows as a
+  run event and a ledger entry, and its request and response are saved
+  as evidence.
+- Switch: `RunOptions::summarize_history` on the run service, a
+  `summarize_history` field on the custody request, the
+  `summarize_history` flag on the sidecar custody route and the Tauri
+  `custody_begin` command (review only; this change has not been through
+  CI yet), and
+  a third `custodyBegin` argument in `src/data/custodyRun.ts`. Legacy
+  briefs and checkpoints load with it off.
+- Tests: 5 unit (trigger, cap, prompt, requests, clipping), 1 memory
+  spill test, 5 end-to-end runs (off makes no extra call and keeps
+  nothing; on summarises right after the overflowing turn and shows the
+  summary next turn; stale reads left out after an edit and after a
+  patch; token budget respected), 1 vitest. Mutations: 17 of 17 fail the
+  tests.
+- Gap left: no switch in the app UI yet (the API takes it). REX
+  summarises dropped tool results, not the whole conversation, because
+  its loop sends fresh state each turn instead of a growing transcript.
