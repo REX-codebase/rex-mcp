@@ -1254,10 +1254,17 @@ fn agent_undo(
     agent: State<'_, Arc<Agent>>,
     run_id: String,
     to: Option<u64>,
+    after_call: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    // `to`: rewind every write after journal entry N (0 = all), all or nothing
-    if let Some(seq) = to {
-        return agent.undo_to_write(&run_id, seq).map(|entries| {
+    // `after_call`: rewind to just after that call's write; `to`: rewind
+    // every write after journal entry N (0 = all). Both all or nothing.
+    let rewind = match (after_call, to) {
+        (Some(call), _) => Some(agent.undo_after_call(&run_id, &call)),
+        (None, Some(seq)) => Some(agent.undo_to_write(&run_id, seq)),
+        (None, None) => None,
+    };
+    if let Some(result) = rewind {
+        return result.map(|entries| {
             let mut files: Vec<String> = Vec::new();
             for e in &entries {
                 for f in &e.files {
@@ -1271,7 +1278,7 @@ fn agent_undo(
                 "call_id": entries.first().map(|e| e.call_id.clone()),
                 "tool": entries.first().map(|e| e.tool.clone()),
                 "files": files,
-                "undone": entries.iter().map(|e| serde_json::json!({"seq": e.seq, "tool": e.tool})).collect::<Vec<_>>(),
+                "undone": entries.iter().map(|e| serde_json::json!({"seq": e.seq, "tool": e.tool, "call_id": e.call_id})).collect::<Vec<_>>(),
             })
         });
     }

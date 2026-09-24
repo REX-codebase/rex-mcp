@@ -2,7 +2,12 @@
 import { fireEvent, render, screen, waitFor, cleanup } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi, afterEach } from "vitest";
 
-const calls = vi.hoisted(() => ({ answer: [] as unknown[][], many: [] as unknown[][], undo: [] as unknown[][] }));
+const calls = vi.hoisted(() => ({
+  answer: [] as unknown[][],
+  many: [] as unknown[][],
+  undo: [] as unknown[][],
+  undoReply: null as unknown,
+}));
 vi.mock("../data/agentRun", () => ({
   agentAnswer: (...args: unknown[]) => {
     calls.answer.push(args);
@@ -14,7 +19,7 @@ vi.mock("../data/agentRun", () => ({
   },
   agentUndo: (...args: unknown[]) => {
     calls.undo.push(args);
-    return Promise.resolve({ ok: true, call_id: "c1", tool: "create_file", files: ["index.html"] });
+    return Promise.resolve(calls.undoReply ?? { ok: true, call_id: "c1", tool: "create_file", files: ["index.html"] });
   },
   agentCapture: () => Promise.resolve({}),
   agentPreviewAction: () => Promise.resolve({ ok: true }),
@@ -152,6 +157,53 @@ describe("AgentRunView ask_user and undo", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Undo last file change" }));
     await waitFor(() => expect(screen.getByText("Undid create file · index.html")).toBeTruthy());
-    expect(calls.undo).toEqual([["run-1"]]);
+    expect(calls.undo).toEqual([["run-1", undefined]]);
+  });
+
+  it("rewinds to an earlier write and marks the undone ones", async () => {
+    const w = (id: string, target: string) =>
+      ({
+        state: "tool_finished",
+        result: { call_id: id, ok: true, tool: "edit_file", state: "executed", output: "", error: null, receipt: { target, bytes_written: 1, duration_ms: 1 } },
+      }) as never;
+    const failed = {
+      state: "tool_finished",
+      result: { call_id: "cx", ok: false, tool: "edit_file", state: "executed", output: "", error: { kind: "x", detail: "x" }, receipt: { target: "bad.txt", bytes_written: 0, duration_ms: 1 } },
+    } as never;
+    calls.undoReply = {
+      ok: true,
+      call_id: "c3",
+      tool: "edit_file",
+      files: ["c.txt", "b.txt"],
+      undone: [
+        { seq: 3, tool: "edit_file", call_id: "c3" },
+        { seq: 2, tool: "edit_file", call_id: "c2" },
+      ],
+    };
+    const { container } = render(
+      <AgentRunView
+        run={snap({ status: "completed", terminal_reason: { kind: "completed" }, events: [w("c1", "a.txt"), failed, w("c2", "b.txt"), w("c3", "c.txt")] })}
+        deciding={false}
+        cancelling={false}
+        onDecide={noop}
+        onCancel={noop}
+      />
+    );
+    fireEvent.click(screen.getByText("Rewind to an earlier step"));
+    // failed writes are not listed; the newest write has no rewind button
+    const list = container.querySelector(".agent-rewind ol");
+    expect(list?.textContent).toContain("a.txt");
+    expect(list?.textContent).not.toContain("bad.txt");
+    const buttons = screen.getAllByRole("button", { name: "Rewind to here" });
+    expect(buttons).toHaveLength(2);
+    fireEvent.click(buttons[1]); // oldest row last: a.txt
+    await waitFor(() => expect(screen.getByText("Rewound 2 changes · c.txt, b.txt")).toBeTruthy());
+    expect(calls.undo[calls.undo.length - 1]).toEqual(["run-1", { afterCall: "c1" }]);
+    expect(screen.getAllByText("undone")).toHaveLength(2);
+    // c1 is now the newest live write: nothing left to rewind to
+    expect(screen.queryByRole("button", { name: "Rewind to here" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Undo every change" }));
+    await waitFor(() => expect(calls.undo[calls.undo.length - 1]).toEqual(["run-1", { to: 0 }]));
+    calls.undoReply = null;
   });
 });

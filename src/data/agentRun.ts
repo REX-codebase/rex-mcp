@@ -76,13 +76,19 @@ export const agentAnswer = (runId: string, answer: string | null) =>
 /** Answer every question of an ask_user batch at once (null declines one). */
 export const agentAnswerMany = (runId: string, answers: (string | null)[]) =>
   call<AgentSnapshot>("agent_answer", `/runs/${runId}/answer`, { runId, answer: null, answers });
-/** Undo the newest write, or with `to` every write after journal entry `to` (0 = all), all or nothing. */
-export const agentUndo = (runId: string, to?: number) =>
-  call<{ ok: boolean; call_id: string; tool: string; files: string[]; undone?: { seq: number; tool: string }[] }>(
-    "agent_undo",
-    `/runs/${runId}/undo`,
-    to === undefined ? { runId } : { runId, to },
-  );
+export type UndoResult = {
+  ok: boolean;
+  call_id: string | null;
+  tool: string | null;
+  files: string[];
+  undone?: { seq: number; tool: string; call_id: string }[];
+};
+/**
+ * Undo the newest write; or rewind (all or nothing) to just after the write
+ * made by tool call `afterCall`, or to journal entry `to` (0 = every write).
+ */
+export const agentUndo = (runId: string, target?: { afterCall?: string; to?: number }) =>
+  call<UndoResult>("agent_undo", `/runs/${runId}/undo`, { runId, ...(target ?? {}) });
 export const agentPreviewAction = (runId: string, action: PreviewPointerAction) =>
   call<{ ok: boolean }>("agent_preview_action", `/runs/${runId}/action`, { runId, action });
 export const agentCapture = (runId: string) =>

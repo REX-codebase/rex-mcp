@@ -124,7 +124,13 @@ is shared it is noted in the module docs.
   to zero, through a file two writes touched, and the blocked all-or-
   nothing case; service rewind; sidecar response shape. 3 mutations
   (no simulated state, off-by-one on `seq`, no pre-check) each fail.
-- Gap left: the app has no control to pick the step yet (API only).
+- Round 10: the run view lists a finished run's successful writes
+  (newest first, failed ones left out) under "Rewind to an earlier step",
+  with "Rewind to here" on each older write and "Undo every change". It
+  calls `agentUndo(runId, {afterCall})`, which the service resolves to
+  the journal entry of that tool call (`undo_after_call`); rows the
+  backend reports as undone are struck through. Covered by a vitest test
+  (3 mutations each fail it) and a render with the compiled dark theme.
 
 ## Round 4: ask the user (`ask_user`)
 

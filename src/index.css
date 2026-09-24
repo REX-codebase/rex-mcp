@@ -395,8 +395,20 @@ html,body,#root{height:100%}body{margin:0;background:var(--color-canvas);color:v
 .question-batch-item:first-of-type{border-top:0;padding-top:0}
 .question-batch-text{margin:0;font-weight:600}
 .question-choices button[aria-pressed="true"]{border-color:var(--color-accent);color:var(--color-accent);background:color-mix(in srgb,var(--color-accent) 12%,var(--color-surface))}
-.agent-undo{display:flex;align-items:center;gap:12px;margin:12px 0}
-.agent-undo button{border:1px solid var(--color-line);border-radius:10px;padding:6px 12px;font-size:13px;background:var(--color-surface);cursor:pointer}
+.agent-undo{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:12px 0}
+.agent-undo button{border:1px solid var(--color-line);border-radius:10px;padding:6px 12px;font-size:13px;background:var(--color-surface);color:var(--color-text);cursor:pointer}
+.agent-undo button:hover:not(:disabled){border-color:color-mix(in srgb,var(--color-muted) 55%,transparent)}
+.agent-undo button:disabled{opacity:.5;cursor:default}
+.agent-rewind{flex-basis:100%;font-size:12px;color:var(--color-muted)}
+.agent-rewind summary{cursor:pointer;width:max-content}
+.agent-rewind summary:hover{color:var(--color-text)}
+.agent-rewind ol{list-style:none;margin:10px 0 0;padding:0;border-top:1px solid var(--color-line)}
+.agent-rewind li{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:38px;border-bottom:1px solid var(--color-line)}
+.agent-rewind-what{font-family:var(--font-mono);color:var(--color-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-rewind li.is-undone .agent-rewind-what{text-decoration:line-through;color:var(--color-faint)}
+.agent-rewind-state{font-size:11px;color:var(--color-faint)}
+.agent-rewind li button{padding:3px 10px;font-size:12px}
+.agent-rewind-all{margin-top:12px}
 .agent-undo-note{font-size:.9em;opacity:.8}
 @media(max-width:520px){.plan-approval{padding:16px}}
 

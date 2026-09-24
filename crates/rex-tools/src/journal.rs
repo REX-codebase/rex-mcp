@@ -197,6 +197,14 @@ impl Journal {
         Ok(entries[idx].clone())
     }
 
+    /// Journal sequence number of the write made by tool call `call_id`.
+    pub fn seq_of_call(&self, call_id: &str) -> Option<u64> {
+        self.entries()
+            .into_iter()
+            .find(|e| e.call_id == call_id)
+            .map(|e| e.seq)
+    }
+
     /// Undo every write after `seq` (newest first), leaving the workspace
     /// as it was right after write `seq`; `seq` 0 undoes the whole run.
     /// All or nothing: every step is checked against the file state the
@@ -293,6 +301,8 @@ mod tests {
         assert!(!root.join("b.txt").exists());
         assert!(root.join("new.txt").exists());
         assert!(j.undo_to(&root, 1).unwrap_err().contains("nothing to undo"));
+        assert_eq!(j.seq_of_call("c2"), Some(2));
+        assert_eq!(j.seq_of_call("nope"), None);
         assert_eq!(j.undo_to(&root, 0).unwrap().len(), 1);
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "one");
         assert!(!root.join("new.txt").exists());

@@ -1143,6 +1143,20 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         journal.undo_to(&workspace, seq)
     }
 
+    /// Rewind a finished run to just after the write made by tool call
+    /// `call_id` (the id on its `ToolFinished` event), all or nothing.
+    pub fn undo_after_call(
+        &self,
+        run_id: &str,
+        call_id: &str,
+    ) -> Result<Vec<rex_tools::journal::JournalEntry>, String> {
+        let (journal, workspace) = self.finished_run_journal(run_id)?;
+        let seq = journal
+            .seq_of_call(call_id)
+            .ok_or_else(|| format!("no journaled write for call {call_id}"))?;
+        journal.undo_to(&workspace, seq)
+    }
+
     /// The write journal and workspace of a run that is not active.
     fn finished_run_journal(
         &self,
@@ -6232,6 +6246,25 @@ mod tests {
         assert_eq!(undone.len(), 2);
         assert_eq!(fs::read_to_string(ws.join("x.txt")).unwrap(), "one");
         assert!(!ws.join("y.txt").exists());
+        assert!(svc
+            .undo_after_call(&snap.id, "no-such-call")
+            .unwrap_err()
+            .contains("no journaled write"));
+        // rewind to just after the first write, by its call id
+        let first = fs::read_to_string(
+            tmp.path()
+                .join("runs")
+                .join(&snap.id)
+                .join("state")
+                .join("journal")
+                .join("journal.jsonl"),
+        )
+        .unwrap();
+        let first: Value = serde_json::from_str(first.lines().next().unwrap()).unwrap();
+        assert!(svc
+            .undo_after_call(&snap.id, first["call_id"].as_str().unwrap())
+            .unwrap_err()
+            .contains("nothing to undo"));
         assert_eq!(svc.undo_to_write(&snap.id, 0).unwrap().len(), 1);
         assert!(!ws.join("x.txt").exists());
         assert!(svc.undo_to_write("no-such-run", 0).is_err());

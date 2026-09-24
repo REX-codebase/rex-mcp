@@ -16,6 +16,8 @@ import {
   type AgentEvent,
 } from "../data/agentTypes";
 
+const WRITE_TOOLS = ["create_file", "edit_file", "apply_patch"];
+
 const PAGE_W = 1280;
 
 function planMark(status: string): string {
@@ -104,6 +106,8 @@ export function AgentRunView({
   const [answerError, setAnswerError] = useState<string | null>(null);
   const [undoing, setUndoing] = useState(false);
   const [undoNote, setUndoNote] = useState<string | null>(null);
+  // tool calls whose writes this view has undone (newest-first rewinds)
+  const [undoneCalls, setUndoneCalls] = useState<string[]>([]);
   const questionId = run.pending_question?.call_id ?? null;
 
   useEffect(() => {
@@ -145,17 +149,35 @@ export function AgentRunView({
   const batch = run.pending_question?.batch ?? [];
   const showBatchForm = batch.length > 1 && (run.pending_question?.batch_index ?? 1) === 1;
 
-  const undoLast = useCallback(async () => {
-    setUndoing(true);
-    try {
-      const r = await agentUndo(runId);
-      setUndoNote(`Undid ${r.tool.replace(/_/g, " ")} · ${r.files.join(", ")}`);
-    } catch (err) {
-      setUndoNote(`Undo refused · ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setUndoing(false);
-    }
-  }, [runId]);
+  const writes = run.events
+    .filter((e): e is Extract<AgentEvent, { state: "tool_finished" }> => e.state === "tool_finished")
+    .map((e) => e.result)
+    .filter((r) => r.ok && WRITE_TOOLS.includes(r.tool));
+  const liveWrites = writes.filter((w) => !undoneCalls.includes(w.call_id));
+
+  const undo = useCallback(
+    async (target?: { afterCall?: string; to?: number }) => {
+      setUndoing(true);
+      try {
+        const r = await agentUndo(runId, target);
+        const steps = r.undone?.length ?? 1;
+        // mark rows by the call ids the backend reports (edit sub-agent
+        // writes are journaled too but have no row here)
+        const gone = r.undone ? r.undone.map((u) => u.call_id) : r.call_id ? [r.call_id] : [];
+        setUndoneCalls((prev) => [...prev, ...gone]);
+        setUndoNote(
+          steps > 1
+            ? `Rewound ${steps} changes · ${r.files.join(", ")}`
+            : `Undid ${(r.tool ?? "change").replace(/_/g, " ")} · ${r.files.join(", ")}`
+        );
+      } catch (err) {
+        setUndoNote(`Undo refused · ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        setUndoing(false);
+      }
+    },
+    [runId]
+  );
 
   useEffect(() => {
     setShot(run.preview?.desktop_shot ?? null);
@@ -395,12 +417,47 @@ export function AgentRunView({
         </details>
       )}
 
-      {terminal && receipts.some((r) => r.result.ok && ["create_file", "edit_file", "apply_patch"].includes(r.result.tool)) && (
+      {terminal && writes.length > 0 && (
         <div className="agent-undo">
-          <button type="button" disabled={undoing} onClick={() => void undoLast()}>
+          <button type="button" disabled={undoing || liveWrites.length === 0} onClick={() => void undo()}>
             {undoing ? "Undoing…" : "Undo last file change"}
           </button>
           {undoNote && <span className="agent-undo-note">{undoNote}</span>}
+          {writes.length > 1 && (
+            <details className="agent-rewind">
+              <summary>Rewind to an earlier step</summary>
+              <ol reversed>
+                {[...writes].reverse().map((w) => {
+                  const idx = liveWrites.findIndex((l) => l.call_id === w.call_id);
+                  const undone = idx < 0;
+                  const newest = idx === liveWrites.length - 1;
+                  return (
+                    <li key={w.call_id} className={undone ? "is-undone" : undefined}>
+                      <span className="agent-rewind-what">
+                        {w.tool.replace(/_/g, " ")}
+                        {w.receipt.target ? ` · ${w.receipt.target}` : ""}
+                      </span>
+                      {!undone && !newest && (
+                        <button
+                          type="button"
+                          disabled={undoing}
+                          onClick={() => void undo({ afterCall: w.call_id })}
+                        >
+                          Rewind to here
+                        </button>
+                      )}
+                      {undone && <span className="agent-rewind-state">undone</span>}
+                    </li>
+                  );
+                })}
+              </ol>
+              {liveWrites.length > 0 && (
+                <button type="button" className="agent-rewind-all" disabled={undoing} onClick={() => void undo({ to: 0 })}>
+                  Undo every change
+                </button>
+              )}
+            </details>
+          )}
         </div>
       )}
 
