@@ -1123,3 +1123,24 @@ is shared it is noted in the module docs.
   only). Hand mutation: 3/3 killed.
 - Gap left: the global excludes file (`core.excludesFile`) and a
   worktree's real git folder are not read.
+
+## Round 27: past_runs ranks matches and falls back to partial ones
+
+- Competitors: Hermes's session search ranks hits with SQLite FTS5
+  relevance and adds a recency bias (`tools/session_search_tool.py`).
+  opencode has no recall of earlier sessions for the agent.
+- REX before: a query kept only runs containing every word, newest
+  first, and returned nothing when no run had all words (round 18's
+  "no ranking" gap).
+- REX now: runs with every word come back best first: a word found in
+  the task weighs 3, in the summary 2, in the files 1 (best place, once
+  per word), ties go to the newest. If no run has every word, runs with
+  some of them come back marked `partial`, most words first, and the
+  tool note says so. Repeated query words count once. Without a query the
+  order is still newest first.
+- Tests: a ranking test (task over summary over files, a word counted
+  once, full matches hiding partial ones, repeated words, limit, the
+  `partial` field only when set), the listing test's no-full-match case,
+  and the scripted run now checks the partial note. Hand mutation: 12/12
+  killed.
+- Gap left: plain substring matching (no stemming), unlike FTS5.
