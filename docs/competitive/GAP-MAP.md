@@ -71,7 +71,8 @@ is shared it is noted in the module docs.
   (ignored test `sweep_tree_for_false_positives`): 0 of 269 files in this repo,
   2 of 3,824 in opencode and 1 of 11,046 in Hermes flagged; all 3 are JSX
   prose like "1) item", and JSX notes are worded as possible. Gap left:
-  no semantic (type/LSP) diagnostics, and no YAML/TOML check.
+  no semantic (type/LSP) diagnostics. (YAML/TOML checks were added in
+  round 5; see below.)
 - URL fetch. opencode `src/tool/webfetch.ts` (5 MB cap, format text/
   markdown/html, permission `webfetch`); Hermes `tools/web_tools_extract.py`.
   REX before: `web_search` only. REX now: `web_fetch`
@@ -271,16 +272,6 @@ is shared it is noted in the module docs.
   Hermes). Mutations: 6 of 7 fail the test; the survivor (not clearing
   the key stack after a mismatch) cannot change output, because the
   stack is only read through the flow stack, which is cleared.
-- Round 11: lists and keys mixed at one indent are flagged: a `- `
-  item at the column of a key that already has a value (`a: 1` then
-  `- x`), and a key at the column of a list that is not owned by a key
-  there (`- x` then `b: 1`, or `list:` / `  - a` / `  key: 1`). A list
-  right under its key (`a:` then `- x`) with sibling keys after it, lists
-  inside list items, block scalars, comments and document markers are
-  left alone; templated files are skipped. Sweep: 0 new flags across this
-  repo, opencode, Hermes and the cargo registry (26,894 files checked;
-  the same 5 pre-existing non-YAML notes before and after). Mutations:
-  7 of 7 fail the test after one dead check was removed.
 - Gap left: YAML check is still not a full parser (for example, no
   anchors-before-use or complex-key checks); opencode's LSP route covers
   more.
@@ -313,4 +304,29 @@ is shared it is noted in the module docs.
 - Tests: 3 new (2 unit, 1 decode across both call formats). Mutations: 12
   tried, all fail the tests except one removed filter that could never
   change a result, which I deleted.
-- Gap left: repairs are silent (not logged to the run journal).
+- Gap left: repairs are silent (not logged to the run journal). Closed
+  in round 11.
+
+## Round 11
+
+- Tool-call repairs are now shown as run events (e5aa840): each repaired
+  call emits an info event such as "repaired call: tool name
+  'Create_File' read as 'create_file'" or "repaired call: create_file:
+  fixed argument types for overwrite", so the user can see what was
+  changed before it ran. Hermes coerces silently (`tools/arg_coercion.py`);
+  opencode's case fix is silent too (`session/llm.ts:296-311`). Test:
+  `repaired_calls_run_and_show_in_events`.
+- YAML: lists and keys mixed at one indent are flagged: a `- `
+  item at the column of a key that already has a value (`a: 1` then
+  `- x`), and a key at the column of a list that is not owned by a key
+  there (`- x` then `b: 1`, or `list:` / `  - a` / `  key: 1`). A list
+  right under its key (`a:` then `- x`) with sibling keys after it, lists
+  inside list items, block scalars, comments and document markers are
+  left alone; templated files are skipped. Sweep: 0 new flags across this
+  repo, opencode, Hermes and the cargo registry (26,894 files checked;
+  the same 5 pre-existing non-YAML notes before and after). Mutations:
+  7 of 7 fail the test after one dead check was removed.
+- Head-to-head scaffold (9f0b12c, 9e2c6ba): `bench/h2h` holds synthetic
+  tasks with hidden checks plus `run.sh` and `score.sh`, for running
+  REX, opencode and Hermes on the same tasks. It has not been run (halted
+  before any run), so this map still has no outcome numbers.
