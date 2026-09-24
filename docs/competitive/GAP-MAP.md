@@ -1326,3 +1326,27 @@ is shared it is noted in the module docs.
   (`output_store.rs`), which a resumed run reloads for `read_output`; a
   crash mid-write there costs only that one output's text, so both were
   left as they are. Notes already save through a temp file.
+
+## Round 36: the global excludes file is read
+
+- Competitors: opencode's snapshot test sets a global `core.excludesFile`
+  and checks the file it lists stays out of snapshots
+  (`test/snapshot/snapshot.test.ts`); its glob and grep, and Hermes's
+  search, run ripgrep, which reads the same file.
+- REX before: only `.gitignore` files and `.git/info/exclude` were read;
+  files the user ignores globally (editor swap files, OS clutter) showed
+  up in listings, searches and change snapshots.
+- REX now: inside a git repository the global excludes file comes first,
+  with the lowest priority (`.git/info/exclude` and `.gitignore` can
+  re-include). It is found like git: `core.excludesFile` from the
+  repository config, else `$GIT_CONFIG_GLOBAL`, else `~/.gitconfig`
+  over the XDG `git/config`, else the default `git/ignore` under
+  `$XDG_CONFIG_HOME` or `~/.config`. Keys are case-insensitive, quotes
+  and trailing comments are handled, the last setting wins, `~/` is the
+  home folder, and a relative path is taken from the repository root.
+  Outside a repository the global file is not used.
+- Tests: a lookup test covering each source and its order, sections,
+  comments, quotes and paths; a walker test for priority and the
+  repository requirement. Hand mutation: 12/12 killed.
+- Gap left: the config reader does not follow `[include]` /
+  `[includeIf]` or the system config (`/etc/gitconfig`).

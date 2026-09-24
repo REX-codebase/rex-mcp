@@ -151,6 +151,102 @@ impl Glob {
     }
 }
 
+/// Where git looks for the user's config and global excludes.
+#[derive(Debug, Clone, Default)]
+pub struct GitEnv {
+    pub home: Option<PathBuf>,
+    /// `$XDG_CONFIG_HOME`
+    pub xdg_config: Option<PathBuf>,
+    /// `$GIT_CONFIG_GLOBAL`, which replaces both global config files
+    pub config_global: Option<PathBuf>,
+}
+
+impl GitEnv {
+    pub fn from_process() -> Self {
+        let var = |k: &str| {
+            std::env::var_os(k)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        };
+        Self {
+            home: var("HOME"),
+            xdg_config: var("XDG_CONFIG_HOME"),
+            config_global: var("GIT_CONFIG_GLOBAL"),
+        }
+    }
+
+    fn xdg_git(&self) -> Option<PathBuf> {
+        self.xdg_config
+            .clone()
+            .or_else(|| self.home.as_ref().map(|h| h.join(".config")))
+            .map(|d| d.join("git"))
+    }
+}
+
+/// The value of `core.excludesFile` in one git config file, if set there.
+/// A small reader: `[core]` section, `excludesfile = value` in any case,
+/// optional quotes, `#`/`;` comments; the last setting wins.
+fn config_excludes(text: &str) -> Option<String> {
+    let mut in_core = false;
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            let name = line.trim_start_matches('[').split([']', ' ', '"']).next();
+            in_core = name.is_some_and(|n| n.eq_ignore_ascii_case("core"));
+            continue;
+        }
+        if !in_core || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("excludesfile") {
+            let value = value.trim();
+            let value = if let Some(q) = value.strip_prefix('"') {
+                q.split('"').next().unwrap_or("")
+            } else {
+                value.split([' ', '\t', '#', ';']).next().unwrap_or("")
+            };
+            found = Some(value.to_string());
+        }
+    }
+    found.filter(|v| !v.is_empty())
+}
+
+/// The global excludes file git would use for the repository at `root`:
+/// `core.excludesFile` from the repository config, else the global config
+/// (`$GIT_CONFIG_GLOBAL`, or `~/.gitconfig` over the XDG `git/config`),
+/// else the XDG default `git/ignore`. A leading `~/` is the home folder;
+/// a relative path is taken from the repository root.
+pub fn global_excludes_file(root: &Path, env: &GitEnv) -> Option<PathBuf> {
+    let read = |p: PathBuf| fs::read_to_string(p).ok();
+    let mut configs = vec![read(root.join(".git").join("config"))];
+    match &env.config_global {
+        Some(p) => configs.push(read(p.clone())),
+        None => {
+            configs.push(env.home.as_ref().and_then(|h| read(h.join(".gitconfig"))));
+            configs.push(env.xdg_git().and_then(|d| read(d.join("config"))));
+        }
+    }
+    let set = configs
+        .into_iter()
+        .flatten()
+        .find_map(|t| config_excludes(&t));
+    match set {
+        Some(v) => {
+            if let Some(rest) = v.strip_prefix("~/") {
+                env.home.as_ref().map(|h| h.join(rest))
+            } else {
+                let p = PathBuf::from(&v);
+                Some(if p.is_absolute() { p } else { root.join(p) })
+            }
+        }
+        None => env.xdg_git().map(|d| d.join("ignore")),
+    }
+}
+
 /// One `.gitignore` rule. As in git, the last rule that matches a path
 /// decides: a `!` rule re-includes what an earlier rule ignored. A file
 /// inside an ignored folder stays ignored because the walk never enters
@@ -183,11 +279,29 @@ impl Ignore {
     /// win, so `.gitignore` files override `info/exclude`, as in git.
     /// A `.git` that is a file (a worktree or submodule link) is not
     /// followed.
+    ///
+    /// Inside a git repository the user's global excludes file
+    /// (`core.excludesFile`, by default `~/.config/git/ignore`) comes
+    /// first, with the lowest priority, as in git and ripgrep. opencode's
+    /// snapshot test checks that a global `excludesFile` is honoured
+    /// (`test/snapshot/snapshot.test.ts`).
     pub fn load(root: &Path) -> Self {
+        Self::load_with(root, &GitEnv::from_process())
+    }
+
+    /// `load` with the home and config locations given, for tests.
+    pub fn load_with(root: &Path, env: &GitEnv) -> Self {
+        let mut rules = Vec::new();
+        if root.join(".git").exists() {
+            if let Some(path) = global_excludes_file(root, env) {
+                let text = fs::read_to_string(path).unwrap_or_default();
+                rules.extend(Self::parse(&text).rules);
+            }
+        }
         let exclude =
             fs::read_to_string(root.join(".git").join("info").join("exclude")).unwrap_or_default();
         let text = fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
-        let mut rules = Self::parse(&exclude).rules;
+        rules.extend(Self::parse(&exclude).rules);
         rules.extend(Self::parse(&text).rules);
         Self { rules }
     }
@@ -510,6 +624,98 @@ mod tests {
         let ig = Ignore::parse("!x.txt\n");
         assert!(!ig.is_ignored("x.txt", false));
         assert!(!ig.is_ignored("y.txt", false));
+    }
+
+    #[test]
+    fn global_excludes_file_is_found_like_git() {
+        let t = tree(&[("repo/.git/HEAD", "x")]);
+        let root = t.path().join("repo");
+        let home = t.path().join("home");
+        let env = |xdg: Option<&str>, global: Option<&str>| GitEnv {
+            home: Some(home.clone()),
+            xdg_config: xdg.map(|x| t.path().join(x)),
+            config_global: global.map(|g| t.path().join(g)),
+        };
+        let write = |p: &str, body: &str| {
+            let f = t.path().join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, body).unwrap();
+        };
+        // nothing set: the XDG default, from HOME or XDG_CONFIG_HOME
+        assert_eq!(
+            global_excludes_file(&root, &env(None, None)),
+            Some(home.join(".config/git/ignore"))
+        );
+        assert_eq!(
+            global_excludes_file(&root, &env(Some("xdg"), None)),
+            Some(t.path().join("xdg/git/ignore"))
+        );
+        assert_eq!(global_excludes_file(&root, &GitEnv::default()), None);
+        // the XDG config file sets it
+        write(
+            "home/.config/git/config",
+            "[core]\n\texcludesFile = /x/xdg.ignore\n",
+        );
+        assert_eq!(
+            global_excludes_file(&root, &env(None, None)),
+            Some(PathBuf::from("/x/xdg.ignore"))
+        );
+        // ~/.gitconfig wins over it; ~/ is the home folder; other sections
+        // and comments do not count; the last setting wins
+        write(
+            "home/.gitconfig",
+            "[core]\n; excludesfile = /nope\n\tEXCLUDESFILE = /first\n\texcludesfile = ~/g.ignore # mine\n[user]\n\texcludesfile = /wrong\n",
+        );
+        assert_eq!(
+            global_excludes_file(&root, &env(None, None)),
+            Some(home.join("g.ignore"))
+        );
+        // GIT_CONFIG_GLOBAL replaces both global files
+        write(
+            "alt.gitconfig",
+            "[core]\n\texcludesfile = \"/a b/alt.ignore\"\n",
+        );
+        assert_eq!(
+            global_excludes_file(&root, &env(None, Some("alt.gitconfig"))),
+            Some(PathBuf::from("/a b/alt.ignore"))
+        );
+        // the repository config wins over all; relative is from the root
+        write(
+            "repo/.git/config",
+            "[core]\n\tbare = false\n\texcludesfile = local.ignore\n",
+        );
+        assert_eq!(
+            global_excludes_file(&root, &env(None, Some("alt.gitconfig"))),
+            Some(root.join("local.ignore"))
+        );
+    }
+
+    #[test]
+    fn global_excludes_have_the_lowest_priority_and_need_a_repo() {
+        let t = tree(&[
+            ("home/.config/git/ignore", "global.tmp\n*.log\nnotes.md\n"),
+            ("repo/.git/info/exclude", "!keep.log\n"),
+            ("repo/.gitignore", "!notes.md\n"),
+            ("repo/global.tmp", "x"),
+            ("repo/a.log", "x"),
+            ("repo/keep.log", "x"),
+            ("repo/notes.md", "x"),
+            ("plain/global.tmp", "x"),
+        ]);
+        let env = GitEnv {
+            home: Some(t.path().join("home")),
+            ..GitEnv::default()
+        };
+        let list = |root: &Path| {
+            let (files, _) = walk_files(root, root, &Ignore::load_with(root, &env), 1000);
+            files.iter().map(|f| rel_path(root, f)).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            list(&t.path().join("repo")),
+            [".gitignore", "keep.log", "notes.md"]
+        );
+        // not a git repository: the global file does not apply
+        assert_eq!(list(&t.path().join("plain")), ["global.tmp"]);
     }
 
     #[test]
