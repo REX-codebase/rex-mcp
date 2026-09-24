@@ -5440,6 +5440,34 @@ mod tests {
         assert!(search_seeds("how do closures work", &[]).is_empty());
     }
 
+    /// Live smoke test (network): the keyless REX engine, seeded the way
+    /// the agent seeds it, finds real pages on a public docs site.
+    /// `cargo test -p rex-providers live_seeded_search -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_seeded_search_on_public_docs() {
+        let seeds = search_seeds(
+            "rust closures capture environment doc.rust-lang.org",
+            &["https://doc.rust-lang.org/book/ch13-01-closures.html".into()],
+        );
+        assert!(!seeds.is_empty(), "no seeds");
+        let request: SearchRequest = serde_json::from_value(json!({
+            "query": "closures capture environment", "seeds": seeds, "max_results": 5
+        }))
+        .unwrap();
+        let resp = rex_search::SearchEngine::default().search(request);
+        for e in resp.evidence.iter().take(5) {
+            eprintln!("{} | {:?}", e.url, e.title);
+        }
+        eprintln!("coverage: {:?}", resp.coverage.disclaimer);
+        assert!(
+            resp.evidence
+                .iter()
+                .any(|e| e.url.contains("doc.rust-lang.org")),
+            "no evidence from the seeded site"
+        );
+    }
+
     #[test]
     fn ask_user_args_are_normalised_and_capped() {
         assert!(parse_ask_user(&json!({})).is_err());
