@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ToolApproval, ToolReceiptCard } from "./ToolApproval";
+import { ToolApproval } from "./ToolApproval";
+import { ActivityTimeline } from "./ActivityTimeline";
 import {
   agentAnswer,
   agentAnswerMany,
@@ -33,47 +34,6 @@ function planMark(status: string): string {
   }
 }
 
-function EventLine({ event }: { event: AgentEvent }) {
-  switch (event.state) {
-    case "plan_updated":
-      return <li className="agent-event agent-event-plan">Plan updated · {event.items.length} item{event.items.length === 1 ? "" : "s"}</li>;
-    case "model_text":
-      return <li className="agent-event agent-event-text">{event.text.length > 180 ? `${event.text.slice(0, 180)}…` : event.text}</li>;
-    case "tool_finished":
-      return (
-        <li className={`agent-event ${event.result.ok ? "agent-event-ok" : "agent-event-err"}`}>
-          <span>{event.result.ok ? "✓" : "×"}</span>
-          <span>
-            {event.result.tool.replace(/_/g, " ")}
-            {event.result.receipt.target ? ` · ${event.result.receipt.target}` : ""}
-            {event.result.error ? ` · ${event.result.error.detail}` : ""}
-          </span>
-        </li>
-      );
-    case "approval_required":
-      return <li className="agent-event agent-event-wait">Approval requested · {event.call.tool.replace(/_/g, " ")}</li>;
-    case "approval_resolved":
-      return <li className="agent-event agent-event-wait">{event.approved ? "Approved once" : "Denied"}</li>;
-    case "plan_approval_required":
-      return <li className="agent-event agent-event-wait">Plan proposed · {event.items.length} step{event.items.length === 1 ? "" : "s"} awaiting your approval</li>;
-    case "plan_approval_resolved":
-      return <li className="agent-event agent-event-wait">{event.approved ? "Plan approved · executing" : "Plan rejected · run stopped before any tool ran"}</li>;
-    case "question_asked":
-      return <li className="agent-event agent-event-wait">Question for you · {event.question.question.length > 140 ? `${event.question.question.slice(0, 140)}…` : event.question.question}</li>;
-    case "question_resolved":
-      return <li className="agent-event agent-event-wait">{event.answered ? "You answered · continuing" : "No answer · REX decides and states its assumption"}</li>;
-    case "gate_result":
-      return (
-        <li className={`agent-event ${event.passed ? "agent-event-ok" : "agent-event-err"}`}>
-          {event.passed ? "Completion gates passed" : `Gate attempt ${event.attempt} failed: ${event.failures.join("; ")}`}
-        </li>
-      );
-    case "retry":
-      return <li className="agent-event agent-event-wait">Provider retry {event.attempt} · {event.reason.length > 120 ? `${event.reason.slice(0, 120)}…` : event.reason}</li>;
-    case "info":
-      return <li className="agent-event agent-event-info">{event.message}</li>;
-  }
-}
 
 export function AgentRunView({
   run,
@@ -222,8 +182,6 @@ export function AgentRunView({
   );
 
   const latestText = [...run.events].reverse().find((e) => e.state === "model_text");
-  const receipts = run.events.filter((e): e is Extract<AgentEvent, { state: "tool_finished" }> => e.state === "tool_finished");
-  const lastReceipt = receipts[receipts.length - 1]?.result ?? null;
   const terminal = run.terminal_reason;
   const working = phase === "working" || phase === "verifying";
 
@@ -398,24 +356,7 @@ export function AgentRunView({
         </section>
       )}
 
-      <ul className="agent-events" aria-label="Run events">
-        {run.events.slice(-8).map((event, i) => (
-          <EventLine key={i} event={event} />
-        ))}
-      </ul>
-
-      {lastReceipt && !working && (
-        <details className="live-receipt">
-          <summary>
-            <span className={`live-receipt-mark ${lastReceipt.ok ? "ok" : "err"}`}>{lastReceipt.ok ? "✓" : "×"}</span>
-            <span className="live-receipt-title">{lastReceipt.tool.replace(/_/g, " ")}</span>
-            <span className="live-receipt-meta">
-              {lastReceipt.ok ? `${lastReceipt.receipt.bytes_written.toLocaleString()} B written · ${lastReceipt.receipt.duration_ms} ms` : "stopped"}
-            </span>
-          </summary>
-          <ToolReceiptCard result={lastReceipt} />
-        </details>
-      )}
+      <ActivityTimeline events={run.events} skipText={phase !== "completed" ? latestText : undefined} />
 
       {terminal && writes.length > 0 && (
         <div className="agent-undo">

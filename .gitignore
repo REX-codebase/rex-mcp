@@ -8,3 +8,4 @@ target/
 bench-out/
 packages/rex-mcp-npm/vendor/
 packages/rex-mcp-npm/*.tgz
+dist-gallery/
