@@ -502,6 +502,22 @@ fn route(
                 &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
             ),
         },
+        ("POST", ["api", "agent", "runs", id, "undo"]) => match agent.undo_last_write(id) {
+            Ok(entry) => json_response(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "call_id": entry.call_id,
+                    "tool": entry.tool,
+                    "files": entry.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+                })
+                .to_string(),
+            ),
+            Err(detail) => json_response(
+                200,
+                &format!("{{\"error\":{}}}", serde_json::to_string(&detail).unwrap()),
+            ),
+        },
         ("POST", ["api", "agent", "runs", id, "action"]) => {
             let parsed: Result<rex_preview::BrowserAction, _> = serde_json::from_str(body);
             match parsed {

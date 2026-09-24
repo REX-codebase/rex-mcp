@@ -812,8 +812,6 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         Ok(self.snapshot_of(run_id, handle))
     }
 
-    /// Rehydrate a run from its on-disk checkpoint after a process restart
-    /// and continue the loop where it stopped.
     /// Undo the newest file write a run made, from its on-disk journal.
     /// Refused while the run is active, and refused (changing nothing) when
     /// a touched file changed after the agent wrote it.
@@ -874,6 +872,8 @@ impl<S: SecretStore + 'static, T: Transport + 'static> AutonomousRunService<S, T
         Ok(workspace)
     }
 
+    /// Rehydrate a run from its on-disk checkpoint after a process restart
+    /// and continue the loop where it stopped.
     pub fn resume(&self, run_id: &str) -> Result<AgentSnapshot, String> {
         {
             let runs = self.runs.lock().map_err(|_| "run registry poisoned")?;

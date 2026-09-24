@@ -71,6 +71,8 @@ export const agentCancel = (runId: string) =>
   call<AgentSnapshot>("agent_cancel", `/runs/${runId}/cancel`, { runId });
 export const agentResume = (runId: string) =>
   call<AgentSnapshot>("agent_resume", `/runs/${runId}/resume`, { runId });
+export const agentUndo = (runId: string) =>
+  call<{ ok: boolean; call_id: string; tool: string; files: string[] }>("agent_undo", `/runs/${runId}/undo`, { runId });
 export const agentPreviewAction = (runId: string, action: PreviewPointerAction) =>
   call<{ ok: boolean }>("agent_preview_action", `/runs/${runId}/action`, { runId, action });
 export const agentCapture = (runId: string) =>

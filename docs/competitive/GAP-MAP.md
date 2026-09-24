@@ -88,12 +88,16 @@ is shared it is noted in the module docs.
 - Checkpoint/undo. Hermes snapshots into a shadow git store before
   mutating calls (`tools/checkpoint_manager.py:1-9`); opencode keeps git
   snapshots with `restore`/`revert` (`src/snapshot/index.ts:36-42`). REX
-  before: none. REX now (`crates/rex-tools/src/journal.rs`): every
+  before: `rex serve` had manual checkpoint/rewind of a live run's staged
+  workspace (whole-directory copies, `crates/rex-cli/src/serve.rs:328-390`);
+  the desktop autonomous agent had nothing. REX now (`crates/rex-tools/src/journal.rs`): every
   successful create/edit/patch is journaled on disk with the prior bytes (or
   "absent") and a fingerprint of what the agent wrote. `undo_last_write`
   works on the runtime and on the service for finished or crashed runs. It
   goes newest-first, restores deleted files, removes created ones, and
   refuses (changing nothing) when a file changed after the agent wrote it,
-  so user edits are never clobbered. No git needed. Gap left: undo is a
-  service API; the daemon route and UI button are not wired yet, and there's
-  no undo to an arbitrary step in one call.
+  so user edits are never clobbered. No git needed. Exposed as Tauri command
+  `agent_undo`, sidecar route `POST /api/agent/runs/:id/undo` and
+  `agentUndo()` in `src/data/agentRun.ts`. Gap left: no UI button yet
+  (Tauri shell not compiled on the build box), and no undo to an arbitrary
+  step in one call.
