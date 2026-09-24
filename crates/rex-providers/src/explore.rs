@@ -725,6 +725,13 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                     "past_runs is not available to sub-agents".into(),
                     false,
                 ),
+                AgentCall::LoadSkill { id, .. } => (
+                    "load_skill".into(),
+                    id,
+                    json!({}),
+                    "load_skill is not available to sub-agents".into(),
+                    false,
+                ),
                 AgentCall::ReadOutput { id, .. } => (
                     "read_output".into(),
                     id,

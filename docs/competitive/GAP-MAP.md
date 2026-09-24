@@ -754,3 +754,52 @@ is shared it is noted in the module docs.
   results never carry a target.
 - Gap left: a command the main agent runs (not a sub-agent) that writes
   files is still not listed.
+
+## Round 17: agent skills (`load_skill`)
+
+- Competitors: opencode finds `SKILL.md` folders (front matter `name`,
+  `description`) under `.claude/skills` and `.agents/skills` in the
+  project and home directory plus its own config dirs, lists them to the
+  model, and loads one on demand with its `skill` tool
+  (`packages/opencode/src/skill/index.ts`, `src/tool/skill.ts`; the reply
+  adds the skill's folder and a sample of up to 10 of its files). Hermes
+  keeps skills in `~/.hermes/skills` and exposes `skills_list` and
+  `skill_view` (`tools/skills_tool.py`).
+- REX before: no skills. Only one `AGENTS.md`-style file reached the model.
+- REX now (`crates/rex-prompt/src/skills.rs`, REX's own code):
+  - Lookup, nearest first, first name wins: `.rex/skills`,
+    `.agents/skills`, `.claude/skills` in the workspace and its parents up
+    to the git root (the same rule as `AGENTS.md`), then
+    `~/.config/rex/skills`, `~/.agents/skills`, `~/.claude/skills`. One
+    level only (`<dir>/<folder>/SKILL.md`), at most 64 folders per
+    directory and 40 skills.
+  - A skill needs front matter with a valid name (lowercase letters,
+    digits, `-`, `_`, `.`; up to 64 characters) and a description.
+    Symlinked files, non-UTF-8 files and files without front matter are
+    skipped. Descriptions are cut at 300 characters.
+  - The per-turn state lists name, description and source with a
+    precedence note: skills are guidance, rank below the constitution,
+    approvals, tool limits and the task, and never grant permissions.
+    The list is not in the system prompt.
+  - `load_skill {name}` returns the body (up to 16,000 characters,
+    marked when cut), the source and up to 10 other files in the skill
+    folder (two levels, hidden files skipped). An unknown name gets an
+    error listing the skills that exist. It is read-only and needs no
+    approval; role allowlists apply, sub-agents get a clear refusal, and
+    each load is written to the run ledger.
+  - Adding the tool changes the prompt identity, so older checkpoints
+    fail closed on resume (as in rounds 15 and 16).
+- Tests: 5 skills tests (front matter incl. BOM, CRLF and a `----` line,
+  quotes, names; lookup order across workspace, repo root, config and
+  home; duplicates, skips and description cap; the 40-skill cap; load
+  with body, files, truncation, unknown name and a skill removed after
+  lookup; symlinked `SKILL.md` skipped) and a scripted run (the first
+  request lists the skill without its body, `load_skill` returns the body
+  and `ship.sh`, an unknown name lists `deploy`, a missing name is a bad
+  call, plus event and ledger entry). Hand mutation: 28/28 killed after
+  one test was strengthened (a front-matter closer check survived the
+  first pass).
+- Gap left: no nested skill folders (opencode globs `skills/**`), no
+  remote skill sources, and `read_file` cannot open files of a
+  user-level skill (they are outside the workspace).
+

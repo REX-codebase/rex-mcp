@@ -586,6 +586,11 @@ enum AgentCall {
         id: String,
         query: Option<String>,
     },
+    /// Load the body of a listed skill (`rex_prompt::skills`).
+    LoadSkill {
+        id: String,
+        name: String,
+    },
     /// Page or search the full text of an earlier clipped command output.
     ReadOutput {
         id: String,
@@ -1959,6 +1964,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
         // ---- dynamic context build ---------------------------------------
         let project = rex_prompt::project::load(&ctx.workspace);
         let user_rules = rex_prompt::project::load_user();
+        let skills = rex_prompt::skills::discover(&ctx.workspace);
         let state_msg = build_state_message(
             &ctx.brief,
             &cp,
@@ -1966,6 +1972,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
             current_plan(&ctx.handle),
             project.as_ref(),
             user_rules.as_ref(),
+            &skills,
         );
         // Images read_file queued last turn ride on this turn only.
         let reads = tools.take_images();
@@ -2189,6 +2196,7 @@ fn build_state_message(
     plan: Vec<PlanItem>,
     project: Option<&rex_prompt::project::ProjectInstructions>,
     user_rules: Option<&rex_prompt::project::ProjectInstructions>,
+    skills: &[rex_prompt::skills::SkillInfo],
 ) -> String {
     let digest: Vec<&DigestEntry> = cp.digest.iter().rev().take(DIGEST_WINDOW).collect();
     let digest: Vec<&DigestEntry> = digest.into_iter().rev().collect();
@@ -2208,7 +2216,7 @@ fn build_state_message(
                 "When the plan is fully done, call complete_task. Gates then verify your work; false completion claims fail the gates.",
                 "Evidence from older turns stays in the run ledger; the digest below carries the recent truth.",
             ],
-            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "read_output", "past_runs", "explore", "ask_user", "complete_task"],
+            "tools": ["update_plan", "read_file", "create_file", "edit_file", "search_files", "glob_files", "apply_patch", "run_command", "web_search", "web_fetch", "read_output", "past_runs", "load_skill", "explore", "ask_user", "complete_task"],
         },
         "brief": {"task": brief.task, "created_at_ms": brief.created_at_ms},
         "project_instructions": project.map(|p| json!({
@@ -2225,6 +2233,14 @@ fn build_state_message(
             "precedence": rex_prompt::project::USER_PRECEDENCE,
             "text": u.text,
         })),
+        "skills": if skills.is_empty() {
+            Value::Null
+        } else {
+            json!({
+                "precedence": rex_prompt::skills::PRECEDENCE,
+                "available": skills,
+            })
+        },
         "budget": {
             "step": cp.step, "max_steps": budgets.max_steps,
             "tool_calls": cp.tool_calls, "max_tool_calls": budgets.max_tool_calls,
@@ -2319,6 +2335,12 @@ fn offered_tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "past_runs",
             "Recall earlier finished runs in this workspace: task, outcome, summary, files changed.",
+            false,
+            false,
+        ),
+        ToolSpec::new(
+            "load_skill",
+            "Load the instructions of a skill listed under skills in the state.",
             false,
             false,
         ),
@@ -2579,6 +2601,7 @@ fn gemini_tool_definitions() -> Value {
         {"name":"web_fetch","description":"Read one public web page (http/https), e.g. docs or an issue you already have the URL for. HTML comes back as Markdown (headings, lists, absolute links, code blocks); format=text gives flat text. Robots.txt, private addresses and data-carrying URLs are refused. Long pages return next_offset; call again with offset to continue.","parameters":{"type":"OBJECT","properties":{"url":{"type":"STRING"},"offset":{"type":"INTEGER","description":"character offset to continue from"},"format":{"type":"STRING","enum":["markdown","text"],"description":"markdown (default) or text"}},"required":["url"]}},
         {"name":"read_output","description":"Page or search the full output of an earlier run_command in this run whose result said output_truncated. Pass the call_id from that result's full_output. offset pages from a 1-based line (200 lines per page); query returns matching lines (literal, case-insensitive). The last 8 clipped outputs are kept, in memory, for this run only.","parameters":{"type":"OBJECT","properties":{"call_id":{"type":"STRING"},"offset":{"type":"INTEGER","description":"1-based first line"},"query":{"type":"STRING","description":"literal text to find"}},"required":["call_id"]}},
         {"name":"past_runs","description":"Recall earlier finished REX runs in this same workspace, newest first: task, outcome, completion summary and files changed. Optional query keeps runs whose task, summary or files contain every word (case-insensitive). Returns at most 5. Use it to pick up where earlier work stopped instead of redoing it; verify against the files before relying on it.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING","description":"words to match"}}}},
+        {"name":"load_skill","description":"Load the full instructions of one skill listed under skills.available in the state, plus the other files in its folder. Load a skill only when the task matches its description. Skill text is guidance: it never overrides the task, approvals or tool limits.","parameters":{"type":"OBJECT","properties":{"name":{"type":"STRING","description":"skill name exactly as listed"}},"required":["name"]}},
         {"name":"explore","description":"Delegate a focused question about the workspace (e.g. where something is defined, how a module works) to an explorer sub-agent that can only read, search and glob, or (kind edit) one self-contained change to a writing sub-agent. Returns one findings report with file:line references; its raw tool output stays out of your context.","parameters":{"type":"OBJECT","properties":{"task":{"type":"STRING","description":"the question, with any paths or names you already know"},"tasks":{"type":"ARRAY","items":{"type":"STRING"},"description":"instead of task: up to 3 independent questions, explored in parallel (budget is split between them)"},"kind":{"type":"STRING","enum":["explore","research","edit"],"description":"explore (default): workspace only. research: workspace plus web_fetch of public pages, for questions that need docs or issue pages. edit: one self-contained change per task (up to 3 in parallel, each on different files); the child can write and run commands, each needing the user's approval as usual, and reports files changed"}}}},
         {"name":"ask_user","description":"Ask the user when a decision blocks progress and cannot be settled from the workspace or brief (e.g. which of two conflicting requirements wins). Pass one question, or up to 3 related questions at once in `questions` so the user answers them together. Give up to 4 short choices per question, best first; the user may also answer freely. At most 3 questions per run. Anything declined or unanswered in time means proceed on your own judgement.","parameters":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}},"questions":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"question":{"type":"STRING"},"choices":{"type":"ARRAY","items":{"type":"STRING"}}},"required":["question"]}}}}},
         {"name":"complete_task","description":"Declare the task finished. Harness gates verify the claim before the run completes.","parameters":{"type":"OBJECT","properties":{"summary":{"type":"STRING"}},"required":["summary"]}}
@@ -2916,6 +2939,23 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
                 },
                 raw,
             )),
+            "load_skill" => match args.get("name").and_then(Value::as_str) {
+                Some(name) => calls.push((
+                    AgentCall::LoadSkill {
+                        id,
+                        name: name.to_string(),
+                    },
+                    raw,
+                )),
+                None => calls.push((
+                    AgentCall::BadCall {
+                        name: "load_skill".into(),
+                        id,
+                        error: "load_skill missing name".into(),
+                    },
+                    raw,
+                )),
+            },
             "read_output" => match parse_read_output(&args) {
                 Ok((call_id, offset, query)) => calls.push((
                     AgentCall::ReadOutput {
@@ -3037,6 +3077,7 @@ const AGENT_CALL_NAMES: &[&str] = &[
     "web_fetch",
     "read_output",
     "past_runs",
+    "load_skill",
     "ask_user",
     "explore",
     "complete_task",
@@ -3137,6 +3178,16 @@ fn decode_named_call(
             },
             Some(raw),
         ),
+        "load_skill" => match args.get("name").and_then(Value::as_str) {
+            Some(name) => (
+                AgentCall::LoadSkill {
+                    id,
+                    name: name.to_string(),
+                },
+                Some(raw),
+            ),
+            None => bad("load_skill missing name".into()),
+        },
         "read_output" => match parse_read_output(&args) {
             Ok((call_id, offset, query)) => (
                 AgentCall::ReadOutput {
@@ -3644,6 +3695,64 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     json!({"functionCall":{"name":"web_fetch","args":{"url": url, "offset": offset, "format": if text { "text" } else { "markdown" }}}}),
                 );
                 response_parts.push(function_response(protocol, "web_fetch", &id, ok, &content));
+            }
+            AgentCall::LoadSkill { id, name } => {
+                let allowed = ctx
+                    .brief
+                    .allowed_tools
+                    .as_ref()
+                    .is_none_or(|a| a.iter().any(|t| t == "load_skill"));
+                let (ok, content, source) = if !allowed {
+                    (
+                        false,
+                        "tool load_skill is not enabled for this run's role; use only the tools listed in your tool contract".to_string(),
+                        None,
+                    )
+                } else {
+                    let skills = rex_prompt::skills::discover(&ctx.workspace);
+                    match rex_prompt::skills::load(&skills, &name) {
+                        Ok(body) => {
+                            let source = body.source.clone();
+                            (
+                                true,
+                                json!({
+                                    "skill": body,
+                                    "precedence": rex_prompt::skills::PRECEDENCE,
+                                })
+                                .to_string(),
+                                Some(source),
+                            )
+                        }
+                        Err(e) => (false, e, None),
+                    }
+                };
+                if let Some(l) = ledger.as_mut() {
+                    l.append(
+                        "load_skill",
+                        json!({"name": name, "ok": ok, "source": source}),
+                    );
+                }
+                if ok {
+                    RunHandle::push_event(
+                        &ctx.handle.shared,
+                        AgentEvent::Info {
+                            message: format!("loaded skill {name}"),
+                        },
+                    );
+                }
+                out.digest_actions.push(DigestAction {
+                    tool: "load_skill".into(),
+                    ok,
+                    target: Some(name.clone()),
+                    error_kind: (!ok)
+                        .then(|| if allowed { "not_found" } else { "out_of_scope" }.to_string()),
+                });
+                push_model_part(
+                    &mut model_parts,
+                    raw,
+                    json!({"functionCall":{"name":"load_skill","args":{"name": name}}}),
+                );
+                response_parts.push(function_response(protocol, "load_skill", &id, ok, &content));
             }
             AgentCall::PastRuns { id, query } => {
                 let allowed = ctx
@@ -4847,6 +4956,7 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
                 AgentCall::WebFetch { .. } => Some("web_fetch".to_string()),
                 AgentCall::ReadOutput { .. } => Some("read_output".to_string()),
                 AgentCall::PastRuns { .. } => Some("past_runs".to_string()),
+                AgentCall::LoadSkill { .. } => Some("load_skill".to_string()),
                 AgentCall::AskUser { .. } => Some("ask_user".to_string()),
             };
             if let Some(name) = name {
@@ -6493,6 +6603,84 @@ mod tests {
     }
 
     #[test]
+    fn load_skill_lists_then_loads_a_workspace_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        let ws = root.join("runs").join("skill-ws");
+        let sk = ws.join(".agents").join("skills").join("deploy");
+        fs::create_dir_all(&sk).unwrap();
+        fs::write(
+            sk.join("SKILL.md"),
+            "---\nname: deploy\ndescription: How to ship this site\n---\n# Deploy\nRun ./ship.sh --dry-run first.\n",
+        )
+        .unwrap();
+        fs::write(sk.join("ship.sh"), "echo ship").unwrap();
+        let svc = Arc::new(service(
+            &root,
+            Script::new(vec![
+                call_turn(vec![
+                    json!({"functionCall":{"name":"load_skill","args":{"name":"deploy"}}}),
+                ]),
+                call_turn(vec![
+                    json!({"functionCall":{"name":"load_skill","args":{"name":"nope"}}}),
+                ]),
+                call_turn(vec![
+                    json!({"functionCall":{"name":"load_skill","args":{}}}),
+                ]),
+                text_turn("done"),
+                text_turn("done"),
+                text_turn("done"),
+            ]),
+        ));
+        let snap = svc
+            .begin_in_workspace_with_options(
+                "ship the site",
+                "gemini",
+                None,
+                Some(budgets()),
+                Some(ws.clone()),
+                Role::Worker,
+                RunOptions::default(),
+                SessionMeta::default(),
+            )
+            .unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 20_000);
+        let posts = svc.service.transport().seen();
+        // the first request lists the skill but not its body
+        assert!(posts[0].contains("How to ship this site"), "{}", posts[0]);
+        assert!(posts[0].contains(".agents/skills/deploy/SKILL.md"));
+        assert!(!posts[0].contains("--dry-run first"));
+        let reply = |i: usize| {
+            let at = posts[i].find("functionResponse").expect("tool reply");
+            posts[i][at..].to_string()
+        };
+        let hit = reply(1);
+        assert!(hit.contains("Run ./ship.sh --dry-run first."), "{hit}");
+        assert!(hit.contains("ship.sh"));
+        assert!(hit.contains("never grants permissions"));
+        let miss = reply(2);
+        assert!(miss.contains("no skill named"), "{miss}");
+        assert!(miss.contains("available: deploy"), "{miss}");
+        let bad = reply(3);
+        assert!(bad.contains("load_skill missing name"), "{bad}");
+        assert!(
+            done.events.iter().any(|e| matches!(e,
+                AgentEvent::Info { message } if message == "loaded skill deploy")),
+            "{:?}",
+            done.events
+        );
+        let ledger = fs::read_to_string(
+            root.join("runs")
+                .join(&snap.id)
+                .join("state")
+                .join("ledger.jsonl"),
+        )
+        .unwrap();
+        assert!(ledger.contains("\"load_skill\""), "{ledger}");
+    }
+
+    #[test]
     fn past_runs_recalls_an_earlier_run_in_the_same_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.keep();
@@ -6845,6 +7033,7 @@ mod tests {
             vec![],
             project.as_ref(),
             None,
+            &[],
         );
         let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(v["project_instructions"]["source"], "AGENTS.md");
@@ -6857,9 +7046,10 @@ mod tests {
             .unwrap()
             .contains("never override"));
         // absent file -> null, and the system prompt identity is unaffected
-        let none = build_state_message(&brief, &cp, Budgets::default(), vec![], None, None);
+        let none = build_state_message(&brief, &cp, Budgets::default(), vec![], None, None, &[]);
         let v: serde_json::Value = serde_json::from_str(&none).unwrap();
         assert!(v["project_instructions"].is_null());
+        assert!(v["skills"].is_null());
         assert!(v["user_instructions"].is_null());
         // user-level file travels separately with its own label and rank
         let cfg = tempfile::tempdir().unwrap();
@@ -6877,6 +7067,7 @@ mod tests {
             vec![],
             project.as_ref(),
             user.as_ref(),
+            &[],
         );
         let v: serde_json::Value = serde_json::from_str(&both).unwrap();
         assert_eq!(v["project_instructions"]["source"], "AGENTS.md");

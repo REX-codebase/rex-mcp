@@ -74,7 +74,7 @@ fn read_one(path: &Path, source: String) -> Option<ProjectInstructions> {
 /// Directories to search, nearest first: the workspace, then its parents
 /// up to and including the git root. Only the workspace when there is no
 /// usable git root.
-fn search_dirs(workspace: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn search_dirs(workspace: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = vec![workspace.to_path_buf()];
     let mut dir = workspace;
     for _ in 0..=MAX_PARENT_LEVELS {
@@ -127,13 +127,13 @@ pub fn load_user() -> Option<ProjectInstructions> {
     load_user_from(&config_dir()?)
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
 }
 
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
