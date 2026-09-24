@@ -323,6 +323,24 @@ fn check_yaml(content: &str) -> Vec<Finding> {
                         None => {}
                     }
                     if flow.is_empty() {
+                        // only a comment, or `:` of a complex key like
+                        // `[a, b]: v`, may follow a closed flow collection
+                        let rest: String = chars[i + 1..].iter().collect();
+                        let rest = rest.trim();
+                        let ok = rest.is_empty()
+                            || rest.starts_with('#')
+                            || rest == ":"
+                            || rest.starts_with(": ");
+                        if !ok {
+                            out.push(Finding {
+                                line: line_no,
+                                col: indent + i + 2,
+                                message: format!(
+                                    "text after the flow collection closed with '{c}': {:?}",
+                                    rest.chars().take(40).collect::<String>()
+                                ),
+                            });
+                        }
                         break;
                     }
                 }
@@ -951,6 +969,17 @@ mod tests {
         dirty("a.yaml", "a:\n\tb: 1\n", "tab used for indentation");
         dirty("a.yaml", "a: [1, 2\nb: 3\n", "never closed");
         dirty("a.yaml", "a: {x: [1, 2}\n", "closed with");
+        dirty("a.yaml", "a: [1, 2] x\n", "text after the flow collection");
+        dirty("a.yaml", "a: {b: 1}}\n", "text after the flow collection");
+        dirty(
+            "a.yml",
+            "a:\n  - [x,\n     y] z\n",
+            "text after the flow collection",
+        );
+        clean(
+            "k.yaml",
+            "a: [1, 2]  # note\n[x, y]: pair key\n{k: v}: map key\nb: {c: 1}\n[p, q]:\n  - 1\n",
+        );
         let f = check("a.yaml", "x: 1\na: [1, 2\n").unwrap();
         assert_eq!((f[0].line, f[0].col), (2, 4), "{f:?}");
     }

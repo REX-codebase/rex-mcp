@@ -238,8 +238,15 @@ is shared it is noted in the module docs.
   Sweep: 0 YAML files flagged across this repo, opencode, Hermes and the
   cargo registry (same 5 pre-existing non-YAML notes). 4 mutations of the
   new logic each fail the test.
-- Gap left: YAML check is still not a full parser (no flow-collection or
-  sequence/mapping mix errors); opencode's LSP route covers more.
+- Round 9: text after a closed flow collection (`a: [1, 2] x`,
+  `a: {b: 1}}`, also when the flow spans lines) is flagged; a comment or
+  a complex key (`[x, y]: v`, `[p, q]:` then a block) is allowed.
+  Mismatched closers and unclosed flows were already caught. Sweep: 0
+  YAML files flagged across this repo, opencode, Hermes and the cargo
+  registry. 4 mutations of the rule each fail the test.
+- Gap left: YAML check is still not a full parser (no sequence/mapping
+  mix errors, no flow-mapping duplicate keys); opencode's LSP route
+  covers more.
 - App: AgentRunView shows the ask_user question (choices, free text, "Let
   REX decide") and an "Undo last file change" button on finished runs that
   wrote files. Covered by 2 vitest tests; rendered with the compiled theme
