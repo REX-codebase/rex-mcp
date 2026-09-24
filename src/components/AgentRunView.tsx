@@ -70,6 +70,17 @@ export function AgentRunView({
   // tool calls whose writes this view has undone (newest-first rewinds)
   const [undoneCalls, setUndoneCalls] = useState<string[]>([]);
   const questionId = run.pending_question?.call_id ?? null;
+  const planRejectRef = useRef<HTMLButtonElement>(null);
+  const questionPanelRef = useRef<HTMLElement>(null);
+
+  // Safe default focus: a plan card lands on Reject, a question lands in
+  // the first answer box, so a stray key never approves anything.
+  useEffect(() => {
+    if (phase === "plan") planRejectRef.current?.focus();
+  }, [phase]);
+  useEffect(() => {
+    if (questionId) questionPanelRef.current?.querySelector("textarea")?.focus();
+  }, [questionId]);
 
   useEffect(() => {
     // a new question starts with an empty box
@@ -246,7 +257,18 @@ export function AgentRunView({
       )}
 
       {phase === "plan" && onPlanDecision && (
-        <section className="plan-approval" role="alertdialog" aria-labelledby="plan-approval-title" aria-describedby="plan-approval-detail">
+        <section
+          className="plan-approval"
+          role="alertdialog"
+          aria-labelledby="plan-approval-title"
+          aria-describedby="plan-approval-detail"
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && !planDeciding) {
+              event.preventDefault();
+              onPlanDecision(false);
+            }
+          }}
+        >
           <div className="tool-approval-head">
             <span className="approval-shield" aria-hidden="true">✓</span>
             <div>
@@ -256,14 +278,15 @@ export function AgentRunView({
           </div>
           <p id="plan-approval-detail" className="approval-note">Review the steps above. Approve to let REX execute them, or reject to stop the run before any tool runs.</p>
           <div className="approval-actions">
-            <button type="button" disabled={planDeciding} onClick={() => onPlanDecision(false)} className="approval-deny">Reject plan</button>
+            <span className="approval-keys" aria-hidden="true"><kbd>Esc</kbd> rejects</span>
+            <button ref={planRejectRef} type="button" disabled={planDeciding} onClick={() => onPlanDecision(false)} className="approval-deny">Reject plan</button>
             <button type="button" disabled={planDeciding} onClick={() => onPlanDecision(true)} className="approval-allow">{planDeciding ? "Sending…" : "Approve plan"}</button>
           </div>
         </section>
       )}
 
       {phase === "question" && run.pending_question && showBatchForm && (
-        <section className="plan-approval question-panel" role="alertdialog" aria-labelledby="batch-title">
+        <section ref={questionPanelRef} className="plan-approval question-panel" role="alertdialog" aria-labelledby="batch-title">
           <div className="tool-approval-head">
             <span className="approval-shield" aria-hidden="true">?</span>
             <div>
@@ -315,7 +338,7 @@ export function AgentRunView({
       )}
 
       {phase === "question" && run.pending_question && !showBatchForm && (
-        <section className="plan-approval question-panel" role="alertdialog" aria-labelledby="question-title">
+        <section ref={questionPanelRef} className="plan-approval question-panel" role="alertdialog" aria-labelledby="question-title">
           <div className="tool-approval-head">
             <span className="approval-shield" aria-hidden="true">?</span>
             <div>
@@ -342,10 +365,17 @@ export function AgentRunView({
             value={answerText}
             maxLength={2000}
             onChange={(e) => setAnswerText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && answerText.trim() && !answering) {
+                e.preventDefault();
+                void sendAnswer(answerText);
+              }
+            }}
             placeholder="Or type your own answer"
           />
           {answerError && <p className="approval-note">{answerError}</p>}
           <div className="approval-actions">
+            <span className="approval-keys" aria-hidden="true"><kbd>Ctrl</kbd><kbd>Enter</kbd> sends</span>
             <button type="button" disabled={answering} onClick={() => void sendAnswer(null)} className="approval-deny">Let REX decide</button>
             <button type="button" disabled={answering || !answerText.trim()} onClick={() => void sendAnswer(answerText)} className="approval-allow">{answering ? "Sending…" : "Send answer"}</button>
           </div>

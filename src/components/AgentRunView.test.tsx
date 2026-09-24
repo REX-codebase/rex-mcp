@@ -137,6 +137,44 @@ describe("AgentRunView ask_user and undo", () => {
     await waitFor(() => expect(calls.answer[2]).toEqual(["run-1", null]));
   });
 
+  it("a plan card focuses Reject and Esc rejects, unless a decision is in flight", () => {
+    const onPlan = vi.fn();
+    const planRun = snap({ status: "awaiting_plan" as AgentSnapshot["status"] });
+    const { rerender } = render(
+      <AgentRunView run={planRun} deciding={false} cancelling={false} onDecide={noop} onCancel={noop} onPlanDecision={onPlan} />
+    );
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Reject plan" }));
+    fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
+    expect(onPlan).toHaveBeenCalledWith(false);
+    onPlan.mockClear();
+    rerender(
+      <AgentRunView run={planRun} deciding={false} cancelling={false} onDecide={noop} onCancel={noop} onPlanDecision={onPlan} planDeciding />
+    );
+    fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
+    expect(onPlan).not.toHaveBeenCalled();
+  });
+
+  it("a question focuses the answer box and Ctrl+Enter sends a typed answer", async () => {
+    render(
+      <AgentRunView
+        run={snap({ status: "awaiting_answer", pending_question: { call_id: "q9", question: "Port?", choices: [] } })}
+        deciding={false}
+        cancelling={false}
+        onDecide={noop}
+        onCancel={noop}
+      />
+    );
+    const box = screen.getByLabelText("Your answer");
+    expect(document.activeElement).toBe(box);
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    expect(calls.answer).toEqual([]);
+    fireEvent.change(box, { target: { value: "5173" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(calls.answer).toEqual([]);
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    await waitFor(() => expect(calls.answer).toEqual([["run-1", "5173"]]));
+  });
+
   it("offers undo only after a finished run that wrote files", async () => {
     const wrote = {
       state: "tool_finished",

@@ -35,13 +35,15 @@ const approval: AgentSnapshot = { ...base, status: "awaiting_approval", pending_
 const done: AgentSnapshot = { ...base, status: "completed", terminal_reason: { kind: "completed" }, plan: base.plan.map((p) => ({ ...p, status: "done" })), completion_summary: "Renamed 3 imports across 3 files. Type check and 41 tests pass.", events: [...base.events, fin("c6", "edit_file", "src/pages/Hero.tsx", { bytes_written: 990, diff: "@@ -2 +2 @@\n-import pexels from \"pexels\";\n+import pexels from \"stocksnap\";" }), fin("c7", "run_command", null, { command: ["npm", "test", "--", "--run"], exit_code: 0, duration_ms: 8100 }, true, "Tests 41 passed (41)"), { state: "gate_result", attempt: 1, passed: true, failures: [] }] };
 
 const limit: AgentSnapshot = { ...base, step: 21, tool_calls: 72, tokens_used: 201000, elapsed_ms: 512000 };
-const states: Record<string, AgentSnapshot> = { running: base, approval, done, limit };
+const plan: AgentSnapshot = { ...base, status: "awaiting_plan", events: [] };
+const question: AgentSnapshot = { ...base, status: "awaiting_answer", pending_question: { call_id: "q1", question: "Two files import pexels types only. Rename those too?", choices: ["Yes, rename all", "Only runtime imports"] } };
+const states: Record<string, AgentSnapshot> = { running: base, approval, done, limit, plan, question };
 const which = new URLSearchParams(location.search).get("s") ?? "running";
 const noop = () => undefined;
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <div className="harness-shell min-h-full"><main className="main-spine mx-auto w-full max-w-[820px] px-5 py-10 sm:px-8">
-      <AgentRunView run={states[which]} deciding={false} cancelling={false} onDecide={noop} onCancel={noop} custody={{ grantId: "g-19ac", phase: "active", operator: "human" }} />
+      <AgentRunView run={states[which]} deciding={false} cancelling={false} onDecide={noop} onCancel={noop} onPlanDecision={noop} custody={{ grantId: "g-19ac", phase: "active", operator: "human" }} />
     </main></div>
   </React.StrictMode>,
 );
