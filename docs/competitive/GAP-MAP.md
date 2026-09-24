@@ -1244,3 +1244,19 @@ is shared it is noted in the module docs.
   The provider suite then passed 4 runs in a row.
 - Gap left: the sync step itself is not tested (it only matters on power
   loss), and other state files outside `write_json` were not audited.
+
+## Round 32: edit sub-agents also preflight their writes
+
+- Competitors: as in Round 30, opencode's edit tool fails a missing
+  match before it asks permission (`src/tool/edit.ts`).
+- REX before: Round 30's preflight covered only the parent run; an edit
+  sub-agent still put doomed writes (missing file, missing expected
+  text, unread overwrite) to the user and failed after approval.
+- REX now: an edit sub-agent preflights each call that needs approval;
+  a failure is cancelled and goes back to the sub-agent as "failed
+  before approval: ..." with no approval request.
+- Tests: a scripted edit sub-agent whose edit of a missing file raises no
+  approval request and gets the failure back. Hand mutation: 2/2 killed.
+- Gap left: a doomed write still claims its path for the batch, so a
+  sibling sub-agent is kept off that file; the desktop app's approval
+  path does not preflight.

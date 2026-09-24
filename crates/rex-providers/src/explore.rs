@@ -630,6 +630,10 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                         };
                         let watch_command = limits.kind == ExplorerKind::Edit
                             && matches!(request, ToolRequest::RunCommand { .. });
+                        // a write that would fail anyway is not put to the user
+                        let doomed = (limits.kind == ExplorerKind::Edit)
+                            .then(|| tools.preflight(&request).err())
+                            .flatten();
                         match tools.prepare(request) {
                             Ok(p) if p.approval_required && limits.kind != ExplorerKind::Edit => {
                                 let _ = tools.cancel(&p.call_id);
@@ -638,6 +642,17 @@ pub(super) fn run_explore<T: Transport, A: Fn(&PreparedCall) -> ChildApproval>(
                                     id,
                                     args,
                                     "refused: explorer calls never take approval".into(),
+                                    false,
+                                )
+                            }
+                            Ok(p) if p.approval_required && doomed.is_some() => {
+                                let _ = tools.cancel(&p.call_id);
+                                let detail = doomed.map(|e| e.detail).unwrap_or_default();
+                                (
+                                    name,
+                                    id,
+                                    args,
+                                    format!("failed before approval: {detail}"),
                                     false,
                                 )
                             }

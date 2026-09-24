@@ -7736,6 +7736,37 @@ mod tests {
     }
 
     #[test]
+    fn edit_child_doomed_write_fails_before_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edit = json!({"functionCall":{"name":"explore","args":{
+            "task":"fix missing.txt","kind":"edit"}}});
+        let bad = json!({"functionCall":{"name":"edit_file","args":{
+            "path":"missing.txt","expected":"a","replacement":"b","replace_all":false}}});
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![edit]),
+                call_turn(vec![bad]),
+                call_turn(vec![complete_call("EDIT-REPORT")]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("edit check", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let asked = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ApprovalRequired { .. }))
+            .count();
+        assert_eq!(asked, 0, "the user was asked to approve a doomed write");
+        let posts = svc.service().transport().seen();
+        assert!(posts.len() >= 3, "{}", posts.len());
+        let reply = response_contents(&posts[2]).last().cloned().unwrap();
+        assert!(reply.starts_with("failed before approval: "), "{reply}");
+    }
+
+    #[test]
     fn edit_child_writes_only_through_the_parents_approval_gate() {
         let tmp = tempfile::tempdir().unwrap();
         let edit = json!({"functionCall":{"name":"explore","args":{
