@@ -37,6 +37,8 @@ enum Lang {
     Python,
     Css,
     Json,
+    Toml,
+    Yaml,
 }
 
 fn lang_for(path: &str) -> Option<Lang> {
@@ -50,6 +52,8 @@ fn lang_for(path: &str) -> Option<Lang> {
         "py" | "pyi" => Lang::Python,
         "css" | "scss" | "less" => Lang::Css,
         "json" => Lang::Json,
+        "toml" => Lang::Toml,
+        "yaml" | "yml" => Lang::Yaml,
         _ => return None,
     })
 }
@@ -63,6 +67,8 @@ pub fn check(path: &str, content: &str) -> Option<Vec<Finding>> {
     }
     Some(match lang {
         Lang::Json => check_json(content),
+        Lang::Toml => check_toml(content),
+        Lang::Yaml => check_yaml(content),
         other => {
             let jsx = path.ends_with(".jsx") || path.ends_with(".tsx");
             check_delimiters(content, other, jsx)
@@ -86,6 +92,192 @@ fn check_json(content: &str) -> Vec<Finding> {
             message: format!("invalid JSON: {e}"),
         }],
     }
+}
+
+/// 1-based line and column of a byte offset.
+fn line_col(src: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(src.len());
+    let before = &src[..src.floor_char_boundary(offset)];
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, col)
+}
+
+/// Full TOML parse. The message carries no position, so the same problem
+/// on a shifted line still counts as pre-existing in `delta_note`.
+fn check_toml(content: &str) -> Vec<Finding> {
+    match toml::from_str::<toml::Table>(content) {
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            let (line, col) = e.span().map_or((1, 1), |r| line_col(content, r.start));
+            vec![Finding {
+                line,
+                col,
+                message: format!("invalid TOML: {}", e.message().trim()),
+            }]
+        }
+    }
+}
+
+/// Conservative YAML check, tuned for no false alarms rather than full
+/// validation: tabs used for indentation (YAML forbids them) and flow
+/// collections (`key: [a, b` / `{`) that are never closed or close with the
+/// wrong bracket. Block scalars (`|`, `>`) are skipped, and brackets inside
+/// plain scalars such as `run: echo ${{ x }}` are ignored because only a
+/// value that *starts* a flow collection is tracked.
+fn check_yaml(content: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut block_indent: Option<usize> = None;
+    // open flow brackets: (char, line, col)
+    let mut flow: Vec<(char, usize, usize)> = Vec::new();
+    for (idx, raw) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let indent = raw.len() - raw.trim_start_matches([' ', '\t']).len();
+        let body = raw.trim_start_matches([' ', '\t']);
+        if let Some(bi) = block_indent {
+            if body.is_empty() || indent > bi {
+                continue;
+            }
+            block_indent = None;
+        }
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        if flow.is_empty() && raw[..indent].contains('\t') {
+            out.push(Finding {
+                line: line_no,
+                col: 1,
+                message: "tab used for indentation (YAML allows spaces only)".into(),
+            });
+        }
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0;
+        if flow.is_empty() {
+            // find where a value starts: after `- ` markers and `key: `
+            let mut start = 0;
+            loop {
+                if chars.get(start) == Some(&'-') && chars.get(start + 1).is_none_or(|c| *c == ' ')
+                {
+                    start += 2;
+                    while chars.get(start) == Some(&' ') {
+                        start += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            let value_start = match find_mapping_colon(&chars[start.min(chars.len())..]) {
+                Some(c) => {
+                    let mut v = start + c + 1;
+                    while chars.get(v) == Some(&' ') {
+                        v += 1;
+                    }
+                    v
+                }
+                None => start,
+            };
+            match chars.get(value_start) {
+                Some('[') | Some('{') => i = value_start,
+                Some('|') | Some('>') => {
+                    let rest: String = chars[value_start + 1..].iter().collect();
+                    let rest = rest.split('#').next().unwrap_or("").trim().to_string();
+                    if rest
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '-' || c == '+')
+                    {
+                        block_indent = Some(indent);
+                    }
+                    continue;
+                }
+                _ => continue,
+            }
+        }
+        // inside (or entering) a flow collection: track brackets, skipping
+        // quoted strings and comments
+        while i < chars.len() {
+            let c = chars[i];
+            match c {
+                '"' | '\'' => {
+                    let q = c;
+                    i += 1;
+                    while i < chars.len() {
+                        if q == '"' && chars[i] == '\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if chars[i] == q {
+                            if q == '\'' && chars.get(i + 1) == Some(&'\'') {
+                                i += 2;
+                                continue;
+                            }
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                '#' if i == 0 || chars[i - 1] == ' ' => break,
+                '[' | '{' => flow.push((c, line_no, indent + i + 1)),
+                ']' | '}' => {
+                    let want = if c == ']' { '[' } else { '{' };
+                    match flow.pop() {
+                        Some((open, _, _)) if open == want => {}
+                        Some((open, l, _)) => {
+                            out.push(Finding {
+                                line: line_no,
+                                col: indent + i + 1,
+                                message: format!(
+                                    "flow collection opened with '{open}' on line {l} closed with '{c}'"
+                                ),
+                            });
+                            flow.clear();
+                            break;
+                        }
+                        None => {}
+                    }
+                    if flow.is_empty() {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if out.len() >= MAX_FINDINGS {
+            break;
+        }
+    }
+    if let Some((open, line, col)) = flow.first().copied() {
+        out.push(Finding {
+            line,
+            col,
+            message: format!("flow collection '{open}' is never closed"),
+        });
+    }
+    cap(out)
+}
+
+/// Index of the `:` that ends a mapping key (followed by space or end of
+/// line), outside quotes. `None` when the line is not `key: value`.
+fn find_mapping_colon(chars: &[char]) -> Option<usize> {
+    let mut i = 0;
+    if matches!(chars.first(), Some('"') | Some('\'')) {
+        let q = chars[0];
+        i = 1;
+        while i < chars.len() && chars[i] != q {
+            i += 1;
+        }
+        i += 1;
+    }
+    while i < chars.len() {
+        match chars[i] {
+            ':' if chars.get(i + 1).is_none_or(|c| *c == ' ') => return Some(i),
+            '#' if i > 0 && chars[i - 1] == ' ' => return None,
+            '[' | '{' if i == 0 => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Drop `//` and `/* */` comments outside strings, then trailing commas.
@@ -611,6 +803,28 @@ mod tests {
             f.iter().any(|f| f.message.contains(needle)),
             "{path}: wanted {needle}, got {f:?}"
         );
+    }
+
+    #[test]
+    fn toml_is_parsed_and_errors_carry_no_position_text() {
+        clean("Cargo.toml", "[package]\nname = \"x\"\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n");
+        dirty("a.toml", "[package]\nname = \"x\n", "invalid TOML");
+        let f = check("a.toml", "a = 1\na = 2\n").unwrap();
+        assert_eq!(f[0].line, 2, "{f:?}");
+        assert!(!f[0].message.contains("line"), "{f:?}");
+    }
+
+    #[test]
+    fn yaml_flags_tabs_and_unclosed_flow_but_not_real_world_shapes() {
+        clean(
+            "ci.yml",
+            "on: [push, pull_request]\njobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: echo \"[not flow\"\n      - run: |\n          if [ -f x ]; then\n            \techo {\n          fi\n      - with: { a: 1, b: [2, 3] }\n      - name: see [docs  # plain scalar\n      - key: 'it''s [ok'\n      - list:\n          [a,\n           b]\n",
+        );
+        dirty("a.yaml", "a:\n\tb: 1\n", "tab used for indentation");
+        dirty("a.yaml", "a: [1, 2\nb: 3\n", "never closed");
+        dirty("a.yaml", "a: {x: [1, 2}\n", "closed with");
+        let f = check("a.yaml", "x: 1\na: [1, 2\n").unwrap();
+        assert_eq!((f[0].line, f[0].col), (2, 4), "{f:?}");
     }
 
     #[test]
