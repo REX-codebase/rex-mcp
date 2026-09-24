@@ -34,6 +34,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod lease_keeper;
 pub use lease_keeper::{LeaseKeeper, LeaseKeeperConfig, LeaseRenewalReport, RenewedLease};
+mod lease_failsafe;
+pub use lease_failsafe::{FailsafeReport, PauseReason, PauseRecord, PauseStatus};
 
 const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
 const MAX_PLAN_STEPS: usize = 100;
@@ -183,6 +185,9 @@ impl HarnessDaemon {
         // Heal any crash window between a promotion commit and the task's
         // terminal persist before serving new calls.
         daemon.reconcile_ultra_tasks();
+        // Grants that recover() suspended need their durable pause record even
+        // when the lease keeper is disabled.
+        let _ = daemon.pause_lapsed_leases(now_ms());
         Ok(daemon)
     }
 
@@ -239,9 +244,13 @@ impl HarnessDaemon {
                     id,
                 ));
             }
-            let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
+            // Verify, gate, then rotate: a resume the lease gate refuses must
+            // not burn the host's only resume handle.
+            self.verify_resume_handle(&task, &req)?;
+            let renewed = self.renew_lease_on_resume(&mut task)?;
+            let handle = self.rotate_resume_handle(&mut task)?;
             let capability = self.rotate_capability(&mut task)?;
-            if self.renew_lease_on_resume(&mut task)? {
+            if renewed {
                 self.append_event(&mut task, "lease_renewed_on_resume", json!({}))?;
             }
             if let Some(follow_up) = req
@@ -263,9 +272,13 @@ impl HarnessDaemon {
                 ));
             }
             let mut task = task;
-            let handle = self.verify_and_rotate_resume_handle(&mut task, &req)?;
+            // Verify, gate, then rotate: a resume the lease gate refuses must
+            // not burn the host's only resume handle.
+            self.verify_resume_handle(&task, &req)?;
+            let renewed = self.renew_lease_on_resume(&mut task)?;
+            let handle = self.rotate_resume_handle(&mut task)?;
             let capability = self.rotate_capability(&mut task)?;
-            if self.renew_lease_on_resume(&mut task)? {
+            if renewed {
                 self.append_event(&mut task, "lease_renewed_on_resume", json!({}))?;
             }
             if let Some(follow_up) = req
@@ -690,7 +703,16 @@ impl HarnessDaemon {
         self.sync_lease_from_custody(&mut t)?;
         let lease = lease_view(&t);
         let used_wall = elapsed(&t);
-        let operation = status_operation(&t);
+        // A task the failsafe paused reports Stale until it is resumed. This
+        // path is read-only: the pause record is never written from here.
+        let paused = self
+            .read_pause_record(&t.task_id)?
+            .is_some_and(|rec| rec.status == PauseStatus::Paused);
+        let operation = if paused {
+            OperationStatus::Stale
+        } else {
+            status_operation(&t)
+        };
         let packet =
             PacketIdentity::new(&t.branch_id, t.lease_epoch, t.resume_nonce, &t.request_id);
         Ok(StatusResponse {
@@ -1872,13 +1894,37 @@ impl HarnessDaemon {
         // The keeper may have renewed the lease in custody since this
         // record was written; judge expiry on the live view.
         self.sync_lease_from_custody(&mut t)?;
-        if now_ms() >= t.lease_expires_ms {
-            return Err(perr(ErrorCode::StaleLease, "lease expired", id));
+        // The failsafe already paused this task (this process, the keeper, or a
+        // restart sweep). Land the pause in the task's own durable state and
+        // refuse work; only a verified resume moves it again.
+        if self.grant_suspended(&t)? {
+            self.absorb_pause(&mut t)?;
+            return Err(perr(
+                ErrorCode::StaleLease,
+                "lease lapsed: task paused; resume with rex_execute, task_id and the current resume handle",
+                id,
+            ));
+        }
+        let now = now_ms();
+        if now >= t.lease_expires_ms {
+            // Lapse discovered on a live call: pause here and now, durably.
+            let reason = if now >= t.created_ms + t.max_wall_ms as u128 {
+                PauseReason::WallBudgetSpent
+            } else {
+                PauseReason::LeaseLapsed
+            };
+            self.pause_now(&t, reason)?;
+            self.absorb_pause(&mut t)?;
+            return Err(perr(
+                ErrorCode::StaleLease,
+                "lease lapsed: task paused; resume with rex_execute, task_id and the current resume handle",
+                id,
+            ));
         }
         self.custody
             .lock()
             .map_err(|_| internal("custody registry poisoned"))?
-            .verify_token(&t.token, now_ms())
+            .verify_token(&t.token, now)
             .map_err(custody_err)?;
         Ok(t)
     }
@@ -1908,9 +1954,38 @@ impl HarnessDaemon {
     /// A verified resume (the rotated host handle) also renews a lapsed
     /// lease: docs/rex-mcp-ultra.md promises that an expired lease plus the
     /// current handle resumes the task. Without this, a host working longer
-    /// than one lease window between calls - exactly the long Ultra loop -
+    /// than one lease window between calls - exactly the long Ultra loop,
     /// bricked its own task with no recovery path.
+    ///
+    /// A lapse is never healed by a bare heartbeat: a paused task is fenced
+    /// through custody suspend + resume (epoch bump, rotated secrets) and its
+    /// pause record is closed out. A live lease still resumes without an epoch
+    /// bump.
     fn renew_lease_on_resume(&self, t: &mut DurableTask) -> Result<bool, ProtocolError> {
+        // The pause record is authoritative and read first: a paused task is
+        // always re-fenced even if custody's lease view has since been
+        // extended, and a record past its grace window refuses every resume.
+        // Reading it fails closed on corruption.
+        match self.read_pause_record(&t.task_id)?.map(|rec| rec.status) {
+            Some(PauseStatus::Paused) => {
+                self.reacquire_lapsed(t, now_ms())?;
+                return Ok(true);
+            }
+            Some(PauseStatus::Expired) => {
+                return Err(perr(
+                    ErrorCode::StaleLease,
+                    "lease expired beyond the resume grace window",
+                    &t.task_id,
+                ));
+            }
+            Some(PauseStatus::Resumed) | None => {}
+        }
+        // A lapse already recorded on the task is fenced before the live
+        // custody view can heal the record.
+        if now_ms() >= t.lease_expires_ms {
+            self.reacquire_lapsed(t, now_ms())?;
+            return Ok(true);
+        }
         // The keeper may have renewed this lease already; only a lapsed
         // lease needs the renewal work below.
         self.sync_lease_from_custody(t)?;
@@ -1922,38 +1997,17 @@ impl HarnessDaemon {
                 .custody
                 .lock()
                 .map_err(|_| internal("custody registry poisoned"))?;
-            reg.grant(&t.grant_id)
-                .map(|g| (g.phase, g.resume_secret.clone()))
+            reg.grant(&t.grant_id).map(|g| g.phase)
         };
         match phase {
-            Some((rex_custody::CustodyPhase::Active, _)) => {
-                // The grant was never swept (same daemon process): a plain
-                // heartbeat extends both lease views.
-                self.heartbeat(t)?;
+            Some(rex_custody::CustodyPhase::Active) => {
+                // Never swept in this process: fence it like every other
+                // lapse (suspend, then resume), never heartbeat it alive.
+                self.reacquire_lapsed(t, now_ms())?;
             }
-            Some((rex_custody::CustodyPhase::Suspended, secret)) => {
-                let mut reg = self
-                    .custody
-                    .lock()
-                    .map_err(|_| internal("custody registry poisoned"))?;
-                let token = reg
-                    .resume(&t.grant_id, &secret, now_ms())
-                    .map_err(|e| match e {
-                        CustodyError::GrantReleased(_) => perr(
-                            ErrorCode::StaleLease,
-                            "lease expired beyond the resume grace window",
-                            &t.task_id,
-                        ),
-                        other => custody_err(other),
-                    })?;
-                t.token = token;
-                let grant = reg
-                    .grant(&t.grant_id)
-                    .ok_or_else(|| internal("grant missing after resume"))?;
-                t.lease_epoch = grant.lease.epoch;
-                t.lease_expires_ms = grant.lease.expires_ms;
-                t.heartbeat_seq = grant.lease.next_seq;
-                t.resume_nonce = grant.lease.next_seq;
+            Some(rex_custody::CustodyPhase::Suspended) => {
+                let epoch_before = self.resume_suspended(t, now_ms())?;
+                self.complete_resume_after_pause(t, epoch_before)?;
             }
             _ => {
                 return Err(perr(
@@ -1974,11 +2028,11 @@ impl HarnessDaemon {
         Ok(capability)
     }
 
-    fn verify_and_rotate_resume_handle(
+    fn verify_resume_handle(
         &self,
-        t: &mut DurableTask,
+        t: &DurableTask,
         req: &ExecuteRequest,
-    ) -> Result<String, ProtocolError> {
+    ) -> Result<(), ProtocolError> {
         let expected = t.host_resume_handle_hash.clone().ok_or_else(|| {
             perr(
                 ErrorCode::ScopeDenied,
@@ -2000,6 +2054,11 @@ impl HarnessDaemon {
                 &t.task_id,
             ));
         }
+        Ok(())
+    }
+
+    /// Only after the verified resume has passed every gate.
+    fn rotate_resume_handle(&self, t: &mut DurableTask) -> Result<String, ProtocolError> {
         let rotated = format!("hrh-{}", random_hex(24));
         t.host_resume_handle_hash = Some(hex_sha256(rotated.as_bytes()));
         self.persist(t)?;

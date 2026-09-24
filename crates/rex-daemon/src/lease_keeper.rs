@@ -21,9 +21,10 @@ use rex_custody::{CapabilityToken, CustodyError, CustodyPhase, CustodyRegistry};
 use rex_protocol::{ProtocolError, TaskState};
 use serde::Serialize;
 use serde_json::Value;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -228,20 +229,34 @@ impl super::HarnessDaemon {
 
     /// Start the background keeper thread. Dropping the returned handle
     /// always stops it.
+    ///
+    /// Lease upkeep is single-owner: `<root>/lease-keeper.lock` is held with an
+    /// advisory `flock` for the life of the thread, so one process per state
+    /// directory renews and sweeps. A second process starts in standby and
+    /// takes over the moment the owner stops.
     pub fn spawn_lease_keeper(&self, cfg: LeaseKeeperConfig) -> Result<LeaseKeeper, ProtocolError> {
         let root = self.root.clone();
         let custody = Arc::clone(&self.custody);
         assert_send(&root);
         assert_send(&custody);
         let tick = Duration::from_millis(cfg.tick_ms.max(1));
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join("lease-keeper.lock"))
+            .map_err(internal)?;
         let (stop, stopped) = mpsc::channel::<()>();
+        let owner = Arc::new(AtomicBool::new(false));
+        let owner_flag = Arc::clone(&owner);
         let handle = thread::Builder::new()
             .name("rex-lease-keeper".into())
-            .spawn(move || keeper_loop(root, custody, cfg, stopped, tick))
+            .spawn(move || keeper_loop(root, custody, cfg, stopped, tick, lock, owner_flag))
             .map_err(internal)?;
         Ok(LeaseKeeper {
             stop: Some(stop),
             handle: Some(handle),
+            owner,
         })
     }
 
@@ -271,9 +286,16 @@ impl super::HarnessDaemon {
 pub struct LeaseKeeper {
     stop: Option<Sender<()>>,
     handle: Option<JoinHandle<()>>,
+    owner: Arc<AtomicBool>,
 }
 
 impl LeaseKeeper {
+    /// Whether this keeper holds lease upkeep for the state directory right
+    /// now. False while standing by behind another process's lock.
+    pub fn is_owner(&self) -> bool {
+        self.owner.load(Ordering::SeqCst)
+    }
+
     /// Stop the keeper thread and wait for it to finish.
     pub fn stop(mut self) {
         self.shutdown();
@@ -303,14 +325,54 @@ fn keeper_loop(
     cfg: LeaseKeeperConfig,
     stopped: Receiver<()>,
     tick: Duration,
+    lock: File,
+    owner: Arc<AtomicBool>,
 ) {
+    let mut owns_upkeep = false;
+    let mut standby_logged = false;
     loop {
-        let report = renew_due(&root, &custody, &cfg, now_ms());
-        for err in &report.errors {
-            eprintln!("rex-lease-keeper: {err}");
+        if !owns_upkeep {
+            match lock.try_lock() {
+                Ok(()) => {
+                    owns_upkeep = true;
+                    owner.store(true, Ordering::SeqCst);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if !standby_logged {
+                        standby_logged = true;
+                        eprintln!(
+                            "rex-lease-keeper: another process owns lease upkeep for {}; standing by",
+                            root.display()
+                        );
+                    }
+                }
+                Err(_) => {
+                    if !standby_logged {
+                        standby_logged = true;
+                        eprintln!(
+                            "rex-lease-keeper: lease upkeep lock unusable for {}; standing by",
+                            root.display()
+                        );
+                    }
+                }
+            }
+        }
+        if owns_upkeep {
+            let now = now_ms();
+            let report = renew_due(&root, &custody, &cfg, now);
+            for err in &report.errors {
+                eprintln!("rex-lease-keeper: {err}");
+            }
+            let failsafe = crate::lease_failsafe::pause_lapsed(&root, &custody, now);
+            for err in &failsafe.errors {
+                eprintln!("rex-lease-keeper: {err}");
+            }
         }
         match stopped.recv_timeout(tick) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                owner.store(false, Ordering::SeqCst);
+                return;
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
