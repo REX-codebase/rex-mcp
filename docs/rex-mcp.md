@@ -1,7 +1,7 @@
 # REX MCP server: host setup, contracts, and operations
 
-REX is a local custody daemon. A subscribed host agent (Claude Code,
-Antigravity, any MCP client) stays the worker: it thinks, reads, writes,
+REX is a local custody daemon. A connected host agent (Claude Code,
+Codex, OpenCode, Hermes, or another MCP client) stays the worker: it thinks, reads, writes,
 and runs commands. REX freezes intent, confines every action to one
 workspace, enforces leases and budgets, and decides completion from
 evidence. REX holds no provider credentials and makes no model calls.
@@ -13,58 +13,20 @@ promotion, proof bundles) - see docs/rex-mcp-ultra.md.
 
 ## Install
 
-The release install surface is one command, matching what stdio MCP hosts
-already accept:
+The npm launcher is staged but not published. `npx @rex-codebase/rex-mcp@latest`
+will not work until it is released. For this private checkout, install Rust and
+run `bash scripts/rex-mcp-install.sh`; use the resulting absolute path to
+`~/.rex/bin/rex-mcp` (or `REX_INSTALL_DIR`) in the host's stdio MCP settings.
+Set `REX_STATE_DIR` and `REX_WORKSPACE` to absolute paths. Refer to the
+[private host setup](../README.md) for current Claude Code, Codex, OpenCode
+and Hermes examples. These are documented configurations, not verified
+installed-host integration results. Antigravity is not an installed backend in
+this project; do not present it as tested.
 
-```sh
-npx --yes @rex-codebase/rex-mcp@latest
-```
-
-The npm package contains the native binary. It does not require Rust, clone the
-repository, install a daemon, or send telemetry. It supports Linux x64/arm64,
-macOS x64/arm64 and Windows x64. REX runs only while a host keeps its stdio
-session open.
-
-The package is staged but intentionally unpublished while this repository is
-private. Maintainers can still build from source with
-`scripts/rex-mcp-install.sh` (requires Rust and git). The private packaging
-workflow builds every native target and emits one unpublished `.tgz`; publishing
-that reviewed tarball later is a single `npm publish <file> --access public`.
-
-## Claude Code
-
-```sh
-claude mcp add rex --scope user \
-  --env REX_STATE_DIR=$HOME/.rex/harness \
-  --env REX_WORKSPACE=/path/to/project \
-  --env REX_APPROVE_TASK_MUTATIONS=1 \
-  -- npx --yes @rex-codebase/rex-mcp@latest
-```
-
-Set `REX_APPROVE_TASK_MUTATIONS=1` only when you accept that this host may
+Set `REX_APPROVE_TASK_MUTATIONS=1` only when you accept that the host may
 write files and run allowlisted commands inside `REX_WORKSPACE`. With it
 unset, writes and commands return `approval_required`; reads, search,
 status, events, execute, next, submit, result and cancel still work.
-
-## Antigravity
-
-Add to the MCP servers config (`~/.antigravity/mcp_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "rex": {
-      "command": "npx",
-      "args": ["--yes", "@rex-codebase/rex-mcp@latest"],
-      "env": {
-        "REX_STATE_DIR": "/home/USER/.rex/harness",
-        "REX_WORKSPACE": "/path/to/project",
-        "REX_APPROVE_TASK_MUTATIONS": "1"
-      }
-    }
-  }
-}
-```
 
 ## The caller-driven loop
 
@@ -119,34 +81,22 @@ $REX_STATE_DIR/
 Both directories are append-safe and crash-recoverable: on open, custody
 recovery suspends lapsed leases and the daemon reloads every task record.
 
-## Update
+## Update and uninstall
 
-```sh
-npx --yes @rex-codebase/rex-mcp@latest     # hosts resolve the released package
-```
+Until npm is published, rebuild from the private checkout with
+`bash scripts/rex-mcp-install.sh`. Restart the host MCP session to load the new
+binary. Durable tasks in `REX_STATE_DIR` remain, and a stored task with an
+incompatible major protocol version refuses to load.
 
-Hosts pick up the new binary on their next MCP session start. Durable
-tasks in `$REX_STATE_DIR` survive; a stored task with an incompatible
-major protocol version refuses to load instead of being mangled.
+Run `scripts/rex-mcp-uninstall.sh` to remove the installed binary, then remove
+`rex` from the relevant host MCP settings. Removing `~/.rex/harness` (or a
+custom state directory) is irreversible: it contains durable tasks, events and
+audit records. Archive it first if needed.
 
-## Uninstall
+## Release gates
 
-```sh
-scripts/rex-mcp-uninstall.sh            # removes the binary
-claude mcp remove rex                   # Claude Code config
-# Antigravity: delete the "rex" entry from ~/.antigravity/mcp_config.json
-rm -rf ~/.rex/harness                   # optional: durable tasks, custody, audits
-```
-
-Removing state is irreversible: events.jsonl and the custody audit chain
-are the only proof of what happened. Archive them first if they matter.
-
-## Release gates (current status)
-
-- Unit + integration tests: green (`cargo test` across the workspace).
-- End-to-end stdio lifecycle: green (crates/rex-mcp/tests/stdio.rs).
-- Clean-machine proof: green (fresh clone, `rex-mcp-install.sh` with an
-  empty target dir, full lifecycle against the installed binary).
-- Not yet done: Tauri Human/Agent picker UI, SBOM/dependency scan,
-  fuzzing, secret scan, malicious-workspace corpus, external review.
-  Do not claim release readiness before those land.
+CI tests the narrowed Rust workspace and the npm launcher on candidate and
+main. A passing run is evidence for that commit, not proof of integration
+with every installed host or publication readiness. Before any public release,
+review packaging targets, supply-chain scans, host setup and compatibility,
+then publish only with explicit approval.
