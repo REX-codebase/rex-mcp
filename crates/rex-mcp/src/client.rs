@@ -56,6 +56,13 @@ impl McpStdioClient {
             let _ = client.child.kill();
             return Err(format!("rex-mcp refused initialize: {hello}"));
         }
+        let negotiated = hello["result"]["protocolVersion"].as_str();
+        if negotiated != Some(CLIENT_PROTOCOL_VERSION) {
+            let _ = client.child.kill();
+            return Err(format!(
+                "rex-mcp negotiated unsupported protocol version {negotiated:?}; expected {CLIENT_PROTOCOL_VERSION}"
+            ));
+        }
         client.notify("notifications/initialized", json!({}))?;
         Ok(client)
     }

@@ -117,3 +117,27 @@ fn one_shot_call_matches_persistent_session() {
         "active"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn shell_client_rejects_an_incompatible_mcp_protocol_version() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("fake-mcp");
+    // A server that replies successfully but negotiates a version this
+    // bundled client does not speak must not receive initialized or calls.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nread request\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2099-01-01\"}}'\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&fake, perms).unwrap();
+    let error = match McpStdioClient::spawn(&fake, tmp.path(), tmp.path()) {
+        Ok(_) => panic!("incompatible protocol must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.contains("unsupported protocol version"), "{error}");
+    assert!(error.contains("2099-01-01"), "{error}");
+}
