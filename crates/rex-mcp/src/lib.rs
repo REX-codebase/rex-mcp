@@ -476,30 +476,55 @@ mod tests {
     #[test]
     fn task_status_resource_template_reads_current_custody() {
         let (_d, mut s) = server();
-        s.handle(rpc(1, "initialize", json!({"protocolVersion": MCP_PROTOCOL_VERSION})))
+        s.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+        ))
+        .unwrap();
+        let templates = s
+            .handle(rpc(2, "resources/templates/list", json!({})))
             .unwrap();
-        let templates = s.handle(rpc(2, "resources/templates/list", json!({}))).unwrap();
         assert_eq!(
             templates["result"]["resourceTemplates"][0]["uriTemplate"],
             "rex://task/{task_id}/status"
         );
-        let started = s.handle(rpc(3, "tools/call", json!({
-            "name": "rex_execute",
-            "arguments": {
-                "request_id": "status-resource-test",
-                "task": "inspect status",
-                "host": "claude_code",
-                "operator_is_agent": true
-            }
-        }))).unwrap();
-        let task_id = started["result"]["structuredContent"]["task_id"].as_str().unwrap();
+        let started = s
+            .handle(rpc(
+                3,
+                "tools/call",
+                json!({
+                    "name": "rex_execute",
+                    "arguments": {
+                        "request_id": "status-resource-test",
+                        "task": "inspect status",
+                        "host": "claude_code",
+                        "operator_is_agent": true
+                    }
+                }),
+            ))
+            .unwrap();
+        let task_id = started["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .unwrap();
         let uri = format!("rex://task/{task_id}/status");
-        let read = s.handle(rpc(4, "resources/read", json!({"uri": uri}))).unwrap();
+        let read = s
+            .handle(rpc(4, "resources/read", json!({"uri": uri})))
+            .unwrap();
         let text = read["result"]["contents"][0]["text"].as_str().unwrap();
         let status: Value = serde_json::from_str(text).unwrap();
         assert_eq!(status["task_id"], task_id);
-        assert_eq!(read["result"]["contents"][0]["mimeType"], "application/json");
-        let malformed = s.handle(rpc(5, "resources/read", json!({"uri": "rex://task/a/b/status"}))).unwrap();
+        assert_eq!(
+            read["result"]["contents"][0]["mimeType"],
+            "application/json"
+        );
+        let malformed = s
+            .handle(rpc(
+                5,
+                "resources/read",
+                json!({"uri": "rex://task/a/b/status"}),
+            ))
+            .unwrap();
         assert_eq!(malformed["error"]["code"], -32602);
     }
 
