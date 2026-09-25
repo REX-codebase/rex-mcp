@@ -774,7 +774,11 @@ impl ToolRuntime {
                 &call_id,
                 "trusted_scoring",
                 e.kind,
-                &e.detail,
+                &if e.detail.starts_with("failed to start ") && e.detail.contains(NOT_ON_PATH) {
+                    format!("{}; suite checks must use an interpreter-prefixed argv such as [\"python3\", \"-m\", \"pytest\", ...]", e.detail)
+                } else {
+                    e.detail
+                },
                 started_at_ms,
                 started,
                 &self.root,
@@ -1793,16 +1797,21 @@ impl ToolRuntime {
             });
         }
         command.spawn().map_err(|e| {
-            let hint = if e.kind() == std::io::ErrorKind::NotFound {
-                "; suite checks must use an interpreter-prefixed argv such as [\"python3\", \"-m\", \"pytest\", ...]"
-            } else {
-                ""
-            };
             let message = format!("{e}");
             if message.starts_with(sandbox::SANDBOX_ERROR_PREFIX) {
                 message
             } else {
-                format!("failed to spawn scoring command '{}' ({e}){hint}", argv[0])
+                // execvp reports EACCES rather than ENOENT when a PATH entry
+                // cannot be searched, so a bare name missing from every
+                // PATH folder counts as missing too.
+                let missing = e.kind() == std::io::ErrorKind::NotFound
+                    || (!argv[0].contains('/') && !on_path(&argv[0]));
+                let hint = if missing {
+                    missing_program_hint(&argv[0])
+                } else {
+                    String::new()
+                };
+                format!("failed to start '{}' ({e}){hint}", argv[0])
             }
         })
     }
@@ -2380,6 +2389,38 @@ fn checked_join(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
     }
     Ok(root.join(path))
 }
+const NOT_ON_PATH: &str = "is not installed or not on PATH";
+
+/// True when some folder on PATH holds a file named `program`.
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
+}
+
+/// Why a program could not be found, in words the model can act on. The
+/// model-facing hint used to be the scoring one ("use python3 -m ..."),
+/// which names an interpreter `command_policy` blocks. opencode and Hermes
+/// run a shell line, so the shell's "command not found" does this there;
+/// REX takes an argv, so it says it itself, including the common slip of
+/// a whole command line in `argv[0]`.
+fn missing_program_hint(program: &str) -> String {
+    let words: Vec<&str> = program.split_whitespace().collect();
+    if words.len() > 1 {
+        let split = words
+            .iter()
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "; argv[0] holds a whole command line - put each word in its own item, e.g. [{split}]"
+        )
+    } else if program.contains('/') {
+        "; no such program at that path".to_string()
+    } else {
+        format!("; '{program}' {NOT_ON_PATH}")
+    }
+}
+
 /// Key for a run-scoped standing approval of one exact command.
 ///
 /// Only a command that already passes `command_policy` qualifies (so no
@@ -4381,6 +4422,50 @@ mod tests {
         rt.resolve_approval(&p.call_id, true).unwrap();
         assert!(rt.execute(&p.call_id).ok);
         assert_eq!(fs::read_to_string(root.join("p.txt")).unwrap(), "a\nc\n");
+    }
+    #[test]
+    fn missing_program_says_what_to_fix() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let run = |argv: &[&str]| {
+            let p = rt
+                .prepare(ToolRequest::RunCommand {
+                    argv: argv.iter().map(|s| s.to_string()).collect(),
+                    cwd: None,
+                    timeout_ms: None,
+                })
+                .unwrap();
+            let _ = rt.resolve_approval(&p.call_id, true);
+            rt.execute(&p.call_id).error.unwrap().detail
+        };
+        let d = run(&["rex-no-such-tool-xyz", "--v"]);
+        assert!(
+            d.starts_with("failed to start 'rex-no-such-tool-xyz' ("),
+            "{d}"
+        );
+        assert!(
+            d.ends_with("; 'rex-no-such-tool-xyz' is not installed or not on PATH"),
+            "{d}"
+        );
+        assert!(!d.contains("python3") && !d.contains("scoring"), "{d}");
+        let d = run(&["cargo  test --quiet"]);
+        assert!(
+            d.ends_with("; argv[0] holds a whole command line - put each word in its own item, e.g. [\"cargo\", \"test\", \"--quiet\"]"),
+            "{d}"
+        );
+        let d = run(&["make build"]);
+        assert!(d.ends_with("e.g. [\"make\", \"build\"]"), "{d}");
+        let d = run(&["./bin/nothing-here"]);
+        assert!(d.ends_with("; no such program at that path"), "{d}");
+        // the scoring path keeps its own hint
+        let r = rt.execute_trusted_scoring(
+            &["rex-no-such-tool-xyz".into()],
+            None,
+            5_000,
+            &["rex-no-such-tool-xyz"],
+        );
+        let d = r.error.unwrap().detail;
+        assert!(d.contains("is not installed or not on PATH; suite checks must use an interpreter-prefixed argv"), "{d}");
     }
     #[test]
     fn shell_is_hard_denied() {

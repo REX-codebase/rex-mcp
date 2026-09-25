@@ -1727,3 +1727,24 @@ is shared it is noted in the module docs.
   1- and 3-byte files, overwrite after the read). Hand mutation: 5/5
   killed.
 - Gap left: a file of only blank lines reads as those lines.
+
+## Round 56: a missing program says what to fix
+
+- opencode and Hermes run commands through a shell, so the shell's own
+  "command not found" tells the model what went wrong.
+- REX before: `run_command` takes an argv. When the program could not be
+  started, the model saw "failed to spawn scoring command 'x' (...);
+  suite checks must use an interpreter-prefixed argv such as
+  ["python3", "-m", "pytest", ...]", a hint written for the benchmark
+  scorer that names an interpreter `run_command` blocks. On this box a
+  missing program also showed as "Permission denied", because execvp
+  reports EACCES when a PATH folder cannot be searched.
+- REX now: "failed to start 'x' (...)" plus one of: "'x' is not
+  installed or not on PATH"; "argv[0] holds a whole command line - put
+  each word in its own item, e.g. ["cargo", "test"]"; or "no such
+  program at that path". A bare name found in no PATH folder counts as
+  missing whatever the OS error. The trusted scorer keeps its own
+  python3 hint.
+- Tests: one test (missing tool, whole line in argv[0] with 2 and 3
+  words, missing path, scorer hint). Hand mutation: 6/6 killed.
+- Gap left: none known.
