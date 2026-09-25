@@ -524,12 +524,12 @@ impl ToolRuntime {
                 }
                 refuse_text_into_container(path)?;
                 let target = self.resolve_for_write(path)?;
+                if target.is_dir() {
+                    return Err(folder_not_file(&relative(&self.root, &target)));
+                }
                 if target.exists() {
                     if !overwrite {
-                        return Err(err(
-                            ErrorKind::AlreadyExists,
-                            "file exists and overwrite is false",
-                        ));
+                        return Err(err(ErrorKind::AlreadyExists, EXISTS_NO_OVERWRITE));
                     }
                     self.check_not_stale(&target)?;
                     self.check_seen_before_overwrite(&target)?;
@@ -1167,10 +1167,7 @@ impl ToolRuntime {
         }
         let previous = if target.exists() {
             if !overwrite {
-                return Err(err(
-                    ErrorKind::AlreadyExists,
-                    "file exists and overwrite is false",
-                ));
+                return Err(err(ErrorKind::AlreadyExists, EXISTS_NO_OVERWRITE));
             }
             let meta = fs::metadata(&target).map_err(io_err)?;
             if meta.len() > MAX_FILE_BYTES {
@@ -2447,6 +2444,11 @@ fn checked_join(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
     }
     Ok(root.join(path))
 }
+/// `create_file` on an existing file without `overwrite`. opencode's
+/// write tool replaces files outright; REX keeps the guard and says how to
+/// get past it on purpose.
+const EXISTS_NO_OVERWRITE: &str = "file exists and overwrite is false; to change part of it use edit_file, or to replace all of it read it first and send create_file again with overwrite: true";
+
 /// A file tool pointed at a folder. opencode says "Path is a directory,
 /// not a file" (`tool/edit.ts`); REX also names the tool that lists it.
 fn folder_not_file(rel: &str) -> ToolError {
@@ -3443,6 +3445,37 @@ mod tests {
         );
         assert_eq!(r.error.unwrap().detail, want);
         assert!(root.join("src/sub").is_dir());
+        // the pre-approval check says the same
+        let e = rt
+            .preflight(&ToolRequest::CreateFile {
+                path: "src/sub".into(),
+                content: "y".into(),
+                overwrite: false,
+            })
+            .unwrap_err();
+        assert_eq!(e.detail, want);
+        let e = rt
+            .preflight(&ToolRequest::CreateFile {
+                path: "src/a.rs".into(),
+                content: "y".into(),
+                overwrite: false,
+            })
+            .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::AlreadyExists);
+        assert_eq!(e.detail, "file exists and overwrite is false; to change part of it use edit_file, or to replace all of it read it first and send create_file again with overwrite: true");
+        // a file that appears between approval and running gets it too
+        let p = rt
+            .prepare(ToolRequest::CreateFile {
+                path: "late.txt".into(),
+                content: "y".into(),
+                overwrite: false,
+            })
+            .unwrap();
+        fs::write(root.join("late.txt"), "first").unwrap();
+        let _ = rt.resolve_approval(&p.call_id, true);
+        let r = rt.execute(&p.call_id);
+        assert_eq!(r.error.unwrap().detail, e.detail);
+        assert_eq!(fs::read_to_string(root.join("late.txt")).unwrap(), "first");
         let run = |cwd: &str| {
             approved(
                 &rt,

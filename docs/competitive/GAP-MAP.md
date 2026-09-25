@@ -1814,3 +1814,21 @@ is shared it is noted in the module docs.
 - Tests: one test (edit and overwrite on a folder, nested and top-level
   file as cwd). Hand mutation: 4/4 killed.
 - Gap left: none known.
+
+## Round 61: "file exists" says how to proceed
+
+- opencode: the write tool replaces an existing file outright (after a
+  read). REX keeps its `overwrite: false` guard, which neither
+  competitor has.
+- REX before: "file exists and overwrite is false", with no next step.
+  The pre-approval check on a folder also said "file exists" (Round 60
+  only fixed the execute path).
+- REX now: "file exists and overwrite is false; to change part of it use
+  edit_file, or to replace all of it read it first and send create_file
+  again with overwrite: true", in both the pre-approval check and the
+  execute path. A folder gets the Round 60 folder message in the
+  pre-approval check too.
+- Tests: the Round 60 test gained both pre-approval cases and a file
+  that appears between approval and running (not overwritten). Hand
+  mutation: 3/3 killed (each message site, pre-approval folder check).
+- Gap left: none known.
