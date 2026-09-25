@@ -657,11 +657,14 @@ pub fn tool_descriptors() -> Vec<Value> {
     }
     out
 }
+fn task_id_schema() -> Value {
+    json!({"type":"string","minLength":1,"maxLength":199,"pattern":"^[A-Za-z0-9_-]+$"})
+}
 fn task_ref_schema() -> Value {
-    json!({"type":"object","required":["task_id"],"properties":{"task_id":{"type":"string","minLength":1,"maxLength":199,"pattern":"^[A-Za-z0-9_-]+$"}},"additionalProperties":false})
+    json!({"type":"object","required":["task_id"],"properties":{"task_id":task_id_schema()},"additionalProperties":false})
 }
 fn task_epoch_schema() -> Value {
-    json!({"type":"object","required":["task_id","capability","lease_epoch"],"properties":{"task_id":{"type":"string"},"capability":{"type":"string"},"lease_epoch":{"type":"integer"}},"additionalProperties":false})
+    json!({"type":"object","required":["task_id","capability","lease_epoch"],"properties":{"task_id":task_id_schema(),"capability":{"type":"string"},"lease_epoch":{"type":"integer"}},"additionalProperties":false})
 }
 fn extend(mut base: Value, props: Value, required: &[&str]) -> Value {
     if let (Some(dst), Some(src)) = (base["properties"].as_object_mut(), props.as_object()) {
@@ -748,6 +751,10 @@ mod tests {
         assert_eq!(event_input["properties"]["task_id"]["maxLength"], 199);
         assert_eq!(event_input["properties"]["after_seq"]["minimum"], 0);
         assert_eq!(event_input["properties"]["limit"]["maximum"], 1000);
+        assert_eq!(
+            find("rex_next")["inputSchema"]["properties"]["task_id"],
+            event_input["properties"]["task_id"]
+        );
         let status_schema = &find("rex_status")["outputSchema"];
         assert_eq!(status_schema["type"], "object");
         assert_eq!(
