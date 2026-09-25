@@ -1668,3 +1668,18 @@ is shared it is noted in the module docs.
   removes the same event in the plan-gate turn, which has no test
   harness here.
 - Gap left: no retry with a larger cap; REX's cap is fixed per request.
+
+## Round 52: chat mode reads blank tool arguments as no arguments
+
+- Hermes: `agent/turn_tool_validation.py` reads empty tool arguments as
+  `{}`.
+- REX before: the agent-mode decoder did this since Round 46, but the
+  chat-mode decoder (`conversation.rs`, used by the live loop) failed
+  the whole turn with "invalid tool arguments" on a blank string.
+- REX now: blank or whitespace-only arguments read as `{}` there too, so
+  a tool with no required fields runs and one with required fields gets
+  the normal request error. Broken non-blank JSON still fails as before.
+- Tests: one decoder test (empty, whitespace, broken, valid). Hand
+  mutation: 3/3 killed.
+- Gap left: chat mode still fails the turn on broken non-blank JSON; its
+  turn type has no per-call error slot yet.

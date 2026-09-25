@@ -114,7 +114,14 @@ fn decode_openai(v: &Value) -> Result<NormalizedTurn, String> {
             .get("arguments")
             .and_then(Value::as_str)
             .ok_or("tool call missing arguments")?;
-        let args = serde_json::from_str(raw).map_err(|e| format!("invalid tool arguments: {e}"))?;
+        // Blank arguments mean "no arguments", as Hermes reads them
+        // (`agent/turn_tool_validation.py`); the agent-mode decoder does
+        // the same (Round 46).
+        let args = if raw.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(raw).map_err(|e| format!("invalid tool arguments: {e}"))?
+        };
         calls.push(tool(&args, id, name)?);
     }
     Ok(NormalizedTurn {
@@ -224,6 +231,21 @@ mod tests {
         let b = r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search_files","args":{"query":"TODO"}}}]},"finishReason":"STOP"}]}"#;
         let t = decode_turn(ProviderProtocol::Gemini, b).unwrap();
         assert_eq!(t.tool_calls.len(), 1)
+    }
+    #[test]
+    fn openai_blank_arguments_read_as_empty_object() {
+        let turn = |args: &str| {
+            let b = json!({"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"read_file","arguments": args}}]},"finish_reason":"tool_calls"}]}).to_string();
+            decode_turn(ProviderProtocol::OpenAiCompatible, &b)
+        };
+        // read_file needs a path, so {} reaches request validation, not JSON parsing
+        for blank in ["", "  \n"] {
+            let e = turn(blank).unwrap_err();
+            assert!(e.starts_with("invalid read_file request"), "{e}");
+        }
+        let e = turn("{\"path\":").unwrap_err();
+        assert!(e.starts_with("invalid tool arguments"), "{e}");
+        assert_eq!(turn("{\"path\":\"a\"}").unwrap().tool_calls.len(), 1);
     }
     #[test]
     fn model_cannot_smuggle_approval() {
