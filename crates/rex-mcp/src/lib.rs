@@ -159,6 +159,12 @@ impl McpServer {
     }
 
     fn initialize(&mut self, _: &Value, params: Value) -> Result<Value, ProtocolError> {
+        if self.initialized {
+            return Err(ProtocolError::new(
+                ErrorCode::MalformedRequest,
+                "MCP session is already initialized",
+            ));
+        }
         let offered = params
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -487,14 +493,20 @@ mod tests {
         }
         let blocked = s.handle(rpc(1, "tools/list", json!({}))).unwrap();
         assert_eq!(blocked["error"]["data"]["code"], "unauthorized");
-        for id in [json!(0), json!("a")] {
-            let response = s
-                .handle(json!({"jsonrpc":"2.0", "id":id,
-                "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}}))
-                .unwrap();
-            assert_eq!(response["id"], id);
-            assert!(response.get("result").is_some());
-        }
+        let first = s
+            .handle(json!({"jsonrpc":"2.0", "id":0,
+            "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}}))
+            .unwrap();
+        assert_eq!(first["id"], 0);
+        assert!(first.get("result").is_some());
+        let repeat = s
+            .handle(json!({"jsonrpc":"2.0", "id":"a",
+            "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}}))
+            .unwrap();
+        assert_eq!(repeat["id"], "a");
+        assert_eq!(repeat["error"]["code"], -32602);
+        let still_ready = s.handle(rpc(2, "tools/list", json!({}))).unwrap();
+        assert!(still_ready["result"]["tools"].is_array());
     }
     #[test]
     fn tool_call_notification_cannot_mutate_custody() {
