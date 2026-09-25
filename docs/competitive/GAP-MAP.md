@@ -1698,3 +1698,16 @@ is shared it is noted in the module docs.
 - Tests: one test (named file, ignored named file, include that matches
   and one that does not, folder walk). Hand mutation: 3/3 killed.
 - Gap left: `glob_files` with a file as `path` still lists nothing.
+
+## Round 54: glob_files with a file path says so
+
+- opencode: `tool/glob.ts` refuses a file path ("glob path must be a
+  directory").
+- REX before: a file as `path` was walked as a folder and the answer was
+  "[no files match]", which reads as "nothing there" (Round 53 gap left).
+- REX now: the call is refused with the file's name, the folder to use
+  instead, and a pointer to `search_files` / `read_file` for looking
+  inside it. A top-level file points to ".".
+- Tests: one test (nested file, top-level file, folder still lists).
+  Hand mutation: 3/3 killed.
+- Gap left: none known.

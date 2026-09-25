@@ -1552,6 +1552,27 @@ impl ToolRuntime {
         max_results: usize,
     ) -> Result<ExecData, ToolError> {
         let base = self.resolve_existing(path.unwrap_or("."), true)?;
+        // A file is not a folder to list. opencode refuses it too
+        // (`tool/glob.ts`); REX also names the folder to use instead of
+        // answering "[no files match]", which read as "nothing there".
+        if base.is_file() {
+            let parent = base
+                .parent()
+                .map(|p| relative(&self.root, p))
+                .unwrap_or_else(|| ".".into());
+            let parent = if parent.is_empty() {
+                ".".into()
+            } else {
+                parent
+            };
+            return Err(err(
+                ErrorKind::InvalidRequest,
+                &format!(
+                    "glob_files path must be a folder, and {} is a file; use path \"{parent}\" to list its folder, or search_files / read_file to look inside it",
+                    relative(&self.root, &base)
+                ),
+            ));
+        }
         let limit = max_results.clamp(1, MAX_SEARCH_RESULTS);
         let glob = walk::Glob::new(pattern).ok_or_else(|| {
             err(
@@ -4075,6 +4096,33 @@ mod tests {
         assert_eq!(with("a.rs", "*.ts"), "[no matches]");
         // a folder still walks, skipping ignored files
         assert_eq!(run("."), "a.rs:2:fn needle() {}\nb.rs:1:fn needle() {}");
+    }
+    #[test]
+    fn glob_with_a_file_path_names_the_folder() {
+        let root = temp();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "").unwrap();
+        fs::write(root.join("top.rs"), "").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let run = |path: &str| {
+            let p = rt
+                .prepare(ToolRequest::GlobFiles {
+                    pattern: "*.rs".into(),
+                    path: Some(path.into()),
+                    max_results: None,
+                })
+                .unwrap();
+            rt.execute(&p.call_id)
+        };
+        let e = run("src/a.rs").error.unwrap();
+        assert_eq!(e.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            e.detail,
+            "glob_files path must be a folder, and src/a.rs is a file; use path \"src\" to list its folder, or search_files / read_file to look inside it"
+        );
+        let e = run("top.rs").error.unwrap();
+        assert!(e.detail.contains("use path \".\""), "{}", e.detail);
+        assert_eq!(run("src").output.unwrap(), "src/a.rs");
     }
     fn search_repo() -> PathBuf {
         let root = temp();
