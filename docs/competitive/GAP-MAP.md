@@ -1798,3 +1798,19 @@ is shared it is noted in the module docs.
 - Tests: one test (existing and missing file, preflight and execute).
   Hand mutation: 4/4 killed.
 - Gap left: none known.
+
+## Round 60: a folder given to a file tool says so
+
+- opencode: `tool/edit.ts` answers "Path is a directory, not a file:
+  <path>".
+- REX before: `edit_file` on a folder said "directory not allowed here"
+  without the path; `create_file` with overwrite on a folder failed with
+  a raw OS error from reading it; `run_command` with a file as `cwd`
+  said "command cwd is not a directory".
+- REX now: "<path> is a folder, not a file; read_file on it lists what
+  is inside" for edit and overwrite (checked before anything is read or
+  written), and "command cwd <file> is a file, not a folder; use cwd
+  "<its folder>"" for commands.
+- Tests: one test (edit and overwrite on a folder, nested and top-level
+  file as cwd). Hand mutation: 4/4 killed.
+- Gap left: none known.

@@ -1162,6 +1162,9 @@ impl ToolRuntime {
             fs::create_dir_all(parent).map_err(io_err)?;
             self.reject_symlinks(parent)?;
         }
+        if target.is_dir() {
+            return Err(folder_not_file(&relative(&self.root, &target)));
+        }
         let previous = if target.exists() {
             if !overwrite {
                 return Err(err(
@@ -1668,9 +1671,17 @@ impl ToolRuntime {
     ) -> Result<ExecData, ToolError> {
         let cwd = self.resolve_existing(cwd.unwrap_or("."), true)?;
         if !cwd.is_dir() {
+            let parent = cwd
+                .parent()
+                .map(|p| relative(&self.root, p))
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| ".".into());
             return Err(err(
                 ErrorKind::InvalidRequest,
-                "command cwd is not a directory",
+                &format!(
+                    "command cwd {} is a file, not a folder; use cwd \"{parent}\"",
+                    relative(&self.root, &cwd)
+                ),
             ));
         }
         // The real boundary is the OS sandbox: every child enters fresh
@@ -1898,7 +1909,7 @@ impl ToolRuntime {
         }
         self.reject_symlinks(&joined)?;
         if !allow_dir && canonical.is_dir() {
-            return Err(err(ErrorKind::InvalidRequest, "directory not allowed here"));
+            return Err(folder_not_file(&relative(&self.root, &canonical)));
         }
         Ok(canonical)
     }
@@ -2436,6 +2447,15 @@ fn checked_join(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
     }
     Ok(root.join(path))
 }
+/// A file tool pointed at a folder. opencode says "Path is a directory,
+/// not a file" (`tool/edit.ts`); REX also names the tool that lists it.
+fn folder_not_file(rel: &str) -> ToolError {
+    err(
+        ErrorKind::InvalidRequest,
+        &format!("{rel} is a folder, not a file; read_file on it lists what is inside"),
+    )
+}
+
 const NOT_ON_PATH: &str = "is not installed or not on PATH";
 
 /// True when some folder on PATH holds a file named `program`.
@@ -3395,6 +3415,56 @@ mod tests {
         // a new file is written as given
         write("n.txt", "p\nq\n");
         assert_eq!(bytes("n.txt"), b"p\nq\n");
+    }
+    #[test]
+    fn folder_given_to_a_file_tool_says_so() {
+        let root = temp();
+        fs::create_dir_all(root.join("src/sub")).unwrap();
+        fs::write(root.join("src/a.rs"), "x\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let want = "src/sub is a folder, not a file; read_file on it lists what is inside";
+        let r = approved(
+            &rt,
+            ToolRequest::EditFile {
+                path: "src/sub".into(),
+                expected: "x".into(),
+                replacement: "y".into(),
+                replace_all: false,
+            },
+        );
+        assert_eq!(r.error.unwrap().detail, want);
+        let r = approved(
+            &rt,
+            ToolRequest::CreateFile {
+                path: "src/sub".into(),
+                content: "y".into(),
+                overwrite: true,
+            },
+        );
+        assert_eq!(r.error.unwrap().detail, want);
+        assert!(root.join("src/sub").is_dir());
+        let run = |cwd: &str| {
+            approved(
+                &rt,
+                ToolRequest::RunCommand {
+                    argv: vec!["ls".into()],
+                    cwd: Some(cwd.into()),
+                    timeout_ms: None,
+                },
+            )
+            .error
+            .unwrap()
+            .detail
+        };
+        assert_eq!(
+            run("src/a.rs"),
+            "command cwd src/a.rs is a file, not a folder; use cwd \"src\""
+        );
+        fs::write(root.join("top.txt"), "").unwrap();
+        assert_eq!(
+            run("top.txt"),
+            "command cwd top.txt is a file, not a folder; use cwd \".\""
+        );
     }
     #[test]
     fn empty_expected_text_names_the_right_tool() {
