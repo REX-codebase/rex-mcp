@@ -1162,6 +1162,18 @@ impl ToolRuntime {
         // Replacing a file that starts with a byte order mark keeps the
         // mark (opencode's write tool does the same); the model never
         // sees or writes it.
+        // Replacing a CRLF file with bare-LF text keeps CRLF, as Hermes's
+        // write_file does (`tools/file_operations.py`): read_file hides the
+        // endings and models write LF, so a round trip would otherwise
+        // rewrite every line. Text that has any CRLF of its own is written
+        // as given.
+        let with_crlf;
+        let content = if fuzzy::uses_crlf(&previous) && !content.contains("\r\n") {
+            with_crlf = fuzzy::to_crlf(content);
+            with_crlf.as_str()
+        } else {
+            content
+        };
         let with_bom;
         let content = if previous.starts_with(fuzzy::BOM) && !content.starts_with(fuzzy::BOM) {
             with_bom = format!("{}{content}", fuzzy::BOM);
@@ -3196,6 +3208,52 @@ mod tests {
         assert_eq!(bytes("plain.cs"), b"class Q {}\n");
         assert!(write("new.cs", "class N {}\n").ok);
         assert_eq!(bytes("new.cs"), b"class N {}\n");
+    }
+    #[test]
+    fn overwrite_keeps_crlf_line_endings() {
+        let root = temp();
+        fs::write(root.join("w.bat"), "@echo off\r\necho hi\r\n").unwrap();
+        fs::write(root.join("m.txt"), "a\r\nb\nc\nd\n").unwrap();
+        fs::write(root.join("bc.cs"), "\u{FEFF}class A {}\r\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let bytes = |p: &str| fs::read(root.join(p)).unwrap();
+        for p in ["w.bat", "m.txt", "bc.cs"] {
+            let read = ToolRequest::ReadFile {
+                path: p.into(),
+                offset: None,
+                limit: None,
+            };
+            assert!(approved(&rt, read).ok);
+        }
+        let write = |path: &str, content: &str| {
+            let r = approved(
+                &rt,
+                ToolRequest::CreateFile {
+                    path: path.into(),
+                    content: content.into(),
+                    overwrite: true,
+                },
+            );
+            assert!(r.ok, "{:?}", r.error);
+        };
+        // bare LF over a CRLF file becomes CRLF
+        write("w.bat", "@echo off\necho bye\n");
+        assert_eq!(bytes("w.bat"), b"@echo off\r\necho bye\r\n");
+        // text with its own CRLF is written as given
+        write("w.bat", "one\r\ntwo\n");
+        assert_eq!(bytes("w.bat"), b"one\r\ntwo\n");
+        // a mostly-LF file stays LF
+        write("m.txt", "x\ny\n");
+        assert_eq!(bytes("m.txt"), b"x\ny\n");
+        // mark and CRLF are both kept
+        write("bc.cs", "class B {}\nclass C {}\n");
+        assert_eq!(
+            bytes("bc.cs"),
+            "\u{FEFF}class B {}\r\nclass C {}\r\n".as_bytes()
+        );
+        // a new file is written as given
+        write("n.txt", "p\nq\n");
+        assert_eq!(bytes("n.txt"), b"p\nq\n");
     }
     #[test]
     fn edit_that_changes_nothing_is_refused() {

@@ -1624,3 +1624,22 @@ is shared it is noted in the module docs.
   it.
 - Gap left: only the first missing folder is corrected; a path with two
   misspelt folders gets the first fix as a folder hint.
+
+## Round 50: overwriting a CRLF file keeps CRLF
+
+- Hermes: `write_file` (`tools/file_operations.py`) checks the file it
+  is about to replace and, when that file uses CRLF, converts the new
+  text to CRLF, because `read_file` hides the endings and models send LF.
+- REX before: `edit_file` and `apply_patch` kept CRLF (Round 43), but
+  `create_file` with `overwrite` wrote the text as given (Round 43 gap
+  left). A read-then-rewrite of a Windows file turned every line to LF,
+  and the diff and the next `git diff` showed every line changed.
+- REX now: when the file being replaced is mostly CRLF (same majority
+  rule as Round 43) and the new text has no CRLF of its own, the text is
+  written with CRLF. Text that has any CRLF is written as given, so a
+  deliberate choice is kept. Mostly-LF files and new files are
+  unchanged. A byte-order mark is still kept too (Round 44).
+- Tests: one test (bare LF over CRLF, text with its own CRLF, mostly-LF
+  file, CRLF plus mark, new file). Hand mutation: 5/5 killed.
+- Gap left: turning a CRLF file into LF on purpose needs text that
+  keeps one CRLF, or a command; Hermes has the same limit.
