@@ -131,11 +131,44 @@ impl McpServer {
                     "mimeType": "text/plain"
                 }]
             })),
+            "resources/templates/list" => self.require_initialized().map(|_| json!({
+                "resourceTemplates": [{
+                    "uriTemplate": "rex://task/{task_id}/status",
+                    "name": "REX task status",
+                    "description": "Read the current custody status of a known REX task ID.",
+                    "mimeType": "application/json"
+                }]
+            })),
             "resources/read" => self.require_initialized().and_then(|_| {
                 let uri = request.get("params").and_then(|p| p.get("uri"))
                     .and_then(Value::as_str).ok_or_else(|| {
                         ProtocolError::new(ErrorCode::MalformedRequest, "resource URI required")
                     })?;
+                if let Some(task_id) = uri
+                    .strip_prefix("rex://task/")
+                    .and_then(|path| path.strip_suffix("/status"))
+                {
+                    if task_id.is_empty() || task_id.contains('/') {
+                        return Err(ProtocolError::new(
+                            ErrorCode::MalformedRequest,
+                            "invalid task status resource URI",
+                        ));
+                    }
+                    let status = self.daemon.dispatch(
+                        ToolName::Status,
+                        json!({"task_id": task_id}),
+                    )?;
+                    return Ok(json!({"contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": serde_json::to_string_pretty(&status).map_err(|e| {
+                            ProtocolError::new(
+                                ErrorCode::MalformedRequest,
+                                format!("cannot encode task status: {e}"),
+                            )
+                        })?
+                    }]}));
+                }
                 if uri != "rex://workflow/quickstart" {
                     return Err(ProtocolError::new(
                         ErrorCode::MalformedRequest, format!("unknown resource: {uri}")
@@ -438,6 +471,36 @@ mod tests {
             ))
             .unwrap();
         assert!(bad.get("error").is_some());
+    }
+
+    #[test]
+    fn task_status_resource_template_reads_current_custody() {
+        let (_d, mut s) = server();
+        s.handle(rpc(1, "initialize", json!({"protocolVersion": MCP_PROTOCOL_VERSION})))
+            .unwrap();
+        let templates = s.handle(rpc(2, "resources/templates/list", json!({}))).unwrap();
+        assert_eq!(
+            templates["result"]["resourceTemplates"][0]["uriTemplate"],
+            "rex://task/{task_id}/status"
+        );
+        let started = s.handle(rpc(3, "tools/call", json!({
+            "name": "rex_execute",
+            "arguments": {
+                "request_id": "status-resource-test",
+                "task": "inspect status",
+                "host": "claude_code",
+                "operator_is_agent": true
+            }
+        }))).unwrap();
+        let task_id = started["result"]["structuredContent"]["task_id"].as_str().unwrap();
+        let uri = format!("rex://task/{task_id}/status");
+        let read = s.handle(rpc(4, "resources/read", json!({"uri": uri}))).unwrap();
+        let text = read["result"]["contents"][0]["text"].as_str().unwrap();
+        let status: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(status["task_id"], task_id);
+        assert_eq!(read["result"]["contents"][0]["mimeType"], "application/json");
+        let malformed = s.handle(rpc(5, "resources/read", json!({"uri": "rex://task/a/b/status"}))).unwrap();
+        assert_eq!(malformed["error"]["code"], -32602);
     }
 
     #[test]
