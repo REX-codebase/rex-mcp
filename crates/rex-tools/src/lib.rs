@@ -2562,7 +2562,9 @@ pub fn standing_key(request: &ToolRequest) -> Option<String> {
     if program.is_empty() || program.contains('/') || program.contains('\\') {
         return None;
     }
-    let dir = match cwd.as_deref().map(str::trim) {
+    // Whitespace belongs to a path component: `web` and `web ` can be
+    // different directories. Never trim it from a standing approval key.
+    let dir = match cwd.as_deref() {
         None | Some("") | Some(".") => ".".to_string(),
         Some(d) => d.trim_end_matches('/').to_string(),
     };
@@ -5186,6 +5188,19 @@ mod tests {
         assert_eq!(
             standing_key(&run(&["npm", "test"], Some("web/"))),
             standing_key(&run(&["npm", "test"], Some("web")))
+        );
+        // Space is part of the actual directory name, not formatting.
+        assert_ne!(
+            standing_key(&run(&["npm", "test"], Some("web "))),
+            standing_key(&run(&["npm", "test"], Some("web")))
+        );
+        assert_ne!(
+            standing_key(&run(&["npm", "test"], Some(" web"))),
+            standing_key(&run(&["npm", "test"], Some("web")))
+        );
+        assert_ne!(
+            standing_key(&run(&["npm", "test"], Some(" "))),
+            Some(npm.clone())
         );
         // programs given as a path can be rewritten by the model
         assert_eq!(standing_key(&run(&["./build.sh"], None)), None);

@@ -1970,3 +1970,18 @@ is shared it is noted in the module docs.
 - Hand mutations: 4/4 killed by test panics (drop limit from key, skip
   cap, wrong default, replace effective limit with constant). Source
   restored.
+
+## Round 72 - retain whitespace in standing approval cwd
+
+- Gap: the key for a run-scoped command approval trimmed `cwd` before
+  storing it. `web` and `web ` can be distinct folders on disk, so an
+  approval for one could silently execute the same argv in the other.
+- Grounding: opencode's `tool/shell.ts` uses its resolved `workdir` for
+  permission scanning, while Hermes' `tools/terminal_tool_guards.py`
+  validates characters in `workdir` and allows spaces. REX must not
+  collapse path spellings that point at different directories. It still
+  merges an absent, empty, or `.` cwd, and strips a trailing slash.
+- Test: standing key differs for leading/trailing space and space-only
+  folder, while the same actual folder with a trailing slash still matches.
+- Hand mutations: 4/4 killed by test panics (trim all, trim only start,
+  trim only end, and treat space-only as root). Source restored.
