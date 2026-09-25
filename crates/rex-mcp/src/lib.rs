@@ -143,6 +143,11 @@ impl McpServer {
                     "name": "REX task events",
                     "description": "Read up to 100 append-only events after a known sequence cursor; start at 0.",
                     "mimeType": "application/json"
+                }, {
+                    "uriTemplate": "rex://task/{task_id}/result",
+                    "name": "REX task result",
+                    "description": "Read the terminal result and proof bundle of a known REX task ID.",
+                    "mimeType": "application/json"
                 }]
             })),
             "resources/read" => self.require_initialized().and_then(|_| {
@@ -179,6 +184,31 @@ impl McpServer {
                             })?
                         }]}));
                     }
+                }
+                if let Some(task_id) = uri
+                    .strip_prefix("rex://task/")
+                    .and_then(|path| path.strip_suffix("/result"))
+                {
+                    if task_id.is_empty() || task_id.contains('/') {
+                        return Err(ProtocolError::new(
+                            ErrorCode::MalformedRequest,
+                            "invalid task result resource URI",
+                        ));
+                    }
+                    let result = self.daemon.dispatch(
+                        ToolName::Result,
+                        json!({"task_id": task_id}),
+                    )?;
+                    return Ok(json!({"contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": serde_json::to_string_pretty(&result).map_err(|e| {
+                            ProtocolError::new(
+                                ErrorCode::MalformedRequest,
+                                format!("cannot encode task result: {e}"),
+                            )
+                        })?
+                    }]}));
                 }
                 if let Some(task_id) = uri
                     .strip_prefix("rex://task/")
@@ -643,6 +673,78 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(bad["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn task_result_resource_template_reads_terminal_proof() {
+        let (_d, mut s) = server();
+        s.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+        ))
+        .unwrap();
+        let templates = s
+            .handle(rpc(2, "resources/templates/list", json!({})))
+            .unwrap();
+        assert_eq!(
+            templates["result"]["resourceTemplates"][2]["uriTemplate"],
+            "rex://task/{task_id}/result"
+        );
+        let started = s
+            .handle(rpc(
+                3,
+                "tools/call",
+                json!({
+                    "name": "rex_execute",
+                    "arguments": {
+                        "request_id": "result-resource-test",
+                        "task": "inspect result",
+                        "host": "claude_code",
+                        "operator_is_agent": true
+                    }
+                }),
+            ))
+            .unwrap();
+        let task_id = started["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .unwrap();
+        let uri = format!("rex://task/{task_id}/result");
+        let pending = s
+            .handle(rpc(4, "resources/read", json!({"uri": uri})))
+            .unwrap();
+        assert_eq!(pending["error"]["data"]["code"], "no_result");
+        let stopped = s
+            .handle(rpc(
+                5,
+                "tools/call",
+                json!({
+                    "name": "rex_cancel",
+                    "arguments": {
+                        "task_id": task_id,
+                        "capability": started["result"]["structuredContent"]["task_capability"]
+                    }
+                }),
+            ))
+            .unwrap();
+        assert_eq!(stopped["result"]["isError"], false);
+        let read = s
+            .handle(rpc(6, "resources/read", json!({"uri": uri})))
+            .unwrap();
+        let text = read["result"]["contents"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["task_id"], task_id);
+        assert_eq!(result["state"], "cancelled");
+        let malformed = s
+            .handle(rpc(
+                7,
+                "resources/read",
+                json!({
+                    "uri": "rex://task/a/b/result"
+                }),
+            ))
+            .unwrap();
+        assert_eq!(malformed["error"]["code"], -32602);
     }
 
     #[test]
