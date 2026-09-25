@@ -581,7 +581,7 @@ impl ToolRuntime {
             summary: summarize(&request),
             risk,
             approval_required,
-            policy_reason: reason.into(),
+            policy_reason: reason,
             standing_key: if approval_required {
                 standing_key(&request)
             } else {
@@ -2358,30 +2358,30 @@ fn scoring_policy(argv: &[String], allowed: &[&str]) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn classify(r: &ToolRequest) -> (RiskClass, &'static str) {
+fn classify(r: &ToolRequest) -> (RiskClass, String) {
     match r {
         ToolRequest::ReadFile { .. }
         | ToolRequest::SearchFiles { .. }
         | ToolRequest::GlobFiles { .. } => (
             RiskClass::Read,
-            "bounded read inside the selected workspace",
+            "bounded read inside the selected workspace".into(),
         ),
         ToolRequest::CreateFile { .. }
         | ToolRequest::EditFile { .. }
         | ToolRequest::ApplyPatch { .. } => (
             RiskClass::Write,
-            "changes workspace files and requires user approval",
+            "changes workspace files and requires user approval".into(),
         ),
         ToolRequest::RunCommand { argv, .. } if command_policy(argv).is_err() => {
-            (RiskClass::Denied, "command is blocked by hard policy")
+            (RiskClass::Denied, command_policy(argv).unwrap_err().detail)
         }
         ToolRequest::RunCommand { .. } => (
             RiskClass::Execute,
-            "runs a bounded process and requires user approval",
+            "runs a bounded process and requires user approval".into(),
         ),
         ToolRequest::McpCall { .. } => (
             RiskClass::Execute,
-            "calls a third-party MCP server and requires user approval",
+            "calls a third-party MCP server and requires user approval".into(),
         ),
     }
 }
@@ -5028,10 +5028,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(p.risk, RiskClass::Denied);
-        assert_eq!(
-            rt.execute(&p.call_id).error.unwrap().kind,
-            ErrorKind::PolicyDenied
-        );
+        let e = rt.execute(&p.call_id).error.unwrap();
+        assert_eq!(e.kind, ErrorKind::PolicyDenied);
+        assert_eq!(e.detail, p.policy_reason);
+        assert!(e
+            .detail
+            .starts_with("'sh' is blocked: run_command has no shell"));
     }
     #[test]
     fn output_redacts_secrets() {

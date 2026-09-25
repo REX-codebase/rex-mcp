@@ -1985,3 +1985,19 @@ is shared it is noted in the module docs.
   folder, while the same actual folder with a trailing slash still matches.
 - Hand mutations: 4/4 killed by test panics (trim all, trim only start,
   trim only end, and treat space-only as root). Source restored.
+
+## Round 73 - policy denials reach the model with a remedy
+
+- Gap left by Round 66: `denied_detail` had specific advice, but a
+  model-submitted command takes `prepare` -> `classify` -> `execute`.
+  `classify` stored the generic "command is blocked by hard policy" as
+  its reason, so the model never saw the new advice on this path.
+- Grounding: Hermes `tools/terminal_tool.py` and
+  `tools/terminal_tool_guards.py` return the guard's own rejection to the
+  caller; opencode `tool/shell.ts` passes rejection from its permission
+  check before spawning. REX now preserves `command_policy`'s exact
+  refusal in the prepared call. Denied commands remain denied.
+- Test: the existing shell-denial test now requires the specific reason
+  to survive prepare and appear in the execution error.
+- Hand mutations: 3/3 killed by test panics (generic classify reason,
+  generic prepared reason, generic execution error). Source restored.
