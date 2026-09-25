@@ -123,6 +123,30 @@ impl McpServer {
             "tools/list" => self
                 .require_initialized()
                 .map(|_| json!({"tools": tool_descriptors()})),
+            "resources/list" => self.require_initialized().map(|_| json!({
+                "resources": [{
+                    "uri": "rex://workflow/quickstart",
+                    "name": "REX task workflow quickstart",
+                    "description": "How an MCP host uses REX task custody and scoped tools.",
+                    "mimeType": "text/plain"
+                }]
+            })),
+            "resources/read" => self.require_initialized().and_then(|_| {
+                let uri = request.get("params").and_then(|p| p.get("uri"))
+                    .and_then(Value::as_str).ok_or_else(|| {
+                        ProtocolError::new(ErrorCode::MalformedRequest, "resource URI required")
+                    })?;
+                if uri != "rex://workflow/quickstart" {
+                    return Err(ProtocolError::new(
+                        ErrorCode::MalformedRequest, format!("unknown resource: {uri}")
+                    ));
+                }
+                Ok(json!({"contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id with rex_next and scoped rex_tools, then rex_submit with evidence. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
+                }]}))
+            }),
             "prompts/list" => self.require_initialized().map(|_| json!({
                 "prompts": [{
                     "name": "rex_task_workflow",
@@ -205,7 +229,7 @@ impl McpServer {
         self.initialized = true;
         Ok(json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": false }, "prompts": { "listChanged": false } },
+            "capabilities": { "tools": { "listChanged": false }, "prompts": { "listChanged": false }, "resources": { "listChanged": false } },
             "serverInfo": { "name": "rex-mcp", "version": env!("CARGO_PKG_VERSION") },
             "instructions": format!("REX Harness protocol {PROTOCOL_VERSION}. Caller-driven custody; call rex_execute, then rex_next/tools, and rex_submit. Continuation is cooperative.")
         }))
@@ -359,6 +383,46 @@ mod tests {
     fn rpc(id: i64, method: &str, params: Value) -> Value {
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
     }
+    #[test]
+    fn resource_quickstart_is_static_and_rejects_unknown_uris() {
+        let (_d, mut s) = server();
+        let init = s
+            .handle(rpc(
+                1,
+                "initialize",
+                json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+            ))
+            .unwrap();
+        assert_eq!(
+            init["result"]["capabilities"]["resources"]["listChanged"],
+            false
+        );
+        let list = s.handle(rpc(2, "resources/list", json!({}))).unwrap();
+        assert_eq!(
+            list["result"]["resources"][0]["uri"],
+            "rex://workflow/quickstart"
+        );
+        let read = s
+            .handle(rpc(
+                3,
+                "resources/read",
+                json!({"uri":"rex://workflow/quickstart"}),
+            ))
+            .unwrap();
+        assert!(read["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("rex_execute"));
+        let bad = s
+            .handle(rpc(
+                4,
+                "resources/read",
+                json!({"uri":"file:///etc/passwd"}),
+            ))
+            .unwrap();
+        assert!(bad.get("error").is_some());
+    }
+
     #[test]
     fn prompt_discovery_and_get_after_initialize() {
         let (_d, mut s) = server();
