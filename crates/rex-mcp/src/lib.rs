@@ -297,7 +297,7 @@ impl McpServer {
                             "role": "user",
                             "content": {
                                 "type": "text",
-                                "text": format!("Inspect existing REX task {task_id}. Call rex_status, then read rex://task/{task_id}/events/0 and rex://task/{task_id}/result only if available. Report the current status, recent events and any terminal result with their sources. Do not call rex_execute, rex_next, rex_submit, or any mutation or command tool. Do not invent missing task data.")
+                                "text": format!("Inspect existing REX task {task_id}. Call rex_status, then read rex://task/{task_id}/events/0. Event pages contain up to 100 entries; if the last event seq is less than last_seq, read rex://task/{task_id}/events/<last event seq> and repeat until caught up. If you cannot finish paging, say the event history is incomplete. Read rex://task/{task_id}/result only if available. Report the current status, events and any terminal result with their sources. Do not call rex_execute, rex_next, rex_submit, or any mutation or command tool. Do not invent missing task data.")
                             }
                         }]
                     }));
@@ -1163,6 +1163,8 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(text.contains("rex://task/task-123/events/0"));
+        assert!(text.contains("last event seq"));
+        assert!(text.contains("event history is incomplete"));
         assert!(text.contains("Do not call rex_execute"));
         let missing = s
             .handle(rpc(
