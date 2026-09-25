@@ -1175,19 +1175,21 @@ impl ToolRuntime {
             content,
             &relative(&self.root, &target),
         ));
-        Ok(exec(
-            Some(with_check(
-                format!(
-                    "wrote {} bytes to {}",
-                    content.len(),
-                    relative(&self.root, &target)
-                ),
-                &relative(&self.root, &target),
-                (!previous.is_empty()).then_some(previous.as_str()),
-                content,
-            )),
-            r,
-        ))
+        let mut text = with_check(
+            format!(
+                "wrote {} bytes to {}",
+                content.len(),
+                relative(&self.root, &target)
+            ),
+            &relative(&self.root, &target),
+            (!previous.is_empty()).then_some(previous.as_str()),
+            content,
+        );
+        if let Some(hint) = rewrite_hint(&previous, content) {
+            text.push('\n');
+            text.push_str(&hint);
+        }
+        Ok(exec(Some(text), r))
     }
 
     fn edit_file(
@@ -2617,6 +2619,46 @@ fn redact(input: &str) -> (String, usize) {
 }
 
 /// Append the post-write syntax note, if any, to a write result message.
+/// Smallest old and new file size, in bytes, for [`rewrite_hint`].
+const REWRITE_HINT_MIN_BYTES: usize = 12_000;
+
+/// A note for a whole-file overwrite that mostly re-sends lines already in
+/// the file: at least 80% of lines kept (counted as a line multiset, so
+/// the cost stays linear), with both versions at least
+/// `REWRITE_HINT_MIN_BYTES`. Re-sending a large file to change a few lines
+/// costs output tokens for every unchanged line; `edit_file` and
+/// `apply_patch` send only the change. Hermes adds the same kind of hint
+/// to `write_file` (`_whole_file_rewrite_hint`, `tools/file_tools.py`).
+fn rewrite_hint(old: &str, new: &str) -> Option<String> {
+    if old.len() < REWRITE_HINT_MIN_BYTES || new.len() < REWRITE_HINT_MIN_BYTES {
+        return None;
+    }
+    let mut left: HashMap<&str, usize> = HashMap::new();
+    let mut old_lines = 0usize;
+    for line in old.lines() {
+        *left.entry(line).or_default() += 1;
+        old_lines += 1;
+    }
+    let mut new_lines = 0usize;
+    let mut kept = 0usize;
+    for line in new.lines() {
+        new_lines += 1;
+        if let Some(n) = left.get_mut(line).filter(|n| **n > 0) {
+            *n -= 1;
+            kept += 1;
+        }
+    }
+    let most = old_lines.max(new_lines);
+    if most == 0 || kept * 5 < most * 4 {
+        return None;
+    }
+    Some(format!(
+        "note: {kept} of {new_lines} lines were already in the file, so about {} changed; \
+         for a change like this use edit_file or apply_patch, which send only the changed lines",
+        most - kept
+    ))
+}
+
 fn with_check(msg: String, rel: &str, before: Option<&str>, after: &str) -> String {
     match check::delta_note(rel, before, after) {
         Some(note) => format!("{msg}\n{note}"),
@@ -2924,6 +2966,87 @@ mod tests {
             .is_err());
     }
 
+    fn numbered(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("let value_{i} = compute({i}); // padding text"))
+            .collect()
+    }
+    #[test]
+    fn rewrite_hint_needs_a_big_mostly_unchanged_file() {
+        let old = numbered(1000);
+        let with_changes = |k: usize| {
+            let mut v = old.clone();
+            for line in v.iter_mut().take(k) {
+                line.push_str(" changed");
+            }
+            v.join("\n")
+        };
+        let old_text = old.join("\n");
+        let h = rewrite_hint(&old_text, &with_changes(10)).unwrap();
+        assert!(h.contains("990 of 1000 lines"), "{h}");
+        assert!(h.contains("about 10 changed"), "{h}");
+        assert!(h.contains("edit_file or apply_patch"), "{h}");
+        // dropped lines count as changed
+        let h = rewrite_hint(&old_text, &old[..900].join("\n")).unwrap();
+        assert!(h.contains("900 of 900 lines"), "{h}");
+        assert!(h.contains("about 100 changed"), "{h}");
+        // 80% kept is the edge
+        assert!(rewrite_hint(&old_text, &with_changes(200)).is_some());
+        assert!(rewrite_hint(&old_text, &with_changes(201)).is_none());
+        // growth counts against the ratio: 1000 kept of 1300
+        let mut grown = old.clone();
+        grown.extend(numbered(1300).into_iter().skip(1000).map(|l| l + " new"));
+        assert!(rewrite_hint(&old_text, &grown.join("\n")).is_none());
+        // lines are counted as a multiset, not a set
+        let same = "x".repeat(20);
+        let one = vec![same.as_str(); 1000].join("\n");
+        let two = vec![same.as_str(); 2000].join("\n");
+        assert!(rewrite_hint(&one, &two).is_none());
+        assert!(rewrite_hint(&two, &one).is_none());
+        // small files never get the note, on either side
+        let small_old = numbered(100).join("\n");
+        let mut small_new = numbered(100);
+        small_new[0].push('!');
+        assert!(small_old.len() < REWRITE_HINT_MIN_BYTES);
+        assert!(rewrite_hint(&small_old, &small_new.join("\n")).is_none());
+        let big_new = format!("{small_old}\n{}", "y".repeat(REWRITE_HINT_MIN_BYTES));
+        assert!(rewrite_hint(&small_old, &big_new).is_none());
+        assert!(rewrite_hint(&big_new, &small_old).is_none());
+        // exactly at the size floor still counts
+        let floor = "a".repeat(REWRITE_HINT_MIN_BYTES);
+        assert!(rewrite_hint(&floor, &floor).is_some());
+    }
+    #[test]
+    fn overwrite_of_a_big_file_suggests_edit_tools() {
+        let root = temp();
+        let old = numbered(1000).join("\n");
+        fs::write(root.join("big.rs"), &old).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let read = ToolRequest::ReadFile {
+            path: "big.rs".into(),
+            offset: None,
+            limit: None,
+        };
+        assert!(approved(&rt, read).ok);
+        let write = |path: &str, content: String| {
+            approved(
+                &rt,
+                ToolRequest::CreateFile {
+                    path: path.into(),
+                    content,
+                    overwrite: true,
+                },
+            )
+        };
+        let r = write("big.rs", old.replacen("value_5 ", "value_five ", 1));
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.output.unwrap();
+        assert!(out.starts_with("wrote "), "{out}");
+        assert!(out.contains("note: 999 of 1000 lines"), "{out}");
+        // a new file gets no note
+        let r = write("fresh.rs", old.clone());
+        assert!(!r.output.unwrap().contains("note:"));
+    }
     #[test]
     fn similar_names_ranks_likely_meanings() {
         let names = |v: &[(&str, bool)]| {

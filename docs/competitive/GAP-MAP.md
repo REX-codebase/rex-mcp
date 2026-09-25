@@ -1437,3 +1437,24 @@ is shared it is noted in the module docs.
   workspace" check changes nothing, because the symlink check already
   covers it; it stays as a second guard.
 - Gap left: no suggestions when the folder itself is missing.
+
+## Round 41: big whole-file rewrites point to the edit tools
+
+- Hermes: `_whole_file_rewrite_hint` in `tools/file_tools.py` adds a
+  hint when `write_file` replaces a large file while keeping most of its
+  lines (counted as a line multiset), telling the model a patch would
+  have sent only the change.
+- REX before: `create_file` with `overwrite` gave no feedback when the
+  model re-sent a large file to change a few lines, so it kept paying
+  output tokens for every unchanged line.
+- REX now: when both versions are at least 12,000 bytes and at least
+  80% of lines are kept, the result adds "note: K of N lines were
+  already in the file, so about C changed; for a change like this use
+  edit_file or apply_patch". Lines are counted as a multiset (linear
+  cost); growth and dropped lines count as changed. The write itself is
+  unchanged.
+- Tests: a threshold unit test (the 80% edge, growth, shrink, repeated
+  lines, the size floor on each side) and an end-to-end overwrite test.
+  Hand mutation: 14/14 killed; two were killed only after a shrink case
+  was added.
+- Gap left: none known.
