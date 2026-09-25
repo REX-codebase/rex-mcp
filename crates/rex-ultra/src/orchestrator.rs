@@ -1463,10 +1463,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bad_contract = r#"{"obligations":[{"id":"marker","statement":"result.txt contains PASS","proof":{"kind":"file_contains","path":"result.txt","needle":"PASS"}}]}"#;
         let mut turns = vec![text_turn(bad_contract)];
-        for _ in 0..3 {
+        // Each builder attempt must make a real change. Rewriting the
+        // same already-existing file is refused by the read-before-overwrite
+        // guard, so later attempts would stall before fresh verification.
+        for attempt in 0..3 {
+            let path = format!("result-{attempt}.txt");
             turns.push(call_turn(vec![
                 plan_call(vec![("1", "write result", "in_progress")]),
-                create_call("result.txt", "almost"),
+                create_call(&path, "almost"),
             ]));
             turns.push(call_turn(vec![
                 plan_call(vec![("1", "write result", "done")]),
@@ -1493,6 +1497,14 @@ mod tests {
             other => panic!("expected rejection, got {other:?}"),
         }
         assert_eq!(done.repair, 2);
+        // Rejection rolls the workspace back to its pre-run snapshot. The
+        // proof file is absent even though every builder attempt wrote a
+        // different false artifact.
+        let workspace = tmp.path().join("runs").join(&snap.id).join("workspace");
+        for attempt in 0..3 {
+            assert!(!workspace.join(format!("result-{attempt}.txt")).exists());
+        }
+        assert!(!workspace.join("result.txt").exists());
         // The adversary and judge never ran: verification already failed.
         assert!(done.adversary.is_none());
         assert!(done.judge.is_none());
