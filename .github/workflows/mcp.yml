@@ -15,7 +15,7 @@ jobs:
           toolchain: 1.98.1
           components: rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
   npm:
     runs-on: ubuntu-latest
     steps:

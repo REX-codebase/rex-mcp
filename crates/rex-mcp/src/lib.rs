@@ -58,10 +58,14 @@ impl McpServer {
         let notify = id.is_none();
         let id = id.unwrap_or(Value::Null);
         if !notify && !id.is_string() && !id.is_i64() && !id.is_u64() {
-            return Some(rpc_err(Value::Null, -32600, "invalid JSON-RPC id", None));
+            return Some(rpc_error(Value::Null, -32600, "invalid JSON-RPC id", None));
         }
         if request.get("jsonrpc") != Some(&Value::String("2.0".into())) {
-            return if notify { None } else { Some(rpc_error(id, -32600, "invalid JSON-RPC envelope", None)) };
+            return if notify {
+                None
+            } else {
+                Some(rpc_error(id, -32600, "invalid JSON-RPC envelope", None))
+            };
         }
         // Notifications cannot request a reply. Never dispatch tools or
         // initialize through one: otherwise a no-id tools/call could mutate
@@ -323,16 +327,20 @@ mod tests {
     fn invalid_json_rpc_ids_do_not_initialize() {
         let (_d, mut s) = server();
         for id in [json!(null), json!(true), json!([]), json!({"key": 1})] {
-            let response = s.handle(json!({"jsonrpc":"2.0", "id":id,
-                "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}})).unwrap();
+            let response = s
+                .handle(json!({"jsonrpc":"2.0", "id":id,
+                "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}}))
+                .unwrap();
             assert_eq!(response["error"]["code"], -32600);
             assert!(response["id"].is_null());
         }
         let blocked = s.handle(rpc(1, "tools/list", json!({}))).unwrap();
         assert_eq!(blocked["error"]["data"]["code"], "unauthorized");
         for id in [json!(0), json!("a")] {
-            let response = s.handle(json!({"jsonrpc":"2.0", "id":id,
-                "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}})).unwrap();
+            let response = s
+                .handle(json!({"jsonrpc":"2.0", "id":id,
+                "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}}))
+                .unwrap();
             assert_eq!(response["id"], id);
             assert!(response.get("result").is_some());
         }
@@ -340,17 +348,29 @@ mod tests {
     #[test]
     fn tool_call_notification_cannot_mutate_custody() {
         let (_d, mut s) = server();
-        s.handle(rpc(1, "initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION})))
-            .unwrap();
+        s.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ))
+        .unwrap();
         let args = json!({"request_id":"no-id", "task":"discard me",
                           "host":"generic_agent", "operator_is_agent":true});
-        assert!(s.handle(json!({"jsonrpc":"2.0", "method":"tools/call",
-            "params":{"name":"rex_execute", "arguments":args}})).is_none());
+        assert!(s
+            .handle(json!({"jsonrpc":"2.0", "method":"tools/call",
+            "params":{"name":"rex_execute", "arguments":args}}))
+            .is_none());
         // If the notification had executed, this reuse of request_id with a
         // different task would be an idempotency conflict.
-        let result = s.handle(rpc(2, "tools/call", json!({"name":"rex_execute",
+        let result = s
+            .handle(rpc(
+                2,
+                "tools/call",
+                json!({"name":"rex_execute",
             "arguments":{"request_id":"no-id", "task":"actually do this",
-                         "host":"generic_agent", "operator_is_agent":true}}))).unwrap();
+                         "host":"generic_agent", "operator_is_agent":true}}),
+            ))
+            .unwrap();
         assert_eq!(result["result"]["structuredContent"]["state"], "active");
     }
     #[test]
@@ -362,7 +382,11 @@ mod tests {
         let blocked = s.handle(rpc(1, "tools/list", json!({}))).unwrap();
         assert_eq!(blocked["error"]["data"]["code"], "unauthorized");
         let ready = s
-            .handle(rpc(2, "initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION})))
+            .handle(rpc(
+                2,
+                "initialize",
+                json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+            ))
             .unwrap();
         assert!(ready.get("result").is_some());
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
