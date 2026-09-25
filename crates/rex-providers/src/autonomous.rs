@@ -3450,14 +3450,32 @@ fn decode_openai_calls(response: &str) -> Result<DecodedCalls, String> {
             .get("arguments")
             .and_then(Value::as_str)
             .ok_or("tool call missing arguments")?;
-        let args = serde_json::from_str(raw).map_err(|e| format!("invalid tool arguments: {e}"))?;
-        calls.push(decode_named_call(
-            name,
-            id,
-            args,
-            call.clone(),
-            &mut repairs,
-        ));
+        match parse_openai_arguments(name, raw, &mut repairs) {
+            Ok(args) => calls.push(decode_named_call(
+                name,
+                id,
+                args,
+                call.clone(),
+                &mut repairs,
+            )),
+            Err(error) => {
+                // One call with broken JSON must not end the run: the model
+                // gets the parse error as that call's result and can send it
+                // again, like Hermes's invalid-JSON recovery results
+                // (`agent/turn_tool_validation.py`). The replayed call
+                // carries `{}` so the provider never sees the broken text.
+                let mut replay = call.clone();
+                replay["function"]["arguments"] = Value::String("{}".into());
+                calls.push((
+                    AgentCall::BadCall {
+                        name: canonical_call_name(name),
+                        id,
+                        error,
+                    },
+                    Some(replay),
+                ));
+            }
+        }
     }
     Ok(DecodedCalls {
         texts,
@@ -3465,6 +3483,30 @@ fn decode_openai_calls(response: &str) -> Result<DecodedCalls, String> {
         thought_signature: None,
         repairs,
     })
+}
+
+/// Parse an OpenAI-style `arguments` string. An empty or blank string (some
+/// servers send it for a call with no arguments) reads as `{}`, as Hermes
+/// does; any other text that is not a JSON object is an error for the
+/// model to fix.
+fn parse_openai_arguments(
+    name: &str,
+    raw: &str,
+    repairs: &mut Vec<String>,
+) -> Result<Value, String> {
+    if raw.trim().is_empty() {
+        repairs.push(format!("{name}: empty arguments read as {{}}"));
+        return Ok(Value::Object(Default::default()));
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => {
+            Err("tool arguments must be a JSON object; send the call again with an object".into())
+        }
+        Err(e) => Err(format!(
+            "tool arguments are not valid JSON ({e}); send the call again with valid JSON"
+        )),
+    }
 }
 
 fn call_signature(tool: &str, request: &Value) -> String {
@@ -9336,6 +9378,71 @@ mod tests {
         assert_eq!(svc.undo_to_write(&snap.id, 0).unwrap().len(), 1);
         assert!(!ws.join("x.txt").exists());
         assert!(svc.undo_to_write("no-such-run", 0).is_err());
+    }
+
+    #[test]
+    fn broken_openai_arguments_become_per_call_errors() {
+        let openai = json!({"choices":[{"message":{"tool_calls":[
+            {"id":"c1","function":{"name":"glob_files","arguments":"{\"pattern\":\"*.rs\"}"}},
+            {"id":"c2","function":{"name":"Read_File","arguments":"{\"path\": \"a.rs\""}},
+            {"id":"c3","function":{"name":"read_file","arguments":"[\"a.rs\"]"}},
+            {"id":"c4","function":{"name":"search_files","arguments":"  "}}
+        ]}}]})
+        .to_string();
+        let got = decode_openai_calls(&openai).unwrap();
+        assert_eq!(got.calls.len(), 4);
+        assert!(matches!(
+            &got.calls[0].0,
+            AgentCall::Tool {
+                request: ToolRequest::GlobFiles { .. },
+                ..
+            }
+        ));
+        match &got.calls[1] {
+            (AgentCall::BadCall { name, id, error }, Some(replay)) => {
+                assert_eq!((name.as_str(), id.as_str()), ("read_file", "c2"));
+                assert!(
+                    error.starts_with("tool arguments are not valid JSON ("),
+                    "{error}"
+                );
+                assert!(
+                    error.ends_with("send the call again with valid JSON"),
+                    "{error}"
+                );
+                assert_eq!(replay["function"]["arguments"], "{}");
+                assert_eq!(replay["id"], "c2");
+            }
+            _ => panic!("unexpected call shape"),
+        }
+        match &got.calls[2] {
+            (AgentCall::BadCall { error, .. }, Some(replay)) => {
+                assert!(
+                    error.starts_with("tool arguments must be a JSON object"),
+                    "{error}"
+                );
+                assert_eq!(replay["function"]["arguments"], "{}");
+            }
+            _ => panic!("unexpected call shape"),
+        }
+        // blank arguments read as {}: search_files then fails on its own
+        // terms, not as a JSON error
+        match &got.calls[3].0 {
+            AgentCall::BadCall { error, .. } => {
+                assert!(!error.contains("JSON"), "{error}");
+            }
+            _ => panic!("unexpected call shape"),
+        }
+        assert!(got
+            .repairs
+            .contains(&"search_files: empty arguments read as {}".to_string()));
+        assert_eq!(
+            parse_openai_arguments("x", "", &mut Vec::new()),
+            Ok(json!({}))
+        );
+        assert_eq!(
+            parse_openai_arguments("x", " {\"a\":1} ", &mut Vec::new()),
+            Ok(json!({"a":1}))
+        );
     }
 
     #[test]

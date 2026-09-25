@@ -1534,3 +1534,25 @@ is shared it is noted in the module docs.
 - Tests: one end-to-end test (whole read, paged read from line 1 and
   from line 2, bytes on disk). Hand mutation: 5/5 killed.
 - Gap left: `search_files` can still show a mark on a line-1 match.
+
+## Round 46: broken tool-argument JSON no longer ends the run
+
+- Hermes: `agent/turn_tool_validation.py` treats empty tool arguments as
+  `{}` and answers a call with invalid JSON arguments with an error
+  result telling the model to retry with valid JSON, instead of failing
+  the turn.
+- REX before: in the OpenAI-compatible decoder, one call whose
+  `arguments` string was empty or not valid JSON made the whole turn
+  "undecodable", and the run ended with a provider error. Any other
+  calls in that response were lost too.
+- REX now: blank arguments read as `{}` (noted as a repair). Invalid
+  JSON, or JSON that is not an object, becomes an error result for that
+  call only ("tool arguments are not valid JSON (...); send the call
+  again with valid JSON"), under the call's own id and its normalised
+  tool name. The other calls in the response still run. The call kept
+  for replay to the provider carries `{}` instead of the broken text.
+- Tests: one decoder test (valid, broken, array and blank arguments in
+  one response). Hand mutation: 7/7 killed.
+- Gap left: the chat-mode decoder (`conversation.rs`) still fails the
+  turn on broken arguments. Hermes also retries the API call up to
+  three times first; REX goes straight to the error result.
