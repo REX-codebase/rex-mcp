@@ -555,6 +555,10 @@ impl ToolRuntime {
                 plan_edit_checked(&old, expected, replacement, *replace_all).map(|_| ())
             }
             ToolRequest::ApplyPatch { patch } => self.plan_patch(patch).map(|_| ()),
+            // A bad cwd cannot succeed. Check it before asking a person to
+            // approve the command; execution still checks it again in case
+            // the directory changes while approval is pending.
+            ToolRequest::RunCommand { cwd, .. } => self.command_cwd(cwd.as_deref()).map(|_| ()),
             _ => Ok(()),
         }
     }
@@ -1681,15 +1685,10 @@ impl ToolRuntime {
         Ok(data)
     }
 
-    /// Bounded process execution shared by model-approved commands and
-    /// trusted scoring. Callers are responsible for policy; this applies
-    /// the sandbox (env_clear, rlimits, kill-tree timeout, capped output).
-    fn run_command_impl(
-        &self,
-        argv: &[String],
-        cwd: Option<&str>,
-        timeout_ms: u64,
-    ) -> Result<ExecData, ToolError> {
+    /// Validate a command working directory both before approval and at
+    /// execution. The second check catches deletion or replacement while
+    /// the decision is pending.
+    fn command_cwd(&self, cwd: Option<&str>) -> Result<PathBuf, ToolError> {
         let cwd = self.resolve_existing(cwd.unwrap_or("."), true)?;
         if !cwd.is_dir() {
             let parent = cwd
@@ -1705,6 +1704,19 @@ impl ToolRuntime {
                 ),
             ));
         }
+        Ok(cwd)
+    }
+
+    /// Bounded process execution shared by model-approved commands and
+    /// trusted scoring. Callers are responsible for policy; this applies
+    /// the sandbox (env_clear, rlimits, kill-tree timeout, capped output).
+    fn run_command_impl(
+        &self,
+        argv: &[String],
+        cwd: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<ExecData, ToolError> {
+        let cwd = self.command_cwd(cwd)?;
         // The real boundary is the OS sandbox: every child enters fresh
         // user/network/IPC/UTS namespaces. If the kernel refuses, degrade
         // honestly - the command still runs under rlimits and process-group
@@ -4752,6 +4764,43 @@ mod tests {
         assert!(prep(&["grep", "-E", "a|b", "f.txt"]).is_ok());
         assert!(prep(&["git", "log", "--format=%h > %s"]).is_ok());
         assert!(prep(&["cargo", "test"]).is_ok());
+    }
+    #[test]
+    fn command_cwd_is_checked_before_approval_and_again_before_execution() {
+        let root = temp();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("f.txt"), "x").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let request = |cwd: &str| ToolRequest::RunCommand {
+            argv: vec!["touch".into(), "made".into()],
+            cwd: Some(cwd.into()),
+            timeout_ms: None,
+        };
+        for (cwd, kind) in [
+            ("missing", ErrorKind::NotFound),
+            ("f.txt", ErrorKind::InvalidRequest),
+        ] {
+            let e = rt.preflight(&request(cwd)).unwrap_err();
+            assert_eq!(e.kind, kind);
+            assert!(!root.join("made").exists());
+        }
+        let e = rt.preflight(&request("f.txt")).unwrap_err();
+        assert_eq!(
+            e.detail,
+            "command cwd f.txt is a file, not a folder; use cwd \".\""
+        );
+        assert!(rt.preflight(&request("sub")).is_ok());
+        let p = rt.prepare(request("sub")).unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        fs::remove_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub"), "now a file").unwrap();
+        let e = rt.execute(&p.call_id).error.unwrap();
+        assert_eq!(e.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            e.detail,
+            "command cwd sub is a file, not a folder; use cwd \".\""
+        );
+        assert!(!root.join("made").exists());
     }
     #[test]
     fn failed_command_reports_exit_code_or_signal_and_output() {

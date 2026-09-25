@@ -1919,3 +1919,19 @@ is shared it is noted in the module docs.
   error without issuing an approval, then confirms the default executes.
 - Hand mutations: 3/3 killed by test panics (prepare guard removed,
   zero changed to one, and wrong error kind). Source restored.
+
+## Round 69 - check command cwd before asking for approval
+
+- Gap: a command with a missing cwd or a file as cwd could be prepared
+  and approved but could never start. The failure came only at execution.
+- Grounding: opencode's `tool/shell.ts` resolves `workdir` before `ask`,
+  and Hermes' `tools/terminal_tool.py` validates `workdir` before command
+  guards and approval. REX now checks the cwd in `preflight`, before its
+  trusted approval UI; execution still checks it again in case the path
+  changes while a decision is pending.
+- Test: missing and file cwd fail preflight, valid cwd passes, and removal
+  of that cwd with a file after approval still fails safely before a process starts.
+- Hand mutations: 3/3 killed by test panics (remove preflight cwd check,
+  skip directory check, and skip execution-time directory check). Source
+  restored; the last test case was strengthened to replace the approved
+  folder with a file after an initial surviving mutation.
