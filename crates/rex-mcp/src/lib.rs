@@ -446,8 +446,31 @@ fn read_frame<R: BufRead>(reader: &mut R) -> std::io::Result<Option<(Vec<u8>, bo
 }
 
 fn tool_result(v: Value) -> Value {
-    json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())}],
-        "structuredContent":v,"isError":false})
+    let mut content = vec![
+        json!({"type":"text","text":serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())}),
+    ];
+    if let Some(task_id) = v
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+    {
+        for (suffix, name, description) in [
+            ("status", "REX task status", "Current custody state"),
+            (
+                "events/0",
+                "REX task events",
+                "Append-only events from sequence zero",
+            ),
+            (
+                "result",
+                "REX task result",
+                "Terminal result and proof bundle when available",
+            ),
+        ] {
+            content.push(json!({"type":"resource_link","uri":format!("rex://task/{task_id}/{suffix}"),"name":name,"description":description,"mimeType":"application/json"}));
+        }
+    }
+    json!({"content":content,"structuredContent":v,"isError":false})
 }
 fn tool_error(e: ProtocolError) -> Value {
     let body = json!({"code":e.code,"message":e.message,"task_id":e.task_id});
@@ -631,6 +654,25 @@ mod tests {
     fn rpc(id: i64, method: &str, params: Value) -> Value {
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
     }
+    #[test]
+    fn task_tool_result_links_back_to_custody_resources() {
+        let result = tool_result(json!({"task_id":"task-123","state":"active"}));
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["uri"], "rex://task/task-123/status");
+        assert_eq!(content[2]["uri"], "rex://task/task-123/events/0");
+        assert_eq!(content[3]["uri"], "rex://task/task-123/result");
+        assert_eq!(result["structuredContent"]["task_id"], "task-123");
+        assert_eq!(
+            tool_result(json!({"message":"no task"}))["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn inspection_output_schemas_match_success_shapes() {
         let descriptors = tool_descriptors();
