@@ -52,8 +52,24 @@ impl McpServer {
     }
 
     pub fn handle(&mut self, request: Value) -> Option<Value> {
+        // A malformed request is not a notification. In particular, an array
+        // or an object without a string method must receive an error rather
+        // than disappearing as if it were a valid no-id notification.
+        if !request.is_object()
+            || !request
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| !method.is_empty())
+        {
+            return Some(rpc_error(
+                Value::Null,
+                -32600,
+                "invalid JSON-RPC request",
+                None,
+            ));
+        }
         let id = request.get("id").cloned();
-        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+        let method = request.get("method").and_then(Value::as_str).unwrap();
         // JSON-RPC notifications have no id and never get a response.
         let notify = id.is_none();
         let id = id.unwrap_or(Value::Null);
@@ -322,6 +338,23 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(unknown["error"]["data"]["code"], "unknown_tool");
+    }
+    #[test]
+    fn malformed_requests_receive_errors_instead_of_becoming_notifications() {
+        let (_d, mut s) = server();
+        for request in [
+            json!(null),
+            json!([]),
+            json!({"jsonrpc":"2.0"}),
+            json!({"jsonrpc":"2.0", "id": 1, "method": 3}),
+            json!({"jsonrpc":"2.0", "method": ""}),
+        ] {
+            let response = s.handle(request).expect("malformed request response");
+            assert_eq!(response["error"]["code"], -32600);
+            assert!(response["id"].is_null());
+        }
+        let blocked = s.handle(rpc(2, "tools/list", json!({}))).unwrap();
+        assert_eq!(blocked["error"]["data"]["code"], "unauthorized");
     }
     #[test]
     fn invalid_json_rpc_ids_do_not_initialize() {
