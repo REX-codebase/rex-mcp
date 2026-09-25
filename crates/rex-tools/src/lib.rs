@@ -2429,6 +2429,15 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         // and even a shell could not carry the change to the next call.
         // opencode tells its model to use `workdir` instead of `cd`
         // (`tool/shell/prompt.ts`); REX points at `cwd`.
+        ToolRequest::RunCommand { argv, .. } if SHELL_OPERATORS.contains(&argv[0].as_str()) => {
+            Err(err(
+                ErrorKind::InvalidRequest,
+                &format!(
+                    "'{op}' is a shell operator, not a program; run_command has no shell; put one program in argv[0] and make separate calls for other commands",
+                    op = argv[0]
+                ),
+            ))
+        }
         ToolRequest::RunCommand { argv, .. } if SHELL_BUILTINS.contains(&argv[0].trim()) => {
             Err(err(
                 ErrorKind::InvalidRequest,
@@ -4770,6 +4779,11 @@ mod tests {
                 e.detail,
                 format!("run_command runs one program with no shell, so '{op}' would be passed to it as a plain argument; run each command as its own call, and read output with read_output instead of redirecting it")
             );
+        }
+        for op in ["&&", "|", ">", "2>&1", ";"] {
+            let e = prep(&[op, "cargo", "test"]).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::InvalidRequest);
+            assert_eq!(e.detail, format!("'{op}' is a shell operator, not a program; run_command has no shell; put one program in argv[0] and make separate calls for other commands"));
         }
         for b in ["cd", "pushd", "export", "source"] {
             let e = prep(&[b, "x"]).unwrap_err();

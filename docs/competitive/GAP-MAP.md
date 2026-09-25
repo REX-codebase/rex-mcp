@@ -2015,3 +2015,18 @@ is shared it is noted in the module docs.
   follow-up reads line 10.
 - Hand mutations: 3/3 killed by test panics (wrong suggested offset,
   no retry hint, off-by-one suggestion). Source restored.
+
+## Round 75 - shell operator in argv[0] fails before approval
+
+- Gap left by Round 57: the first argv item was not checked for shell
+  operators. `["&&", "cargo", "test"]` still asked for approval, then
+  tried to spawn a program named `&&` and returned a missing-program
+  error rather than explaining the missing shell.
+- Grounding: opencode `tool/shell.ts` parses shell syntax before asking
+  permission; Hermes `tools/terminal_tool.py` accepts a shell command
+  string and routes its guards before execution. REX's direct argv
+  transport should reject shell syntax in program position up front.
+- Test: five operators in argv[0] now get actionable InvalidRequest;
+  argument-position operators and valid expressions retain Round 57 tests.
+- Hand mutations: 4/4 killed by test panics (remove check, inspect wrong
+  argv item, wrong error kind, wrong guidance). Source restored.
