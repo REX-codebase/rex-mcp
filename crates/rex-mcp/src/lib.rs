@@ -48,7 +48,17 @@ impl McpServer {
             } else {
                 match std::str::from_utf8(&bytes) {
                     Ok(line) => match serde_json::from_str::<Value>(line) {
-                        Ok(v) => self.handle(v),
+                        Ok(v) => {
+                            // A host-supplied token is scoped to this live call only.
+                            // Emit before dispatch so a slow gate can display activity,
+                            // never after the response or for unrelated requests.
+                            if let Some(notification) = progress_start(&v, self.initialized) {
+                                serde_json::to_writer(&mut writer, &notification)?;
+                                writer.write_all(b"\n")?;
+                                writer.flush()?;
+                            }
+                            self.handle(v)
+                        }
                         Err(e) => Some(rpc_error(
                             Value::Null,
                             -32700,
@@ -368,6 +378,40 @@ impl McpServer {
             ))
         }
     }
+}
+
+fn progress_start(request: &Value, initialized: bool) -> Option<Value> {
+    if !initialized
+        || request.get("jsonrpc")?.as_str()? != "2.0"
+        || request.get("method")?.as_str()? != "tools/call"
+        || !request.get("id")?.is_string() && !request.get("id")?.is_number()
+    {
+        return None;
+    }
+    let params = request.get("params")?;
+    let name = params.get("name")?.as_str()?;
+    let long_call = matches!(
+        name,
+        "rex_execute"
+            | "rex_run"
+            | "rex_test"
+            | "rex_ultra_open"
+            | "rex_ultra_submit"
+            | "rex_ultra_promote"
+            | "rex_proof_verify"
+    );
+    if !long_call {
+        return None;
+    }
+    let token = params.get("_meta")?.get("progressToken")?;
+    if !(token.is_string() || token.is_i64() || token.is_u64()) {
+        return None;
+    }
+    Some(
+        json!({"jsonrpc":"2.0","method":"notifications/progress","params":{
+            "progressToken":token,"progress":1,"message":"REX processing request"
+        }}),
+    )
 }
 
 fn read_frame<R: BufRead>(reader: &mut R) -> std::io::Result<Option<(Vec<u8>, bool)>> {
@@ -921,6 +965,49 @@ mod tests {
             .handle(rpc(4, "prompts/get", json!({"name":"missing"})))
             .unwrap();
         assert!(missing.get("error").is_some());
+    }
+
+    #[test]
+    fn progress_only_for_opted_in_active_long_calls() {
+        let (_d, mut s) = server();
+        let init = rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        );
+        let mut call = rpc(
+            2,
+            "tools/call",
+            json!({"name":"rex_test","arguments":{},"_meta":{"progressToken":"gate-1"}}),
+        );
+        let input = format!("{}\n{}\n", init, call);
+        let mut out = Vec::new();
+        s.serve(std::io::Cursor::new(input), &mut out).unwrap();
+        let rows: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["method"], "notifications/progress");
+        assert_eq!(rows[1]["params"]["progressToken"], "gate-1");
+        assert_eq!(rows[1]["params"]["progress"], 1);
+        assert_eq!(rows[2]["id"], 2);
+        // No token, malformed token, unknown/read-only tool, or missing id.
+        call["params"].as_object_mut().unwrap().remove("_meta");
+        assert!(progress_start(&call, true).is_none());
+        call["params"]["_meta"] = json!({"progressToken":true});
+        assert!(progress_start(&call, true).is_none());
+        call["params"]["_meta"] = json!({"progressToken":7});
+        assert_eq!(
+            progress_start(&call, true).unwrap()["params"]["progressToken"],
+            7
+        );
+        assert!(progress_start(&call, false).is_none());
+        call["params"]["name"] = json!("rex_status");
+        assert!(progress_start(&call, true).is_none());
+        call.as_object_mut().unwrap().remove("id");
+        assert!(progress_start(&call, true).is_none());
     }
 
     #[test]
