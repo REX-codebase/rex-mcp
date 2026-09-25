@@ -277,7 +277,8 @@ fn host_profiles_share_a_durable_task_over_stdio() {
     let ws = d.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     let state = d.path().join("state");
-    for (index, host) in ["claude_code", "codex", "opencode", "hermes"].iter()
+    for (index, host) in ["claude_code", "codex", "opencode", "hermes"]
+        .iter()
         .enumerate()
     {
         let mut s = Session::start(&state, &ws, true);
