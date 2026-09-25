@@ -32,20 +32,22 @@ status, events, execute, next, submit, result and cancel still work.
 
 1. `rex_execute` with an idempotency `request_id`, the task, and an
    optional `plan` (frozen at creation; the freeze hash enters the audit
-   chain). Returns the task id, the first action and the lease.
+   chain). Returns the task id, per-task capability, first action and lease.
 2. For the open action: `rex_read` / `rex_edit` / `rex_search` /
-   `rex_run` / `rex_test`, each with `task_id` + `lease_epoch`.
-   `rex_next` heartbeats the lease and returns the open action.
-3. `rex_submit` the action with narrative and evidence. REX verifies and
-   issues the next action, or completes the task through custody gates.
-4. `rex_status`, `rex_events`, `rex_result` inspect; `rex_cancel` ends.
+   `rex_run` / `rex_test`, each with `task_id`, `capability` and
+   `lease_epoch`. `rex_next` heartbeats the lease and returns the open action.
+3. `rex_submit` the action with the same scope fields, narrative and evidence.
+   REX verifies and issues the next action, or completes through custody gates.
+4. `rex_status`, `rex_events`, `rex_result` inspect by task id;
+   `rex_cancel` requires the per-task capability and ends the task.
 
 Continuation is cooperative: REX cannot force a host to keep working, and
 a host cannot force REX to accept a claim. Either side stops cleanly.
 
 ## Security contract
 
-- Every call needs a live lease; stale epochs return `stale_lease`.
+- Work calls need a live lease and the per-task capability; stale epochs return
+  `stale_lease`. Task id and lease epoch alone do not authorize work.
 - Every file path and command is confined to the task workspace. A path
   escape quarantines the custody grant: all further calls fail closed.
 - Mutations (edit, run, test) additionally require the trusted launcher
@@ -60,8 +62,9 @@ a host cannot force REX to accept a claim. Either side stops cleanly.
 - REX protocol version: `PROTOCOL_VERSION` in rex-protocol (now `1.0`).
   Minor versions add optional fields only; major bumps break. Stored
   tasks with a different major version refuse to load.
-- MCP protocol version: `2025-11-25`; a mismatched `initialize` is
-  rejected with `version_mismatch`.
+- MCP protocol versions: `2025-11-25` and `2025-06-18`. Initialize echoes a
+  supported client version; for another offered version it returns the latest
+  supported version so the client can decide whether to disconnect.
 - Error codes are stable snake_case (`task_not_found`, `stale_lease`,
   `scope_denied`, `approval_required`, `budget_exceeded`, `gate_failed`,
   `no_result`, ...). Valid tool calls that fail in REX return MCP tool results
