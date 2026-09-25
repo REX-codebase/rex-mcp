@@ -65,7 +65,8 @@ impl McpServer {
                 self.initialize(&id, request.get("params").cloned().unwrap_or(json!({})))
             }
             "notifications/initialized" => {
-                self.initialized = true;
+                // This is a client acknowledgement, not an alternate handshake.
+                // A premature notification must not unlock the tool surface.
                 return None;
             }
             "ping" => Ok(json!({})),
@@ -308,6 +309,21 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(unknown["error"]["data"]["code"], "unknown_tool");
+    }
+    #[test]
+    fn premature_initialized_notification_does_not_unlock_tools() {
+        let (_d, mut s) = server();
+        assert!(s
+            .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .is_none());
+        let blocked = s.handle(rpc(1, "tools/list", json!({}))).unwrap();
+        assert_eq!(blocked["error"]["data"]["code"], "unauthorized");
+        let ready = s
+            .handle(rpc(2, "initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION})))
+            .unwrap();
+        assert!(ready.get("result").is_some());
+        let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 19);
     }
     #[test]
     fn notifications_get_no_response() {
