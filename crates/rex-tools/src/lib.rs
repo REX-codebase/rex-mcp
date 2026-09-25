@@ -543,10 +543,7 @@ impl ToolRuntime {
                 replace_all,
             } => {
                 if expected.is_empty() {
-                    return Err(err(
-                        ErrorKind::InvalidRequest,
-                        "expected text must not be empty",
-                    ));
+                    return Err(self.empty_expected_error(path));
                 }
                 let target = self.resolve_existing(path, false)?;
                 let old = fs::read_to_string(&target).map_err(io_err)?;
@@ -1245,6 +1242,20 @@ impl ToolRuntime {
         Ok(exec(Some(text), r))
     }
 
+    /// An edit with no text to find. opencode treats an empty `oldString`
+    /// as "create this file" and refuses it on an existing file with a
+    /// pointer to its write tool (`tool/edit.ts`). REX keeps creating in
+    /// `create_file`, and says which tool fits.
+    fn empty_expected_error(&self, path: &str) -> ToolError {
+        let exists = checked_join(&self.root, path).is_ok_and(|p| p.exists());
+        let detail = if exists {
+            "expected text must not be empty: give the exact text to replace, or use create_file with overwrite: true to replace the whole file"
+        } else {
+            "expected text must not be empty, and the file does not exist: use create_file to make a new file"
+        };
+        err(ErrorKind::InvalidRequest, detail)
+    }
+
     fn edit_file(
         &self,
         path: &str,
@@ -1253,10 +1264,7 @@ impl ToolRuntime {
         replace_all: bool,
     ) -> Result<ExecData, ToolError> {
         if expected.is_empty() {
-            return Err(err(
-                ErrorKind::InvalidRequest,
-                "expected text must not be empty",
-            ));
+            return Err(self.empty_expected_error(path));
         }
         let target = self.resolve_existing(path, false)?;
         let old = fs::read_to_string(&target).map_err(io_err)?;
@@ -3387,6 +3395,28 @@ mod tests {
         // a new file is written as given
         write("n.txt", "p\nq\n");
         assert_eq!(bytes("n.txt"), b"p\nq\n");
+    }
+    #[test]
+    fn empty_expected_text_names_the_right_tool() {
+        let root = temp();
+        fs::write(root.join("a.txt"), "x\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let edit = |path: &str| ToolRequest::EditFile {
+            path: path.into(),
+            expected: String::new(),
+            replacement: "y".into(),
+            replace_all: false,
+        };
+        let e = rt.preflight(&edit("a.txt")).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::InvalidRequest);
+        assert_eq!(e.detail, "expected text must not be empty: give the exact text to replace, or use create_file with overwrite: true to replace the whole file");
+        let e = rt.preflight(&edit("new.txt")).unwrap_err();
+        assert_eq!(e.detail, "expected text must not be empty, and the file does not exist: use create_file to make a new file");
+        // the execute path says the same
+        let r = approved(&rt, edit("new.txt"));
+        assert_eq!(r.error.unwrap().detail, e.detail);
+        let r = approved(&rt, edit("a.txt"));
+        assert!(r.error.unwrap().detail.contains("overwrite: true"));
     }
     #[test]
     fn edit_that_changes_nothing_is_refused() {

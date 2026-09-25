@@ -1783,3 +1783,18 @@ is shared it is noted in the module docs.
 - Tests: the Round 57 test gained four builtins and one argument case.
   Hand mutation: 3/3 killed.
 - Gap left: none known.
+
+## Round 59: an edit with empty expected text names the right tool
+
+- opencode: `tool/edit.ts` treats an empty `oldString` as "create the
+  file", and on an existing file refuses with "Provide the exact text to
+  replace, or use write for an intentional full-file replacement."
+- REX before: "expected text must not be empty", with no next step.
+- REX now: on an existing file, "give the exact text to replace, or use
+  create_file with overwrite: true to replace the whole file"; on a
+  missing file, "the file does not exist: use create_file to make a new
+  file". Both the preflight and the execute path say the same. REX keeps
+  file creation in `create_file` rather than overloading `edit_file`.
+- Tests: one test (existing and missing file, preflight and execute).
+  Hand mutation: 4/4 killed.
+- Gap left: none known.
