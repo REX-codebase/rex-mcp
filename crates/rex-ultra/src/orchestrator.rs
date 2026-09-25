@@ -376,7 +376,9 @@ fn finish_after_rollback(
             finish(
                 handle,
                 UltraTerminal::ProviderError {
-                    detail: format!("workspace rollback failed: {e}; original terminal: {terminal:?}"),
+                    detail: format!(
+                        "workspace rollback failed: {e}; original terminal: {terminal:?}"
+                    ),
                 },
             );
             return;
@@ -519,10 +521,10 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
         Ok(m) => m,
         Err(e) => {
             finish_after_rollback(
-                    &mut rollback,
-                    &ctx.handle,
-                    UltraTerminal::ProviderError { detail: e },
-                );
+                &mut rollback,
+                &ctx.handle,
+                UltraTerminal::ProviderError { detail: e },
+            );
             return;
         }
     };
@@ -581,7 +583,11 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
         }
     }
     let Some(acceptance) = contract else {
-        finish_after_rollback(&mut rollback, &ctx.handle, UltraTerminal::ContractFailed { errors });
+        finish_after_rollback(
+            &mut rollback,
+            &ctx.handle,
+            UltraTerminal::ContractFailed { errors },
+        );
         return;
     };
     write_json(&ultra_dir.join("contract.json"), &acceptance);
@@ -688,7 +694,11 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                     continue;
                 }
                 drop(state);
-                finish_after_rollback(&mut rollback, &ctx.handle, UltraTerminal::BuilderFailed { detail });
+                finish_after_rollback(
+                    &mut rollback,
+                    &ctx.handle,
+                    UltraTerminal::BuilderFailed { detail },
+                );
                 return;
             }
         }
@@ -764,7 +774,11 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                             .builder_run_id = Some(run.id.clone());
                         let attacked = await_subrun(&inner, &ctx.handle, &run.id);
                         if cancelled(&ctx.handle) {
-                            finish_after_rollback(&mut rollback, &ctx.handle, UltraTerminal::Cancelled);
+                            finish_after_rollback(
+                                &mut rollback,
+                                &ctx.handle,
+                                UltraTerminal::Cancelled,
+                            );
                             return;
                         }
                         let summary = attacked.completion_summary.unwrap_or_default();
@@ -1301,7 +1315,11 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                 evidence_id: "gate-failures".into(),
             },
         );
-        finish_after_rollback(&mut rollback, &ctx.handle, UltraTerminal::Rejected { reasons });
+        finish_after_rollback(
+            &mut rollback,
+            &ctx.handle,
+            UltraTerminal::Rejected { reasons },
+        );
         return;
     }
 }
@@ -1580,11 +1598,16 @@ mod tests {
         finish_after_rollback(
             &mut rollback,
             &handle,
-            UltraTerminal::Rejected { reasons: vec!["failed verification".into()] },
+            UltraTerminal::Rejected {
+                reasons: vec!["failed verification".into()],
+            },
         );
         assert!(!workspace.join("false-artifact").exists());
         assert!(!rollback.armed);
-        assert!(matches!(&handle.shared.lock().unwrap().terminal, Some(UltraTerminal::Rejected { .. })));
+        assert!(matches!(
+            &handle.shared.lock().unwrap().terminal,
+            Some(UltraTerminal::Rejected { .. })
+        ));
 
         let mut corrupt = RollbackGuard {
             workspace,
@@ -1594,7 +1617,9 @@ mod tests {
         corrupt.snapshot.tree_sha256 = "corrupt".into();
         finish_after_rollback(&mut corrupt, &handle, UltraTerminal::Cancelled);
         let state = handle.shared.lock().unwrap();
-        assert!(matches!(&state.terminal, Some(UltraTerminal::ProviderError { detail }) if detail.contains("rollback snapshot integrity mismatch")));
+        assert!(
+            matches!(&state.terminal, Some(UltraTerminal::ProviderError { detail }) if detail.contains("rollback snapshot integrity mismatch"))
+        );
         assert!(!corrupt.armed);
     }
 
