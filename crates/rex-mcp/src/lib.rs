@@ -123,6 +123,33 @@ impl McpServer {
             "tools/list" => self
                 .require_initialized()
                 .map(|_| json!({"tools": tool_descriptors()})),
+            "prompts/list" => self.require_initialized().map(|_| json!({
+                "prompts": [{
+                    "name": "rex_task_workflow",
+                    "title": "Run a durable REX task",
+                    "description": "Guide the host through REX task custody, continuation, and submission."
+                }]
+            })),
+            "prompts/get" => self.require_initialized().and_then(|_| {
+                let name = request.get("params").and_then(|p| p.get("name")).and_then(Value::as_str).ok_or_else(|| {
+                    ProtocolError::new(ErrorCode::MalformedRequest, "prompt name required")
+                })?;
+                if name != "rex_task_workflow" {
+                    return Err(ProtocolError::new(
+                        ErrorCode::MalformedRequest, format!("unknown prompt: {name}")
+                    ));
+                }
+                Ok(json!({
+                    "description": "Use REX to keep a task's plan, tool outcomes, and continuation in durable custody.",
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": "For a task that needs durable custody, call rex_execute with the request and host; use the returned task_id with rex_next, rex_tools, and rex_submit as directed. Follow the tool responses rather than guessing the next step. Do not claim that the host is forced to continue or that REX bypasses host limits."
+                        }
+                    }]
+                }))
+            }),
             "tools/call" => self.require_initialized().and_then(|_| {
                 let p = request.get("params").cloned().unwrap_or(json!({}));
                 let name = p.get("name").and_then(Value::as_str).ok_or_else(|| {
@@ -178,7 +205,7 @@ impl McpServer {
         self.initialized = true;
         Ok(json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": false } },
+            "capabilities": { "tools": { "listChanged": false }, "prompts": { "listChanged": false } },
             "serverInfo": { "name": "rex-mcp", "version": env!("CARGO_PKG_VERSION") },
             "instructions": format!("REX Harness protocol {PROTOCOL_VERSION}. Caller-driven custody; call rex_execute, then rex_next/tools, and rex_submit. Continuation is cooperative.")
         }))
@@ -332,6 +359,33 @@ mod tests {
     fn rpc(id: i64, method: &str, params: Value) -> Value {
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
     }
+    #[test]
+    fn prompt_discovery_and_get_after_initialize() {
+        let (_d, mut s) = server();
+        let init = s
+            .handle(rpc(
+                1,
+                "initialize",
+                json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+            ))
+            .unwrap();
+        assert_eq!(
+            init["result"]["capabilities"]["prompts"]["listChanged"],
+            false
+        );
+        let list = s.handle(rpc(2, "prompts/list", json!({}))).unwrap();
+        assert_eq!(list["result"]["prompts"][0]["name"], "rex_task_workflow");
+        let get = s
+            .handle(rpc(3, "prompts/get", json!({"name":"rex_task_workflow"})))
+            .unwrap();
+        assert_eq!(get["result"]["messages"][0]["role"], "user");
+        assert_eq!(get["result"]["messages"][0]["content"]["type"], "text");
+        let missing = s
+            .handle(rpc(4, "prompts/get", json!({"name":"missing"})))
+            .unwrap();
+        assert!(missing.get("error").is_some());
+    }
+
     #[test]
     fn negotiate_list_and_execute_over_stdio() {
         let (_d, mut s) = server();
