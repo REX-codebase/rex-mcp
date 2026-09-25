@@ -266,12 +266,42 @@ impl McpServer {
                         "description": "The task to run with durable custody.",
                         "required": true
                     }]
+                }, {
+                    "name": "rex_task_inspect",
+                    "title": "Inspect a REX task",
+                    "description": "Read existing custody state and events without executing or mutating a task.",
+                    "arguments": [{
+                        "name": "task_id",
+                        "description": "An existing REX task ID.",
+                        "required": true
+                    }]
                 }]
             })),
             "prompts/get" => self.require_initialized().and_then(|_| {
                 let name = request.get("params").and_then(|p| p.get("name")).and_then(Value::as_str).ok_or_else(|| {
                     ProtocolError::new(ErrorCode::MalformedRequest, "prompt name required")
                 })?;
+                if name == "rex_task_inspect" {
+                    let task_id = request
+                        .get("params")
+                        .and_then(|p| p.get("arguments"))
+                        .and_then(|a| a.get("task_id"))
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty() && !id.contains('/'))
+                        .ok_or_else(|| ProtocolError::new(
+                            ErrorCode::MalformedRequest, "valid task_id argument required"
+                        ))?;
+                    return Ok(json!({
+                        "description": "Read the state of an existing REX task without changing it.",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!("Inspect existing REX task {task_id}. Call rex_status, then read rex://task/{task_id}/events/0 and rex://task/{task_id}/result only if available. Report the current status, recent events and any terminal result with their sources. Do not call rex_execute, rex_next, rex_submit, or any mutation or command tool. Do not invent missing task data.")
+                            }
+                        }]
+                    }));
+                }
                 if name != "rex_task_workflow" {
                     return Err(ProtocolError::new(
                         ErrorCode::MalformedRequest, format!("unknown prompt: {name}")
@@ -1109,6 +1139,41 @@ mod tests {
         );
         let list = s.handle(rpc(2, "prompts/list", json!({}))).unwrap();
         assert_eq!(list["result"]["prompts"][0]["name"], "rex_task_workflow");
+        assert_eq!(list["result"]["prompts"][1]["name"], "rex_task_inspect");
+        let inspect = s
+            .handle(rpc(
+                21,
+                "prompts/get",
+                json!({
+                    "name":"rex_task_inspect", "arguments":{"task_id":"task-123"}
+                }),
+            ))
+            .unwrap();
+        let text = inspect["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("rex://task/task-123/events/0"));
+        assert!(text.contains("Do not call rex_execute"));
+        let missing = s
+            .handle(rpc(
+                22,
+                "prompts/get",
+                json!({
+                    "name":"rex_task_inspect", "arguments":{}
+                }),
+            ))
+            .unwrap();
+        assert_eq!(missing["error"]["code"], -32602);
+        let invalid = s
+            .handle(rpc(
+                23,
+                "prompts/get",
+                json!({
+                    "name":"rex_task_inspect", "arguments":{"task_id":"a/b"}
+                }),
+            ))
+            .unwrap();
+        assert_eq!(invalid["error"]["code"], -32602);
         assert_eq!(list["result"]["prompts"][0]["arguments"][0]["name"], "task");
         let get = s
             .handle(rpc(
