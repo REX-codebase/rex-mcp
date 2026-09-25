@@ -270,3 +270,29 @@ fn mutations_require_trusted_launcher_approval_over_stdio() {
     );
     assert_eq!(err["data"]["code"], "approval_required");
 }
+
+#[test]
+fn host_profiles_share_a_durable_task_over_stdio() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = d.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let state = d.path().join("state");
+    for (index, host) in ["claude_code", "codex", "opencode", "hermes"].iter().enumerate() {
+        let mut s = Session::start(&state, &ws, true);
+        let init = s.call("initialize", json!({"protocolVersion":"2025-11-25"}));
+        assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+        let task = s.tool("rex_execute", json!({
+            "request_id":format!("host-profile-{index}"),
+            "task":format!("task from {host}"),
+            "host":"generic_agent", "operator_is_agent":true
+        }));
+        assert_eq!(task["state"], "active", "{host}: {task}");
+        let task_id = task["task_id"].as_str().unwrap().to_owned();
+        drop(s);
+        let mut reopened = Session::start(&state, &ws, true);
+        reopened.call("initialize", json!({"protocolVersion":"2025-11-25"}));
+        let status = reopened.tool("rex_status", json!({"task_id":task_id}));
+        assert_eq!(status["state"], "active", "{host}: {status}");
+        assert_eq!(status["task_id"], task_id);
+    }
+}
