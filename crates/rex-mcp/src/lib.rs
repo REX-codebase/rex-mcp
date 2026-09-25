@@ -549,7 +549,7 @@ pub fn tool_descriptors() -> Vec<Value> {
         let (description, mut schema) = match t {
             ToolName::Execute => ("Start or resume a durable REX task; plan is frozen at creation.", json!({
                 "type":"object","required":["request_id","task","host","operator_is_agent"],
-                "properties":{"request_id":{"type":"string"},"task":{"type":"string"},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"follow_up":{"type":"string"},
+                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string"},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"follow_up":{"type":"string"},
                 "host":{"enum":["human","claude_code","codex","open_code","hermes","antigravity","generic_agent"]},"operator_is_agent":{"type":"boolean"},"ultra":{"type":"boolean"},
                 "budgets":{"type":"object"},"proof":{"type":"string"},"plan":{"type":"array","items":{"type":"object","required":["instructions"],"properties":{"instructions":{"type":"string"},"acceptance":{"type":"string"}}}}},"additionalProperties":false})),
             ToolName::Next => ("Heartbeat and get the currently open action.", task_epoch_schema()),
@@ -767,6 +767,9 @@ mod tests {
             find("rex_execute")["inputSchema"]["properties"]["task_id"],
             event_input["properties"]["task_id"]
         );
+        let req = &find("rex_execute")["inputSchema"]["properties"]["request_id"];
+        assert_eq!(req["minLength"], 1);
+        assert_eq!(req["maxLength"], 200);
         let status_schema = &find("rex_status")["outputSchema"];
         assert_eq!(status_schema["type"], "object");
         assert_eq!(
