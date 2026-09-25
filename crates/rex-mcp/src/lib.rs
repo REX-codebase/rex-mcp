@@ -126,6 +126,13 @@ impl McpServer {
         }
         Some(match out {
             Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+            Err(e)
+                if method == "tools/call"
+                    && self.initialized
+                    && !matches!(e.code, ErrorCode::MalformedRequest | ErrorCode::UnknownTool) =>
+            {
+                json!({"jsonrpc":"2.0","id":id,"result":tool_error(e)})
+            }
             Err(e) => protocol_rpc_error(id, e),
         })
     }
@@ -164,6 +171,11 @@ impl McpServer {
 fn tool_result(v: Value) -> Value {
     json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())}],
         "structuredContent":v,"isError":false})
+}
+fn tool_error(e: ProtocolError) -> Value {
+    let body = json!({"code":e.code,"message":e.message,"task_id":e.task_id});
+    json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())}],
+        "structuredContent":body,"isError":true})
 }
 fn protocol_rpc_error(id: Value, e: ProtocolError) -> Value {
     // Invalid/unknown method arguments use JSON-RPC codes. Domain failures
@@ -355,6 +367,42 @@ mod tests {
         }
         let blocked = s.handle(rpc(2, "tools/list", json!({}))).unwrap();
         assert_eq!(blocked["error"]["data"]["code"], "unauthorized");
+    }
+    #[test]
+    fn execution_failures_are_visible_as_mcp_tool_errors() {
+        let (_d, mut s) = server();
+        let before = s.handle(rpc(1, "tools/list", json!({}))).unwrap();
+        assert_eq!(before["error"]["data"]["code"], "unauthorized");
+        s.handle(rpc(
+            2,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ))
+        .unwrap();
+        let unknown = s
+            .handle(rpc(3, "tools/call", json!({"name":"missing"})))
+            .unwrap();
+        assert_eq!(unknown["error"]["code"], -32601);
+        let malformed = s
+            .handle(rpc(4, "tools/call", json!({"name":"rex_status"})))
+            .unwrap();
+        assert_eq!(malformed["error"]["code"], -32602);
+        let not_found = s
+            .handle(rpc(
+                5,
+                "tools/call",
+                json!({"name":"rex_status", "arguments":{"task_id":"absent"}}),
+            ))
+            .unwrap();
+        assert_eq!(not_found["result"]["isError"], true);
+        assert_eq!(
+            not_found["result"]["structuredContent"]["code"],
+            "task_not_found"
+        );
+        assert!(not_found["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("task_not_found"));
     }
     #[test]
     fn invalid_json_rpc_ids_do_not_initialize() {

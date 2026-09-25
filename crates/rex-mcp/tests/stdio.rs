@@ -178,13 +178,13 @@ fn full_caller_driven_lifecycle_over_stdio() {
         "rex_read",
         json!({"task_id":t3,"capability":cap3,"lease_epoch":e3,"path":"../outside"}),
     );
-    assert_eq!(denied["data"]["code"], "scope_denied");
+    assert_eq!(denied["code"], "scope_denied");
     let after = s2.tool(
         "rex_submit",
         json!({"task_id":t3,"capability":cap3,"lease_epoch":e3,
         "action_id":ex3["next"]["action_id"],"narrative":"try anyway"}),
     );
-    assert_eq!(after["data"]["code"], "unauthorized");
+    assert_eq!(after["code"], "unauthorized");
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn mutations_require_trusted_launcher_approval_over_stdio() {
         json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
         "path":"x.txt","replacement":"nope","create":true}),
     );
-    assert_eq!(err["data"]["code"], "approval_required");
+    assert_eq!(err["code"], "approval_required");
 }
 
 #[test]
