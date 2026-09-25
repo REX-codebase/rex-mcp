@@ -1847,3 +1847,19 @@ is shared it is noted in the module docs.
   last, "error: " prefix kept). A third mutant showed a blank-line
   filter could never matter, so the filter was removed.
 - Gap left: none known.
+
+## Round 63: a timeout at the cap says to split the work
+
+- opencode: `tool/shell.ts` tells a model whose command timed out to
+  "retry with a larger timeout value", and has no hard cap on it.
+- REX before: the same hint (Round 38), even when the limit was already
+  REX's 120 s cap, so the model was told to ask for more than it can
+  get. A larger request was cut to the cap silently (Round 38 gap left).
+- REX now: below the cap, the retry hint as before. At the cap, "that is
+  the longest run_command allows, so split the work into smaller
+  commands (one test file, package or target at a time)", and when the
+  model asked for more, "the N ms asked for was cut to the maximum".
+- Tests: one unit test on the message (below, at and over the cap), so
+  no 2-minute run is needed. Hand mutation: 4/4 killed.
+- Gap left: a larger request that finishes in time is still cut
+  silently; only a timeout reports it.

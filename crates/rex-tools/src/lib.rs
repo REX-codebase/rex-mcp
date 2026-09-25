@@ -1714,10 +1714,7 @@ impl ToolRuntime {
                 let (stderr, _) = err_handle.join().unwrap_or_default();
                 return Err(err(
                     ErrorKind::Timeout,
-                    &timeout_detail(
-                        timeout_ms.min(MAX_TIMEOUT_MS),
-                        &command_output(&stdout, &stderr),
-                    ),
+                    &timeout_detail(timeout_ms, &command_output(&stdout, &stderr)),
                 ));
             }
             thread::sleep(Duration::from_millis(15));
@@ -2814,11 +2811,30 @@ fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
 /// before being stopped is kept (a hung test run has usually already
 /// named its failures), with a hint to retry with a larger limit, as
 /// opencode's shell tool gives.
-fn timeout_detail(limit_ms: u64, output: &str) -> String {
+///
+/// At the cap there is no larger limit to ask for, and a model told to
+/// "retry with a larger timeout" loops; so it is told the limit was the
+/// most allowed (and that its own larger request was cut down), and to
+/// split the work instead.
+fn timeout_detail(requested_ms: u64, output: &str) -> String {
+    let limit_ms = requested_ms.min(MAX_TIMEOUT_MS);
     let mut detail = format!(
-        "command exceeded its time limit of {limit_ms} ms and its process group was terminated; \
-         if it is not waiting for input, retry with a larger timeout_ms (at most {MAX_TIMEOUT_MS})"
+        "command exceeded its time limit of {limit_ms} ms and its process group was terminated; "
     );
+    if limit_ms < MAX_TIMEOUT_MS {
+        detail.push_str(&format!(
+            "if it is not waiting for input, retry with a larger timeout_ms (at most {MAX_TIMEOUT_MS})"
+        ));
+    } else {
+        if requested_ms > MAX_TIMEOUT_MS {
+            detail.push_str(&format!(
+                "the {requested_ms} ms asked for was cut to the maximum; "
+            ));
+        }
+        detail.push_str(
+            "that is the longest run_command allows, so split the work into smaller commands (one test file, package or target at a time)",
+        );
+    }
     if output.is_empty() {
         detail.push_str("; it printed nothing");
     } else {
@@ -4631,6 +4647,23 @@ mod tests {
         assert!(prep(&["grep", "-E", "a|b", "f.txt"]).is_ok());
         assert!(prep(&["git", "log", "--format=%h > %s"]).is_ok());
         assert!(prep(&["cargo", "test"]).is_ok());
+    }
+    #[test]
+    fn timeout_at_the_cap_says_to_split_the_work() {
+        let below = timeout_detail(5_000, "");
+        assert_eq!(below, "command exceeded its time limit of 5000 ms and its process group was terminated; if it is not waiting for input, retry with a larger timeout_ms (at most 120000); it printed nothing");
+        let at = timeout_detail(MAX_TIMEOUT_MS, "x");
+        assert_eq!(at, "command exceeded its time limit of 120000 ms and its process group was terminated; that is the longest run_command allows, so split the work into smaller commands (one test file, package or target at a time); output before it was stopped:\nx");
+        let over = timeout_detail(600_000, "");
+        assert!(
+            over.starts_with("command exceeded its time limit of 120000 ms"),
+            "{over}"
+        );
+        assert!(
+            over.contains("; the 600000 ms asked for was cut to the maximum; that is the longest"),
+            "{over}"
+        );
+        assert!(!at.contains("asked for"));
     }
     #[test]
     fn missing_program_says_what_to_fix() {
