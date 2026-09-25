@@ -529,13 +529,13 @@ pub fn tool_descriptors() -> Vec<Value> {
                     "state":{"enum":["created","active","verifying","completed","failed","cancelled"]},
                     "task":{"type":"string"},
                     "operator_is_agent":{"type":"boolean"},
-                    "host":{"type":"string"},
-                    "lease":{"type":"object"},
+                    "host":{"enum":["human","claude_code","codex","open_code","hermes","antigravity","generic_agent"]},
+                    "lease":{"type":"object","required":["epoch","expires_ms_from_now","heartbeat_interval_ms"],"properties":{"epoch":{"type":"integer"},"expires_ms_from_now":{"type":"integer"},"heartbeat_interval_ms":{"type":"integer"}}},
                     "open_action":{"type":["object","null"]},
                     "budgets":{"type":"object"},
                     "last_event_seq":{"type":"integer"},
-                    "operation":{"type":"object"},
-                    "packet":{"type":"object"}
+                    "operation":{"enum":["queued","prepared","committed","aborted","revoked","stale","conflict","external_host_required"]},
+                    "packet":{"type":"object","required":["protocol_version","task_schema_version","kernel_schema_version","branch_id","lease_epoch","resume_nonce","idempotency_key"],"properties":{"protocol_version":{"type":"string"},"task_schema_version":{"type":"integer"},"kernel_schema_version":{"type":"integer"},"branch_id":{"type":"string"},"lease_epoch":{"type":"integer"},"resume_nonce":{"type":"integer"},"idempotency_key":{"type":"string"}}}
                 }
             }),
             ToolName::Events => json!({
