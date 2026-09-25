@@ -1832,3 +1832,18 @@ is shared it is noted in the module docs.
   that appears between approval and running (not overwritten). Hand
   mutation: 3/3 killed (each message site, pre-approval folder check).
 - Gap left: none known.
+
+## Round 62: a bad search pattern says how to search literally
+
+- opencode: `packages/core/src/ripgrep.ts` turns ripgrep's "regex parse
+  error" into its own `InvalidPatternError`.
+- REX before: `search_files` with `regex: true` returned the regex
+  crate's multi-line message with a caret diagram, and nothing about
+  the common cause: code with `(` or `[` sent as a pattern.
+- REX now: one line, "invalid regex: unclosed group; to find the text
+  exactly as written, send regex: false".
+- Tests: the regex search test checks the exact message for `fn foo(`.
+  Hand mutation: 2/2 killed on the final code (first line instead of
+  last, "error: " prefix kept). A third mutant showed a blank-line
+  filter could never matter, so the filter was removed.
+- Gap left: none known.

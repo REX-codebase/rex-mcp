@@ -1327,7 +1327,7 @@ impl ToolRuntime {
             let re = regex::RegexBuilder::new(query)
                 .size_limit(1 << 20)
                 .build()
-                .map_err(|e| err(ErrorKind::InvalidRequest, &format!("invalid regex: {e}")))?;
+                .map_err(|e| err(ErrorKind::InvalidRequest, &regex_error_detail(&e)))?;
             Box::new(move |line: &str| re.find(line).map(|m| line[..m.start()].chars().count()))
         } else {
             let needle = query.to_lowercase();
@@ -4422,6 +4422,10 @@ mod tests {
         assert_eq!(out, "src/deep/mod.ts:1:const needle_two = 2;");
         let out = search(&rt, "needle", false, Some("src/**/*.{rs,ts}"));
         assert!(out.contains("lib.rs") && out.contains("mod.ts"), "{out}");
+        assert_eq!(
+            search(&rt, "fn foo(", true, None),
+            "ERR Some(ToolError { kind: InvalidRequest, detail: \"invalid regex: unclosed group; to find the text exactly as written, send regex: false\" })"
+        );
         assert!(search(&rt, "(", true, None).contains("invalid regex"));
         assert_eq!(search(&rt, "zzz_absent", false, None), "[no matches]");
     }
@@ -5444,6 +5448,22 @@ fn similar_names(wanted: &str, names: impl Iterator<Item = (String, bool)>) -> V
         .take(3)
         .map(|(_, name, is_dir)| (name, is_dir))
         .collect()
+}
+
+/// A bad pattern, in one line. The regex crate's message spans several
+/// lines with a caret diagram; the last line holds the reason. opencode
+/// reports a bad ripgrep pattern as its own error (`InvalidPatternError`,
+/// `packages/core/src/ripgrep.ts`); REX also says how to search the text
+/// as written, since most bad patterns are code with `(` or `[` in it.
+fn regex_error_detail(e: &regex::Error) -> String {
+    let text = e.to_string();
+    let reason = text
+        .lines()
+        .last()
+        .map(str::trim)
+        .unwrap_or("bad pattern")
+        .trim_start_matches("error: ");
+    format!("invalid regex: {reason}; to find the text exactly as written, send regex: false")
 }
 
 /// Finds the char offset of the first match in a line.
