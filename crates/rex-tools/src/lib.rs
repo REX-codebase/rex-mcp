@@ -1151,6 +1151,16 @@ impl ToolRuntime {
         } else {
             String::new()
         };
+        // Replacing a file that starts with a byte order mark keeps the
+        // mark (opencode's write tool does the same); the model never
+        // sees or writes it.
+        let with_bom;
+        let content = if previous.starts_with(fuzzy::BOM) && !content.starts_with(fuzzy::BOM) {
+            with_bom = format!("{}{content}", fuzzy::BOM);
+            with_bom.as_str()
+        } else {
+            content
+        };
         let mut options = OpenOptions::new();
         options.write(true).truncate(true).create(true);
         #[cfg(unix)]
@@ -3046,6 +3056,54 @@ mod tests {
         // a new file gets no note
         let r = write("fresh.rs", old.clone());
         assert!(!r.output.unwrap().contains("note:"));
+    }
+    #[test]
+    fn byte_order_mark_survives_edits_and_overwrites() {
+        let root = temp();
+        fs::write(root.join("b.cs"), "\u{FEFF}using System;\nclass A {}\n").unwrap();
+        fs::write(root.join("plain.cs"), "class P {}\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let bytes = |p: &str| fs::read(root.join(p)).unwrap();
+        let r = approved(
+            &rt,
+            ToolRequest::EditFile {
+                path: "b.cs".into(),
+                expected: "using System;".into(),
+                replacement: "using System.IO;".into(),
+                replace_all: false,
+            },
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(
+            bytes("b.cs"),
+            "\u{FEFF}using System.IO;\nclass A {}\n".as_bytes()
+        );
+        let write = |path: &str, content: &str| {
+            approved(
+                &rt,
+                ToolRequest::CreateFile {
+                    path: path.into(),
+                    content: content.into(),
+                    overwrite: true,
+                },
+            )
+        };
+        // overwrite without the mark keeps it; with the mark it is not doubled
+        assert!(write("b.cs", "class B {}\n").ok);
+        assert_eq!(bytes("b.cs"), "\u{FEFF}class B {}\n".as_bytes());
+        assert!(write("b.cs", "\u{FEFF}class C {}\n").ok);
+        assert_eq!(bytes("b.cs"), "\u{FEFF}class C {}\n".as_bytes());
+        // files without one never gain one
+        let read = ToolRequest::ReadFile {
+            path: "plain.cs".into(),
+            offset: None,
+            limit: None,
+        };
+        assert!(approved(&rt, read).ok);
+        assert!(write("plain.cs", "class Q {}\n").ok);
+        assert_eq!(bytes("plain.cs"), b"class Q {}\n");
+        assert!(write("new.cs", "class N {}\n").ok);
+        assert_eq!(bytes("new.cs"), b"class N {}\n");
     }
     #[test]
     fn edit_that_changes_nothing_is_refused() {

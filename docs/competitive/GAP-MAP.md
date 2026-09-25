@@ -1499,3 +1499,23 @@ is shared it is noted in the module docs.
   Hand mutation: 11/11 killed.
 - Gap left: `create_file` writes content as given, even over a CRLF
   file.
+
+## Round 44: a UTF-8 byte order mark survives edits and overwrites
+
+- opencode: `util/bom.ts` splits a leading byte order mark off before
+  its edit and write tools work on a file and puts it back afterwards
+  (`tool/edit.ts`, `tool/write.ts`).
+- REX before: the mark was treated as file text. Replacing the first
+  line of such a file (common for C# and Windows-made files) could
+  drop it, an exact match on that line failed, and a whole-file
+  `create_file` overwrite always removed it.
+- REX now: the edit planner (shared by `edit_file` and `apply_patch`)
+  plans on the text after the mark, ignores a mark carried by the find
+  or replacement text, and puts the mark back. `create_file` replacing
+  a file that has one keeps it, without doubling it. Files without the
+  mark never gain one.
+- Tests: planner (first line exact and loose, a mark in the find or
+  replacement, other lines, replace_all, no-mark file) and an end-to-end
+  edit and overwrite test. Hand mutation: 7/7 killed; one was killed
+  only after the test checked the match strategy.
+- Gap left: `read_file` still shows the mark as the first character.

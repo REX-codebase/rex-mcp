@@ -60,6 +60,18 @@ pub fn plan_edit(
     replacement: &str,
     replace_all: bool,
 ) -> Result<EditPlan, PlanError> {
+    // A UTF-8 byte order mark is not part of the text the model sees or
+    // writes: plan on the rest and put it back, so an edit of the first
+    // line neither fails to match nor drops the mark. opencode's edit tool
+    // splits and restores it the same way (`util/bom.ts`).
+    if let Some(rest) = content.strip_prefix(BOM) {
+        let find = find.strip_prefix(BOM).unwrap_or(find);
+        let replacement = replacement.strip_prefix(BOM).unwrap_or(replacement);
+        return plan_edit(rest, find, replacement, replace_all).map(|mut p| {
+            p.new_content.insert(0, BOM);
+            p
+        });
+    }
     for (name, strategy) in STRATEGIES {
         let mut spans = strategy(content, find);
         spans.sort_unstable();
@@ -104,6 +116,9 @@ pub fn plan_edit(
         hint: closest_hint(content, find),
     })
 }
+
+/// The UTF-8 byte order mark.
+pub const BOM: char = '\u{FEFF}';
 
 /// True when most of `content`'s line breaks are CRLF. Replacement text
 /// written by a model almost always uses LF; inserting it as-is into a
@@ -839,6 +854,35 @@ mod tests {
         // a mostly-LF file with one stray CRLF stays LF
         let p = apply("a\r\nb\nc\n", "c", "C1\nC2").unwrap();
         assert_eq!(p.new_content, "a\r\nb\nC1\nC2\n");
+    }
+
+    #[test]
+    fn byte_order_mark_is_kept_and_not_matched() {
+        let c = "\u{FEFF}first\nsecond\n";
+        // the first line matches without the mark, and the mark stays
+        assert_eq!(
+            apply(c, "first", "1st").unwrap().new_content,
+            "\u{FEFF}1st\nsecond\n"
+        );
+        // a find or replacement that carries the mark is not doubled
+        let p = apply(c, "\u{FEFF}first", "\u{FEFF}1st").unwrap();
+        assert_eq!(
+            (p.new_content.as_str(), p.strategy),
+            ("\u{FEFF}1st\nsecond\n", "exact")
+        );
+        // a loose match on the first line keeps it too
+        let p = apply(c, "first  \nsecond", "one\ntwo").unwrap();
+        assert_eq!(p.new_content, "\u{FEFF}one\ntwo\n");
+        assert_ne!(p.strategy, "exact");
+        // other lines, and replace_all
+        assert_eq!(
+            apply(c, "second", "2nd").unwrap().new_content,
+            "\u{FEFF}first\n2nd\n"
+        );
+        let p = plan_edit("\u{FEFF}x\nx\n", "x", "y", true).unwrap();
+        assert_eq!((p.new_content.as_str(), p.replaced), ("\u{FEFF}y\ny\n", 2));
+        // a file without the mark is left as it was
+        assert_eq!(apply("a\n", "a", "b").unwrap().new_content, "b\n");
     }
 
     #[test]
