@@ -22,6 +22,8 @@ codex mcp add rex --env REX_STATE_DIR="$HOME/.rex/harness" --env REX_WORKSPACE="
 
 Codex's [MCP guide](https://developers.openai.com/codex/mcp) documents the stdio command and `--env` flags. Use `/mcp` in the Codex TUI to inspect the connection.
 
+Codex CLI v0.157.0 in an isolated no-inference test discovered REX tools and resources via app-server. Reading the workflow quickstart through Codex also worked. This does not establish live agent tool use. The Auth: Unsupported column in codex mcp list is not a connection failure. See https://developers.openai.com/codex/app-server.
+
 ## OpenCode
 
 In `opencode.jsonc`, replace the sample absolute paths:
