@@ -1767,3 +1767,19 @@ is shared it is noted in the module docs.
   with `>`, a plain command). Hand mutation: 3/3 killed.
 - Gap left: an operator as the program name itself is left to the
   missing-program hint from Round 56.
+
+## Round 58: `cd` and other shell builtins point to `cwd`
+
+- opencode: `tool/shell/prompt.ts` tells the model to use the `workdir`
+  parameter instead of `cd <dir> && <command>`, and `tool/shell.ts`
+  treats `cd`, `pushd`, `popd` and similar as directory changes.
+- REX before: `["cd", "crates/app"]` was sent for approval, then failed
+  with the Round 56 hint "'cd' is not installed or not on PATH", which is
+  true but does not say what to do.
+- REX now: a call whose program is a shell builtin (`cd`, `chdir`,
+  `pushd`, `popd`, `export`, `source`, `.`, `alias`, `set`, `unset`) is
+  refused when prepared, before any approval, with "set the cwd field
+  on that command". The same word as an argument is fine.
+- Tests: the Round 57 test gained four builtins and one argument case.
+  Hand mutation: 3/3 killed.
+- Gap left: none known.

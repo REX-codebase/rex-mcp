@@ -2362,6 +2362,19 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         // run the first command only. opencode and Hermes run a shell line,
         // so these work there; REX refuses before anyone is asked to
         // approve, and says what to do instead.
+        // `cd` and friends are shell builtins: there is no such program,
+        // and even a shell could not carry the change to the next call.
+        // opencode tells its model to use `workdir` instead of `cd`
+        // (`tool/shell/prompt.ts`); REX points at `cwd`.
+        ToolRequest::RunCommand { argv, .. } if SHELL_BUILTINS.contains(&argv[0].trim()) => {
+            Err(err(
+                ErrorKind::InvalidRequest,
+                &format!(
+                    "'{}' is a shell builtin and run_command has no shell; to run a command in a folder, set the cwd field (e.g. cwd: \"crates/app\") on that command",
+                    argv[0].trim()
+                ),
+            ))
+        }
         ToolRequest::RunCommand { argv, .. } => {
             match argv.iter().skip(1).find(|a| SHELL_OPERATORS.contains(&a.as_str())) {
                 Some(op) => Err(err(
@@ -2384,6 +2397,11 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         _ => Ok(()),
     }
 }
+/// Programs that exist only inside a shell.
+const SHELL_BUILTINS: &[&str] = &[
+    "cd", "chdir", "pushd", "popd", "export", "source", ".", "alias", "set", "unset",
+];
+
 /// Whole argv items that only mean something to a shell.
 const SHELL_OPERATORS: &[&str] = &[
     "&&", "||", "|", ";", "&", ">", ">>", "<", "2>", "2>&1", "&>", "|&",
@@ -4463,6 +4481,15 @@ mod tests {
                 format!("run_command runs one program with no shell, so '{op}' would be passed to it as a plain argument; run each command as its own call, and read output with read_output instead of redirecting it")
             );
         }
+        for b in ["cd", "pushd", "export", "source"] {
+            let e = prep(&[b, "x"]).unwrap_err();
+            assert_eq!(
+                e.detail,
+                format!("'{b}' is a shell builtin and run_command has no shell; to run a command in a folder, set the cwd field (e.g. cwd: \"crates/app\") on that command")
+            );
+        }
+        // a builtin name as an argument is fine
+        assert!(prep(&["git", "cd"]).is_ok());
         // operators inside a word, and ordinary args, are fine
         assert!(prep(&["grep", "-E", "a|b", "f.txt"]).is_ok());
         assert!(prep(&["git", "log", "--format=%h > %s"]).is_ok());
