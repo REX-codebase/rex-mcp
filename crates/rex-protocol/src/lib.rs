@@ -132,6 +132,9 @@ impl ToolName {
 pub enum HostKind {
     Human,
     ClaudeCode,
+    Codex,
+    OpenCode,
+    Hermes,
     Antigravity,
     GenericAgent,
 }

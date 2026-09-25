@@ -289,7 +289,7 @@ fn host_profiles_share_a_durable_task_over_stdio() {
             json!({
             "request_id":format!("host-profile-{index}"),
             "task":format!("task from {host}"),
-            "host":"generic_agent", "operator_is_agent":true
+            "host": if *host == "opencode" { "open_code" } else { host }, "operator_is_agent":true
             }),
         );
         assert_eq!(task["state"], "active", "{host}: {task}");

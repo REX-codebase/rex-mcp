@@ -2544,6 +2544,9 @@ fn host_label(h: HostKind) -> &'static str {
     match h {
         HostKind::Human => "human-ui",
         HostKind::ClaudeCode => "claude-code",
+        HostKind::Codex => "codex",
+        HostKind::OpenCode => "opencode",
+        HostKind::Hermes => "hermes",
         HostKind::Antigravity => "antigravity",
         HostKind::GenericAgent => "generic-mcp",
     }
