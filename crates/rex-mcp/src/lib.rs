@@ -151,7 +151,12 @@ impl McpServer {
                 "prompts": [{
                     "name": "rex_task_workflow",
                     "title": "Run a durable REX task",
-                    "description": "Guide the host through REX task custody, continuation, and submission."
+                    "description": "Guide the host through REX task custody, continuation, and submission.",
+                    "arguments": [{
+                        "name": "task",
+                        "description": "The task to run with durable custody.",
+                        "required": true
+                    }]
                 }]
             })),
             "prompts/get" => self.require_initialized().and_then(|_| {
@@ -163,13 +168,25 @@ impl McpServer {
                         ErrorCode::MalformedRequest, format!("unknown prompt: {name}")
                     ));
                 }
+                let task = request
+                    .get("params")
+                    .and_then(|p| p.get("arguments"))
+                    .and_then(|a| a.get("task"))
+                    .and_then(Value::as_str)
+                    .filter(|task| !task.trim().is_empty())
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ErrorCode::MalformedRequest,
+                            "non-empty task argument required",
+                        )
+                    })?;
                 Ok(json!({
                     "description": "Use REX to keep a task's plan, tool outcomes, and continuation in durable custody.",
                     "messages": [{
                         "role": "user",
                         "content": {
                             "type": "text",
-                            "text": "For a task that needs durable custody, call rex_execute with the request and host; use the returned task_id with rex_next, rex_tools, and rex_submit as directed. Follow the tool responses rather than guessing the next step. Do not claim that the host is forced to continue or that REX bypasses host limits."
+                            "text": format!("For this task: {task}\n\nCall rex_execute with the task and host. Use the returned task_id with rex_next, rex_tools, and rex_submit as directed. Follow tool responses rather than guessing the next step. The host controls continuation and limits; REX does not force further calls.")
                         }
                     }]
                 }))
@@ -439,11 +456,24 @@ mod tests {
         );
         let list = s.handle(rpc(2, "prompts/list", json!({}))).unwrap();
         assert_eq!(list["result"]["prompts"][0]["name"], "rex_task_workflow");
+        assert_eq!(list["result"]["prompts"][0]["arguments"][0]["name"], "task");
         let get = s
-            .handle(rpc(3, "prompts/get", json!({"name":"rex_task_workflow"})))
+            .handle(rpc(
+                3,
+                "prompts/get",
+                json!({"name":"rex_task_workflow", "arguments":{"task":"fix parser"}}),
+            ))
             .unwrap();
         assert_eq!(get["result"]["messages"][0]["role"], "user");
         assert_eq!(get["result"]["messages"][0]["content"]["type"], "text");
+        assert!(get["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fix parser"));
+        let no_task = s
+            .handle(rpc(4, "prompts/get", json!({"name":"rex_task_workflow"})))
+            .unwrap();
+        assert_eq!(no_task["error"]["code"], -32602);
         let missing = s
             .handle(rpc(4, "prompts/get", json!({"name":"missing"})))
             .unwrap();
