@@ -64,8 +64,11 @@ a host cannot force REX to accept a claim. Either side stops cleanly.
   rejected with `version_mismatch`.
 - Error codes are stable snake_case (`task_not_found`, `stale_lease`,
   `scope_denied`, `approval_required`, `budget_exceeded`, `gate_failed`,
-  `no_result`, ...). Domain failures travel in JSON-RPC error `data.code`
-  so MCP transport never erases them.
+  `no_result`, ...). Valid tool calls that fail in REX return MCP tool results
+  with `isError: true`, a human-readable message, and structured error
+  details including the code. Malformed arguments and unknown tool names
+  remain JSON-RPC errors with `data.code`. Hosts must inspect `isError`;
+  transport success alone does not mean the tool succeeded.
 - Idempotency: repeating `rex_execute` with the same `request_id` and
   payload resumes; same key with a different payload is
   `idempotency_conflict`.
