@@ -1871,3 +1871,11 @@ is shared it is noted in the module docs.
 - REX now: the model-facing `run_command` refuses 0 as `InvalidRequest` before spawning. The message says to omit it for the 30000 ms default or give up to 120000. Trusted scoring (`run_command_impl`) is unchanged.
 - Test: `zero_timeout_is_refused_before_the_command_runs` goes through prepare/approve/execute and checks that `touch made` does not create the file at 0 and does create it with the default.
 - Mutants (3/3 killed by test panics): guard removed, `== 0` to `!= 0`, and `== 0` to `== 1`.
+
+## Round 65 - a cut timeout is reported even when the command finishes
+
+- Gap (left by Rounds 38 and 63): a `timeout_ms` above the 120000 ms cap was cut silently whenever the command finished in time, so the model kept asking for a limit it never got. The daemon's `test` recipe itself asked for 10 minutes and was silently cut to 2.
+- Grounding: Hermes `tools/terminal_tool.py` tells the caller when a foreground request above its cap was handled differently ("Requested foreground timeout ... exceeds the ...s cap"). opencode's shell tool has no hard cap to report.
+- REX now: a successful model `run_command` with `timeout_ms` above the cap ends with "note: timeout_ms N is above the 120000 ms cap, so it ran with 120000". Output at or under the cap is unchanged. `MAX_TIMEOUT_MS` is now public, and the daemon `test` recipe asks for exactly that instead of a 10-minute limit it never got, so its stdout/stderr carry no note.
+- Test: `a_cut_timeout_is_reported_even_when_the_command_finishes` checks over the cap with and without output, at the cap, and the default. rex-daemon tests: 64 pass.
+- Mutants (4/4 killed by test panics): `>` to `>=`, guard to `false`, `!is_empty` to `is_empty`, and the separator push removed.

@@ -112,7 +112,8 @@ pub fn clip_middle(text: &str, max: usize) -> (String, bool) {
 const MAX_WRITE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
-const MAX_TIMEOUT_MS: u64 = 120_000;
+/// Longest a model-requested command may run; larger requests are cut to it.
+pub const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_PENDING: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1664,7 +1665,20 @@ impl ToolRuntime {
                 ),
             ));
         }
-        self.run_command_impl(argv, cwd, timeout_ms)
+        let mut data = self.run_command_impl(argv, cwd, timeout_ms)?;
+        // A timeout means the cut is reported by timeout_detail; a command
+        // that finished in time must still hear that its request was cut,
+        // or it keeps asking for a limit it never gets.
+        if timeout_ms > MAX_TIMEOUT_MS {
+            let out = data.output.get_or_insert_with(String::new);
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "note: timeout_ms {timeout_ms} is above the {MAX_TIMEOUT_MS} ms cap, so it ran with {MAX_TIMEOUT_MS}"
+            ));
+        }
+        Ok(data)
     }
 
     /// Bounded process execution shared by model-approved commands and
@@ -4696,6 +4710,33 @@ mod tests {
         assert!(!root.join("made").exists(), "the command must not run");
         assert!(run(None).error.is_none());
         assert!(root.join("made").exists());
+    }
+    #[test]
+    fn a_cut_timeout_is_reported_even_when_the_command_finishes() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let run = |argv: &[&str], timeout_ms: Option<u64>| {
+            let p = rt
+                .prepare(ToolRequest::RunCommand {
+                    argv: argv.iter().map(|s| s.to_string()).collect(),
+                    cwd: None,
+                    timeout_ms,
+                })
+                .unwrap();
+            let _ = rt.resolve_approval(&p.call_id, true);
+            let r = rt.execute(&p.call_id);
+            assert!(r.error.is_none(), "{:?}", r.error);
+            r.output.unwrap_or_default()
+        };
+        let note = "note: timeout_ms 600000 is above the 120000 ms cap, so it ran with 120000";
+        assert_eq!(
+            run(&["echo", "hi"], Some(600_000)),
+            format!("stdout:\nhi\n\n{note}")
+        );
+        assert_eq!(run(&["true"], Some(600_000)), note);
+        // at or under the cap, nothing is added
+        assert_eq!(run(&["echo", "hi"], Some(MAX_TIMEOUT_MS)), "stdout:\nhi\n");
+        assert_eq!(run(&["true"], None), "");
     }
     #[test]
     fn missing_program_says_what_to_fix() {

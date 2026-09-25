@@ -561,7 +561,9 @@ impl HarnessDaemon {
             capability: req.capability.clone(),
             lease_epoch: req.lease_epoch,
             argv,
-            timeout_ms: Some(10 * 60 * 1000),
+            // run_command cuts every request to its cap, so ask for the cap
+            // itself rather than a 10-minute limit the recipe never gets.
+            timeout_ms: Some(rex_tools::MAX_TIMEOUT_MS),
         })?;
         let passed = run.exit_code == Some(0);
         let evidence_id = format!("evidence-{}", random_id());
