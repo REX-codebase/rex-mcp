@@ -23,22 +23,21 @@ if [ -d "$STATE_DIR/tasks" ]; then
 fi
 echo "Building rex-mcp (release)..."
 cargo build --release -p rex-mcp --manifest-path "$ROOT/Cargo.toml"
-mkdir -p "$DEST" "$HOME/.rex/harness"
+mkdir -p "$DEST" "$STATE_DIR"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-cp "$TARGET_DIR/release/rex-mcp" "$DEST/rex-mcp"
-chmod +x "$DEST/rex-mcp"
+# Stage beside the destination, then rename: an interrupted copy must never
+# replace a working MCP binary with a truncated one.
+STAGED="$(mktemp "$DEST/.rex-mcp.XXXXXXXX")"
+trap 'rm -f "$STAGED"' EXIT
+cp "$TARGET_DIR/release/rex-mcp" "$STAGED"
+chmod +x "$STAGED"
+mv -f "$STAGED" "$DEST/rex-mcp"
+trap - EXIT
 echo "Installed: $DEST/rex-mcp"
-echo
-echo "Claude Code:"
-echo "  claude mcp add rex --scope user \\"
-echo "    --env REX_STATE_DIR=$HOME/.rex/harness \\"
-echo "    --env REX_WORKSPACE=/path/to/project \\"
-echo "    --env REX_APPROVE_TASK_MUTATIONS=1 \\"
-echo "    -- $DEST/rex-mcp"
-echo
-echo "Antigravity (~/.antigravity/mcp_config.json):"
-printf '  {"mcpServers":{"rex":{"command":"%s","env":{"REX_STATE_DIR":"%s","REX_WORKSPACE":"/path/to/project","REX_APPROVE_TASK_MUTATIONS":"1"}}}}\n' \
-  "$DEST/rex-mcp" "$HOME/.rex/harness"
+echo "Configure Claude Code, Codex, OpenCode or Hermes with this absolute path."
+echo "See README.md for current private host setup examples."
+echo "REX_STATE_DIR=$STATE_DIR"
+echo "Mutation approval stays off unless you explicitly set REX_APPROVE_TASK_MUTATIONS=1."
 echo
 echo "Read docs/rex-mcp.md for the security and error contracts before"
 echo "enabling REX_APPROVE_TASK_MUTATIONS=1."
