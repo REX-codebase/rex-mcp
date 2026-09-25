@@ -395,7 +395,7 @@ impl McpServer {
             "protocolVersion": version,
             "capabilities": { "tools": { "listChanged": false }, "prompts": { "listChanged": false }, "resources": { "listChanged": false } },
             "serverInfo": { "name": "rex-mcp", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": format!("REX Harness protocol {PROTOCOL_VERSION}. Caller-driven custody; call rex_execute, then rex_next/tools, and rex_submit. Continuation is cooperative.")
+            "instructions": format!("REX Harness protocol {PROTOCOL_VERSION}. Read rex://workflow/quickstart for the workflow. Call rex_execute to create a task, then rex_next/tools and rex_submit with evidence. For an existing task, use rex_task_inspect and its status/events/result resources without mutation. Continuation is cooperative; the host controls further calls.")
         }))
     }
     fn require_initialized(&self) -> Result<(), ProtocolError> {
@@ -1185,6 +1185,10 @@ mod tests {
             init["result"]["capabilities"]["prompts"]["listChanged"],
             false
         );
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("rex://workflow/quickstart"));
+        assert!(instructions.contains("rex_task_inspect"));
+        assert!(instructions.contains("host controls further calls"));
         let list = s.handle(rpc(2, "prompts/list", json!({}))).unwrap();
         assert_eq!(list["result"]["prompts"][0]["name"], "rex_task_workflow");
         assert_eq!(list["result"]["prompts"][1]["name"], "rex_task_inspect");
