@@ -8,6 +8,8 @@ The stdio server negotiates MCP `2025-11-25` and `2025-06-18`. A client offering
 
 Pin `REX_STATE_DIR` and `REX_WORKSPACE` to the intended absolute paths. Without them, state defaults to `$HOME/.rex/harness` and workspace to the process current directory. Leave `REX_APPROVE_TASK_MUTATIONS` unset for read-only use; set it to `1` only when you intend to allow file edits and allowlisted commands in that workspace.
 
+For a cautious host-by-host check, see [manual host test](docs/HOST-TEST.md).
+
 ## Claude Code
 
 ```sh

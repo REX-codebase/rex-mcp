@@ -1,0 +1,11 @@
+# Test REX MCP in an agent host
+
+This is a manual test, not a claim that a model-driven run passed. CI tests the stdio protocol and launcher. Codex v0.157.0 discovered tools and read a resource without inference; OpenCode v1.17.4 reported a connection without inference. Claude Code and Hermes have not had an installed-host check here.
+
+1. Install from this private checkout with `bash scripts/rex-mcp-install.sh`. Use the absolute path of the installed binary (normally `$HOME/.rex/bin/rex-mcp`). Set `REX_STATE_DIR` to your Harness state directory and `REX_WORKSPACE` to an absolute disposable project path. The four host config examples are in [README](../README.md). Leave `REX_APPROVE_TASK_MUTATIONS` unset for read-only tests.
+2. Restart the host or reload MCP servers. Check discovery: `claude mcp list`, `codex mcp list`, `opencode mcp list`, or `hermes mcp test rex`. A configured entry alone is not proof of a live connection. For Codex, `Auth: Unsupported` for stdio is an auth label, not a connection failure; check status separately.
+3. In a fresh host session, ask: "Use the REX MCP server to list its tools and read its workflow quickstart resource. Tell me the names, URI and errors. Do not edit files or run commands." Confirm the actual returned tool/resource data, not a model guess.
+4. Ask: "Call `rex_status` for a nonexistent task ID. Report the structured error without trying another task or changing files." This is a harmless error-path check. For a real task, a read-only status check is also fine.
+5. Only after reviewing workspace and permissions, try a tiny disposable task. Ask the host to call `rex_execute`, follow its returned `task_id`, `task_capability` and scoped leases, then inspect `rex_status` and task resources. Review every proposed mutation or command. A denied or stale lease must stop the action, not trigger a bypass. Submit completion only with real evidence. REX does not force the host to keep calling tools.
+
+Record host/version, connection status, server commit, tool/resource responses, errors and whether the host actually used a REX tool. Redact credentials and private task content before sharing a log. Discovery or connection is not a live agent-use test.
