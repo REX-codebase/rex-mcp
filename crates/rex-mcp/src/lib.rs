@@ -253,7 +253,7 @@ impl McpServer {
                 Ok(json!({"contents": [{
                     "uri": uri,
                     "mimeType": "text/plain",
-                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id with rex_next and scoped rex_tools, then rex_submit with evidence. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
+                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with evidence. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
                 }]}))
             }),
             "prompts/list" => self.require_initialized().map(|_| json!({
@@ -295,7 +295,7 @@ impl McpServer {
                         "role": "user",
                         "content": {
                             "type": "text",
-                            "text": format!("For this task: {task}\n\nCall rex_execute with the task and host. Use the returned task_id with rex_next, rex_tools, and rex_submit as directed. Follow tool responses rather than guessing the next step. The host controls continuation and limits; REX does not force further calls.")
+                            "text": format!("For this task: {task}\n\nCall rex_execute with a fresh request_id, this task, the host, and operator_is_agent=true. Keep the returned task_id, task_capability, and lease epoch. Use rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by the open action; submit evidence through rex_submit. Follow tool responses rather than guessing the next step. The host controls continuation and limits; REX does not force further calls.")
                         }
                     }]
                 }))
