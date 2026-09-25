@@ -22,7 +22,7 @@ if [ -d "$STATE_DIR/tasks" ]; then
   fi
 fi
 echo "Building rex-mcp (release)..."
-cargo build --release -p rex-mcp --manifest-path "$ROOT/Cargo.toml"
+cargo build --release --locked -p rex-mcp --manifest-path "$ROOT/Cargo.toml"
 mkdir -p "$DEST" "$STATE_DIR"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 # Stage beside the destination, then rename: an interrupted copy must never
