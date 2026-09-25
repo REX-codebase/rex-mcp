@@ -253,7 +253,7 @@ impl McpServer {
                 Ok(json!({"contents": [{
                     "uri": uri,
                     "mimeType": "text/plain",
-                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with evidence. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
+                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with evidence. For an existing task, use the rex_task_inspect prompt and task status/events/result resources for read-only inspection; event pages have at most 100 entries, so page until caught up. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
                 }]}))
             }),
             "prompts/list" => self.require_initialized().map(|_| json!({
@@ -957,6 +957,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("rex_execute"));
+        assert!(read["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("rex_task_inspect"));
         let bad = s
             .handle(rpc(
                 4,
