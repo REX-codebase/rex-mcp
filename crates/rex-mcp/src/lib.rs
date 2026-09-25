@@ -384,7 +384,9 @@ fn progress_start(request: &Value, initialized: bool) -> Option<Value> {
     if !initialized
         || request.get("jsonrpc")?.as_str()? != "2.0"
         || request.get("method")?.as_str()? != "tools/call"
-        || !request.get("id")?.is_string() && !request.get("id")?.is_number()
+        || !(request.get("id")?.is_string()
+            || request.get("id")?.is_i64()
+            || request.get("id")?.is_u64())
     {
         return None;
     }
@@ -1127,6 +1129,11 @@ mod tests {
         );
         assert!(progress_start(&call, false).is_none());
         call["params"]["name"] = json!("rex_status");
+        assert!(progress_start(&call, true).is_none());
+        call["params"]["name"] = json!("rex_test");
+        call["id"] = json!(1.5);
+        assert!(progress_start(&call, true).is_none());
+        call["id"] = Value::Null;
         assert!(progress_start(&call, true).is_none());
         call.as_object_mut().unwrap().remove("id");
         assert!(progress_start(&call, true).is_none());
