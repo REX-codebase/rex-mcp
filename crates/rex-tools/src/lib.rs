@@ -1835,7 +1835,13 @@ impl ToolRuntime {
             return detail;
         };
         let inside = fs::canonicalize(dir).is_ok_and(|c| c.starts_with(&*self.root));
-        if !inside || self.reject_symlinks(dir).is_err() {
+        if !inside {
+            if let Some(hint) = self.missing_folder_hint(joined) {
+                detail.push_str(&format!("; did you mean {hint}?"));
+            }
+            return detail;
+        }
+        if self.reject_symlinks(dir).is_err() {
             return detail;
         }
         let Ok(entries) = fs::read_dir(dir) else {
@@ -1865,6 +1871,43 @@ impl ToolRuntime {
             detail.push_str(&format!("; did you mean {}?", shown.join(", ")));
         }
         detail
+    }
+
+    /// When a folder on the way is what is missing (`scr/main.rs`), look
+    /// in the deepest folder that does exist for one folder named like the
+    /// missing one. Offer the corrected full path when it exists, else the
+    /// folder. Neither competitor looks past the last folder; both only
+    /// list the file's own folder. Same limits: inside the workspace, no
+    /// symlinks, at most `MAX_LIST_ENTRIES` names, and only one clear pick.
+    fn missing_folder_hint(&self, joined: &Path) -> Option<String> {
+        let mut base = joined.parent()?;
+        let mut missing = joined.file_name()?;
+        while !base.exists() {
+            missing = base.file_name()?;
+            base = base.parent()?;
+        }
+        let inside = fs::canonicalize(base).is_ok_and(|c| c.starts_with(&*self.root));
+        if !inside || self.reject_symlinks(base).is_err() || !base.is_dir() {
+            return None;
+        }
+        let rest = joined.strip_prefix(base.join(missing)).ok()?;
+        let names = fs::read_dir(base)
+            .ok()?
+            .take(MAX_LIST_ENTRIES)
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| Some((e.file_name().to_str()?.to_string(), true)));
+        let picks = similar_names(&missing.to_string_lossy(), names);
+        let [(name, _)] = picks.as_slice() else {
+            return None;
+        };
+        let folder = base.join(name);
+        let full = folder.join(rest);
+        if full.symlink_metadata().is_ok() && self.reject_symlinks(&full).is_ok() {
+            Some(relative(&self.root, &full))
+        } else {
+            Some(format!("{}/", relative(&self.root, &folder)))
+        }
     }
 
     fn resolve_for_write(&self, raw: &str) -> Result<PathBuf, ToolError> {
@@ -3316,6 +3359,26 @@ mod tests {
         // nothing alike, or no such folder: the plain message
         assert_eq!(read("src/zzzz.py").detail, "path not found: src/zzzz.py");
         assert_eq!(read("nope/main.rs").detail, "path not found: nope/main.rs");
+        // a misspelt folder: the fixed path when it exists, else the folder
+        assert_eq!(
+            read("srcs/main.rs").detail,
+            "path not found: srcs/main.rs; did you mean src/main.rs?"
+        );
+        assert_eq!(
+            read("SRC/tests/a/b.rs").detail,
+            "path not found: SRC/tests/a/b.rs; did you mean src/?"
+        );
+        assert_eq!(
+            read("src/test/x.rs").detail,
+            "path not found: src/test/x.rs; did you mean src/tests/?"
+        );
+        // a file with a folder's name is not a folder
+        fs::write(root.join("docs"), "x").unwrap();
+        assert_eq!(read("doc/a.md").detail, "path not found: doc/a.md");
+        // two folders alike: no guess
+        fs::create_dir_all(root.join("lib1")).unwrap();
+        fs::create_dir_all(root.join("lib2")).unwrap();
+        assert_eq!(read("lib/x.rs").detail, "path not found: lib/x.rs");
         // a folder reached through a symlink is not listed
         let outside = temp();
         fs::write(outside.join("secret.txt"), "x").unwrap();
@@ -3328,6 +3391,11 @@ mod tests {
         assert_eq!(
             read("alias/Main.rs").detail,
             "path not found: alias/Main.rs"
+        );
+        // nor a missing folder under a symlinked one
+        assert_eq!(
+            read("alias/test/x.rs").detail,
+            "path not found: alias/test/x.rs"
         );
     }
     #[test]

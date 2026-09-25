@@ -1599,3 +1599,28 @@ is shared it is noted in the module docs.
 - Gap left: REX keeps a 300-char window where opencode shows up to
   2,000 chars; REX's choice keeps 100 results small, and the window now
   always contains the match. Only the first match on a line is centred.
+
+## Round 49: a misspelt folder on the way also gets a suggestion
+
+- opencode (`tool/read.ts`) and Hermes (`_suggest_similar_files`,
+  `tools/file_operations.py`) list names alike only from the file's own
+  folder. When that folder is itself missing, both give no suggestion.
+- REX before: the same as both (Round 40 gap left: no suggestions when
+  the folder is missing).
+- REX now: when a folder on the way is missing (`srcs/main.rs`,
+  `SRC/tests/a/b.rs`), REX looks in the deepest folder that exists for
+  folders named like the missing one. With exactly one clear pick it
+  offers the corrected full path if that exists ("did you mean
+  src/main.rs?"), else the folder ("did you mean src/?"). Files are
+  never offered as folders, two alike folders give no guess, and the
+  same limits as Round 40 hold (inside the workspace, no symlinks, at
+  most 500 names read).
+- Tests: the Round 40 test gained six cases (fixed path, folder only,
+  missing inner folder, file named like the folder, two alike folders,
+  missing folder under a symlink). Hand mutation: 7 of 8 killed. The
+  survivor removes the "inside the workspace" check on the base folder;
+  it is kept as a second guard because the joined path is already held
+  inside the workspace and symlinks are refused, so no test can reach
+  it.
+- Gap left: only the first missing folder is corrected; a path with two
+  misspelt folders gets the first fix as a folder hint.
