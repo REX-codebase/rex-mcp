@@ -1004,12 +1004,17 @@ impl ToolRuntime {
             if looks_binary(&bytes) {
                 return Err(binary_error(meta.len()));
             }
-            let text = String::from_utf8(bytes).map_err(|_| {
+            let mut text = String::from_utf8(bytes).map_err(|_| {
                 err(
                     ErrorKind::InvalidRequest,
                     "binary or non-UTF-8 files are not supported",
                 )
             })?;
+            // The byte order mark is not text: the model never sees it, and
+            // edits and overwrites keep it (see `fuzzy::plan_edit`).
+            if text.starts_with(fuzzy::BOM) {
+                text.drain(..fuzzy::BOM.len_utf8());
+            }
             let line_count = text.lines().count();
             if line_count <= DEFAULT_READ_LINES {
                 self.note_seen(&target);
@@ -1047,6 +1052,9 @@ impl ToolRuntime {
             }
             if line.last() == Some(&b'\r') {
                 line.pop();
+            }
+            if total == 1 && line.starts_with(b"\xEF\xBB\xBF") {
+                line.drain(..3);
             }
             let text = String::from_utf8_lossy(&line);
             let text = if text.chars().count() > MAX_LINE_CHARS {
@@ -3056,6 +3064,36 @@ mod tests {
         // a new file gets no note
         let r = write("fresh.rs", old.clone());
         assert!(!r.output.unwrap().contains("note:"));
+    }
+    #[test]
+    fn read_file_hides_the_byte_order_mark() {
+        let root = temp();
+        fs::write(root.join("b.txt"), "\u{FEFF}one\n\u{FEFF}two\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let read = |offset: Option<usize>, limit: Option<usize>| {
+            let r = approved(
+                &rt,
+                ToolRequest::ReadFile {
+                    path: "b.txt".into(),
+                    offset,
+                    limit,
+                },
+            );
+            r.output.unwrap()
+        };
+        // whole file: only the leading mark goes
+        assert_eq!(read(None, None), "one\n\u{FEFF}two\n");
+        // paged: the same, line numbers unchanged
+        let out = read(Some(1), Some(2));
+        assert!(
+            out.starts_with("     1\tone\n     2\t\u{FEFF}two\n"),
+            "{out:?}"
+        );
+        assert!(read(Some(2), Some(1)).starts_with("     2\t\u{FEFF}two\n"));
+        // the file itself is untouched
+        assert!(fs::read(root.join("b.txt"))
+            .unwrap()
+            .starts_with(b"\xEF\xBB\xBF"));
     }
     #[test]
     fn byte_order_mark_survives_edits_and_overwrites() {

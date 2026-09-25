@@ -1519,3 +1519,18 @@ is shared it is noted in the module docs.
   edit and overwrite test. Hand mutation: 7/7 killed; one was killed
   only after the test checked the match strategy.
 - Gap left: `read_file` still shows the mark as the first character.
+
+## Round 45: read_file hides the byte order mark
+
+- opencode: `util/bom.ts` `readFile` returns file text with a leading
+  byte order mark split off, so its read tool never shows it.
+- REX before: Round 44's gap: `read_file` showed the mark as the first
+  character of line 1, so the model could copy it into find or
+  replacement text.
+- REX now: both read paths (whole small file, and paged with line
+  numbers) drop a leading mark from line 1 only. A mark elsewhere is
+  real content and is shown. The file is not changed, and the stale
+  check still fingerprints the real bytes.
+- Tests: one end-to-end test (whole read, paged read from line 1 and
+  from line 2, bytes on disk). Hand mutation: 5/5 killed.
+- Gap left: `search_files` can still show a mark on a line-1 match.
