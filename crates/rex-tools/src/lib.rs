@@ -995,6 +995,25 @@ impl ToolRuntime {
         if let Some(done) = self.read_image(path, &target, meta.len())? {
             return Ok(done);
         }
+        // An empty file reads as a plain note, not as "" (which looks like
+        // a broken tool) or "[lines 1-0 of 0]". Hermes names it the same
+        // way ("File is empty (0 bytes)", `tools/file_operations.py`). A
+        // file holding only a byte order mark counts as empty.
+        if meta.len() <= fuzzy::BOM.len_utf8() as u64 {
+            let bytes = fs::read(&target).map_err(io_err)?;
+            if bytes.is_empty() || bytes == b"\xEF\xBB\xBF" {
+                self.note_seen(&target);
+                let note = if bytes.is_empty() {
+                    "[empty file: 0 bytes]"
+                } else {
+                    "[empty file: only a byte order mark]"
+                };
+                return Ok(exec(
+                    Some(note.into()),
+                    receipt(&self.root, Some(&target), meta.len(), 0),
+                ));
+            }
+        }
         let paged = offset.is_some() || limit.is_some() || meta.len() > RAW_READ_BYTES;
         if !paged {
             let mut bytes = Vec::with_capacity(meta.len() as usize);
@@ -3963,6 +3982,41 @@ mod tests {
         let out = read(&rt, "l.txt", Some(1), None).output.unwrap();
         assert!(out.contains("[line truncated]"));
         assert!(out.contains("1 line(s) longer than 2000 chars were cut"));
+    }
+    #[test]
+    fn empty_file_reads_as_a_note() {
+        let root = temp();
+        fs::write(root.join("e.txt"), "").unwrap();
+        fs::write(root.join("b.txt"), "\u{feff}").unwrap();
+        fs::write(root.join("x.txt"), "x").unwrap();
+        fs::write(root.join("xyz.txt"), "xyz").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        assert_eq!(
+            read(&rt, "e.txt", None, None).output.unwrap(),
+            "[empty file: 0 bytes]"
+        );
+        assert_eq!(
+            read(&rt, "e.txt", Some(1), None).output.unwrap(),
+            "[empty file: 0 bytes]"
+        );
+        assert_eq!(
+            read(&rt, "b.txt", None, None).output.unwrap(),
+            "[empty file: only a byte order mark]"
+        );
+        // short files with content read as themselves
+        assert_eq!(read(&rt, "x.txt", None, None).output.unwrap(), "x");
+        assert_eq!(read(&rt, "xyz.txt", None, None).output.unwrap(), "xyz");
+        // reading an empty file counts as seen, so it can be overwritten
+        let p = rt
+            .prepare(ToolRequest::CreateFile {
+                path: "e.txt".into(),
+                content: "now\n".into(),
+                overwrite: true,
+            })
+            .unwrap();
+        let _ = rt.resolve_approval(&p.call_id, true);
+        let r = rt.execute(&p.call_id);
+        assert!(r.ok, "{:?}", r.error);
     }
     #[test]
     fn reading_a_directory_lists_it() {

@@ -1711,3 +1711,19 @@ is shared it is noted in the module docs.
 - Tests: one test (nested file, top-level file, folder still lists).
   Hand mutation: 3/3 killed.
 - Gap left: none known.
+
+## Round 55: an empty file reads as a note
+
+- Hermes: `tools/file_operations.py` answers an empty file with the hint
+  "File is empty (0 bytes)", because empty output looks like a broken
+  tool.
+- REX before: a whole read of an empty file returned "", and a paged
+  read returned "[lines 1-0 of 0; end of file]". A file holding only a
+  byte order mark read as "" or as one blank numbered line.
+- REX now: both read paths answer "[empty file: 0 bytes]", or "[empty
+  file: only a byte order mark]". The read still counts as seen, so the
+  file can then be overwritten.
+- Tests: one test (whole and paged read of an empty file, BOM-only file,
+  1- and 3-byte files, overwrite after the read). Hand mutation: 5/5
+  killed.
+- Gap left: a file of only blank lines reads as those lines.
