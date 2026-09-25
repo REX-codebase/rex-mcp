@@ -1902,3 +1902,20 @@ is shared it is noted in the module docs.
   Unix exit status checks signal 9 with and without captured output.
 - Hand mutations: 4/4 killed by test panics (exit label, signal lookup,
   empty-output branch, output label). The original source was restored.
+
+## Round 68 - reject zero timeout before approval
+
+- Gap left by Round 64: `timeout_ms: 0` was safe at execution, but the
+  approval screen still asked the user to permit a command that could
+  never run. This wasted a decision and returned the refusal only after
+  approval.
+- Grounding: Hermes' `tools/terminal_tool.py` rejects non-positive
+  timeouts in its execution plan before command guards and approval;
+  opencode's `tool/shell.ts` checks negative timeouts before its `ask`
+  call, though zero is still accepted there. REX now rejects zero at
+  prepare time, while retaining the execution-time guard for defense
+  against future callers. No shell or network policy change.
+- Test: the existing zero-timeout test now checks prepare returns the
+  error without issuing an approval, then confirms the default executes.
+- Hand mutations: 3/3 killed by test panics (prepare guard removed,
+  zero changed to one, and wrong error kind). Source restored.

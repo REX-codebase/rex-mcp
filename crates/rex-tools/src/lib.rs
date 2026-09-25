@@ -2394,6 +2394,14 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         ToolRequest::RunCommand { argv, .. } if argv.is_empty() || argv[0].trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "command argv is empty"))
         }
+        // A zero timeout cannot run. Reject it before asking for approval,
+        // rather than approving a call that is guaranteed to fail.
+        ToolRequest::RunCommand { timeout_ms: Some(0), .. } => Err(err(
+            ErrorKind::InvalidRequest,
+            &format!(
+                "timeout_ms must be a positive number of milliseconds (got 0); omit it for the 30000 ms default or give up to {MAX_TIMEOUT_MS}"
+            ),
+        )),
         // There is no shell: `&&`, `|`, `>` and the like would reach the
         // program as plain words and fail in a confusing way, or, worse,
         // run the first command only. opencode and Hermes run a shell line,
@@ -4807,7 +4815,13 @@ mod tests {
             let _ = rt.resolve_approval(&p.call_id, true);
             rt.execute(&p.call_id)
         };
-        let e = run(Some(0)).error.unwrap();
+        let e = rt
+            .prepare(ToolRequest::RunCommand {
+                argv: vec!["touch".into(), "made".into()],
+                cwd: None,
+                timeout_ms: Some(0),
+            })
+            .unwrap_err();
         assert_eq!(e.kind, ErrorKind::InvalidRequest);
         assert_eq!(e.detail, "timeout_ms must be a positive number of milliseconds (got 0); omit it for the 30000 ms default or give up to 120000");
         assert!(!root.join("made").exists(), "the command must not run");
