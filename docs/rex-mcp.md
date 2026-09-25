@@ -19,8 +19,7 @@ run `bash scripts/rex-mcp-install.sh`; use the resulting absolute path to
 `~/.rex/bin/rex-mcp` (or `REX_INSTALL_DIR`) in the host's stdio MCP settings.
 Set `REX_STATE_DIR` and `REX_WORKSPACE` to absolute paths. Refer to the
 [private host setup](../README.md) for current Claude Code, Codex, OpenCode
-and Hermes examples. These are documented configurations, not verified
-installed-host integration results. Antigravity is not an installed backend in
+and Hermes examples. The OpenCode CLI v1.17.4 connected to a built REX binary in an isolated no-inference smoke test. Codex CLI v0.157.0 accepted the stdio configuration and displayed it as enabled; that does not establish a connection. Neither check used an agent to call tools, and Claude Code and Hermes remain untested as installed hosts. Antigravity is not an installed backend in
 this project; do not present it as tested.
 
 Set `REX_APPROVE_TASK_MUTATIONS=1` only when you accept that the host may
