@@ -466,7 +466,15 @@ pub fn tool_descriptors() -> Vec<Value> {
         if schema.is_null() {
             schema = obj();
         }
-        out.push(json!({"name":t.wire_name(),"description":description,"inputSchema":schema}));
+        // Be conservative: many apparently observational operations record
+        // custody or consume budgets. Only the terminal result and event-log
+        // reads are guaranteed not to change task state.
+        let mut descriptor =
+            json!({"name":t.wire_name(),"description":description,"inputSchema":schema});
+        if matches!(t, ToolName::Events | ToolName::Result) {
+            descriptor["annotations"] = json!({"readOnlyHint": true, "openWorldHint": false});
+        }
+        out.push(descriptor);
     }
     out
 }
@@ -507,6 +515,28 @@ mod tests {
     fn rpc(id: i64, method: &str, params: Value) -> Value {
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
     }
+    #[test]
+    fn tool_annotations_are_conservative_about_custody_side_effects() {
+        let descriptors = tool_descriptors();
+        let find = |name: &str| descriptors.iter().find(|d| d["name"] == name).unwrap();
+        for name in ["rex_events", "rex_result"] {
+            assert_eq!(find(name)["annotations"]["readOnlyHint"], true);
+            assert_eq!(find(name)["annotations"]["openWorldHint"], false);
+        }
+        // Status reconciles custody; read and search may charge budgets.
+        // Mutating tools must not be suggested as read-only to a host.
+        for name in [
+            "rex_status",
+            "rex_read",
+            "rex_search",
+            "rex_edit",
+            "rex_run",
+            "rex_proof",
+        ] {
+            assert!(find(name).get("annotations").is_none());
+        }
+    }
+
     #[test]
     fn resource_quickstart_is_static_and_rejects_unknown_uris() {
         let (_d, mut s) = server();
