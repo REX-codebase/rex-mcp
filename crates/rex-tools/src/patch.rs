@@ -302,13 +302,14 @@ fn apply_hunk(text: &str, h: &Hunk) -> Result<String, String> {
     if h.old.iter().all(|l| l.trim().is_empty()) {
         // Pure insertion with no anchor: append at end of file.
         if h.old.is_empty() {
+            let eol = if fuzzy::uses_crlf(text) { "\r\n" } else { "\n" };
             let mut out = text.to_string();
             if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
+                out.push_str(eol);
             }
             for l in &h.new {
                 out.push_str(l);
-                out.push('\n');
+                out.push_str(eol);
             }
             return Ok(out);
         }
@@ -333,6 +334,10 @@ fn apply_hunk(text: &str, h: &Hunk) -> Result<String, String> {
     let attempt = fuzzy::plan_edit(base, &old, &new, false).map(|mut p| {
         if !had_nl && p.new_content.ends_with('\n') {
             p.new_content.pop();
+            // the padding newline may have become CRLF in a CRLF file
+            if !text.ends_with('\r') && p.new_content.ends_with('\r') {
+                p.new_content.pop();
+            }
         }
         p
     });
@@ -403,6 +408,29 @@ mod tests {
             e.contains("hunk 1") && e.contains("context not found"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn patches_keep_a_crlf_file_crlf() {
+        let written = |files: &[(&str, &str)], patch: &str| -> String {
+            match run(files, patch).unwrap().pop() {
+                Some(Change::Write { content, .. }) => content,
+                other => panic!("{other:?}"),
+            }
+        };
+        let upd = "*** Begin Patch\n*** Update File: a.txt\n@@\n a\n-b\n+B1\n+B2\n*** End Patch";
+        assert_eq!(
+            written(&[("a.txt", "a\r\nb\r\nc\r\n")], upd),
+            "a\r\nB1\r\nB2\r\nc\r\n"
+        );
+        // no final newline: the change reaches the last line, and the file
+        // still ends without one (no stray CR either)
+        let last = "*** Begin Patch\n*** Update File: a.txt\n@@\n-b\n+B\n*** End Patch";
+        assert_eq!(written(&[("a.txt", "a\r\nb")], last), "a\r\nB");
+        // an unanchored hunk appends with the file's ending
+        let add = "*** Begin Patch\n*** Update File: a.txt\n@@\n+z\n*** End Patch";
+        assert_eq!(written(&[("a.txt", "a\r\nb")], add), "a\r\nb\r\nz\r\n");
+        assert_eq!(written(&[("a.txt", "a\nb")], add), "a\nb\nz\n");
     }
 
     #[test]

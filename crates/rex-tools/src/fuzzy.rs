@@ -75,15 +75,21 @@ pub fn plan_edit(
         if spans.len() > 1 && (!replace_all || *name == "block_anchor") {
             return Err(ambiguous(content, name, &spans));
         }
+        let crlf = uses_crlf(content);
         let mut out = String::with_capacity(content.len() + replacement.len());
         let mut cursor = 0;
         for &(s, e) in &spans {
             out.push_str(&content[cursor..s]);
             let matched = &content[s..e];
-            if *name == "exact" {
-                out.push_str(replacement);
+            let inserted = if *name == "exact" {
+                replacement.to_string()
             } else {
-                out.push_str(&reindent(find, matched, replacement));
+                reindent(find, matched, replacement)
+            };
+            if crlf {
+                out.push_str(&to_crlf(&inserted));
+            } else {
+                out.push_str(&inserted);
             }
             cursor = e;
         }
@@ -97,6 +103,23 @@ pub fn plan_edit(
     Err(PlanError::NotFound {
         hint: closest_hint(content, find),
     })
+}
+
+/// True when most of `content`'s line breaks are CRLF. Replacement text
+/// written by a model almost always uses LF; inserting it as-is into a
+/// CRLF file leaves mixed line endings, so it takes the file's ending.
+/// opencode's edit tool converts to the file's ending the same way
+/// (`tool/edit.ts`); REX goes by the majority so a mostly-LF file with one
+/// stray CRLF stays LF.
+pub fn uses_crlf(content: &str) -> bool {
+    let crlf = content.matches("\r\n").count();
+    let lf = content.matches('\n').count();
+    crlf > 0 && crlf * 2 >= lf
+}
+
+/// `text` with every line break written as CRLF.
+pub fn to_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
 fn overlapping(spans: &[Span]) -> bool {
@@ -784,9 +807,38 @@ mod tests {
     fn crlf_files_keep_their_bytes_outside_the_edit() {
         let c = "a\r\n  b\r\nc\r\n";
         let p = apply(c, "b\nc", "B\nc").unwrap();
-        // The replaced lines take the file's indentation; the surrounding
-        // CRLF bytes survive untouched.
-        assert_eq!(p.new_content, "a\r\n  B\nc\r\n");
+        // The replaced lines take the file's indentation and its CRLF
+        // line ending; the surrounding bytes survive untouched.
+        assert_eq!(p.new_content, "a\r\n  B\r\nc\r\n");
+    }
+
+    #[test]
+    fn crlf_is_decided_by_the_majority_of_line_breaks() {
+        assert!(uses_crlf("a\r\nb\r\n"));
+        assert!(uses_crlf("a\r\nb\r\nc\n"));
+        assert!(uses_crlf("a\r\nb\n"));
+        assert!(!uses_crlf("a\r\nb\nc\n"));
+        assert!(!uses_crlf("a\nb\n"));
+        assert!(!uses_crlf("no breaks"));
+        assert!(!uses_crlf(""));
+        assert_eq!(to_crlf("x\ny\r\nz\n"), "x\r\ny\r\nz\r\n");
+        assert_eq!(to_crlf("plain"), "plain");
+    }
+
+    #[test]
+    fn inserted_text_takes_the_file_line_ending() {
+        // exact match, multi-line replacement
+        let p = apply("a\r\nb\r\n", "b", "B1\nB2").unwrap();
+        assert_eq!(p.new_content, "a\r\nB1\r\nB2\r\n");
+        // every span of a replace_all
+        let p = plan_edit("x\r\ny\r\nx\r\n", "x", "1\n2", true).unwrap();
+        assert_eq!(p.new_content, "1\r\n2\r\ny\r\n1\r\n2\r\n");
+        // an LF file keeps the replacement as written
+        let p = apply("a\nb\n", "b", "B1\nB2").unwrap();
+        assert_eq!(p.new_content, "a\nB1\nB2\n");
+        // a mostly-LF file with one stray CRLF stays LF
+        let p = apply("a\r\nb\nc\n", "c", "C1\nC2").unwrap();
+        assert_eq!(p.new_content, "a\r\nb\nC1\nC2\n");
     }
 
     #[test]

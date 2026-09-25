@@ -1478,3 +1478,24 @@ is shared it is noted in the module docs.
   real edit, trailing-newline-only edit). Hand mutation: 7/7 killed; one
   was killed only after the trailing-newline case was added.
 - Gap left: none known.
+
+## Round 43: edits keep a CRLF file's line endings
+
+- opencode: `tool/edit.ts` detects the file's line ending and converts
+  the old and new strings to it before replacing, so an edit never mixes
+  LF lines into a CRLF file.
+- REX before: replacement text (a model almost always writes LF) went in
+  as written. An `edit_file` or `apply_patch` on a Windows-style file
+  left mixed line endings; the planner's own test expected
+  `a\r\n  B\nc\r\n`.
+- REX now: when most of a file's line breaks are CRLF, text inserted by
+  the edit planner (every strategy, every `replace_all` span) and lines
+  appended by an unanchored patch hunk use CRLF. A mostly-LF file with a
+  stray CRLF stays LF (opencode switches on any CRLF). A CRLF file with
+  no final newline still ends without one, with no stray CR. That old
+  test now expects `a\r\n  B\r\nc\r\n`.
+- Tests: majority rule, conversion, planner (exact, replace_all, LF,
+  mostly-LF) and patch (update, last line without newline, append).
+  Hand mutation: 11/11 killed.
+- Gap left: `create_file` writes content as given, even over a CRLF
+  file.
