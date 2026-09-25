@@ -1458,3 +1458,23 @@ is shared it is noted in the module docs.
   Hand mutation: 14/14 killed; two were killed only after a shrink case
   was added.
 - Gap left: none known.
+
+## Round 42: an edit that changes nothing is refused
+
+- opencode: `tool/edit.ts` refuses an edit whose old and new strings are
+  identical ("No changes to apply").
+- REX before: such an edit went to approval, rewrote the file with the
+  same bytes and added a no-op undo entry. A loose match (whitespace or
+  line-trimmed) whose replacement equals what the file already holds did
+  the same.
+- REX now: the shared edit planner refuses any edit whose result equals
+  the current file, at preflight and at execution, so no approval is
+  asked. The error says whether expected and replacement are identical
+  or the file already has the replacement text (naming the match
+  strategy) and suggests reading the file again. This goes beyond
+  opencode, which checks only the two strings. A change to trailing
+  whitespace alone still goes through.
+- Tests: one end-to-end test (identical strings, loose no-op match,
+  real edit, trailing-newline-only edit). Hand mutation: 7/7 killed; one
+  was killed only after the trailing-newline case was added.
+- Gap left: none known.

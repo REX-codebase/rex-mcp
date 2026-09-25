@@ -3048,6 +3048,61 @@ mod tests {
         assert!(!r.output.unwrap().contains("note:"));
     }
     #[test]
+    fn edit_that_changes_nothing_is_refused() {
+        let root = temp();
+        let text = "fn main() {\n    let x = 1;\n}\n";
+        fs::write(root.join("m.rs"), text).unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let edit = |expected: &str, replacement: &str| ToolRequest::EditFile {
+            path: "m.rs".into(),
+            expected: expected.into(),
+            replacement: replacement.into(),
+            replace_all: false,
+        };
+        let e = rt.preflight(&edit("let x = 1;", "let x = 1;")).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            e.detail,
+            "edit makes no change: expected and replacement are identical"
+        );
+        let r = approved(&rt, edit("let x = 1;", "let x = 1;"));
+        assert!(!r.ok);
+        assert!(r.error.unwrap().detail.starts_with("edit makes no change"));
+        // a loose match whose replacement is already what the file holds
+        let e = rt
+            .preflight(&edit("let  x = 1;", "let x = 1;"))
+            .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::InvalidRequest);
+        assert!(
+            e.detail.starts_with(
+                "edit makes no change: the file already has the replacement text (matched "
+            ),
+            "{}",
+            e.detail
+        );
+        assert!(
+            e.detail.contains("(matched whitespace_normalized)"),
+            "{}",
+            e.detail
+        );
+        assert!(e
+            .detail
+            .ends_with("read the file again if you expected something else"));
+        assert_eq!(fs::read_to_string(root.join("m.rs")).unwrap(), text);
+        // a real edit still goes through
+        let r = approved(&rt, edit("let x = 1;", "let x = 2;"));
+        assert!(r.ok, "{:?}", r.error);
+        assert!(fs::read_to_string(root.join("m.rs"))
+            .unwrap()
+            .contains("x = 2"));
+        // a change to trailing whitespace alone is still a change
+        let r = approved(&rt, edit("}\n", "}"));
+        assert!(r.ok, "{:?}", r.error);
+        assert!(fs::read_to_string(root.join("m.rs"))
+            .unwrap()
+            .ends_with("2;\n}"));
+    }
+    #[test]
     fn similar_names_ranks_likely_meanings() {
         let names = |v: &[(&str, bool)]| {
             v.iter()
@@ -4536,6 +4591,28 @@ fn plan_edit_checked(
                 "expected text is not unique: {count} matches ({strategy}) starting at lines {lines:?}; include more surrounding lines, or set replace_all explicitly"
             ),
         ),
+    })
+    .and_then(|plan| {
+        // An edit that leaves the file as it was would still ask for
+        // approval and journal a no-op. opencode refuses identical
+        // old/new strings (`tool/edit.ts`); REX also catches a loose match
+        // whose replacement turns out to equal what is already there.
+        if plan.new_content != old {
+            Ok(plan)
+        } else if expected == replacement {
+            Err(err(
+                ErrorKind::InvalidRequest,
+                "edit makes no change: expected and replacement are identical",
+            ))
+        } else {
+            Err(err(
+                ErrorKind::InvalidRequest,
+                &format!(
+                    "edit makes no change: the file already has the replacement text (matched {}); read the file again if you expected something else",
+                    plan.strategy
+                ),
+            ))
+        }
     })
 }
 
