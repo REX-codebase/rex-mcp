@@ -560,7 +560,7 @@ pub fn tool_descriptors() -> Vec<Value> {
             ToolName::Test => ("Run a named allowlisted test recipe and record evidence.", extend(task_epoch_schema(), json!({"recipe":{"enum":["cargo-test","npm-test"]}}), &["recipe"])),
             ToolName::Submit => ("Submit the open action with evidence; REX verifies completion.", extend(task_epoch_schema(), json!({"action_id":{"type":"string"},"narrative":{"type":"string"},"evidence":{"type":"object","additionalProperties":{"type":"string"}}}), &["action_id","narrative"])),
             ToolName::Status => ("Get durable task state.", task_ref_schema()),
-            ToolName::Events => ("Read the append-only task event stream.", extend(task_ref_schema(), json!({"after_seq":{"type":"integer"},"limit":{"type":"integer"}}), &[])),
+            ToolName::Events => ("Read the append-only task event stream (at most 1,000 events per call).", extend(task_ref_schema(), json!({"after_seq":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}}), &[])),
             ToolName::Result => ("Read a terminal result and proof bundle.", task_ref_schema()),
             ToolName::Cancel => ("Operator-cancel a non-terminal task; requires the per-task capability.", json!({"type":"object","required":["task_id","capability"],"properties":{"task_id":{"type":"string"},"capability":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false})),
             ToolName::HumanStop => ("Final human Stop for any task; requires the trusted launcher's human-stop token, terminal in every phase.", json!({"type":"object","required":["task_id","human_token"],"properties":{"task_id":{"type":"string"},"human_token":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false})),
@@ -658,7 +658,7 @@ pub fn tool_descriptors() -> Vec<Value> {
     out
 }
 fn task_ref_schema() -> Value {
-    json!({"type":"object","required":["task_id"],"properties":{"task_id":{"type":"string"}},"additionalProperties":false})
+    json!({"type":"object","required":["task_id"],"properties":{"task_id":{"type":"string","minLength":1,"maxLength":199,"pattern":"^[A-Za-z0-9_-]+$"}},"additionalProperties":false})
 }
 fn task_epoch_schema() -> Value {
     json!({"type":"object","required":["task_id","capability","lease_epoch"],"properties":{"task_id":{"type":"string"},"capability":{"type":"string"},"lease_epoch":{"type":"integer"}},"additionalProperties":false})
@@ -740,6 +740,14 @@ mod tests {
         for key in next_schema["required"].as_array().unwrap() {
             assert!(next_shape.get(key.as_str().unwrap()).is_some());
         }
+        let event_input = &find("rex_events")["inputSchema"];
+        assert_eq!(
+            event_input["properties"]["task_id"]["pattern"],
+            "^[A-Za-z0-9_-]+$"
+        );
+        assert_eq!(event_input["properties"]["task_id"]["maxLength"], 199);
+        assert_eq!(event_input["properties"]["after_seq"]["minimum"], 0);
+        assert_eq!(event_input["properties"]["limit"]["maximum"], 1000);
         let status_schema = &find("rex_status")["outputSchema"];
         assert_eq!(status_schema["type"], "object");
         assert_eq!(
