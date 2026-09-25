@@ -661,6 +661,33 @@ mod tests {
         }
         assert_eq!(status_value["state"], "active");
         assert!(status_value["open_action"].is_null() || status_value["open_action"].is_object());
+        for key in ["host", "operation"] {
+            assert!(status_schema["properties"][key]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&status_value[key]));
+        }
+        for key in ["lease", "packet"] {
+            for field in status_schema["properties"][key]["required"]
+                .as_array()
+                .unwrap()
+            {
+                let field = field.as_str().unwrap();
+                let actual = &status_value[key][field];
+                assert!(!actual.is_null(), "missing {key}.{field}");
+                let expected = status_schema["properties"][key]["properties"][field]["type"]
+                    .as_str()
+                    .unwrap();
+                assert!(
+                    match expected {
+                        "string" => actual.is_string(),
+                        "integer" => actual.is_u64(),
+                        _ => false,
+                    },
+                    "wrong type for {key}.{field}"
+                );
+            }
+        }
         let actual_events = server
             .handle(rpc(
                 3,
