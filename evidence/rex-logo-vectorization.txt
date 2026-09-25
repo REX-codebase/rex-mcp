@@ -1,7 +1,0 @@
-REX logo vectorization
-
-Source: user-supplied JPEG, preserved verbatim as evidence/rex-logo-source.jpg.
-Online conversion surface: FWD Tools Image to SVG, https://fwdtools.com/image-to-svg/
-Engine identified by the generated SVG: ImageTracer.js 1.2.6.
-Settings: default color trace, with no decorative effects. The converter screenshot is evidence/rex-logo-vectorization.png.
-Integration: the generated SVG is preserved as src/assets/rex-logo.svg. No paths were manually redrawn. The mark is shown without recoloring, filters, shadows, or animation.

@@ -1,7 +1,0 @@
-{
-  "reason": "BuilderFailed { detail: \"builder ended without completing: Some(ProviderError { detail: \\\"provider HTTP 429: {\\\\n  \\\\\\\"error\\\\\\\": {\\\\n    \\\\\\\"code\\\\\\\": 429,\\\\n    \\\\\\\"message\\\\\\\": \\\\\\\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your cur\\\" })\" }",
-  "run_id": "evalplus-humanevalplus/evalplus-humanevalplus/HumanEval/0/ultra/seed0",
-  "attempt": 1,
-  "stopped_at": "2026-09-20T04:32:13.045533+00:00",
-  "resume": "python3 orchestrate.py --plan /home/vscode/bench/plans/hep.json --rex-bench /home/vscode/bin/rex-bench --results /home/vscode/bench/results/hep.jsonl --provider gemini"
-}

@@ -1,9 +1,0 @@
-24-feature-grounding: owner request and constraints
-Date: 2026-09-18 (IST)
-Owner (WhatsApp, via main agent): "Add follower option so that users can continue to talk
-with ei and ask for iterations with an AI can do this without losing context. And also
-implement setting tab"
-Interpretation confirmed by main: contextual follow-ups after a run, plus a Settings tab.
-Earlier same day: owner asked "What's atlas 1.5 pro" - model labels are invented mock copy
-and must be replaced with truthful neutral UI. Frontend-only scope stands: no backend,
-no fake model/provider/persistence claims. Approved logo/header (56bbb17) stays intact.

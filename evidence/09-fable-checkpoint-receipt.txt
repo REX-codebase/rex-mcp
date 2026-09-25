@@ -1,9 +1,0 @@
-### 💾 Fable Session Checkpointed
-
-- **Session**: `rex-harness-tauri-ui`
-- **Path**: `/home/sandbox/.local/share/fable-engine/data/sessions/rex-harness-tauri-ui.json`
-- **Phase**: `Phase 3: Adversarial Red-Teaming & Falsification`
-- **Epistemic Items**: `7`
-- **Invariants**: `2`
-- **Refinement Cycles**: `3`
-- **Execution Lock**: `UNLOCKED`

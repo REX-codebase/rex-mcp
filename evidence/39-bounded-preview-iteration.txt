@@ -1,8 +1,0 @@
-REX bounded preview iteration integration
-- Each live supervisor runtime now owns the existing PreviewSession state machine.
-- Starting/readiness advances that state machine; cancellation is terminal.
-- Real CDP capture items are pushed into its bounded evidence queue.
-- Tauri commands expose begin-iteration, rejected/accepted iteration receipt preservation, concrete production report generation, and finish guarded by the full production gate matrix.
-- No model self-score can finish a session.
-- Real-browser regression now proves capture evidence and rejected receipt survive before a second iteration begins.
-- Full locked native workspace tests and frontend production build passed.

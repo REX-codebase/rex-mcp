@@ -1,1 +1,0 @@
-`python3 sumcol.py sales.csv amount` crashes. Fix column_sum so it handles real CSV (quoted fields with commas, the header row, blank lines) and skips rows where the column is empty. Keep the same function signature.

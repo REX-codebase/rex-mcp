@@ -1,5 +1,0 @@
-Exact service verified: Monid (monid.ai).
-Official current sources:
-- https://monid.ai/blog/tinyfish states "Search & fetch the web. 100% free," powered by TinyFish, with live browser-rendered search and clean page fetch. It says no subscription, no per-call charge, and setup through https://monid.ai/SKILL.md.
-- https://monid.ai describes Monid more broadly as a pay-per-call tool catalog. Other search providers and other capabilities can cost money. Therefore only Monid's TinyFish search/fetch can currently be represented as free, not Monid as a whole.
-Frontend decision: represent "Monid · search planned" as a non-live capability note. Do not claim it is connected and do not wire a backend in this frontend-only build.

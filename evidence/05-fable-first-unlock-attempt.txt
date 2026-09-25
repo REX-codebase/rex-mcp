@@ -1,7 +1,0 @@
-🛑 Anti-Rush Lockout Active! Execution unlock denied due to missing cognitive gates:
-  - Requires at least 2 [PROVEN] items with evidence (currently 0).
-  - Requires at least 1 formal Invariant with a proof or rationale.
-  - Requires phase progression to at least Phase 3: Adversarial Red-Teaming & Falsification (currently in Phase 1: Epistemic Grounding & Live Research).
-  - Anti-Idle Requirement Not Satisfied: Requires at least 2 rethink-refine cycles for a 2.0m budget (currently 0 recorded). Continuous cognitive refinement is mandatory during deliberation.
-
-Please log required proven facts, formal invariants, refinement cycles, and advance to Phase 3+ before unlocking.
