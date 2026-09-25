@@ -522,6 +522,7 @@ impl ToolRuntime {
                 if content.len() > MAX_WRITE_BYTES {
                     return Err(err(ErrorKind::TooLarge, "write exceeds 2 MiB limit"));
                 }
+                refuse_text_into_container(path)?;
                 let target = self.resolve_for_write(path)?;
                 if target.exists() {
                     if !overwrite {
@@ -1127,6 +1128,7 @@ impl ToolRuntime {
         if content.len() > MAX_WRITE_BYTES {
             return Err(err(ErrorKind::TooLarge, "write exceeds 2 MiB limit"));
         }
+        refuse_text_into_container(path)?;
         let target = self.resolve_for_write(path)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(io_err)?;
@@ -1374,6 +1376,7 @@ impl ToolRuntime {
                     if content.len() > MAX_WRITE_BYTES {
                         return Err(err(ErrorKind::TooLarge, "patched file exceeds 2 MiB limit"));
                     }
+                    refuse_text_into_container(path)?;
                     path
                 }
                 patch::Change::Delete { path, .. } => path,
@@ -2876,6 +2879,84 @@ mod tests {
     }
 
     #[test]
+    fn container_names_are_refused_for_text_writes() {
+        for bad in [
+            "report.docx",
+            "out/Q3.XLSX",
+            "deck.pptx",
+            "old.doc",
+            "sheet.ods",
+            "book.epub",
+            "tmpl.dotx",
+            "data.db-wal",
+            "app.sqlite-shm",
+            "x.sqlite3-journal",
+            "v2.final.docx",
+        ] {
+            let e = refuse_text_into_container(bad).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::InvalidRequest, "{bad}");
+            assert!(e.detail.starts_with(bad), "{bad}: {}", e.detail);
+        }
+        let e = refuse_text_into_container("r.docx").unwrap_err();
+        assert!(e.detail.contains(".docx document"), "{}", e.detail);
+        assert!(
+            e.detail.contains(".md, .txt, .html or .csv"),
+            "{}",
+            e.detail
+        );
+        let e = refuse_text_into_container("a.db-wal").unwrap_err();
+        assert!(e.detail.contains("SQLite journal"), "{}", e.detail);
+        for ok in [
+            "notes.rtf",
+            "a.md",
+            "docx",
+            "store.db",
+            "x.docx-wal",
+            "notes.txt-journal",
+            "docs.docx/readme.md",
+            "Makefile",
+            "archive.docx.md",
+        ] {
+            assert!(refuse_text_into_container(ok).is_ok(), "{ok}");
+        }
+    }
+    #[test]
+    fn text_is_not_written_into_documents() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let create = ToolRequest::CreateFile {
+            path: "report.docx".into(),
+            content: "Quarterly report".into(),
+            overwrite: false,
+        };
+        assert_eq!(
+            rt.preflight(&create).unwrap_err().kind,
+            ErrorKind::InvalidRequest
+        );
+        let r = approved(&rt, create);
+        assert!(!r.ok);
+        assert!(r.error.unwrap().detail.contains(".docx document"));
+        assert!(!root.join("report.docx").exists());
+        // a patch that adds a document, or moves text into one, writes nothing
+        let add =
+            "*** Begin Patch\n*** Add File: a.md\n+x\n*** Add File: b.xlsx\n+y\n*** End Patch\n";
+        let r = approved(&rt, ToolRequest::ApplyPatch { patch: add.into() });
+        assert!(!r.ok);
+        assert!(r.error.unwrap().detail.contains("b.xlsx"));
+        assert!(!root.join("a.md").exists() && !root.join("b.xlsx").exists());
+        fs::write(root.join("n.txt"), "one\n").unwrap();
+        let mv = "*** Begin Patch\n*** Update File: n.txt\n*** Move to: n.odt\n@@\n-one\n+two\n*** End Patch\n";
+        let r = approved(&rt, ToolRequest::ApplyPatch { patch: mv.into() });
+        assert!(!r.ok);
+        assert_eq!(fs::read_to_string(root.join("n.txt")).unwrap(), "one\n");
+        // deleting a stray document is still allowed
+        fs::write(root.join("junk.docx"), "not really a doc").unwrap();
+        let del = "*** Begin Patch\n*** Delete File: junk.docx\n*** End Patch\n";
+        let r = approved(&rt, ToolRequest::ApplyPatch { patch: del.into() });
+        assert!(r.ok, "{:?}", r.error);
+        assert!(!root.join("junk.docx").exists());
+    }
+    #[test]
     fn preflight_catches_doomed_writes_before_approval() {
         let root = temp();
         fs::write(root.join("old.txt"), "keep me").unwrap();
@@ -4170,6 +4251,46 @@ fn plan_edit_checked(
 
 /// NUL bytes in the first 8 KiB mark a file as binary (the same heuristic
 /// git and grep use).
+/// Office, OpenDocument and EPUB files are zip or OLE containers, and
+/// SQLite's `-wal`/`-shm`/`-journal` files are raw database pages: no text
+/// the file tools write can be a valid one, so a "report.docx" made of
+/// plain text is a file its owner cannot open. Hermes refuses the same
+/// writes (`tools/file_tools_write_guards.py`). RTF is left out on
+/// purpose: it is plain text. Only the file name is checked, so the
+/// refusal comes before anything is touched.
+fn refuse_text_into_container(path: &str) -> Result<(), ToolError> {
+    const CONTAINERS: &[&str] = &[
+        "doc", "docx", "docm", "dot", "dotx", "xls", "xlsx", "xlsm", "xlsb", "ppt", "pptx", "pptm",
+        "pps", "ppsx", "ppsm", "pot", "potx", "odt", "ods", "odp", "odg", "epub",
+    ];
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let sidecar = ["-wal", "-shm", "-journal"].iter().any(|m| {
+        ext.strip_suffix(m)
+            .is_some_and(|db| matches!(db, "db" | "sqlite" | "sqlite3"))
+    });
+    if sidecar {
+        return Err(err(
+            ErrorKind::InvalidRequest,
+            &format!("{path} is a SQLite journal file; it holds raw database pages and must not be written as text"),
+        ));
+    }
+    if CONTAINERS.contains(&ext) {
+        return Err(err(
+            ErrorKind::InvalidRequest,
+            &format!(
+                "{path} is a .{ext} document, a binary container that plain text cannot produce; \
+                 write the content as .md, .txt, .html or .csv instead, or build the document with a tool the project already has"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }

@@ -1389,3 +1389,28 @@ is shared it is noted in the module docs.
   formatting. Hand mutation: 13/13 killed.
 - Gap left: timeouts above the 120 s cap are clamped silently in the
   detail; no test covers the clamp because it would need a 2-minute run.
+
+## Round 39: no plain text written into document files
+
+- Hermes: `tools/file_tools_write_guards.py` refuses text-tool writes to
+  Office/OpenDocument/EPUB containers and to SQLite `-wal`/`-shm`/
+  `-journal` files, using the lists in `tools/binary_extensions.py`,
+  because no plain-text write can produce a valid one.
+- REX before: asked for "a Word doc", a model could `create_file
+  report.docx` with plain text (or add one in a patch) and leave the
+  user a file no office app opens. Overwriting a real document was
+  already blocked (it cannot be read as text), but new files were not.
+- REX now: `create_file` and `apply_patch` (added files and move
+  targets) refuse `.doc/.docx/.docm/.dot/.dotx`, the Excel and
+  PowerPoint families, `.odt/.ods/.odp/.odg`, `.epub`, and SQLite
+  journal files, before anything is written and at preflight, so no
+  approval is asked for a doomed write. The error points to `.md`,
+  `.txt`, `.html` or `.csv`. Deleting such a file still works. RTF is
+  allowed, unlike Hermes: it is plain text.
+- Tests: a name-rule test (case, double extensions, directories named
+  like documents, non-SQLite `-journal` names) and an end-to-end test
+  (create, preflight, patch add, patch move, delete). Hand mutation:
+  14/14 killed. Each list entry is not tested one by one: a mutant
+  removing `potx` survived until retargeted at a tested entry.
+- Gap left: `run_command` can still write such files (by design: real
+  tools that build documents run there).
