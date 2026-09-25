@@ -277,15 +277,20 @@ fn host_profiles_share_a_durable_task_over_stdio() {
     let ws = d.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     let state = d.path().join("state");
-    for (index, host) in ["claude_code", "codex", "opencode", "hermes"].iter().enumerate() {
+    for (index, host) in ["claude_code", "codex", "opencode", "hermes"].iter()
+        .enumerate()
+    {
         let mut s = Session::start(&state, &ws, true);
         let init = s.call("initialize", json!({"protocolVersion":"2025-11-25"}));
         assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
-        let task = s.tool("rex_execute", json!({
+        let task = s.tool(
+            "rex_execute",
+            json!({
             "request_id":format!("host-profile-{index}"),
             "task":format!("task from {host}"),
             "host":"generic_agent", "operator_is_agent":true
-        }));
+            }),
+        );
         assert_eq!(task["state"], "active", "{host}: {task}");
         let task_id = task["task_id"].as_str().unwrap().to_owned();
         drop(s);
