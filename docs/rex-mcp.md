@@ -19,8 +19,7 @@ run `bash scripts/rex-mcp-install.sh`; use the resulting absolute path to
 `~/.rex/bin/rex-mcp` (or `REX_INSTALL_DIR`) in the host's stdio MCP settings.
 Set `REX_STATE_DIR` and `REX_WORKSPACE` to absolute paths. Refer to the
 [private host setup](../README.md) for current Claude Code, Codex, OpenCode
-and Hermes examples. The OpenCode CLI v1.17.4 connected to a built REX binary in an isolated no-inference smoke test. Codex CLI v0.157.0 accepted the stdio configuration and displayed it as enabled; that does not establish a connection. Neither check used an agent to call tools, and Claude Code and Hermes remain untested as installed hosts. Antigravity is not an installed backend in
-this project; do not present it as tested.
+and Hermes examples. OpenCode CLI v1.17.4 reported a connection to a built REX binary in an isolated no-inference smoke test. Codex CLI v0.157.0 discovered the tools and resource templates through app-server and read the workflow quickstart. Neither check used a model-driven agent to call tools, and Claude Code and Hermes remain untested as installed hosts. Antigravity is not an installed backend in this project; do not present it as tested.
 
 Set `REX_APPROVE_TASK_MUTATIONS=1` only when you accept that the host may
 write files and run allowlisted commands inside `REX_WORKSPACE`. With it
@@ -39,6 +38,14 @@ status, events, execute, next, submit, result and cancel still work.
    REX verifies and issues the next action, or completes through custody gates.
 4. `rex_status`, `rex_events`, `rex_result` inspect by task id;
    `rex_cancel` requires the per-task capability and ends the task.
+
+MCP hosts can also read the `rex://workflow/quickstart` resource and the
+`rex://task/{task_id}/status`, `events/{after_seq}`, and `result` resource
+templates. The `rex_task_workflow` prompt guides a new task; the
+`rex_task_inspect` prompt takes an existing task ID and asks for read-only
+status, events and an available result. These prompts are suggestions to the
+host, not execution or permission grants. The host remains responsible for
+choosing calls and honoring its user's approval.
 
 Continuation is cooperative: REX cannot force a host to keep working, and
 a host cannot force REX to accept a claim. Either side stops cleanly.
