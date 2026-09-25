@@ -563,7 +563,7 @@ pub fn tool_descriptors() -> Vec<Value> {
             ToolName::Events => ("Read the append-only task event stream (at most 1,000 events per call).", extend(task_ref_schema(), json!({"after_seq":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}}), &[])),
             ToolName::Result => ("Read a terminal result and proof bundle.", task_ref_schema()),
             ToolName::Cancel => ("Operator-cancel a non-terminal task; requires the per-task capability.", json!({"type":"object","required":["task_id","capability"],"properties":{"task_id":task_id_schema(),"capability":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false})),
-            ToolName::HumanStop => ("Final human Stop for any task; requires the trusted launcher's human-stop token, terminal in every phase.", json!({"type":"object","required":["task_id","human_token"],"properties":{"task_id":{"type":"string"},"human_token":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false})),
+            ToolName::HumanStop => ("Final human Stop for any task; requires the trusted launcher's human-stop token, terminal in every phase.", json!({"type":"object","required":["task_id","human_token"],"properties":{"task_id":task_id_schema(),"human_token":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false})),
             ToolName::UltraOpen => ("Open the Ultra external-host loop: fetch the open candidate or adversary/verifier/visual evidence requests. First open requires contract_draft: a host-drafted acceptance contract the daemon parses, freezes and executes itself; later opens must hash-match the frozen contract.", extend(task_epoch_schema(), json!({"contract_draft":{"type":"string"}}), &[])),
             ToolName::UltraPromote => ("Promote the qualified Ultra candidate bundle into the task workspace with verified rollback.", task_epoch_schema()),
             ToolName::Proof => ("Fetch the deterministic per-task proof bundle: frozen plan, kernel state, per-candidate evidence manifests, promotion receipt, hash-chained events, bundle hash and daemon MAC.", task_ref_schema()),
@@ -757,6 +757,10 @@ mod tests {
         );
         assert_eq!(
             find("rex_cancel")["inputSchema"]["properties"]["task_id"],
+            event_input["properties"]["task_id"]
+        );
+        assert_eq!(
+            find("rex_human_stop")["inputSchema"]["properties"]["task_id"],
             event_input["properties"]["task_id"]
         );
         let status_schema = &find("rex_status")["outputSchema"];
