@@ -534,6 +534,15 @@ pub fn tool_descriptors() -> Vec<Value> {
         // Declare outputs only where the actual success shape is stable and
         // fully represented. Tool errors are separately marked isError.
         descriptor["outputSchema"] = match t {
+            ToolName::Next => json!({
+                "type":"object", "required":["state","next","lease"],
+                "properties":{
+                    "state":{"enum":["created","active","verifying","completed","failed","cancelled"]},
+                    "next":{"type":["object","null"]},
+                    "lease":{"type":"object", "required":["epoch","expires_ms_from_now","heartbeat_interval_ms"],
+                        "properties":{"epoch":{"type":"integer"},"expires_ms_from_now":{"type":"integer"},"heartbeat_interval_ms":{"type":"integer"}}}
+                }
+            }),
             ToolName::Status => json!({
                 "type":"object",
                 "required":["task_id","state","task","operator_is_agent","host","lease","open_action","budgets","last_event_seq","operation","packet"],
@@ -624,6 +633,29 @@ mod tests {
     fn inspection_output_schemas_match_success_shapes() {
         let descriptors = tool_descriptors();
         let find = |name: &str| descriptors.iter().find(|d| d["name"] == name).unwrap();
+        let next_schema = &find("rex_next")["outputSchema"];
+        assert_eq!(next_schema["required"], json!(["state", "next", "lease"]));
+        assert_eq!(
+            next_schema["properties"]["next"]["type"],
+            json!(["object", "null"])
+        );
+        assert_eq!(
+            next_schema["properties"]["lease"]["required"],
+            json!(["epoch", "expires_ms_from_now", "heartbeat_interval_ms"])
+        );
+        let next_shape = serde_json::to_value(rex_protocol::NextResponse {
+            state: rex_protocol::TaskState::Active,
+            next: None,
+            lease: rex_protocol::LeaseView {
+                epoch: 1,
+                expires_ms_from_now: 1000,
+                heartbeat_interval_ms: 500,
+            },
+        })
+        .unwrap();
+        for key in next_schema["required"].as_array().unwrap() {
+            assert!(next_shape.get(key.as_str().unwrap()).is_some());
+        }
         let status_schema = &find("rex_status")["outputSchema"];
         assert_eq!(status_schema["type"], "object");
         assert_eq!(
