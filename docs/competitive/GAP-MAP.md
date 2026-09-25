@@ -1748,3 +1748,22 @@ is shared it is noted in the module docs.
 - Tests: one test (missing tool, whole line in argv[0] with 2 and 3
   words, missing path, scorer hint). Hand mutation: 6/6 killed.
 - Gap left: none known.
+
+## Round 57: shell operators in argv are refused before approval
+
+- opencode (`tool/shell.ts`) and Hermes (`tools/terminal_tool.py`) run a
+  shell line, so `&&`, `|` and `>` work there.
+- REX before: `run_command` has no shell. A model used to shells would
+  send `["cargo", "build", "&&", "cargo", "test"]`; the human was asked
+  to approve it, and then `cargo` got "&&" as an argument and failed in
+  a confusing way.
+- REX now: an argv item that is exactly a shell operator (`&&`, `||`,
+  `|`, `;`, `&`, `>`, `>>`, `<`, `2>`, `2>&1`, `&>`, `|&`) is refused when
+  the call is prepared, before any approval prompt, with "run each
+  command as its own call, and read output with read_output instead of
+  redirecting it". Operators inside a word (`a|b` in a grep pattern) are
+  not touched.
+- Tests: one test (five operators, a pattern with `|`, a format string
+  with `>`, a plain command). Hand mutation: 3/3 killed.
+- Gap left: an operator as the program name itself is left to the
+  missing-program hint from Round 56.

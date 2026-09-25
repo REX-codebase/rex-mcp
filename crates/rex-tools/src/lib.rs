@@ -2357,6 +2357,22 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         ToolRequest::RunCommand { argv, .. } if argv.is_empty() || argv[0].trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "command argv is empty"))
         }
+        // There is no shell: `&&`, `|`, `>` and the like would reach the
+        // program as plain words and fail in a confusing way, or, worse,
+        // run the first command only. opencode and Hermes run a shell line,
+        // so these work there; REX refuses before anyone is asked to
+        // approve, and says what to do instead.
+        ToolRequest::RunCommand { argv, .. } => {
+            match argv.iter().skip(1).find(|a| SHELL_OPERATORS.contains(&a.as_str())) {
+                Some(op) => Err(err(
+                    ErrorKind::InvalidRequest,
+                    &format!(
+                        "run_command runs one program with no shell, so '{op}' would be passed to it as a plain argument; run each command as its own call, and read output with read_output instead of redirecting it"
+                    ),
+                )),
+                None => Ok(()),
+            }
+        }
         ToolRequest::McpCall { server, name, .. }
             if server.trim().is_empty() || name.trim().is_empty() =>
         {
@@ -2368,6 +2384,11 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         _ => Ok(()),
     }
 }
+/// Whole argv items that only mean something to a shell.
+const SHELL_OPERATORS: &[&str] = &[
+    "&&", "||", "|", ";", "&", ">", ">>", "<", "2>", "2>&1", "&>", "|&",
+];
+
 fn checked_join(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
     let path = Path::new(raw);
     if path.is_absolute() {
@@ -4422,6 +4443,30 @@ mod tests {
         rt.resolve_approval(&p.call_id, true).unwrap();
         assert!(rt.execute(&p.call_id).ok);
         assert_eq!(fs::read_to_string(root.join("p.txt")).unwrap(), "a\nc\n");
+    }
+    #[test]
+    fn shell_operators_in_argv_are_refused_up_front() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let prep = |argv: &[&str]| {
+            rt.prepare(ToolRequest::RunCommand {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                cwd: None,
+                timeout_ms: None,
+            })
+        };
+        for op in ["&&", "|", ">", "2>&1", ";"] {
+            let e = prep(&["cargo", "build", op, "x"]).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::InvalidRequest);
+            assert_eq!(
+                e.detail,
+                format!("run_command runs one program with no shell, so '{op}' would be passed to it as a plain argument; run each command as its own call, and read output with read_output instead of redirecting it")
+            );
+        }
+        // operators inside a word, and ordinary args, are fine
+        assert!(prep(&["grep", "-E", "a|b", "f.txt"]).is_ok());
+        assert!(prep(&["git", "log", "--format=%h > %s"]).is_ok());
+        assert!(prep(&["cargo", "test"]).is_ok());
     }
     #[test]
     fn missing_program_says_what_to_fix() {
