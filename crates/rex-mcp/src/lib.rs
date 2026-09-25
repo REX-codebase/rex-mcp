@@ -27,20 +27,41 @@ impl McpServer {
 
     /// Serve newline-delimited JSON-RPC until EOF. A bad message yields a
     /// JSON-RPC error and does not crash the process.
-    pub fn serve<R: BufRead, W: Write>(&mut self, reader: R, mut writer: W) -> std::io::Result<()> {
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let response = match serde_json::from_str::<Value>(&line) {
-                Ok(v) => self.handle(v),
-                Err(e) => Some(rpc_error(
+    pub fn serve<R: BufRead, W: Write>(
+        &mut self,
+        mut reader: R,
+        mut writer: W,
+    ) -> std::io::Result<()> {
+        // Bound each untrusted stdio frame before allocation, while continuing
+        // to serve later requests after an oversized or invalid UTF-8 frame.
+        while let Some((bytes, oversized)) = read_frame(&mut reader)? {
+            let response = if oversized {
+                Some(rpc_error(
                     Value::Null,
                     -32700,
-                    format!("parse error: {e}"),
+                    "MCP frame exceeds 1 MiB",
                     None,
-                )),
+                ))
+            } else if bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            } else {
+                match std::str::from_utf8(&bytes) {
+                    Ok(line) => match serde_json::from_str::<Value>(line) {
+                        Ok(v) => self.handle(v),
+                        Err(e) => Some(rpc_error(
+                            Value::Null,
+                            -32700,
+                            format!("parse error: {e}"),
+                            None,
+                        )),
+                    },
+                    Err(_) => Some(rpc_error(
+                        Value::Null,
+                        -32700,
+                        "MCP frame is not UTF-8",
+                        None,
+                    )),
+                }
             };
             if let Some(response) = response {
                 serde_json::to_writer(&mut writer, &response)?;
@@ -164,6 +185,35 @@ impl McpServer {
                 ErrorCode::Unauthorized,
                 "initialize before calling tools",
             ))
+        }
+    }
+}
+
+fn read_frame<R: BufRead>(reader: &mut R) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+    const MAX_FRAME_BYTES: usize = 1024 * 1024;
+    let mut bytes = Vec::new();
+    let mut oversized = false;
+    let mut seen = false;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(seen.then_some((bytes, oversized)));
+        }
+        seen = true;
+        let count = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(chunk.len(), |i| i + 1);
+        if bytes.len().saturating_add(count) > MAX_FRAME_BYTES {
+            oversized = true;
+        }
+        if !oversized {
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        let ended = chunk[count - 1] == b'\n';
+        reader.consume(count);
+        if ended {
+            return Ok(Some((bytes, oversized)));
         }
     }
 }
@@ -350,6 +400,26 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(unknown["error"]["data"]["code"], "unknown_tool");
+    }
+    #[test]
+    fn malformed_stdio_frames_are_bounded_and_do_not_poison_later_requests() {
+        let (_d, mut s) = server();
+        let mut input = vec![b'a'; 1024 * 1024 + 10];
+        input.extend_from_slice(b"\n");
+        input.extend_from_slice(&[0xff, b'\n']);
+        input.extend_from_slice(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.as_bytes());
+        input.push(b'\n');
+        let mut output = Vec::new();
+        s.serve(std::io::Cursor::new(input), &mut output).unwrap();
+        let results: Vec<Value> = output
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["error"]["code"], -32700);
+        assert_eq!(results[1]["error"]["code"], -32700);
+        assert_eq!(results[2]["result"], json!({}));
     }
     #[test]
     fn malformed_requests_receive_errors_instead_of_becoming_notifications() {
