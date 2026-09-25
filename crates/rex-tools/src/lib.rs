@@ -1278,15 +1278,20 @@ impl ToolRuntime {
     ) -> Result<ExecData, ToolError> {
         let base = self.resolve_existing(path.unwrap_or("."), true)?;
         let limit = max_results.clamp(1, MAX_SEARCH_RESULTS);
-        let matcher: Box<dyn Fn(&str) -> bool> = if regex {
+        // The matcher returns the char offset of the first match so a long
+        // line can be shown around the match instead of from its start.
+        let matcher: LineMatcher = if regex {
             let re = regex::RegexBuilder::new(query)
                 .size_limit(1 << 20)
                 .build()
                 .map_err(|e| err(ErrorKind::InvalidRequest, &format!("invalid regex: {e}")))?;
-            Box::new(move |line: &str| re.is_match(line))
+            Box::new(move |line: &str| re.find(line).map(|m| line[..m.start()].chars().count()))
         } else {
             let needle = query.to_lowercase();
-            Box::new(move |line: &str| line.to_lowercase().contains(&needle))
+            Box::new(move |line: &str| {
+                let lower = line.to_lowercase();
+                lower.find(&needle).map(|at| lower[..at].chars().count())
+            })
         };
         let include = match include.map(str::trim).filter(|g| !g.is_empty()) {
             Some(g) => Some(walk::Glob::new(g).ok_or_else(|| {
@@ -1322,12 +1327,18 @@ impl ToolRuntime {
             }
             let text = String::from_utf8_lossy(&bytes);
             for (idx, line) in text.lines().take(50_000).enumerate() {
-                if matcher(line) {
+                // A byte-order mark is not content; hide it as read_file does.
+                let line = if idx == 0 {
+                    line.strip_prefix('\u{feff}').unwrap_or(line)
+                } else {
+                    line
+                };
+                if let Some(at) = matcher(line) {
                     if hits.len() >= limit {
                         more = true;
                         break 'files;
                     }
-                    let shown: String = line.trim().chars().take(300).collect();
+                    let shown = match_window(line, at);
                     hits.push(format!(
                         "{}:{}:{}",
                         relative(&self.root, &file),
@@ -3818,6 +3829,72 @@ mod tests {
         let r = rt.execute(&p.call_id);
         r.output.unwrap_or_else(|| format!("ERR {:?}", r.error))
     }
+    #[test]
+    fn search_shows_long_lines_around_the_match() {
+        let root = temp();
+        let far = format!("{}needle_far{}", "x".repeat(1000), "y".repeat(1000));
+        let near = format!("needle_near{}", "z".repeat(500));
+        let short = format!("  {}needle_short  ", "w".repeat(20));
+        let edge = format!("{}needle_end", "v".repeat(400));
+        fs::write(
+            root.join("a.txt"),
+            format!("{far}\n{near}\n{short}\n{edge}\n"),
+        )
+        .unwrap();
+        fs::write(root.join("b.txt"), "\u{feff}needle_bom here\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let hit = |q: &str, re: bool| {
+            let out = search(&rt, q, re, None);
+            let line = out.lines().next().unwrap().to_string();
+            line.splitn(3, ':').nth(2).unwrap().to_string()
+        };
+        // match deep in a long line: window around it, both ends marked
+        let f = hit("NEEDLE_FAR", false);
+        assert!(f.contains("needle_far"), "{f}");
+        assert!(f.starts_with('…') && f.ends_with('…'), "{f}");
+        assert_eq!(f.chars().count(), 302);
+        assert!(
+            f.starts_with(&format!("…{}needle_far", "x".repeat(100))),
+            "{f}"
+        );
+        // the same through a regex
+        let r = hit("needle_f[a]r", true);
+        assert_eq!(r, f);
+        // match near the start: no leading mark
+        let n = hit("needle_near", false);
+        assert!(n.starts_with("needle_near") && n.ends_with('…'), "{n}");
+        assert_eq!(n.chars().count(), 301);
+        // short line: trimmed, unmarked
+        assert_eq!(
+            hit("needle_short", false),
+            format!("{}needle_short", "w".repeat(20))
+        );
+        // match at the very end: window ends at the line end, no trailing mark
+        let e = hit("needle_end", false);
+        assert!(e.starts_with('…') && e.ends_with("needle_end"), "{e}");
+        assert_eq!(e.chars().count(), 301);
+        // one char cut at either end is still marked
+        fs::write(
+            root.join("c.txt"),
+            format!(
+                "{}needle_one{}\nneedle_two{}\n",
+                "u".repeat(101),
+                "t".repeat(300),
+                "s".repeat(291)
+            ),
+        )
+        .unwrap();
+        let o = hit("needle_one", false);
+        assert!(
+            o.starts_with(&format!("…{}needle_one", "u".repeat(100))),
+            "{o}"
+        );
+        let t = hit("needle_two", false);
+        assert_eq!(t.chars().count(), 301, "{t}");
+        assert!(t.ends_with('…'), "{t}");
+        // a byte-order mark is not shown
+        assert_eq!(hit("needle_bom", false), "needle_bom here");
+    }
     fn search_repo() -> PathBuf {
         let root = temp();
         fs::create_dir_all(root.join("src/deep")).unwrap();
@@ -4794,6 +4871,46 @@ fn similar_names(wanted: &str, names: impl Iterator<Item = (String, bool)>) -> V
         .take(3)
         .map(|(_, name, is_dir)| (name, is_dir))
         .collect()
+}
+
+/// Finds the char offset of the first match in a line.
+type LineMatcher = Box<dyn Fn(&str) -> Option<usize>>;
+
+/// Chars of a matching line shown by `search_files`.
+const SEARCH_LINE_CHARS: usize = 300;
+
+/// The part of a matching line to show: the whole trimmed line when it is
+/// short, otherwise a window that starts a little before the match, with
+/// `…` marking each cut end so the model knows the line goes on.
+fn match_window(line: &str, at: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let first = chars
+        .iter()
+        .position(|c| !c.is_whitespace())
+        .unwrap_or(chars.len());
+    let last = chars
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(first, |i| i + 1);
+    if last - first <= SEARCH_LINE_CHARS {
+        return chars[first..last].iter().collect();
+    }
+    let at = at.clamp(first, last);
+    let start = if at - first <= SEARCH_LINE_CHARS / 3 {
+        first
+    } else {
+        (at - SEARCH_LINE_CHARS / 3).min(last - SEARCH_LINE_CHARS)
+    };
+    let end = start + SEARCH_LINE_CHARS;
+    let mut out = String::new();
+    if start > first {
+        out.push('…');
+    }
+    out.extend(&chars[start..end]);
+    if end < last {
+        out.push('…');
+    }
+    out
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {

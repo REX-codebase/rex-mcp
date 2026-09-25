@@ -1576,3 +1576,26 @@ is shared it is noted in the module docs.
   Hand mutation: 4/4 killed (a fifth did not compile and is not
   counted).
 - Gap left: none known for this path.
+
+## Round 48: search results show long lines around the match
+
+- opencode: its ripgrep wrapper (`packages/core/src/ripgrep.ts`) cuts a
+  matching line at 2,000 chars and adds "..." so the model knows the
+  line was cut.
+- REX before: `search_files` showed the first 300 chars of a matching
+  line with no mark. On a long line (minified code, a data row, a lock
+  file) the match itself was often past char 300, so the result showed
+  text that did not contain the match, and nothing said it was cut. A
+  byte-order mark on line 1 was shown as part of the line.
+- REX now: a short line is shown whole (trimmed). A line over 300 chars
+  is shown as a 300-char window that starts about 100 chars before the
+  first match (or at the line start when the match is near it, or so it
+  ends at the line end when the match is near the end), with "…" at each
+  cut end. This works for literal and regex queries. A byte-order mark
+  on line 1 is hidden, as `read_file` already does.
+- Tests: one test (match deep in a long line, regex, match near the
+  start, short line, match at the end, one-char cuts at each end, BOM).
+  Hand mutation: 9/9 killed.
+- Gap left: REX keeps a 300-char window where opencode shows up to
+  2,000 chars; REX's choice keeps 100 results small, and the window now
+  always contains the match. Only the first match on a line is centred.
