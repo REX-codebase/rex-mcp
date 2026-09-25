@@ -1591,33 +1591,21 @@ impl ToolRuntime {
             if Instant::now() >= deadline {
                 kill_tree(&mut child);
                 let _ = child.wait();
-                let _ = out_handle.join();
-                let _ = err_handle.join();
+                let (stdout, _) = out_handle.join().unwrap_or_default();
+                let (stderr, _) = err_handle.join().unwrap_or_default();
                 return Err(err(
                     ErrorKind::Timeout,
-                    "command exceeded its time limit and its process group was terminated",
+                    &timeout_detail(
+                        timeout_ms.min(MAX_TIMEOUT_MS),
+                        &command_output(&stdout, &stderr),
+                    ),
                 ));
             }
             thread::sleep(Duration::from_millis(15));
         };
         let (stdout, out_truncated) = out_handle.join().unwrap_or_default();
         let (stderr, err_truncated) = err_handle.join().unwrap_or_default();
-        let mut combined = String::new();
-        if !stdout.is_empty() {
-            combined.push_str("stdout:\n");
-            combined.push_str(&term::clean_terminal_text(&String::from_utf8_lossy(
-                &stdout,
-            )));
-        }
-        if !stderr.is_empty() {
-            if !combined.is_empty() {
-                combined.push('\n');
-            }
-            combined.push_str("stderr:\n");
-            combined.push_str(&term::clean_terminal_text(&String::from_utf8_lossy(
-                &stderr,
-            )));
-        }
+        let combined = command_output(&stdout, &stderr);
         let mut r = receipt(
             &self.root,
             Some(&cwd),
@@ -2506,6 +2494,42 @@ fn read_capped<R: Read>(mut r: R, limit: usize) -> (Vec<u8>, bool) {
     head.extend(tail);
     (head, truncated)
 }
+/// A command's two streams as the model sees them: labelled, decoded
+/// lossily and cleaned of terminal codes; empty streams are left out.
+fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut combined = String::new();
+    for (label, bytes) in [("stdout", stdout), ("stderr", stderr)] {
+        if bytes.is_empty() {
+            continue;
+        }
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(label);
+        combined.push_str(":\n");
+        combined.push_str(&term::clean_terminal_text(&String::from_utf8_lossy(bytes)));
+    }
+    combined
+}
+
+/// The error for a command stopped at its time limit. What it printed
+/// before being stopped is kept (a hung test run has usually already
+/// named its failures), with a hint to retry with a larger limit, as
+/// opencode's shell tool gives.
+fn timeout_detail(limit_ms: u64, output: &str) -> String {
+    let mut detail = format!(
+        "command exceeded its time limit of {limit_ms} ms and its process group was terminated; \
+         if it is not waiting for input, retry with a larger timeout_ms (at most {MAX_TIMEOUT_MS})"
+    );
+    if output.is_empty() {
+        detail.push_str("; it printed nothing");
+    } else {
+        detail.push_str("; output before it was stopped:\n");
+        detail.push_str(output);
+    }
+    detail
+}
+
 fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     unsafe {
@@ -3520,6 +3544,59 @@ mod tests {
         let out = r.output.unwrap();
         assert!(out.contains("stderr:\nwarn"), "{out:?}");
         assert!(!out.contains('\u{1b}'), "{out:?}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_command_keeps_what_it_printed() {
+        let rt = ToolRuntime::new(temp()).unwrap();
+        let root = rt.workspace_root().to_path_buf();
+        fs::write(
+            root.join("log.txt"),
+            "test a ... FAILED token=abc123456789\n",
+        )
+        .unwrap();
+        let run = |argv: &[&str]| {
+            let p = rt
+                .prepare(ToolRequest::RunCommand {
+                    argv: argv.iter().map(|s| s.to_string()).collect(),
+                    cwd: None,
+                    timeout_ms: Some(1_500),
+                })
+                .unwrap();
+            rt.resolve_approval(&p.call_id, true).unwrap();
+            rt.execute(&p.call_id)
+        };
+        // tail -F prints the file, complains about the missing one on
+        // stderr, then waits forever
+        let r = run(&["tail", "-F", "log.txt", "gone.txt"]);
+        assert!(!r.ok);
+        let e = r.error.unwrap();
+        assert_eq!(e.kind, ErrorKind::Timeout);
+        assert!(e.detail.contains("time limit of 1500 ms"), "{}", e.detail);
+        assert!(
+            e.detail.contains("larger timeout_ms (at most 120000)"),
+            "{}",
+            e.detail
+        );
+        assert!(
+            e.detail
+                .contains("stopped:\nstdout:\n==> log.txt <==\ntest a ... FAILED"),
+            "{}",
+            e.detail
+        );
+        assert!(e.detail.contains("\nstderr:\ntail: "), "{}", e.detail);
+        // the kept output is still redacted
+        assert!(!e.detail.contains("abc123456789"), "{}", e.detail);
+        let e = run(&["sleep", "30"]).error.unwrap();
+        assert_eq!(e.kind, ErrorKind::Timeout);
+        assert!(e.detail.ends_with("; it printed nothing"), "{}", e.detail);
+    }
+    #[test]
+    fn command_output_labels_and_skips_empty_streams() {
+        assert_eq!(command_output(b"", b""), "");
+        assert_eq!(command_output(b"a\n", b""), "stdout:\na\n");
+        assert_eq!(command_output(b"", b"\x1b[31me\x1b[0m"), "stderr:\ne");
+        assert_eq!(command_output(b"a", b"b"), "stdout:\na\nstderr:\nb");
     }
     #[cfg(target_os = "linux")]
     #[test]

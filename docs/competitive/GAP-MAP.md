@@ -1367,3 +1367,25 @@ is shared it is noted in the module docs.
 - Tests: 3 unit tests over the escape forms and 1 end-to-end
   `command_output_has_no_escape_codes`. Hand mutation: 18/18 killed.
 - Gap left: MCP tool output is not cleaned yet (MCP work is parked).
+
+## Round 38: a timed-out command keeps its output
+
+- opencode: when its shell tool stops a command at the timeout it still
+  returns what the command printed, plus a note saying it was stopped and
+  to retry with a larger timeout if the command is not waiting for input
+  (`tool/shell.ts`).
+- REX before: `run_command` killed the process group at the limit and
+  returned only "command exceeded its time limit"; everything the command
+  printed was thrown away, including failures a hung test run had
+  already named.
+- REX now: the timeout error names the limit, says to retry with a
+  larger `timeout_ms` (and its maximum) if the command is not waiting
+  for input, and includes the stdout/stderr printed before the stop,
+  labelled and cleaned exactly like normal output, or says it printed
+  nothing. Error details still go through the secret redactor. The
+  stream formatting is now one shared helper.
+- Tests: an end-to-end test (`tail -F` prints, complains on stderr, then
+  hangs; plus a silent `sleep`) and a unit test for the stream
+  formatting. Hand mutation: 13/13 killed.
+- Gap left: timeouts above the 120 s cap are clamped silently in the
+  detail; no test covers the clamp because it would need a 2-minute run.
