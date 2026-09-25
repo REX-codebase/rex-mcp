@@ -742,6 +742,20 @@ mod tests {
     }
 
     #[test]
+    fn tool_titles_are_unique_and_host_readable() {
+        let descriptors = tool_descriptors();
+        let mut names = std::collections::HashSet::new();
+        for descriptor in &descriptors {
+            let name = descriptor["name"].as_str().unwrap();
+            let title = descriptor["title"].as_str().unwrap();
+            assert!(names.insert(name), "duplicate MCP tool name: {name}");
+            assert!(title.starts_with("REX "), "missing REX title: {name}");
+            assert!(title.len() > 4, "empty title: {name}");
+        }
+        assert_eq!(names.len(), ToolName::all().len());
+    }
+
+    #[test]
     fn tool_annotations_are_conservative_about_custody_side_effects() {
         let descriptors = tool_descriptors();
         let find = |name: &str| descriptors.iter().find(|d| d["name"] == name).unwrap();
