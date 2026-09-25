@@ -1556,3 +1556,23 @@ is shared it is noted in the module docs.
 - Gap left: the chat-mode decoder (`conversation.rs`) still fails the
   turn on broken arguments. Hermes also retries the API call up to
   three times first; REX goes straight to the error result.
+
+## Round 47: an identical call twice in one response runs once
+
+- Hermes: `run_agent.py` `_deduplicate_tool_calls` drops a tool call
+  whose name and arguments match an earlier call in the same response
+  before anything runs.
+- REX before: every call in a response ran in order, so a model that
+  emitted the same create, patch or command twice asked for approval
+  twice and applied it twice.
+- REX now: the second copy of an identical call (same tool, same
+  arguments) is not run. It gets its own result under its own call id,
+  "not run: this <tool> call is identical to an earlier call in the same
+  response; its result is above", an Info event, and a digest entry with
+  error kind `duplicate_in_turn`. A different call, or the same tool
+  with other arguments, still runs. The check resets every response.
+- Tests: one end-to-end test (duplicate create, a different create, the
+  same tool with new text, files on disk, event, next-prompt digest).
+  Hand mutation: 4/4 killed (a fifth did not compile and is not
+  counted).
+- Gap left: none known for this path.

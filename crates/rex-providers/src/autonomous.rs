@@ -3560,6 +3560,8 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
             first_model_part = false;
             model_parts.push(part);
         };
+    // Signatures of the tool calls already handled in this response.
+    let mut seen_this_turn: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (call, raw) in calls {
         if ctx.handle.cancel.load(Ordering::SeqCst) {
             out.fatal = Some(TerminalReason::Cancelled);
@@ -4448,6 +4450,36 @@ fn execute_turn<S: SecretStore + 'static, T: Transport + 'static>(
                     tool_name,
                     &serde_json::to_value(&request).unwrap_or_default(),
                 );
+                // The same call twice in one response (models do emit
+                // parallel duplicates) runs once: a second create, patch or
+                // command would ask again and apply twice. Hermes drops such
+                // duplicates (`_deduplicate_tool_calls`, run_agent.py); REX
+                // answers the copy so every call id still gets a result.
+                if !seen_this_turn.insert(sig.clone()) {
+                    let content = format!(
+                        "not run: this {tool_name} call is identical to an earlier call in the same response; its result is above"
+                    );
+                    RunHandle::push_event(
+                        &ctx.handle.shared,
+                        AgentEvent::Info {
+                            message: format!("skipped duplicate {tool_name} call in one response"),
+                        },
+                    );
+                    out.digest_actions.push(DigestAction {
+                        tool: tool_name.into(),
+                        ok: false,
+                        target: None,
+                        error_kind: Some("duplicate_in_turn".into()),
+                    });
+                    push_model_part(
+                        &mut model_parts,
+                        raw,
+                        json!({"functionCall":{"name": tool_name,"args": serde_json::to_value(&request).unwrap_or_default()}}),
+                    );
+                    response_parts
+                        .push(function_response(protocol, tool_name, &id, false, &content));
+                    continue;
+                }
                 if cp.last_call_sig.as_deref() == Some(sig.as_str()) {
                     cp.same_call_repeats += 1;
                 } else {
@@ -8733,6 +8765,52 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::Info { message } if message == "refused repeated identical read_file call"))
             .count();
         assert_eq!(refused, 1);
+    }
+
+    #[test]
+    fn duplicate_call_in_one_response_runs_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = create_call("b.txt", "BETA");
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![
+                call_turn(vec![
+                    create_call("a.txt", "ALPHA"),
+                    create_call("a.txt", "ALPHA"),
+                    other,
+                    create_call("a.txt", "ALPHA2"),
+                ]),
+                call_turn(vec![complete_call("done")]),
+            ]),
+        ));
+        let snap = svc.begin("dup check", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let posts = svc.service().transport().seen();
+        assert!(posts.len() >= 2, "{:?}", done.terminal_reason);
+        let results = response_contents(&posts[1]);
+        assert_eq!(results.len(), 4, "{results:?}");
+        let first: Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(
+            results[1],
+            "not run: this create_file call is identical to an earlier call in the same response; its result is above"
+        );
+        // a different call, and the same tool with other arguments, still run
+        let b: Value = serde_json::from_str(&results[2]).unwrap();
+        assert_eq!(b["ok"], true, "{b}");
+        assert_ne!(results[3], results[1]);
+        let ws = tmp.path().join("runs").join(&snap.id).join("workspace");
+        assert_eq!(fs::read_to_string(ws.join("b.txt")).unwrap(), "BETA");
+        assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "ALPHA2");
+        let skipped = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Info { message } if message == "skipped duplicate create_file call in one response"))
+            .count();
+        assert_eq!(skipped, 1);
+        // the next prompt's digest names the skip
+        assert!(posts[1].to_string().contains("duplicate_in_turn"));
     }
 
     #[test]
