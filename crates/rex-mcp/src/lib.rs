@@ -58,7 +58,13 @@ impl McpServer {
         let notify = id.is_none();
         let id = id.unwrap_or(Value::Null);
         if request.get("jsonrpc") != Some(&Value::String("2.0".into())) {
-            return Some(rpc_error(id, -32600, "invalid JSON-RPC envelope", None));
+            return if notify { None } else { Some(rpc_error(id, -32600, "invalid JSON-RPC envelope", None)) };
+        }
+        // Notifications cannot request a reply. Never dispatch tools or
+        // initialize through one: otherwise a no-id tools/call could mutate
+        // custody without giving the host a receipt or error to handle.
+        if notify {
+            return None;
         }
         let out = match method {
             "initialize" => {
@@ -309,6 +315,22 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(unknown["error"]["data"]["code"], "unknown_tool");
+    }
+    #[test]
+    fn tool_call_notification_cannot_mutate_custody() {
+        let (_d, mut s) = server();
+        s.handle(rpc(1, "initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION})))
+            .unwrap();
+        let args = json!({"request_id":"no-id", "task":"discard me",
+                          "host":"generic_agent", "operator_is_agent":true});
+        assert!(s.handle(json!({"jsonrpc":"2.0", "method":"tools/call",
+            "params":{"name":"rex_execute", "arguments":args}})).is_none());
+        // If the notification had executed, this reuse of request_id with a
+        // different task would be an idempotency conflict.
+        let result = s.handle(rpc(2, "tools/call", json!({"name":"rex_execute",
+            "arguments":{"request_id":"no-id", "task":"actually do this",
+                         "host":"generic_agent", "operator_is_agent":true}}))).unwrap();
+        assert_eq!(result["result"]["structuredContent"]["state"], "active");
     }
     #[test]
     fn premature_initialized_notification_does_not_unlock_tools() {
