@@ -1654,6 +1654,16 @@ impl ToolRuntime {
         timeout_ms: u64,
     ) -> Result<ExecData, ToolError> {
         command_policy(argv)?;
+        // A zero limit would start the command and kill it at once, after
+        // any side effects began; refuse it before anything runs.
+        if timeout_ms == 0 {
+            return Err(err(
+                ErrorKind::InvalidRequest,
+                &format!(
+                    "timeout_ms must be a positive number of milliseconds (got 0); omit it for the 30000 ms default or give up to {MAX_TIMEOUT_MS}"
+                ),
+            ));
+        }
         self.run_command_impl(argv, cwd, timeout_ms)
     }
 
@@ -4664,6 +4674,28 @@ mod tests {
             "{over}"
         );
         assert!(!at.contains("asked for"));
+    }
+    #[test]
+    fn zero_timeout_is_refused_before_the_command_runs() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let run = |timeout_ms: Option<u64>| {
+            let p = rt
+                .prepare(ToolRequest::RunCommand {
+                    argv: vec!["touch".into(), "made".into()],
+                    cwd: None,
+                    timeout_ms,
+                })
+                .unwrap();
+            let _ = rt.resolve_approval(&p.call_id, true);
+            rt.execute(&p.call_id)
+        };
+        let e = run(Some(0)).error.unwrap();
+        assert_eq!(e.kind, ErrorKind::InvalidRequest);
+        assert_eq!(e.detail, "timeout_ms must be a positive number of milliseconds (got 0); omit it for the 30000 ms default or give up to 120000");
+        assert!(!root.join("made").exists(), "the command must not run");
+        assert!(run(None).error.is_none());
+        assert!(root.join("made").exists());
     }
     #[test]
     fn missing_program_says_what_to_fix() {

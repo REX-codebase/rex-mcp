@@ -1863,3 +1863,11 @@ is shared it is noted in the module docs.
   no 2-minute run is needed. Hand mutation: 4/4 killed.
 - Gap left: a larger request that finishes in time is still cut
   silently; only a timeout reports it.
+
+## Round 64 - a zero timeout is refused before the command runs
+
+- Gap: `run_command` with `timeout_ms: 0` started the process and killed it on the first poll. Any side effects it had already begun were left half done, and the model was told to "retry with a larger timeout_ms", as if the command had been slow.
+- Grounding: Hermes `tools/terminal_tool.py` refuses a non-positive timeout before its deadline math and says the timeout must be positive. opencode's shell tool has no such check.
+- REX now: the model-facing `run_command` refuses 0 as `InvalidRequest` before spawning. The message says to omit it for the 30000 ms default or give up to 120000. Trusted scoring (`run_command_impl`) is unchanged.
+- Test: `zero_timeout_is_refused_before_the_command_runs` goes through prepare/approve/execute and checks that `touch made` does not create the file at 0 and does create it with the default.
+- Mutants (3/3 killed by test panics): guard removed, `== 0` to `!= 0`, and `== 0` to `== 1`.
