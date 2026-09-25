@@ -521,6 +521,23 @@ pub fn tool_descriptors() -> Vec<Value> {
         // Declare outputs only where the actual success shape is stable and
         // fully represented. Tool errors are separately marked isError.
         descriptor["outputSchema"] = match t {
+            ToolName::Status => json!({
+                "type":"object",
+                "required":["task_id","state","task","operator_is_agent","host","lease","open_action","budgets","last_event_seq","operation","packet"],
+                "properties":{
+                    "task_id":{"type":"string"},
+                    "state":{"enum":["created","active","verifying","completed","failed","cancelled"]},
+                    "task":{"type":"string"},
+                    "operator_is_agent":{"type":"boolean"},
+                    "host":{"type":"string"},
+                    "lease":{"type":"object"},
+                    "open_action":{"type":["object","null"]},
+                    "budgets":{"type":"object"},
+                    "last_event_seq":{"type":"integer"},
+                    "operation":{"type":"object"},
+                    "packet":{"type":"object"}
+                }
+            }),
             ToolName::Events => json!({
                 "type":"object", "required":["events","last_seq"],
                 "properties":{
@@ -594,6 +611,12 @@ mod tests {
     fn inspection_output_schemas_match_success_shapes() {
         let descriptors = tool_descriptors();
         let find = |name: &str| descriptors.iter().find(|d| d["name"] == name).unwrap();
+        let status_schema = &find("rex_status")["outputSchema"];
+        assert_eq!(status_schema["type"], "object");
+        assert_eq!(
+            status_schema["properties"]["open_action"]["type"],
+            json!(["object", "null"])
+        );
         let events = &find("rex_events")["outputSchema"];
         assert_eq!(events["type"], "object");
         assert_eq!(
@@ -625,6 +648,19 @@ mod tests {
         let task_id = started["result"]["structuredContent"]["task_id"]
             .as_str()
             .unwrap();
+        let actual_status = server
+            .handle(rpc(
+                6,
+                "tools/call",
+                json!({"name":"rex_status","arguments":{"task_id":task_id}}),
+            ))
+            .unwrap();
+        let status_value = &actual_status["result"]["structuredContent"];
+        for field in status_schema["required"].as_array().unwrap() {
+            assert!(status_value.get(field.as_str().unwrap()).is_some());
+        }
+        assert_eq!(status_value["state"], "active");
+        assert!(status_value["open_action"].is_null() || status_value["open_action"].is_object());
         let actual_events = server
             .handle(rpc(
                 3,
