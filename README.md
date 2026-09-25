@@ -22,15 +22,15 @@ codex mcp add rex --env REX_STATE_DIR="$HOME/.rex/harness" --env REX_WORKSPACE="
 
 Codex's [MCP guide](https://developers.openai.com/codex/mcp) documents the stdio command and `--env` flags. Use `/mcp` in the Codex TUI to inspect the connection.
 
-## OpenCode V2
+## OpenCode
 
 In `opencode.jsonc`, replace the sample absolute paths:
 
 ```jsonc
-{"mcp":{"servers":{"rex":{"type":"local","command":["/home/USER/.rex/bin/rex-mcp"],"environment":{"REX_STATE_DIR":"/home/USER/.rex/harness","REX_WORKSPACE":"/absolute/project"}}}}}
+{"mcp":{"rex":{"type":"local","command":["/home/USER/.rex/bin/rex-mcp"],"environment":{"REX_STATE_DIR":"/home/USER/.rex/harness","REX_WORKSPACE":"/absolute/project"}}}}
 ```
 
-This matches [OpenCode's V2 local MCP schema](https://opencode.ai/v2/docs/mcp-servers/).
+This matches [OpenCode's local MCP schema](https://opencode.ai/docs/mcp-servers/). A no-inference smoke test with OpenCode CLI v1.17.4 reported `rex connected` for a built local REX binary; this checks connection, not live agent tool use.
 
 ## Hermes Agent
 
