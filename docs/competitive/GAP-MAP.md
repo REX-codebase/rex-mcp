@@ -1414,3 +1414,26 @@ is shared it is noted in the module docs.
   removing `potx` survived until retargeted at a tested entry.
 - Gap left: `run_command` can still write such files (by design: real
   tools that build documents run there).
+
+## Round 40: a missing path suggests nearby names
+
+- opencode: `tool/read.ts` answers a missing file with "Did you mean one
+  of these?" and up to three names from the same folder. Hermes:
+  `_suggest_similar_files` in `tools/file_operations.py` scores names in
+  the folder (same name, same stem, prefix/substring, near spelling).
+- REX before: every tool that needs an existing path (read, edit, search
+  and glob base, command cwd) said only "path not found", so the model
+  had to spend a turn listing the folder.
+- REX now: the error names the path and, when the folder exists inside
+  the workspace and is reached without symlinks, offers up to three
+  names from it: same name in another case, then the same stem with
+  another extension, then one name inside the other (3+ characters),
+  then a near spelling (edit similarity at least 0.75). Folders end in
+  `/`, `.git` is never offered, and at most 500 entries are looked at.
+- Tests: a ranking unit test and an end-to-end read test (case slip,
+  folder, nothing alike, missing folder, symlinked folders inside and
+  outside the workspace). Hand mutation: 17/17 distinct killed. One
+  survivor is disclosed: removing the "folder resolves inside the
+  workspace" check changes nothing, because the symlink check already
+  covers it; it stays as a second guard.
+- Gap left: no suggestions when the folder itself is missing.

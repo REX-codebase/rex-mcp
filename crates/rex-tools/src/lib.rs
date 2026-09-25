@@ -1772,7 +1772,7 @@ impl ToolRuntime {
         let joined = checked_join(&self.root, raw)?;
         let canonical = fs::canonicalize(&joined).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                err(ErrorKind::NotFound, "path not found")
+                err(ErrorKind::NotFound, &self.not_found_detail(&joined))
             } else {
                 io_err(e)
             }
@@ -1788,6 +1788,52 @@ impl ToolRuntime {
             return Err(err(ErrorKind::InvalidRequest, "directory not allowed here"));
         }
         Ok(canonical)
+    }
+
+    /// "path not found", plus up to three names from the same folder that
+    /// look like what was meant (other case, other extension, one name
+    /// inside the other, or a near spelling), so the model can retry
+    /// without a separate listing. opencode's read tool and Hermes's
+    /// `_suggest_similar_files` (`tools/file_operations.py`) do the same.
+    /// Only a folder that exists inside the workspace, reached without
+    /// symlinks, is looked at, and at most `MAX_LIST_ENTRIES` names.
+    fn not_found_detail(&self, joined: &Path) -> String {
+        let shown = relative(&self.root, joined);
+        let mut detail = format!("path not found: {shown}");
+        let (Some(dir), Some(wanted)) = (joined.parent(), joined.file_name()) else {
+            return detail;
+        };
+        let inside = fs::canonicalize(dir).is_ok_and(|c| c.starts_with(&*self.root));
+        if !inside || self.reject_symlinks(dir).is_err() {
+            return detail;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return detail;
+        };
+        let names = entries
+            .take(MAX_LIST_ENTRIES)
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                let is_dir = e.file_type().ok()?.is_dir();
+                Some((name, is_dir))
+            });
+        let picks = similar_names(&wanted.to_string_lossy(), names);
+        if !picks.is_empty() {
+            let shown: Vec<String> = picks
+                .iter()
+                .map(|(name, is_dir)| {
+                    let rel = relative(&self.root, &dir.join(name));
+                    if *is_dir {
+                        format!("{rel}/")
+                    } else {
+                        rel
+                    }
+                })
+                .collect();
+            detail.push_str(&format!("; did you mean {}?", shown.join(", ")));
+        }
+        detail
     }
 
     fn resolve_for_write(&self, raw: &str) -> Result<PathBuf, ToolError> {
@@ -2878,6 +2924,127 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn similar_names_ranks_likely_meanings() {
+        let names = |v: &[(&str, bool)]| {
+            v.iter()
+                .map(|(n, d)| (n.to_string(), *d))
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        let pick = |wanted: &str, v: &[(&str, bool)]| {
+            similar_names(wanted, names(v))
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        };
+        let dir = [
+            ("config.yaml", false),
+            ("Config.yml", false),
+            ("config.yml.bak", false),
+            ("zzz.txt", false),
+            (".git", true),
+        ];
+        // other case beats other extension beats containment
+        assert_eq!(
+            pick("config.yml", &dir),
+            ["Config.yml", "config.yaml", "config.yml.bak"]
+        );
+        // near spelling
+        assert_eq!(
+            pick("AGENT.md", &[("AGENTS.md", false), ("b.md", false)]),
+            ["AGENTS.md"]
+        );
+        // one name inside the other, both ways, 3+ characters
+        assert_eq!(
+            pick("main", &[("domain.rs", false), ("ma", false)]),
+            ["domain.rs"]
+        );
+        assert_eq!(
+            pick("src_utils_old", &[("utils", true), ("x", false)]),
+            ["utils"]
+        );
+        // .git and unrelated names are never offered; at most three, ties alphabetical
+        assert!(pick("git", &[(".git", true), ("qqq", false)]).is_empty());
+        assert_eq!(
+            pick(
+                "a.rs",
+                &[
+                    ("a.md", false),
+                    ("a.c", false),
+                    ("a.h", false),
+                    ("a.go", false)
+                ]
+            ),
+            ["a.c", "a.go", "a.h"]
+        );
+        // the directory flag is kept
+        assert_eq!(
+            similar_names("Src", names(&[("src", true)])),
+            [("src".to_string(), true)]
+        );
+        // rank decides before the alphabet does
+        assert_eq!(
+            pick("B.md", &[("B.txt", false), ("b.md", false)]),
+            ["b.md", "B.txt"]
+        );
+        assert_eq!(
+            pick("lib.rs", &[("alib.rs.old", false), ("lib.go", false)]),
+            ["lib.go", "alib.rs.old"]
+        );
+        // short names are not matched by containment, and dotfiles have no empty stem
+        assert!(pick("ab", &[("xaby.rs", false)]).is_empty());
+        assert!(pick(".env", &[(".zshrc", false)]).is_empty());
+        // the exact name itself is not a suggestion
+        assert!(pick("x.rs", &[("x.rs", false)]).is_empty());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn missing_path_suggests_nearby_names() {
+        let root = temp();
+        fs::create_dir_all(root.join("src/tests")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let read = |path: &str| {
+            approved(
+                &rt,
+                ToolRequest::ReadFile {
+                    path: path.into(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .error
+            .unwrap()
+        };
+        let e = read("src/Main.rs");
+        assert_eq!(e.kind, ErrorKind::NotFound);
+        assert_eq!(
+            e.detail,
+            "path not found: src/Main.rs; did you mean src/main.rs?"
+        );
+        let e = read("src/test");
+        assert_eq!(
+            e.detail,
+            "path not found: src/test; did you mean src/tests/?"
+        );
+        // nothing alike, or no such folder: the plain message
+        assert_eq!(read("src/zzzz.py").detail, "path not found: src/zzzz.py");
+        assert_eq!(read("nope/main.rs").detail, "path not found: nope/main.rs");
+        // a folder reached through a symlink is not listed
+        let outside = temp();
+        fs::write(outside.join("secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert_eq!(
+            read("link/secrets.txt").detail,
+            "path not found: link/secrets.txt"
+        );
+        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
+        assert_eq!(
+            read("alias/Main.rs").detail,
+            "path not found: alias/Main.rs"
+        );
+    }
     #[test]
     fn container_names_are_refused_for_text_writes() {
         for bad in [
@@ -4289,6 +4456,48 @@ fn refuse_text_into_container(path: &str) -> Result<(), ToolError> {
         ));
     }
     Ok(())
+}
+
+/// Rank folder entries against a name that was not found: same name in
+/// another case first, then the same stem with another extension, then
+/// one name containing the other (3+ characters), then a near spelling
+/// (edit similarity of at least 0.75). Ties go alphabetically; `.git` is
+/// never offered. Returns at most three `(name, is_dir)` pairs.
+fn similar_names(wanted: &str, names: impl Iterator<Item = (String, bool)>) -> Vec<(String, bool)> {
+    let want = wanted.to_lowercase();
+    let stem = |s: &str| -> String {
+        match s.rsplit_once('.') {
+            Some((a, _)) if !a.is_empty() => a.to_string(),
+            _ => s.to_string(),
+        }
+    };
+    let want_stem = stem(&want);
+    let mut ranked: Vec<(u8, String, bool)> = names
+        .filter(|(name, _)| name != ".git" && name != wanted)
+        .filter_map(|(name, is_dir)| {
+            let have = name.to_lowercase();
+            let rank = if have == want {
+                0
+            } else if stem(&have) == want_stem {
+                1
+            } else if (want.len() >= 3 && have.contains(&want))
+                || (have.len() >= 3 && want.contains(&have))
+            {
+                2
+            } else if fuzzy::similarity(&want, &have) >= 0.75 {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, name, is_dir))
+        })
+        .collect();
+    ranked.sort();
+    ranked
+        .into_iter()
+        .take(3)
+        .map(|(_, name, is_dir)| (name, is_dir))
+        .collect()
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {
