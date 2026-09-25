@@ -55,6 +55,41 @@ impl Session {
 }
 
 #[test]
+fn codex_compatible_version_negotiates_over_stdio() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = d.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut s = Session::start(&d.path().join("state"), &ws, false);
+    let init = s.call(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "compat-test", "version": "0"}
+        }),
+    );
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    let listed = s.call("tools/list", json!({}));
+    assert!(listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "rex_execute"));
+    let started = s.tool(
+        "rex_execute",
+        json!({
+            "request_id": "compat-stdio-test",
+            "task": "inspect status",
+            "host": "codex",
+            "operator_is_agent": true
+        }),
+    );
+    let task_id = started["task_id"].as_str().unwrap();
+    let status = s.tool("rex_status", json!({"task_id": task_id}));
+    assert_eq!(status["task_id"], task_id);
+}
+
+#[test]
 fn full_caller_driven_lifecycle_over_stdio() {
     let d = tempfile::tempdir().unwrap();
     let ws = d.path().join("ws");
