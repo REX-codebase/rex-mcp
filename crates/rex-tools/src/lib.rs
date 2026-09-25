@@ -1096,7 +1096,7 @@ impl ToolRuntime {
         if start > total.max(1) {
             return Err(err(
                 ErrorKind::InvalidRequest,
-                &format!("offset {start} is past the end of the file ({total} lines)"),
+                &format!("offset {start} is past the end of the file ({total} lines); retry with offset={total} to read the last line"),
             ));
         }
         let last = start + shown - 1;
@@ -4306,6 +4306,9 @@ mod tests {
         assert!(tail.contains("end of file"), "{tail}");
         let past = read(&rt, "p.txt", Some(50), None).error.unwrap();
         assert_eq!(past.kind, ErrorKind::InvalidRequest);
+        assert_eq!(past.detail, "offset 50 is past the end of the file (10 lines); retry with offset=10 to read the last line");
+        let last = read(&rt, "p.txt", Some(10), None).output.unwrap();
+        assert!(last.starts_with("    10\tline10\n"), "{last}");
     }
     #[test]
     fn long_file_pages_by_default_instead_of_flooding_context() {

@@ -2001,3 +2001,17 @@ is shared it is noted in the module docs.
   to survive prepare and appear in the execution error.
 - Hand mutations: 3/3 killed by test panics (generic classify reason,
   generic prepared reason, generic execution error). Source restored.
+
+## Round 74 - past-EOF read says where to retry
+
+- Gap: `read_file` beyond the last line reported the offset and line
+  count but left the model to work out the next read. This costs another
+  guess when a file has shrunk between pages.
+- Grounding: Hermes' `tools/file_operations.py` returns a hint to retry
+  with offset no greater than the actual total; opencode's `tool/read.ts`
+  also reports that the offset is beyond the line count. REX now gives
+  the exact last-line offset in its error and keeps the file unchanged.
+- Test: an offset of 50 on a 10-line file suggests offset 10, and that
+  follow-up reads line 10.
+- Hand mutations: 3/3 killed by test panics (wrong suggested offset,
+  no retry hint, off-by-one suggestion). Source restored.
