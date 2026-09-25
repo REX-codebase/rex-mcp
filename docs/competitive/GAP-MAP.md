@@ -1683,3 +1683,18 @@ is shared it is noted in the module docs.
   mutation: 3/3 killed.
 - Gap left: chat mode still fails the turn on broken non-blank JSON; its
   turn type has no per-call error slot yet.
+
+## Round 53: search_files can search one named file
+
+- opencode: `tool/grep.ts` passes a file path straight to ripgrep, which
+  searches that file.
+- REX before: `search_files` with `path` set to a file tried to walk it
+  as a folder, found nothing, and answered "[no matches]" even when the
+  file held the text. The model was told something false.
+- REX now: a file path is searched itself. As with ripgrep, a file named
+  on purpose is searched even if `.gitignore` would skip it in a walk.
+  An `include` glob is matched against the file's own name. Folders
+  walk as before.
+- Tests: one test (named file, ignored named file, include that matches
+  and one that does not, folder walk). Hand mutation: 3/3 killed.
+- Gap left: `glob_files` with a file as `path` still lists nothing.

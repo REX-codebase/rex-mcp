@@ -1315,13 +1315,26 @@ impl ToolRuntime {
             None => None,
         };
         let ignore = walk::Ignore::load(&self.root);
-        let (files, capped) = walk::walk_files(&self.root, &base, &ignore, 20_000);
+        // A file named as the path is searched itself, as ripgrep does for
+        // an explicit file (opencode's grep passes it straight to rg).
+        // Walking it as a folder found nothing and said "[no matches]".
+        let (files, capped) = if base.is_file() {
+            (vec![base.clone()], false)
+        } else {
+            walk::walk_files(&self.root, &base, &ignore, 20_000)
+        };
         let mut hits = Vec::new();
         let mut bytes_read = 0u64;
         let mut more = false;
         'files: for file in files {
             if let Some(g) = &include {
-                if !g.matches(&walk::rel_path(&base, &file)) {
+                // for a named file, match the glob against its own name
+                let from = if base.is_file() {
+                    base.parent().unwrap_or(&base)
+                } else {
+                    &base
+                };
+                if !g.matches(&walk::rel_path(from, &file)) {
                     continue;
                 }
             }
@@ -4020,6 +4033,48 @@ mod tests {
         assert!(t.ends_with('…'), "{t}");
         // a byte-order mark is not shown
         assert_eq!(hit("needle_bom", false), "needle_bom here");
+    }
+    #[test]
+    fn search_in_one_named_file() {
+        let root = temp();
+        fs::create_dir_all(root.join("gen")).unwrap();
+        fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        fs::write(root.join("a.rs"), "fn one() {}\nfn needle() {}\n").unwrap();
+        fs::write(root.join("b.rs"), "fn needle() {}\n").unwrap();
+        fs::write(root.join("gen/g.rs"), "needle\n").unwrap();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let run = |path: &str| {
+            let p = rt
+                .prepare(ToolRequest::SearchFiles {
+                    query: "needle".into(),
+                    path: Some(path.into()),
+                    max_results: None,
+                    regex: None,
+                    include: None,
+                })
+                .unwrap();
+            rt.execute(&p.call_id).output.unwrap()
+        };
+        assert_eq!(run("a.rs"), "a.rs:2:fn needle() {}");
+        // named on purpose, so an ignored file is still searched
+        assert_eq!(run("gen/g.rs"), "gen/g.rs:1:needle");
+        let with = |path: &str, inc: &str| {
+            let p = rt
+                .prepare(ToolRequest::SearchFiles {
+                    query: "needle".into(),
+                    path: Some(path.into()),
+                    max_results: None,
+                    regex: None,
+                    include: Some(inc.into()),
+                })
+                .unwrap();
+            rt.execute(&p.call_id).output.unwrap()
+        };
+        assert_eq!(with("a.rs", "*.rs"), "a.rs:2:fn needle() {}");
+        assert_eq!(with("gen/g.rs", "g.rs"), "gen/g.rs:1:needle");
+        assert_eq!(with("a.rs", "*.ts"), "[no matches]");
+        // a folder still walks, skipping ignored files
+        assert_eq!(run("."), "a.rs:2:fn needle() {}\nb.rs:1:fn needle() {}");
     }
     fn search_repo() -> PathBuf {
         let root = temp();
