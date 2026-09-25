@@ -2544,9 +2544,15 @@ fn missing_program_hint(program: &str) -> String {
 /// name looked up on PATH. A program given as a path (`./build.sh`,
 /// `bin/tool`) is left out: the model can edit that file between two runs of
 /// the same command line. The key is the exact argv plus the working
-/// directory, so `npm test` never covers `npm test -- --update`.
+/// directory and effective timeout, so `npm test` never covers `npm test
+/// -- --update` or a longer-running invocation than the one approved.
 pub fn standing_key(request: &ToolRequest) -> Option<String> {
-    let ToolRequest::RunCommand { argv, cwd, .. } = request else {
+    let ToolRequest::RunCommand {
+        argv,
+        cwd,
+        timeout_ms,
+    } = request
+    else {
         return None;
     };
     if command_policy(argv).is_err() {
@@ -2560,7 +2566,10 @@ pub fn standing_key(request: &ToolRequest) -> Option<String> {
         None | Some("") | Some(".") => ".".to_string(),
         Some(d) => d.trim_end_matches('/').to_string(),
     };
-    serde_json::to_string(&(argv, dir)).ok()
+    // A longer limit gives the process more time to make changes. Bind the
+    // grant to the time actually available, including the 120s cap.
+    let limit_ms = timeout_ms.unwrap_or(30_000).min(MAX_TIMEOUT_MS);
+    serde_json::to_string(&(argv, dir, limit_ms)).ok()
 }
 
 fn command_policy(argv: &[String]) -> Result<(), ToolError> {
@@ -5139,7 +5148,7 @@ mod tests {
             timeout_ms: None,
         };
         let npm = standing_key(&run(&["npm", "test"], None)).expect("bare command qualifies");
-        // cwd spellings of the workspace root are one key; timeout is ignored
+        // cwd spellings of the workspace root are one key; time is bound
         assert_eq!(
             standing_key(&run(&["npm", "test"], Some("."))),
             Some(npm.clone())
@@ -5150,9 +5159,21 @@ mod tests {
         );
         let mut timed = run(&["npm", "test"], None);
         if let ToolRequest::RunCommand { timeout_ms, .. } = &mut timed {
-            *timeout_ms = Some(5);
+            *timeout_ms = Some(30_000);
         }
         assert_eq!(standing_key(&timed), Some(npm.clone()));
+        if let ToolRequest::RunCommand { timeout_ms, .. } = &mut timed {
+            *timeout_ms = Some(60_000);
+        }
+        assert_ne!(standing_key(&timed), Some(npm.clone()));
+        if let ToolRequest::RunCommand { timeout_ms, .. } = &mut timed {
+            *timeout_ms = Some(MAX_TIMEOUT_MS);
+        }
+        let capped = standing_key(&timed).unwrap();
+        if let ToolRequest::RunCommand { timeout_ms, .. } = &mut timed {
+            *timeout_ms = Some(600_000);
+        }
+        assert_eq!(standing_key(&timed), Some(capped));
         // any other argv or directory is a different key
         assert_ne!(
             standing_key(&run(&["npm", "test", "--", "-u"], None)),

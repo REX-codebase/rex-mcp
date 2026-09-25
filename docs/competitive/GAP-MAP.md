@@ -1952,3 +1952,21 @@ is shared it is noted in the module docs.
   command that still reaches the approval gate.
 - Hand mutations: 4/4 killed by test panics (remove check, skip first
   item, check first item only, wrong error kind). Source restored.
+
+## Round 71 - standing approval includes effective timeout
+
+- Gap: a run-scoped "Allow for this run" covered exact argv and cwd but
+  ignored `timeout_ms`. A model could receive approval for a 5-second
+  command and reuse it for a 120-second invocation without another ask.
+- Grounding: opencode's shell asks for permission based on command text
+  (`tool/shell.ts`) and its always patterns cover command prefixes;
+  Hermes' command guards expose a pending approval for a flagged command
+  (`tools/terminal_tool.py`). REX's stricter exact-command grant now also
+  binds the effective time limit, because a longer run changes the scope
+  of that approval. Default and explicit 30 seconds match, and requests
+  above the 120-second cap match the capped value. No persistence change.
+- Test: existing standing-key test now checks default/explicit 30s,
+  a 60s mismatch, and cap equivalence.
+- Hand mutations: 4/4 killed by test panics (drop limit from key, skip
+  cap, wrong default, replace effective limit with constant). Source
+  restored.
