@@ -1643,3 +1643,28 @@ is shared it is noted in the module docs.
   file, CRLF plus mark, new file). Hand mutation: 5/5 killed.
 - Gap left: turning a CRLF file into LF on purpose needs text that
   keeps one CRLF, or a command; Hermes has the same limit.
+
+## Round 51: a call cut off by the output cap says why
+
+- Hermes: `agent/turn_truncation.py` notices a response that stopped at
+  the output cap (`finish_reason` "length", mapped from Anthropic
+  "max_tokens" and Gemini "MAX_TOKENS"), retries a cut tool call with a
+  larger cap, and then refuses to run incomplete arguments.
+- REX before: the stop reason was never read. A call cut mid-arguments
+  got the Round 46 answer "tool arguments are not valid JSON; send the
+  call again with valid JSON", which invites the same oversized call and
+  the same cut.
+- REX now: when a response stopped at the cap (each provider's own
+  field and value), every call in it that could not be decoded is told
+  "your response hit the output token limit and this call was cut off;
+  send it again in smaller pieces (for a big file, create_file with the
+  first part, then edit_file or apply_patch to add the rest)", followed
+  by the original error. Complete calls in the same response still run.
+  The run's events show "the model's response stopped at the output
+  token limit".
+- Tests: a decoder test (cut and normal OpenAI responses, Anthropic and
+  Gemini reasons, a reason in the wrong protocol's field) and an
+  end-to-end event test. Hand mutation: 8 of 9 killed. The survivor
+  removes the same event in the plan-gate turn, which has no test
+  harness here.
+- Gap left: no retry with a larger cap; REX's cap is fixed per request.

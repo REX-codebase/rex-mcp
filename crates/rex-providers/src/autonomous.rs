@@ -2140,6 +2140,14 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(ctx: LoopCtx<S, T>) {
                 AgentEvent::ModelText { text: text.clone() },
             );
         }
+        if decoded.cut_off {
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::Info {
+                    message: "the model's response stopped at the output token limit".into(),
+                },
+            );
+        }
         for note in &decoded.repairs {
             RunHandle::push_event(
                 &ctx.handle.shared,
@@ -2887,6 +2895,8 @@ struct DecodedCalls {
     /// Slips fixed before decoding (tool name or argument types), one note
     /// each, so the run's events show what was changed.
     repairs: Vec<String>,
+    /// The provider stopped this response at the output token cap.
+    cut_off: bool,
 }
 
 fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
@@ -3127,6 +3137,7 @@ fn decode_gemini_calls(response: &str) -> Result<DecodedCalls, String> {
         calls,
         thought_signature,
         repairs,
+        cut_off: false,
     })
 }
 
@@ -3134,11 +3145,42 @@ fn decode_provider_calls(
     protocol: ProviderProtocol,
     response: &str,
 ) -> Result<DecodedCalls, String> {
-    match protocol {
+    let mut decoded = match protocol {
         ProviderProtocol::Gemini => decode_gemini_calls(response),
         ProviderProtocol::Anthropic => decode_anthropic_calls(response),
         ProviderProtocol::OpenAiCompatible => decode_openai_calls(response),
+    }?;
+    if hit_output_limit(protocol, response) {
+        decoded.cut_off = true;
+        for (call, _) in &mut decoded.calls {
+            if let AgentCall::BadCall { error, .. } = call {
+                *error = format!("{OUTPUT_LIMIT_NOTE} ({error})");
+            }
+        }
     }
+    Ok(decoded)
+}
+
+/// What a call broken by the output cap is told. Hermes retries such a
+/// call with a larger cap and refuses to run it after that
+/// (`agent/turn_truncation.py`); REX has a fixed cap, so it says why the
+/// call broke and how to fit, instead of a bare "not valid JSON" that
+/// invites the same oversized call again.
+const OUTPUT_LIMIT_NOTE: &str = "your response hit the output token limit and this call was cut off; send it again in smaller pieces (for a big file, create_file with the first part, then edit_file or apply_patch to add the rest)";
+
+/// True when the provider says the response stopped at the output token
+/// cap: OpenAI-style `finish_reason: "length"`, Anthropic
+/// `stop_reason: "max_tokens"`, Gemini `finishReason: "MAX_TOKENS"`.
+fn hit_output_limit(protocol: ProviderProtocol, response: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(response) else {
+        return false;
+    };
+    let (pointer, cap) = match protocol {
+        ProviderProtocol::OpenAiCompatible => ("/choices/0/finish_reason", "length"),
+        ProviderProtocol::Anthropic => ("/stop_reason", "max_tokens"),
+        ProviderProtocol::Gemini => ("/candidates/0/finishReason", "MAX_TOKENS"),
+    };
+    v.pointer(pointer).and_then(Value::as_str) == Some(cap)
 }
 
 /// `read_output` arguments: (call_id, offset, query).
@@ -3414,6 +3456,7 @@ fn decode_anthropic_calls(response: &str) -> Result<DecodedCalls, String> {
         calls,
         thought_signature: None,
         repairs,
+        cut_off: false,
     })
 }
 
@@ -3482,6 +3525,7 @@ fn decode_openai_calls(response: &str) -> Result<DecodedCalls, String> {
         calls,
         thought_signature: None,
         repairs,
+        cut_off: false,
     })
 }
 
@@ -5270,6 +5314,14 @@ fn plan_gate<S: SecretStore + 'static, T: Transport + 'static>(
             RunHandle::push_event(
                 &ctx.handle.shared,
                 AgentEvent::ModelText { text: text.clone() },
+            );
+        }
+        if decoded.cut_off {
+            RunHandle::push_event(
+                &ctx.handle.shared,
+                AgentEvent::Info {
+                    message: "the model's response stopped at the output token limit".into(),
+                },
             );
         }
         for note in &decoded.repairs {
@@ -9456,6 +9508,95 @@ mod tests {
         assert_eq!(svc.undo_to_write(&snap.id, 0).unwrap().len(), 1);
         assert!(!ws.join("x.txt").exists());
         assert!(svc.undo_to_write("no-such-run", 0).is_err());
+    }
+
+    #[test]
+    fn output_limit_stop_is_reported_as_an_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cut = json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","args":{"path":"nope.txt"}}}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"totalTokenCount":50}}).to_string();
+        let svc = Arc::new(service(
+            tmp.path(),
+            Script::new(vec![cut, call_turn(vec![complete_call("done")])]),
+        ));
+        let snap = svc.begin("cap check", "gemini", Some(budgets())).unwrap();
+        auto_approve(svc.clone(), snap.id.clone());
+        let done = wait_terminal(&svc, &snap.id, 60_000);
+        let hits = done
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Info { message } if message == "the model's response stopped at the output token limit"))
+            .count();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn call_cut_by_the_output_limit_says_why() {
+        let openai = |finish: &str| {
+            json!({"choices":[{"message":{"tool_calls":[
+                {"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}},
+                {"id":"c2","function":{"name":"create_file","arguments":"{\"path\":\"big.txt\",\"content\":\"aaa"}}
+            ]},"finish_reason": finish}]})
+            .to_string()
+        };
+        let got =
+            decode_provider_calls(ProviderProtocol::OpenAiCompatible, &openai("length")).unwrap();
+        assert!(got.cut_off);
+        // the complete call is untouched
+        assert!(matches!(&got.calls[0].0, AgentCall::Tool { .. }));
+        let AgentCall::BadCall { error, id, .. } = &got.calls[1].0 else {
+            panic!("not a bad call")
+        };
+        assert_eq!(id, "c2");
+        assert!(
+            error.starts_with(&format!(
+                "{OUTPUT_LIMIT_NOTE} (tool arguments are not valid JSON ("
+            )),
+            "{error}"
+        );
+        // a normal stop keeps the plain error
+        let got = decode_provider_calls(ProviderProtocol::OpenAiCompatible, &openai("tool_calls"))
+            .unwrap();
+        assert!(!got.cut_off);
+        let AgentCall::BadCall { error, .. } = &got.calls[1].0 else {
+            panic!()
+        };
+        assert!(
+            error.starts_with("tool arguments are not valid JSON ("),
+            "{error}"
+        );
+        // each provider's own cap reason
+        let anthropic = |stop: &str| {
+            json!({"content":[{"type":"text","text":"hi"}],"stop_reason": stop}).to_string()
+        };
+        assert!(
+            decode_provider_calls(ProviderProtocol::Anthropic, &anthropic("max_tokens"))
+                .unwrap()
+                .cut_off
+        );
+        assert!(
+            !decode_provider_calls(ProviderProtocol::Anthropic, &anthropic("end_turn"))
+                .unwrap()
+                .cut_off
+        );
+        let gemini = |reason: &str| {
+            json!({"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason": reason}]})
+                .to_string()
+        };
+        assert!(
+            decode_provider_calls(ProviderProtocol::Gemini, &gemini("MAX_TOKENS"))
+                .unwrap()
+                .cut_off
+        );
+        assert!(
+            !decode_provider_calls(ProviderProtocol::Gemini, &gemini("STOP"))
+                .unwrap()
+                .cut_off
+        );
+        // a reason read from the wrong protocol's field does not count
+        assert!(
+            !decode_provider_calls(ProviderProtocol::Gemini, &anthropic("max_tokens"))
+                .is_ok_and(|d| d.cut_off)
+        );
     }
 
     #[test]
