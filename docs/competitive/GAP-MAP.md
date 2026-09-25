@@ -1935,3 +1935,20 @@ is shared it is noted in the module docs.
   skip directory check, and skip execution-time directory check). Source
   restored; the last test case was strengthened to replace the approved
   folder with a file after an initial surviving mutation.
+
+## Round 70 - reject NUL in command argv before approval
+
+- Gap: a NUL in the first program name was not checked by REX's command
+  policy, and a NUL in a later argument was only found at execution.
+  Either way, the process API could not spawn it, after an unnecessary
+  user approval.
+- Grounding: Hermes' terminal accepts a command string and checks it
+  before planning execution (`tools/terminal_tool.py`); opencode validates
+  the typed shell command before asking (`tool/shell/prompt.ts` and
+  `tool/shell.ts`). REX's argv transport needs its own byte-level check.
+  It now rejects NUL in any argv item at prepare time, including argv[0].
+  The later command-policy guard remains defense in depth.
+- Test: NUL in the executable, NUL in a later argument, and a normal
+  command that still reaches the approval gate.
+- Hand mutations: 4/4 killed by test panics (remove check, skip first
+  item, check first item only, wrong error kind). Source restored.

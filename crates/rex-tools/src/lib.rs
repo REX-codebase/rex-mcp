@@ -2406,6 +2406,12 @@ fn validate_request(r: &ToolRequest) -> Result<(), ToolError> {
         ToolRequest::RunCommand { argv, .. } if argv.is_empty() || argv[0].trim().is_empty() => {
             Err(err(ErrorKind::InvalidRequest, "command argv is empty"))
         }
+        // An OS argv cannot contain NUL in either the executable or an
+        // argument. Reject it before approval, rather than showing a
+        // command that the process API can never spawn.
+        ToolRequest::RunCommand { argv, .. } if argv.iter().any(|a| a.contains('\0')) => {
+            Err(err(ErrorKind::InvalidRequest, "NUL byte in command argv"))
+        }
         // A zero timeout cannot run. Reject it before asking for approval,
         // rather than approving a call that is guaranteed to fail.
         ToolRequest::RunCommand { timeout_ms: Some(0), .. } => Err(err(
@@ -4764,6 +4770,30 @@ mod tests {
         assert!(prep(&["grep", "-E", "a|b", "f.txt"]).is_ok());
         assert!(prep(&["git", "log", "--format=%h > %s"]).is_ok());
         assert!(prep(&["cargo", "test"]).is_ok());
+    }
+    #[test]
+    fn nul_in_command_or_argument_fails_before_approval() {
+        let rt = ToolRuntime::new(temp()).unwrap();
+        for argv in [vec!["touch\0ignored", "made"], vec!["touch", "made\0else"]] {
+            let e = rt
+                .prepare(ToolRequest::RunCommand {
+                    argv: argv.into_iter().map(str::to_string).collect(),
+                    cwd: None,
+                    timeout_ms: None,
+                })
+                .unwrap_err();
+            assert_eq!(e.kind, ErrorKind::InvalidRequest);
+            assert_eq!(e.detail, "NUL byte in command argv");
+            assert!(!rt.workspace_root().join("made").exists());
+        }
+        let good = rt
+            .prepare(ToolRequest::RunCommand {
+                argv: vec!["touch".into(), "made".into()],
+                cwd: None,
+                timeout_ms: None,
+            })
+            .unwrap();
+        assert!(good.approval_required);
     }
     #[test]
     fn command_cwd_is_checked_before_approval_and_again_before_execution() {
