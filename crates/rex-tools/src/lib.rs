@@ -9,6 +9,7 @@ pub mod fuzzy;
 pub mod journal;
 pub mod patch;
 pub mod sandbox;
+pub mod term;
 pub mod walk;
 
 use regex::Regex;
@@ -1604,14 +1605,18 @@ impl ToolRuntime {
         let mut combined = String::new();
         if !stdout.is_empty() {
             combined.push_str("stdout:\n");
-            combined.push_str(&String::from_utf8_lossy(&stdout));
+            combined.push_str(&term::clean_terminal_text(&String::from_utf8_lossy(
+                &stdout,
+            )));
         }
         if !stderr.is_empty() {
             if !combined.is_empty() {
                 combined.push('\n');
             }
             combined.push_str("stderr:\n");
-            combined.push_str(&String::from_utf8_lossy(&stderr));
+            combined.push_str(&term::clean_terminal_text(&String::from_utf8_lossy(
+                &stderr,
+            )));
         }
         let mut r = receipt(
             &self.root,
@@ -3492,6 +3497,29 @@ mod tests {
         let (s, n) = redact("token=abc123456789 secret\nsk-abcdefghijklmnopqrstuvwxyz");
         assert!(n >= 2);
         assert!(!s.contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_output_has_no_escape_codes() {
+        let rt = ToolRuntime::new(temp()).unwrap();
+        let r = run_approved(
+            &rt,
+            &[
+                "printf",
+                "\\033[1;31mFAILED\\033[0m t\\007\\033]0;title\\007 done\\n",
+            ],
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.output.unwrap();
+        assert!(out.contains("FAILED t done"), "{out:?}");
+        // stderr is cleaned too
+        let root = rt.workspace_root().to_path_buf();
+        fs::write(root.join("e.txt"), "\u{1b}[33mwarn\u{1b}[0m\n").unwrap();
+        let r = run_approved(&rt, &["sed", "-n", "w /dev/stderr", "e.txt"]);
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.output.unwrap();
+        assert!(out.contains("stderr:\nwarn"), "{out:?}");
+        assert!(!out.contains('\u{1b}'), "{out:?}");
     }
     #[cfg(target_os = "linux")]
     #[test]

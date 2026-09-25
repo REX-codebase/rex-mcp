@@ -1350,3 +1350,20 @@ is shared it is noted in the module docs.
   repository requirement. Hand mutation: 12/12 killed.
 - Gap left: the config reader does not follow `[include]` /
   `[includeIf]` or the system config (`/etc/gitconfig`).
+
+## Round 37: command output is cleaned of terminal codes
+
+- Hermes: `tools/ansi_strip.py` removes ANSI/VT escape sequences from
+  command output before the model sees it, so colour codes and cursor
+  moves do not waste context or confuse the model.
+- REX before: `run_command` passed stdout and stderr through as-is;
+  colour codes, cursor controls, stray control bytes and invisible
+  Unicode tag characters reached the model and the transcript.
+- REX now: a new `term::clean_terminal_text` strips CSI, OSC, DCS and
+  other escape sequences (7-bit and 8-bit forms), drops control
+  characters except newline and tab, turns a lone carriage return into a
+  newline, and removes Unicode tag characters (U+E0000-U+E007F), which
+  can hide text from a human reviewer. Both output streams go through it.
+- Tests: 3 unit tests over the escape forms and 1 end-to-end
+  `command_output_has_no_escape_codes`. Hand mutation: 18/18 killed.
+- Gap left: MCP tool output is not cleaned yet (MCP work is parked).
