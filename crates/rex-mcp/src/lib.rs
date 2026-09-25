@@ -57,6 +57,9 @@ impl McpServer {
         // JSON-RPC notifications have no id and never get a response.
         let notify = id.is_none();
         let id = id.unwrap_or(Value::Null);
+        if !notify && !id.is_string() && !id.is_i64() && !id.is_u64() {
+            return Some(rpc_err(Value::Null, -32600, "invalid JSON-RPC id", None));
+        }
         if request.get("jsonrpc") != Some(&Value::String("2.0".into())) {
             return if notify { None } else { Some(rpc_error(id, -32600, "invalid JSON-RPC envelope", None)) };
         }
@@ -315,6 +318,24 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(unknown["error"]["data"]["code"], "unknown_tool");
+    }
+    #[test]
+    fn invalid_json_rpc_ids_do_not_initialize() {
+        let (_d, mut s) = server();
+        for id in [json!(null), json!(true), json!([]), json!({"key": 1})] {
+            let response = s.handle(json!({"jsonrpc":"2.0", "id":id,
+                "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}})).unwrap();
+            assert_eq!(response["error"]["code"], -32600);
+            assert!(response["id"].is_null());
+        }
+        let blocked = s.handle(rpc(1, "tools/list", json!({}))).unwrap();
+        assert_eq!(blocked["error"]["data"]["code"], "unauthorized");
+        for id in [json!(0), json!("a")] {
+            let response = s.handle(json!({"jsonrpc":"2.0", "id":id,
+                "method":"initialize", "params":{"protocolVersion":MCP_PROTOCOL_VERSION}})).unwrap();
+            assert_eq!(response["id"], id);
+            assert!(response.get("result").is_some());
+        }
     }
     #[test]
     fn tool_call_notification_cannot_mutate_custody() {
