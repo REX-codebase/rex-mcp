@@ -474,6 +474,37 @@ pub fn tool_descriptors() -> Vec<Value> {
         if matches!(t, ToolName::Events | ToolName::Result) {
             descriptor["annotations"] = json!({"readOnlyHint": true, "openWorldHint": false});
         }
+        // Declare outputs only where the actual success shape is stable and
+        // fully represented. Tool errors are separately marked isError.
+        descriptor["outputSchema"] = match t {
+            ToolName::Events => json!({
+                "type":"object", "required":["events","last_seq"],
+                "properties":{
+                    "events":{"type":"array","items":{
+                        "type":"object","required":["seq","ts_ms","kind","detail"],
+                        "properties":{
+                            "seq":{"type":"integer"},"ts_ms":{"type":"integer"},
+                            "kind":{"type":"string"},"detail":{}
+                        }
+                    }},
+                    "last_seq":{"type":"integer"}
+                }
+            }),
+            ToolName::Result => json!({
+                "type":"object", "required":["task_id","state"],
+                "properties":{
+                    "task_id":{"type":"string"},
+                    "state":{"enum":["completed","failed","cancelled"]},
+                    "output":{"type":"string"},
+                    "proof_bundle":{"type":"object","additionalProperties":{"type":"string"}},
+                    "terminal_reason":{"type":"string"}
+                }
+            }),
+            _ => Value::Null,
+        };
+        if descriptor["outputSchema"].is_null() {
+            descriptor.as_object_mut().unwrap().remove("outputSchema");
+        }
         out.push(descriptor);
     }
     out
@@ -515,6 +546,81 @@ mod tests {
     fn rpc(id: i64, method: &str, params: Value) -> Value {
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
     }
+    #[test]
+    fn inspection_output_schemas_match_success_shapes() {
+        let descriptors = tool_descriptors();
+        let find = |name: &str| descriptors.iter().find(|d| d["name"] == name).unwrap();
+        let events = &find("rex_events")["outputSchema"];
+        assert_eq!(events["type"], "object");
+        assert_eq!(
+            events["properties"]["events"]["items"]["properties"]["ts_ms"]["type"],
+            "integer"
+        );
+        assert_eq!(events["properties"]["last_seq"]["type"], "integer");
+        let result = &find("rex_result")["outputSchema"];
+        assert_eq!(
+            result["properties"]["state"]["enum"],
+            json!(["completed", "failed", "cancelled"])
+        );
+        assert_eq!(
+            result["properties"]["proof_bundle"]["additionalProperties"]["type"],
+            "string"
+        );
+        assert!(find("rex_execute").get("outputSchema").is_none());
+        let (_d, mut server) = server();
+        server
+            .handle(rpc(
+                1,
+                "initialize",
+                json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+            ))
+            .unwrap();
+        let started = server.handle(rpc(2, "tools/call", json!({"name":"rex_execute","arguments":{
+            "request_id":"schema-check","task":"inspect","host":"claude_code","operator_is_agent":true
+        }}))).unwrap();
+        let task_id = started["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .unwrap();
+        let actual_events = server
+            .handle(rpc(
+                3,
+                "tools/call",
+                json!({"name":"rex_events","arguments":{"task_id":task_id}}),
+            ))
+            .unwrap();
+        let value = &actual_events["result"]["structuredContent"];
+        for field in events["required"].as_array().unwrap() {
+            assert!(value.get(field.as_str().unwrap()).is_some());
+        }
+        for event in value["events"].as_array().unwrap() {
+            for field in events["properties"]["events"]["items"]["required"]
+                .as_array()
+                .unwrap()
+            {
+                assert!(event.get(field.as_str().unwrap()).is_some());
+            }
+        }
+        let stopped = server.handle(rpc(4,"tools/call",json!({"name":"rex_cancel","arguments":{
+            "task_id":task_id,"capability":started["result"]["structuredContent"]["task_capability"]
+        }}))).unwrap();
+        assert_eq!(stopped["result"]["isError"], false);
+        let actual_result = server
+            .handle(rpc(
+                5,
+                "tools/call",
+                json!({"name":"rex_result","arguments":{"task_id":task_id}}),
+            ))
+            .unwrap();
+        let value = &actual_result["result"]["structuredContent"];
+        for field in result["required"].as_array().unwrap() {
+            assert!(value.get(field.as_str().unwrap()).is_some());
+        }
+        assert!(result["properties"]["state"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&value["state"]));
+    }
+
     #[test]
     fn tool_annotations_are_conservative_about_custody_side_effects() {
         let descriptors = tool_descriptors();
