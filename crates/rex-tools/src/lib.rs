@@ -2603,12 +2603,58 @@ fn command_policy(argv: &[String]) -> Result<(), ToolError> {
         "watch",
     ];
     if denied.contains(&exe.as_str()) {
-        return Err(err(ErrorKind::PolicyDenied,"shells, interpreters, network clients, privilege tools, destructive commands, and process-control commands are blocked"));
+        return Err(err(ErrorKind::PolicyDenied, &denied_detail(&exe)));
     }
     if argv.iter().skip(1).any(|a| a.contains('\0')) {
         return Err(err(ErrorKind::InvalidRequest, "NUL byte in argument"));
     }
     Ok(())
+}
+/// Why `exe` is blocked, and what to do instead. A bare "blocked" makes
+/// the model retry the same thing through another blocked program (`bash`
+/// then `sh` then `env bash`); naming the tool or field that does the job
+/// ends that loop.
+fn denied_detail(exe: &str) -> String {
+    let (why, instead) = match exe {
+        "sh" | "bash" | "zsh" | "fish" | "cmd" | "cmd.exe" | "powershell" | "pwsh" => (
+            "run_command has no shell",
+            "put the program and its arguments in argv directly (e.g. [\"cargo\", \"test\"]), one command per call; set cwd for the folder",
+        ),
+        "python" | "python3" | "node" | "ruby" | "perl" => (
+            "interpreters can run any code",
+            "use the project's own commands (cargo, npm, make, pytest ...) and the file tools to read or change files",
+        ),
+        "curl" | "wget" | "nc" | "ncat" | "ssh" | "scp" => (
+            "commands have no network access",
+            "work from the files in the workspace",
+        ),
+        "rm" | "rmdir" => (
+            "deleting through run_command is not allowed",
+            "remove a file with apply_patch (*** Delete File: <path>)",
+        ),
+        "find" => (
+            "find can run other programs with -exec",
+            "use glob_files to list files by pattern, or search_files to search their contents",
+        ),
+        "timeout" => (
+            "timeout runs another program",
+            "set the timeout_ms field on run_command instead",
+        ),
+        "nohup" | "setsid" => (
+            "there is no background mode",
+            "run the command in the foreground; its process group is stopped when it ends or times out",
+        ),
+        "env" | "busybox" | "xargs" | "stdbuf" | "nice" | "ionice" | "taskset" | "unshare"
+        | "nsenter" | "chroot" | "bwrap" | "firejail" | "script" | "watch" => (
+            "it runs another program the policy cannot check",
+            "run that program directly; commands start with a clean environment",
+        ),
+        _ => (
+            "privilege, system and process-control commands are not allowed",
+            "do the work with the file tools or the project's own commands",
+        ),
+    };
+    format!("'{exe}' is blocked: {why}; {instead}")
 }
 fn relative(root: &Path, p: &Path) -> String {
     p.strip_prefix(root).unwrap_or(p).display().to_string()
@@ -4737,6 +4783,34 @@ mod tests {
         // at or under the cap, nothing is added
         assert_eq!(run(&["echo", "hi"], Some(MAX_TIMEOUT_MS)), "stdout:\nhi\n");
         assert_eq!(run(&["true"], None), "");
+    }
+    #[test]
+    fn a_blocked_program_is_told_what_to_use_instead() {
+        let deny = |argv0: &str| {
+            let e = command_policy(&[argv0.to_string(), "x".to_string()]).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::PolicyDenied, "{argv0}");
+            e.detail
+        };
+        assert_eq!(deny("bash"), "'bash' is blocked: run_command has no shell; put the program and its arguments in argv directly (e.g. [\"cargo\", \"test\"]), one command per call; set cwd for the folder");
+        // the basename, lowercased, is what gets named
+        assert!(deny("/usr/bin/PWSH").starts_with("'pwsh' is blocked: run_command has no shell;"));
+        assert!(deny("python3").contains("interpreters can run any code"));
+        assert!(deny("curl").contains("no network access"));
+        assert!(deny("rm").ends_with("remove a file with apply_patch (*** Delete File: <path>)"));
+        assert!(deny("find").contains("use glob_files to list files by pattern, or search_files"));
+        assert!(deny("timeout").contains("set the timeout_ms field"));
+        assert!(deny("nohup").contains("there is no background mode"));
+        assert!(deny("xargs").contains("run that program directly"));
+        assert_eq!(deny("sudo"), "'sudo' is blocked: privilege, system and process-control commands are not allowed; do the work with the file tools or the project's own commands");
+        // every denied program gets a named message
+        for exe in [
+            "sh", "node", "scp", "rmdir", "setsid", "watch", "kill", "dd",
+        ] {
+            assert!(
+                deny(exe).starts_with(&format!("'{exe}' is blocked: ")),
+                "{exe}"
+            );
+        }
     }
     #[test]
     fn missing_program_says_what_to_fix() {

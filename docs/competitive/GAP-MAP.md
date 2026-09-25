@@ -1879,3 +1879,11 @@ is shared it is noted in the module docs.
 - REX now: a successful model `run_command` with `timeout_ms` above the cap ends with "note: timeout_ms N is above the 120000 ms cap, so it ran with 120000". Output at or under the cap is unchanged. `MAX_TIMEOUT_MS` is now public, and the daemon `test` recipe asks for exactly that instead of a 10-minute limit it never got, so its stdout/stderr carry no note.
 - Test: `a_cut_timeout_is_reported_even_when_the_command_finishes` checks over the cap with and without output, at the cap, and the default. rex-daemon tests: 64 pass.
 - Mutants (4/4 killed by test panics): `>` to `>=`, guard to `false`, `!is_empty` to `is_empty`, and the separator push removed.
+
+## Round 66 - a blocked program is told what to use instead
+
+- Gap: every denied program (shells, interpreters, network clients, rm, find, timeout, launchers) got the same line: "shells, interpreters, network clients, privilege tools, destructive commands, and process-control commands are blocked". That named neither the program nor a way forward, so the model tended to retry through another blocked program.
+- Grounding: opencode's shell prompt (`tool/shell/prompt.ts`) steers the model away from `find`/`grep`/`cat` toward its Glob, Grep and Read tools. Hermes `tools/terminal_tool_guards.py` returns specific guidance for backgrounding (`&`, nohup) instead of a bare refusal.
+- REX now: `denied_detail` names the blocked program (its basename, lowercased) and gives a reason and a way forward for each class. Shells get "put the program in argv directly, set cwd". `rm` gets "apply_patch *** Delete File". `find` gets glob_files/search_files. `timeout` gets the timeout_ms field. nohup/setsid are told there is no background mode. Launchers get "run that program directly". Network, interpreter and privilege commands each get their own reason. The policy itself is unchanged.
+- Test: `a_blocked_program_is_told_what_to_use_instead`.
+- Mutants (6/6 killed by test panics): shell, rm, find, timeout and curl arms knocked out, and the reason/way-forward order swapped.
