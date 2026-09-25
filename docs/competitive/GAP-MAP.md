@@ -1887,3 +1887,18 @@ is shared it is noted in the module docs.
 - REX now: `denied_detail` names the blocked program (its basename, lowercased) and gives a reason and a way forward for each class. Shells get "put the program in argv directly, set cwd". `rm` gets "apply_patch *** Delete File". `find` gets glob_files/search_files. `timeout` gets the timeout_ms field. nohup/setsid are told there is no background mode. Launchers get "run that program directly". Network, interpreter and privilege commands each get their own reason. The policy itself is unchanged.
 - Test: `a_blocked_program_is_told_what_to_use_instead`.
 - Mutants (6/6 killed by test panics): shell, rm, find, timeout and curl arms knocked out, and the reason/way-forward order swapped.
+
+## Round 67 - report the cause of a failed command without `None`
+
+- Gap: a nonzero `run_command` exit returned `command exited with Some(1):`,
+  and a signal termination returned `command exited with None:`. A silent
+  failure had no clue whether the process had actually printed anything.
+- Grounding: opencode's `tool/shell.ts` reports `exit: code` separately and
+  preserves output; Hermes' `tools/terminal_tool.py` reports `exit_code`
+  alongside `output` and `error`. REX keeps its failure envelope but makes
+  its detail name an exit code or, on Unix, the terminating signal, and
+  explicitly says when the command printed nothing. No model benchmarks.
+- Test: a real `false` command checks the model-visible failure; a synthetic
+  Unix exit status checks signal 9 with and without captured output.
+- Hand mutations: 4/4 killed by test panics (exit label, signal lookup,
+  empty-output branch, output label). The original source was restored.

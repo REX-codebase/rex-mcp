@@ -1759,7 +1759,7 @@ impl ToolRuntime {
         if !status.success() {
             return Err(err(
                 ErrorKind::ProcessFailed,
-                &format!("command exited with {:?}: {}", status.code(), combined),
+                &failed_command_detail(status, &combined),
             ));
         }
         Ok(exec(Some(combined), r))
@@ -2875,6 +2875,33 @@ fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
         combined.push_str(&term::clean_terminal_text(&String::from_utf8_lossy(bytes)));
     }
     combined
+}
+
+/// A failed command's status is actionable even when it printed nothing.
+/// On Unix, a signal has no exit code: do not tell the model it exited
+/// with `None` when it was actually killed by the OS.
+fn failed_command_detail(status: std::process::ExitStatus, output: &str) -> String {
+    let cause = if let Some(code) = status.code() {
+        format!("command exited with code {code}")
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            match status.signal() {
+                Some(signal) => format!("command was terminated by signal {signal}"),
+                None => "command ended without an exit code".to_string(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            "command ended without an exit code".to_string()
+        }
+    };
+    if output.is_empty() {
+        format!("{cause}; it printed nothing")
+    } else {
+        format!("{cause}; output:\n{output}")
+    }
 }
 
 /// The error for a command stopped at its time limit. What it printed
@@ -4717,6 +4744,36 @@ mod tests {
         assert!(prep(&["grep", "-E", "a|b", "f.txt"]).is_ok());
         assert!(prep(&["git", "log", "--format=%h > %s"]).is_ok());
         assert!(prep(&["cargo", "test"]).is_ok());
+    }
+    #[test]
+    fn failed_command_reports_exit_code_or_signal_and_output() {
+        let root = temp();
+        let rt = ToolRuntime::new(&root).unwrap();
+        let p = rt
+            .prepare(ToolRequest::RunCommand {
+                argv: vec!["false".into()],
+                cwd: None,
+                timeout_ms: None,
+            })
+            .unwrap();
+        rt.resolve_approval(&p.call_id, true).unwrap();
+        let e = rt.execute(&p.call_id).error.unwrap();
+        assert_eq!(e.kind, ErrorKind::ProcessFailed);
+        assert_eq!(e.detail, "command exited with code 1; it printed nothing");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
+            assert_eq!(
+                failed_command_detail(killed, "stderr:\nOOM"),
+                "command was terminated by signal 9; output:\nstderr:\nOOM"
+            );
+            assert_eq!(
+                failed_command_detail(killed, ""),
+                "command was terminated by signal 9; it printed nothing"
+            );
+        }
     }
     #[test]
     fn timeout_at_the_cap_says_to_split_the_work() {
