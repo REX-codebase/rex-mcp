@@ -513,8 +513,21 @@ pub fn tool_descriptors() -> Vec<Value> {
         // Be conservative: many apparently observational operations record
         // custody or consume budgets. Only the terminal result and event-log
         // reads are guaranteed not to change task state.
-        let mut descriptor =
-            json!({"name":t.wire_name(),"description":description,"inputSchema":schema});
+        let title = t
+            .wire_name()
+            .strip_prefix("rex_")
+            .unwrap_or(t.wire_name())
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut descriptor = json!({"name":t.wire_name(),"title":format!("REX {title}"),
+            "description":description,"inputSchema":schema});
         if matches!(t, ToolName::Events | ToolName::Result) {
             descriptor["annotations"] = json!({"readOnlyHint": true, "openWorldHint": false});
         }
