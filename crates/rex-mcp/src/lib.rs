@@ -137,6 +137,11 @@ impl McpServer {
                     "name": "REX task status",
                     "description": "Read the current custody status of a known REX task ID.",
                     "mimeType": "application/json"
+                }, {
+                    "uriTemplate": "rex://task/{task_id}/events/{after_seq}",
+                    "name": "REX task events",
+                    "description": "Read up to 100 append-only events after a known sequence cursor; start at 0.",
+                    "mimeType": "application/json"
                 }]
             })),
             "resources/read" => self.require_initialized().and_then(|_| {
@@ -144,6 +149,36 @@ impl McpServer {
                     .and_then(Value::as_str).ok_or_else(|| {
                         ProtocolError::new(ErrorCode::MalformedRequest, "resource URI required")
                     })?;
+                if let Some(path) = uri.strip_prefix("rex://task/") {
+                    if let Some((task_id, after_seq)) = path.split_once("/events/") {
+                        if task_id.is_empty() || task_id.contains('/') {
+                            return Err(ProtocolError::new(
+                                ErrorCode::MalformedRequest,
+                                "invalid task events resource URI",
+                            ));
+                        }
+                        let after_seq = after_seq.parse::<u64>().map_err(|_| {
+                            ProtocolError::new(
+                                ErrorCode::MalformedRequest,
+                                "invalid task events cursor",
+                            )
+                        })?;
+                        let events = self.daemon.dispatch(
+                            ToolName::Events,
+                            json!({"task_id": task_id, "after_seq": after_seq, "limit": 100}),
+                        )?;
+                        return Ok(json!({"contents": [{
+                            "uri": uri,
+                            "mimeType": "application/json",
+                            "text": serde_json::to_string_pretty(&events).map_err(|e| {
+                                ProtocolError::new(
+                                    ErrorCode::MalformedRequest,
+                                    format!("cannot encode task events: {e}"),
+                                )
+                            })?
+                        }]}));
+                    }
+                }
                 if let Some(task_id) = uri
                     .strip_prefix("rex://task/")
                     .and_then(|path| path.strip_suffix("/status"))
@@ -526,6 +561,79 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(malformed["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn task_events_resource_template_paginates_custody_log() {
+        let (_d, mut s) = server();
+        s.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+        ))
+        .unwrap();
+        let templates = s
+            .handle(rpc(2, "resources/templates/list", json!({})))
+            .unwrap();
+        assert_eq!(
+            templates["result"]["resourceTemplates"][1]["uriTemplate"],
+            "rex://task/{task_id}/events/{after_seq}"
+        );
+        let started = s
+            .handle(rpc(
+                3,
+                "tools/call",
+                json!({
+                    "name": "rex_execute",
+                    "arguments": {
+                        "request_id": "events-resource-test",
+                        "task": "inspect events",
+                        "host": "claude_code",
+                        "operator_is_agent": true
+                    }
+                }),
+            ))
+            .unwrap();
+        let task_id = started["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .unwrap();
+        let first = s
+            .handle(rpc(
+                4,
+                "resources/read",
+                json!({
+                    "uri": format!("rex://task/{task_id}/events/0")
+                }),
+            ))
+            .unwrap();
+        let text = first["result"]["contents"][0]["text"].as_str().unwrap();
+        let events: Value = serde_json::from_str(text).unwrap();
+        assert!(events["events"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        let last_seq = events["last_seq"].as_u64().unwrap();
+        let after = s
+            .handle(rpc(
+                5,
+                "resources/read",
+                json!({
+                    "uri": format!("rex://task/{task_id}/events/{last_seq}")
+                }),
+            ))
+            .unwrap();
+        let later: Value =
+            serde_json::from_str(after["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(later["events"].as_array().unwrap().is_empty());
+        let bad = s
+            .handle(rpc(
+                6,
+                "resources/read",
+                json!({
+                    "uri": format!("rex://task/{task_id}/events/not-a-sequence")
+                }),
+            ))
+            .unwrap();
+        assert_eq!(bad["error"]["code"], -32602);
     }
 
     #[test]
