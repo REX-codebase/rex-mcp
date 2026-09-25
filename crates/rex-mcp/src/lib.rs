@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const MCP_COMPAT_PROTOCOL_VERSION: &str = "2025-06-18";
 
 pub struct McpServer {
     daemon: HarnessDaemon,
@@ -305,15 +306,23 @@ impl McpServer {
             .get("protocolVersion")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if offered != MCP_PROTOCOL_VERSION {
+        // Per MCP version negotiation, return the caller's version when
+        // supported. Otherwise offer our latest; the client can disconnect.
+        // Missing/malformed version is an invalid initialize request.
+        if offered.is_empty() {
             return Err(ProtocolError::new(
-                ErrorCode::VersionMismatch,
-                format!("unsupported MCP protocol {offered:?}; expected {MCP_PROTOCOL_VERSION}"),
+                ErrorCode::MalformedRequest,
+                "protocolVersion required",
             ));
         }
+        let version = if offered == MCP_COMPAT_PROTOCOL_VERSION {
+            MCP_COMPAT_PROTOCOL_VERSION
+        } else {
+            MCP_PROTOCOL_VERSION
+        };
         self.initialized = true;
         Ok(json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "protocolVersion": version,
             "capabilities": { "tools": { "listChanged": false }, "prompts": { "listChanged": false }, "resources": { "listChanged": false } },
             "serverInfo": { "name": "rex-mcp", "version": env!("CARGO_PKG_VERSION") },
             "instructions": format!("REX Harness protocol {PROTOCOL_VERSION}. Caller-driven custody; call rex_execute, then rex_next/tools, and rex_submit. Continuation is cooperative.")
@@ -733,18 +742,24 @@ mod tests {
                 json!({"protocolVersion":"1900-01-01"}),
             ))
             .unwrap();
-        assert_eq!(bad["error"]["data"]["code"], "version_mismatch");
+        assert_eq!(bad["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        // The client may disconnect if it cannot use the offered version.
+        let (_d, mut s) = server();
+        let missing = s.handle(rpc(1, "initialize", json!({}))).unwrap();
+        assert_eq!(missing["error"]["code"], -32602);
         let ok = s
             .handle(rpc(
                 2,
                 "initialize",
-                json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+                json!({"protocolVersion":MCP_COMPAT_PROTOCOL_VERSION}),
             ))
             .unwrap();
-        assert!(ok.get("result").is_some());
+        assert_eq!(ok["result"]["protocolVersion"], MCP_COMPAT_PROTOCOL_VERSION);
+        let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 19);
         let unknown = s
             .handle(rpc(
-                3,
+                4,
                 "tools/call",
                 json!({"name":"rex_hack","arguments":{}}),
             ))
