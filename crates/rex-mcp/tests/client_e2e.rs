@@ -141,3 +141,22 @@ fn shell_client_rejects_an_incompatible_mcp_protocol_version() {
     assert!(error.contains("unsupported protocol version"), "{error}");
     assert!(error.contains("2099-01-01"), "{error}");
 }
+
+#[cfg(unix)]
+#[test]
+fn shell_client_times_out_when_server_never_replies() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("silent-mcp");
+    std::fs::write(&fake, "#!/bin/sh\nread request\nexec sleep 35\n").unwrap();
+    let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&fake, perms).unwrap();
+    let start = std::time::Instant::now();
+    let error = match McpStdioClient::spawn(&fake, tmp.path(), tmp.path()) {
+        Ok(_) => panic!("silent server must time out"),
+        Err(error) => error,
+    };
+    assert!(error.contains("reply timed out for initialize"), "{error}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(34));
+}
