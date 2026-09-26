@@ -66,6 +66,8 @@ promotion are one joined, crash-safe state machine.
    promotion (`gates_not_rerun`), and gate side effects never reach the
    promoted tree. Only a committed receipt completes the durable task.
 
+The MCP also offers `rex_ultra_promote_start` for long-running gates. It takes the same `task_id`, `capability`, and `lease_epoch` as the blocking `rex_ultra_promote`, validates them before starting, and returns a process-local `operation_id` with `state: running`. Keep the MCP process alive and call `rex_ultra_promote_status` with `task_id`, `capability`, and `operation_id` for `running`, `succeeded` with the full receipt, or `failed` with a structured error. A second start for the same task in this process returns its existing operation ID instead of launching another worker. After a server restart, inspect durable task status and proof before retrying; operation handles are not durable. The blocking tool remains available.
+
 ## Recovery
 
 A task or request id alone cannot resume anything. `rex_execute` issues
