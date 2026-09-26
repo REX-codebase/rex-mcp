@@ -1996,6 +1996,17 @@ mod promotion_status_tests {
             },
         );
         let args = json!({"task_id":"task-1","operation_id":"promote-test","capability":"secret"});
+        for (task_id, operation_id) in [
+            ("task-1", "wrong-operation"),
+            ("other-task", "promote-test"),
+        ] {
+            let unknown =
+                json!({"task_id":task_id,"operation_id":operation_id,"capability":"secret"});
+            assert_eq!(
+                server.promotion_status(unknown).unwrap_err().code,
+                ErrorCode::TaskNotFound
+            );
+        }
         let status = server.promotion_status(args.clone()).unwrap();
         assert_eq!(status["state"], "succeeded");
         assert_eq!(status["receipt"], receipt);
