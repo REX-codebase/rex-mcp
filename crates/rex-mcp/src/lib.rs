@@ -422,6 +422,11 @@ fn progress_start(request: &Value, initialized: bool) -> Option<Value> {
     }
     let params = request.get("params")?;
     let name = params.get("name")?.as_str()?;
+    // Don't tell the host a long-running operation has started when the
+    // requested tool is unknown or its arguments are not an object. These
+    // requests fail before any REX work begins.
+    ToolName::from_wire_name(name)?;
+    params.get("arguments")?.as_object()?;
     let long_call = matches!(
         name,
         "rex_execute"
@@ -1319,6 +1324,14 @@ mod tests {
         call["id"] = Value::Null;
         assert!(progress_start(&call, true).is_none());
         call.as_object_mut().unwrap().remove("id");
+        assert!(progress_start(&call, true).is_none());
+        call["id"] = json!(2);
+        call["params"]["name"] = json!("rex_not_a_tool");
+        assert!(progress_start(&call, true).is_none());
+        call["params"]["name"] = json!("rex_test");
+        call["params"]["arguments"] = json!("not an object");
+        assert!(progress_start(&call, true).is_none());
+        call["params"].as_object_mut().unwrap().remove("arguments");
         assert!(progress_start(&call, true).is_none());
     }
 
