@@ -166,23 +166,19 @@ impl McpStdioClient {
 }
 
 fn reply_timeout(method: &str, params: &Value) -> Duration {
-    if method == "tools/call"
-        && matches!(
-            params.get("name").and_then(Value::as_str),
-            Some(
-                "rex_execute"
-                    | "rex_run"
-                    | "rex_test"
-                    | "rex_ultra_open"
-                    | "rex_ultra_submit"
-                    | "rex_ultra_promote"
-                    | "rex_proof_verify"
-            )
-        )
-    {
-        Duration::from_secs(150)
-    } else {
-        Duration::from_secs(30)
+    if method != "tools/call" {
+        return Duration::from_secs(30);
+    }
+    match params.get("name").and_then(Value::as_str) {
+        // Ultra verification has a 600-second budget independent of the
+        // regular command cap. Leave room for persistence and transport.
+        Some("rex_ultra_open" | "rex_ultra_promote" | "rex_proof_verify") => {
+            Duration::from_secs(660)
+        }
+        Some("rex_execute" | "rex_run" | "rex_test" | "rex_ultra_submit") => {
+            Duration::from_secs(150)
+        }
+        _ => Duration::from_secs(30),
     }
 }
 
@@ -192,17 +188,25 @@ mod tests {
 
     #[test]
     fn long_tool_calls_outlive_the_daemon_command_cap() {
-        for name in [
-            "rex_execute", "rex_run", "rex_test", "rex_ultra_open",
-            "rex_ultra_submit", "rex_ultra_promote", "rex_proof_verify",
-        ] {
-            assert!(reply_timeout("tools/call", &json!({"name": name}))
-                > Duration::from_secs(120));
+        for name in ["rex_execute", "rex_run", "rex_test", "rex_ultra_submit"] {
+            assert_eq!(
+                reply_timeout("tools/call", &json!({"name": name})),
+                Duration::from_secs(150)
+            );
+        }
+        for name in ["rex_ultra_open", "rex_ultra_promote", "rex_proof_verify"] {
+            assert!(reply_timeout("tools/call", &json!({"name": name})) > Duration::from_secs(600));
         }
         for name in ["rex_status", "rex_events", "rex_result", "unknown"] {
-            assert_eq!(reply_timeout("tools/call", &json!({"name": name})), Duration::from_secs(30));
+            assert_eq!(
+                reply_timeout("tools/call", &json!({"name": name})),
+                Duration::from_secs(30)
+            );
         }
-        assert_eq!(reply_timeout("initialize", &json!({})), Duration::from_secs(30));
+        assert_eq!(
+            reply_timeout("initialize", &json!({})),
+            Duration::from_secs(30)
+        );
     }
 }
 
