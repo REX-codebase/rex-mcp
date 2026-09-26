@@ -507,11 +507,14 @@ impl McpServer {
                         })?;
                         if tool == ToolName::UltraPromote {
                             let task_id = args.get("task_id").and_then(Value::as_str);
-                            if task_id.is_some_and(|id| self.promotions.lock().ok()
-                                .is_some_and(|ops| ops.contains_key(id))) {
+                            let operations = self.promotions.lock().map_err(|_| {
+                                ProtocolError::new(ErrorCode::Internal, "promotion registry unavailable")
+                            })?;
+                            if task_id.is_some_and(|id| operations.contains_key(id)) {
                                 return Err(ProtocolError::new(ErrorCode::IdempotencyConflict,
                                     "promotion already started here; use rex_ultra_promote_status"));
                             }
+                            drop(operations);
                         }
                         self.daemon.dispatch(tool, args).map(tool_result)
                     }
@@ -2024,6 +2027,42 @@ mod promotion_status_tests {
         let stale = server
             .start_promotion(json!({"task_id":"task-1","capability":"secret","lease_epoch":8}));
         assert_eq!(stale.unwrap_err().code, ErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn blocking_promotion_fails_closed_when_operation_registry_is_unavailable() {
+        let d = tempdir().unwrap();
+        let daemon = HarnessDaemon::open(
+            d.path().join("state"),
+            DaemonPolicy::conservative(d.path().join("ws")),
+        )
+        .unwrap();
+        let mut server = McpServer::new(daemon);
+        server.initialized = true;
+        let registry = Arc::clone(&server.promotions);
+        assert!(std::thread::spawn(move || {
+            let _guard = registry.lock().unwrap();
+            panic!("poison operation registry");
+        })
+        .join()
+        .is_err());
+        let response = server
+            .handle(json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"rex_ultra_promote", "arguments":{
+                    "task_id":"task-1", "capability":"secret", "lease_epoch":7
+                }}
+            }))
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["code"],
+            json!(ErrorCode::Internal)
+        );
+        assert!(response["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("promotion registry unavailable"));
     }
 
     #[test]
