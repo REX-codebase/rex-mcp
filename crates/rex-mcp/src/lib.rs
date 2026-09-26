@@ -1876,7 +1876,7 @@ mod promotion_status_tests {
             DaemonPolicy::conservative(d.path().join("ws")),
         )
         .unwrap();
-        let server = McpServer::new(daemon);
+        let mut server = McpServer::new(daemon);
         let receipt = json!({"state":"committed","bundle_hash":"verified"});
         server.promotions.lock().unwrap().insert(
             "task-1".into(),
@@ -1892,6 +1892,12 @@ mod promotion_status_tests {
         assert_eq!(status["state"], "succeeded");
         assert_eq!(status["receipt"], receipt);
         assert_eq!(status["operation_id"], "promote-test");
+        let repeated = server
+            .start_promotion(json!({"task_id":"task-1","capability":"secret","lease_epoch":7}))
+            .unwrap();
+        assert_eq!(repeated["state"], "succeeded");
+        assert_eq!(repeated["operation_id"], "promote-test");
+        assert_eq!(repeated["receipt"], receipt);
         let mut wrong = args;
         wrong["capability"] = json!("wrong");
         assert_eq!(
