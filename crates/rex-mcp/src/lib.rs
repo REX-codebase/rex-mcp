@@ -821,14 +821,22 @@ fn promotion_descriptors() -> Vec<Value> {
     vec![
         json!({"name":"rex_ultra_promote_start","title":"REX Ultra Promote Start",
             "description":"Start promotion without blocking the MCP stdio host. Keep this process alive; poll rex_ultra_promote_status with the returned operation_id. The operation handle is process-local, while REX custody and committed receipts remain durable. Do not retry a lost operation blindly; inspect durable task status and proof first.",
-            "inputSchema":task_epoch_schema()}),
+            "inputSchema":task_epoch_schema(),"outputSchema":promotion_output_schema()}),
         json!({"name":"rex_ultra_promote_status","title":"REX Ultra Promote Status",
             "description":"Read a process-local Ultra promotion result. The finished response contains the full receipt or an explicit error. After MCP restart, inspect durable task status and proof instead.",
             "inputSchema":{"type":"object","required":["task_id","capability","operation_id"],
                 "properties":{"task_id":task_id_schema(),"capability":{"type":"string"},
                     "operation_id":{"type":"string"}},"additionalProperties":false},
-            "annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+            "annotations":{"readOnlyHint":true,"openWorldHint":false},
+            "outputSchema":promotion_output_schema()}),
     ]
+}
+
+fn promotion_output_schema() -> Value {
+    json!({"type":"object","required":["task_id","operation_id","state"],
+        "properties":{"task_id":task_id_schema(),"operation_id":{"type":"string"},
+            "state":{"enum":["running","succeeded","failed"]},
+            "receipt":{"type":"object"},"error":{"type":"object"}}})
 }
 
 fn task_id_schema() -> Value {
@@ -1092,6 +1100,20 @@ mod tests {
             "string"
         );
         assert!(find("rex_execute").get("outputSchema").is_none());
+        let promotions = promotion_descriptors();
+        for tool in &promotions {
+            let schema = &tool["outputSchema"];
+            assert_eq!(
+                schema["required"],
+                json!(["task_id", "operation_id", "state"])
+            );
+            assert_eq!(
+                schema["properties"]["state"]["enum"],
+                json!(["running", "succeeded", "failed"])
+            );
+            assert_eq!(schema["properties"]["receipt"]["type"], "object");
+            assert_eq!(schema["properties"]["error"]["type"], "object");
+        }
         let (_d, mut server) = server();
         server
             .handle(rpc(
