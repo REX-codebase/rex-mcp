@@ -1853,15 +1853,19 @@ mod promotion_status_tests {
         let daemon = HarnessDaemon::open(
             d.path().join("state"),
             DaemonPolicy::conservative(d.path().join("ws")),
-        ).unwrap();
+        )
+        .unwrap();
         let server = McpServer::new(daemon);
         let receipt = json!({"state":"committed","bundle_hash":"verified"});
-        server.promotions.lock().unwrap().insert("task-1".into(), PromotionOperation {
-            operation_id: "promote-test".into(),
-            capability_hash: hex_sha256(b"secret"),
-            lease_epoch: 7,
-            result: Some(Ok(receipt.clone())),
-        });
+        server.promotions.lock().unwrap().insert(
+            "task-1".into(),
+            PromotionOperation {
+                operation_id: "promote-test".into(),
+                capability_hash: hex_sha256(b"secret"),
+                lease_epoch: 7,
+                result: Some(Ok(receipt.clone())),
+            },
+        );
         let args = json!({"task_id":"task-1","operation_id":"promote-test","capability":"secret"});
         let status = server.promotion_status(args.clone()).unwrap();
         assert_eq!(status["state"], "succeeded");
@@ -1869,6 +1873,9 @@ mod promotion_status_tests {
         assert_eq!(status["operation_id"], "promote-test");
         let mut wrong = args;
         wrong["capability"] = json!("wrong");
-        assert_eq!(server.promotion_status(wrong).unwrap_err().code, ErrorCode::Unauthorized);
+        assert_eq!(
+            server.promotion_status(wrong).unwrap_err().code,
+            ErrorCode::Unauthorized
+        );
     }
 }
