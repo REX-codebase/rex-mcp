@@ -596,7 +596,7 @@ impl McpServer {
                         "role": "user",
                         "content": {
                             "type": "text",
-                            "text": format!("For this product UI task: {task}\n\nFirst locate and read .agents/skills/rex-design/SKILL.md in this repository. If it is missing, say so rather than invent its contents. Follow its workflow: inspect the existing UI, map tasks and states, compare two structural directions for consequential flows, implement, then inspect rendered pixels and adversarial edge states across relevant states and viewports before reporting. This MCP prompt is a pointer, not a replacement for the skill or permission to claim unverified visual results.")
+                            "text": format!("For this product UI task: {task}\n\nFirst locate and read .agents/skills/rex-design/SKILL.md in this repository. If it is missing, say so rather than invent its contents. Follow its workflow: inspect the existing UI, map tasks and build a state coverage ledger, compare two structural directions for consequential flows, implement, then inspect rendered pixels and adversarial edge states across relevant states and viewports before reporting. Distinguish states exercised in the UI from states inferred from code or left unverified. This MCP prompt is a pointer, not a replacement for the skill or permission to claim unverified visual results.")
                         }
                     }]
                 }));
@@ -1867,6 +1867,8 @@ mod tests {
         assert!(design_text.contains("rendered pixels"));
         assert!(design_text.contains("compare two structural directions"));
         assert!(design_text.contains("adversarial edge states"));
+        assert!(design_text.contains("state coverage ledger"));
+        assert!(design_text.contains("left unverified"));
 
         let ultra = s
             .handle(rpc(
