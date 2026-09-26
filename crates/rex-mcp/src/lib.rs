@@ -1977,6 +1977,56 @@ mod promotion_status_tests {
     use tempfile::tempdir;
 
     #[test]
+    fn running_promotion_requires_matching_handle_and_credentials() {
+        let d = tempdir().unwrap();
+        let daemon = HarnessDaemon::open(
+            d.path().join("state"),
+            DaemonPolicy::conservative(d.path().join("ws")),
+        )
+        .unwrap();
+        let mut server = McpServer::new(daemon);
+        server.promotions.lock().unwrap().insert(
+            "task-1".into(),
+            PromotionOperation {
+                operation_id: "promote-test".into(),
+                capability_hash: hex_sha256(b"secret"),
+                lease_epoch: 7,
+                result: None,
+            },
+        );
+        let args = json!({"task_id":"task-1","operation_id":"promote-test","capability":"secret"});
+        for (task_id, operation_id) in [
+            ("task-1", "wrong-operation"),
+            ("other-task", "promote-test"),
+        ] {
+            let wrong =
+                json!({"task_id":task_id,"operation_id":operation_id,"capability":"secret"});
+            assert_eq!(
+                server.promotion_status(wrong).unwrap_err().code,
+                ErrorCode::TaskNotFound
+            );
+        }
+        let wrong_capability =
+            json!({"task_id":"task-1","operation_id":"promote-test","capability":"wrong"});
+        assert_eq!(
+            server.promotion_status(wrong_capability).unwrap_err().code,
+            ErrorCode::Unauthorized
+        );
+        let status = server.promotion_status(args).unwrap();
+        assert_eq!(status["state"], "running");
+        assert_eq!(status["operation_id"], "promote-test");
+        assert!(status.get("receipt").is_none());
+        assert!(status.get("error").is_none());
+        let repeated = server
+            .start_promotion(json!({"task_id":"task-1","capability":"secret","lease_epoch":7}))
+            .unwrap();
+        assert_eq!(repeated, status);
+        let stale = server
+            .start_promotion(json!({"task_id":"task-1","capability":"secret","lease_epoch":8}));
+        assert_eq!(stale.unwrap_err().code, ErrorCode::Unauthorized);
+    }
+
+    #[test]
     fn completed_promotion_returns_receipt_only_to_capability_holder() {
         let d = tempdir().unwrap();
         let daemon = HarnessDaemon::open(
