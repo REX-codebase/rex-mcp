@@ -2027,6 +2027,49 @@ mod promotion_status_tests {
     }
 
     #[test]
+    fn blocking_promotion_cannot_race_running_operation() {
+        let d = tempdir().unwrap();
+        let daemon = HarnessDaemon::open(
+            d.path().join("state"),
+            DaemonPolicy::conservative(d.path().join("ws")),
+        )
+        .unwrap();
+        let mut server = McpServer::new(daemon);
+        server.initialized = true;
+        server.promotions.lock().unwrap().insert(
+            "task-1".into(),
+            PromotionOperation {
+                operation_id: "promote-test".into(),
+                capability_hash: hex_sha256(b"secret"),
+                lease_epoch: 7,
+                result: None,
+            },
+        );
+        let response = server
+            .handle(json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"rex_ultra_promote", "arguments":{
+                    "task_id":"task-1", "capability":"secret", "lease_epoch":7
+                }}
+            }))
+            .unwrap();
+        assert_eq!(
+            response["result"]["structuredContent"]["code"],
+            json!(ErrorCode::IdempotencyConflict)
+        );
+        assert!(response["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rex_ultra_promote_status"));
+        let status = server
+            .promotion_status(json!({
+                "task_id":"task-1", "operation_id":"promote-test", "capability":"secret"
+            }))
+            .unwrap();
+        assert_eq!(status["state"], "running");
+    }
+
+    #[test]
     fn completed_promotion_returns_receipt_only_to_capability_holder() {
         let d = tempdir().unwrap();
         let daemon = HarnessDaemon::open(
