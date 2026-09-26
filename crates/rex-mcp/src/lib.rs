@@ -1865,6 +1865,8 @@ mod tests {
         assert!(design_text.contains(".agents/skills/rex-design/SKILL.md"));
         assert!(design_text.contains("improve settings"));
         assert!(design_text.contains("rendered pixels"));
+        assert!(design_text.contains("compare two structural directions"));
+        assert!(design_text.contains("adversarial edge states"));
 
         let ultra = s
             .handle(rpc(
