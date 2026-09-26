@@ -394,7 +394,7 @@ impl McpServer {
                 Ok(json!({"contents": [{
                     "uri": uri,
                     "mimeType": "text/plain",
-                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with evidence. For an existing task, use the rex_task_inspect prompt and task status/events/result resources for read-only inspection; read rex://task/{task_id}/events/0, then request rex://task/{task_id}/events/{last_seq} until a page is empty. Each page has at most 100 entries. Read rex://task/{task_id}/result only when available, and distinguish a terminal result from an active task. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
+                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with evidence. For an existing task, use the rex_task_inspect prompt and task status/events/result resources for read-only inspection; read rex://task/{task_id}/events/0, then request rex://task/{task_id}/events/{last_seq} until a page is empty. Each page has at most 100 entries. Read rex://task/{task_id}/result only when available, and distinguish a terminal result from an active task. For Ultra, create with rex_execute and ultra: true; use rex_ultra_open with a deterministic contract, submit candidate bundles and gate evidence through rex_ultra_submit, then start long promotion with rex_ultra_promote_start. Poll rex_ultra_promote_status using the returned operation_id while this MCP process remains alive. A running response is not completion; only a succeeded response has a receipt. A failed response has an error. After process loss, inspect durable status and proof before retrying; do not assume a lost operation committed. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
                 }]}))
             }),
             "prompts/list" => self.require_initialized().map(|_| json!({
@@ -1298,6 +1298,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("events/{last_seq}"));
+        let quickstart = read["result"]["contents"][0]["text"].as_str().unwrap();
+        for phrase in [
+            "rex_ultra_promote_start",
+            "rex_ultra_promote_status",
+            "process loss",
+            "not completion",
+        ] {
+            assert!(
+                quickstart.contains(phrase),
+                "missing Ultra guidance: {phrase}"
+            );
+        }
         let bad = s
             .handle(rpc(
                 4,
