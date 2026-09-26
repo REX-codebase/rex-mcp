@@ -10,6 +10,28 @@ Pin `REX_STATE_DIR` and `REX_WORKSPACE` to the intended absolute paths. Without 
 
 For a cautious host-by-host check, see [manual host test](docs/HOST-TEST.md).
 
+### Ultra workflow from a host
+
+The MCP prompt `rex_ultra_workflow` gives the host a step-by-step Ultra path
+for a task; `rex_task_workflow` remains the standard path. Start with
+`rex_execute` using a fresh `request_id`, the intended host, `operator_is_agent=true`,
+and `ultra=true`. Retain the returned `task_id`, capability, and lease epoch.
+The host, not REX, produces candidate work and submits sealed evidence. REX
+runs deterministic gates; a submitted candidate is not a completed task.
+See [Ultra gates](docs/rex-mcp-ultra.md) for the contract and proof format.
+
+After a candidate qualifies, `rex_ultra_promote_start` returns a process-local
+`operation_id` and a `running` state without waiting for the gate rerun. Keep
+the MCP server process alive and call `rex_ultra_promote_status` with the same
+`task_id`, capability, and `operation_id` until it returns `succeeded` with a
+receipt or `failed` with an error. `running` is not completion. Do not retry
+`start` just because it is still running. An operation handle does not survive
+a server restart; inspect durable `rex_status` and `rex_proof` before any
+retry. The blocking `rex_ultra_promote` remains available where the host can
+wait for the complete result. No host integration here supplies model
+credentials or a live agent session.
+
+
 ## Claude Code
 
 ```sh
