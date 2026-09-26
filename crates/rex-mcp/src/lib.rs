@@ -5,25 +5,157 @@
 
 pub mod client;
 
+use rex_custody::capability::hex_sha256;
 use rex_daemon::HarnessDaemon;
 use rex_protocol::{ErrorCode, ProtocolError, ToolName, PROTOCOL_VERSION};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const MCP_COMPAT_PROTOCOL_VERSION: &str = "2025-06-18";
 
 pub struct McpServer {
-    daemon: HarnessDaemon,
+    daemon: Arc<HarnessDaemon>,
     initialized: bool,
+    promotions: Arc<Mutex<HashMap<String, PromotionOperation>>>,
+    promotion_sequence: u64,
+}
+
+// This registry is scoped to this stdio process. The custody receipt remains
+// durable in REX; a lost MCP process cannot promise an in-memory operation result.
+struct PromotionOperation {
+    operation_id: String,
+    capability_hash: String,
+    lease_epoch: u64,
+    result: Option<Result<Value, ProtocolError>>,
 }
 
 impl McpServer {
     pub fn new(daemon: HarnessDaemon) -> Self {
         Self {
-            daemon,
+            daemon: Arc::new(daemon),
             initialized: false,
+            promotions: Arc::new(Mutex::new(HashMap::new())),
+            promotion_sequence: 0,
         }
+    }
+
+    fn start_promotion(&mut self, args: Value) -> Result<Value, ProtocolError> {
+        let req: rex_protocol::UltraPromoteRequest = serde_json::from_value(args.clone())
+            .map_err(|e| ProtocolError::new(ErrorCode::MalformedRequest, e.to_string()))?;
+        let hash = hex_sha256(req.capability.as_bytes());
+        let mut operations = self.promotions.lock().map_err(|_| {
+            ProtocolError::new(ErrorCode::Internal, "promotion registry unavailable")
+        })?;
+        if let Some(existing) = operations.get(&req.task_id) {
+            if existing.capability_hash != hash || existing.lease_epoch != req.lease_epoch {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "operation credentials differ",
+                ));
+            }
+            return Ok(
+                json!({"task_id":req.task_id,"operation_id":existing.operation_id,
+                "state":if existing.result.is_some() { "finished" } else { "running" }}),
+            );
+        }
+        // Reject unauthorized, stale, non-agent and non-Ultra requests on the
+        // calling thread, before reporting that a background operation exists.
+        self.daemon.validate_ultra_promotion(&req)?;
+        self.promotion_sequence += 1;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| ProtocolError::new(ErrorCode::Internal, e.to_string()))?
+            .as_nanos();
+        let operation_id = format!("promote-{stamp}-{}", self.promotion_sequence);
+        operations.insert(
+            req.task_id.clone(),
+            PromotionOperation {
+                operation_id: operation_id.clone(),
+                capability_hash: hash,
+                lease_epoch: req.lease_epoch,
+                result: None,
+            },
+        );
+        let registry = Arc::clone(&self.promotions);
+        let daemon = Arc::clone(&self.daemon);
+        let task_id = req.task_id.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("rex-ultra-promote".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    daemon.dispatch(ToolName::UltraPromote, args)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(ProtocolError::new(
+                        ErrorCode::Internal,
+                        "promotion worker panicked",
+                    ))
+                });
+                if let Ok(mut operations) = registry.lock() {
+                    if let Some(operation) = operations.get_mut(&task_id) {
+                        operation.result = Some(result);
+                    }
+                }
+            })
+        {
+            operations.remove(&req.task_id);
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                format!("cannot start promotion worker: {e}"),
+            ));
+        }
+        Ok(json!({"task_id":req.task_id,"operation_id":operation_id,"state":"running"}))
+    }
+
+    fn promotion_status(&self, args: Value) -> Result<Value, ProtocolError> {
+        let task_id = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|id| valid_task_id(id))
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "valid task_id required")
+            })?;
+        let operation_id = args
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "operation_id required")
+            })?;
+        let capability = args
+            .get("capability")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "capability required")
+            })?;
+        let operations = self.promotions.lock().map_err(|_| {
+            ProtocolError::new(ErrorCode::Internal, "promotion registry unavailable")
+        })?;
+        let op = operations
+            .get(task_id)
+            .filter(|op| op.operation_id == operation_id)
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::TaskNotFound,
+                "operation not found in this MCP process; inspect durable task status and proof")
+            })?;
+        if op.capability_hash != hex_sha256(capability.as_bytes()) {
+            return Err(ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "invalid operation capability",
+            ));
+        }
+        Ok(match &op.result {
+            None => json!({"task_id":task_id,"operation_id":operation_id,"state":"running"}),
+            Some(Ok(receipt)) => json!({"task_id":task_id,"operation_id":operation_id,
+                "state":"succeeded","receipt":receipt}),
+            Some(Err(error)) => json!({"task_id":task_id,"operation_id":operation_id,
+                "state":"failed","error":error}),
+        })
     }
 
     /// Serve newline-delimited JSON-RPC until EOF. A bad message yields a
@@ -131,9 +263,11 @@ impl McpServer {
                 return None;
             }
             "ping" => Ok(json!({})),
-            "tools/list" => self
-                .require_initialized()
-                .map(|_| json!({"tools": tool_descriptors()})),
+            "tools/list" => self.require_initialized().map(|_| {
+                let mut tools = tool_descriptors();
+                tools.extend(promotion_descriptors());
+                json!({"tools":tools})
+            }),
             "resources/list" => self.require_initialized().map(|_| json!({
                 "resources": [{
                     "uri": "rex://workflow/quickstart",
@@ -335,11 +469,25 @@ impl McpServer {
                 let name = p.get("name").and_then(Value::as_str).ok_or_else(|| {
                     ProtocolError::new(ErrorCode::MalformedRequest, "tool name required")
                 })?;
-                let tool = ToolName::from_wire_name(name).ok_or_else(|| {
-                    ProtocolError::new(ErrorCode::UnknownTool, format!("unknown tool: {name}"))
-                })?;
                 let args = p.get("arguments").cloned().unwrap_or(json!({}));
-                self.daemon.dispatch(tool, args).map(tool_result)
+                match name {
+                    "rex_ultra_promote_start" => self.start_promotion(args).map(tool_result),
+                    "rex_ultra_promote_status" => self.promotion_status(args).map(tool_result),
+                    _ => {
+                        let tool = ToolName::from_wire_name(name).ok_or_else(|| {
+                            ProtocolError::new(ErrorCode::UnknownTool, format!("unknown tool: {name}"))
+                        })?;
+                        if tool == ToolName::UltraPromote {
+                            let task_id = args.get("task_id").and_then(Value::as_str);
+                            if task_id.is_some_and(|id| self.promotions.lock().ok()
+                                .is_some_and(|ops| ops.contains_key(id))) {
+                                return Err(ProtocolError::new(ErrorCode::IdempotencyConflict,
+                                    "promotion already started here; use rex_ultra_promote_status"));
+                            }
+                        }
+                        self.daemon.dispatch(tool, args).map(tool_result)
+                    }
+                }
             }),
             _ => {
                 return if notify {
@@ -662,6 +810,20 @@ pub fn tool_descriptors() -> Vec<Value> {
     }
     out
 }
+fn promotion_descriptors() -> Vec<Value> {
+    vec![
+        json!({"name":"rex_ultra_promote_start","title":"REX Ultra Promote Start",
+            "description":"Start promotion without blocking the MCP stdio host. Keep this process alive; poll rex_ultra_promote_status with the returned operation_id. The operation handle is process-local, while REX custody and committed receipts remain durable. Do not retry a lost operation blindly; inspect durable task status and proof first.",
+            "inputSchema":task_epoch_schema()}),
+        json!({"name":"rex_ultra_promote_status","title":"REX Ultra Promote Status",
+            "description":"Read a process-local Ultra promotion result. The finished response contains the full receipt or an explicit error. After MCP restart, inspect durable task status and proof instead.",
+            "inputSchema":{"type":"object","required":["task_id","capability","operation_id"],
+                "properties":{"task_id":task_id_schema(),"capability":{"type":"string"},
+                    "operation_id":{"type":"string"}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+    ]
+}
+
 fn task_id_schema() -> Value {
     json!({"type":"string","minLength":1,"maxLength":199,"pattern":"^[A-Za-z0-9_-]+$"})
 }
@@ -702,6 +864,113 @@ mod tests {
     fn rpc(id: i64, method: &str, params: Value) -> Value {
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
     }
+    #[test]
+    fn asynchronous_promotion_rejects_bad_scope_and_reports_worker_failure() {
+        let (_tmp, mut server) = server();
+        server.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ));
+        let plain = server
+            .handle(rpc(
+                2,
+                "tools/call",
+                json!({"name":"rex_execute",
+            "arguments":{"request_id":"plain", "task":"plain", "host":"generic_agent",
+            "operator_is_agent":true}}),
+            ))
+            .unwrap();
+        let task_id = plain["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .unwrap();
+        let cap = plain["result"]["structuredContent"]["task_capability"]
+            .as_str()
+            .unwrap();
+        let epoch = plain["result"]["structuredContent"]["lease"]["epoch"]
+            .as_u64()
+            .unwrap();
+        let denied = server
+            .handle(rpc(
+                3,
+                "tools/call",
+                json!({"name":"rex_ultra_promote_start",
+            "arguments":{"task_id":task_id,"capability":cap,"lease_epoch":epoch}}),
+            ))
+            .unwrap();
+        assert_eq!(denied["result"]["isError"], true);
+        let ultra = server
+            .handle(rpc(
+                4,
+                "tools/call",
+                json!({"name":"rex_execute",
+            "arguments":{"request_id":"ultra", "task":"promote", "host":"generic_agent",
+            "operator_is_agent":true,"ultra":true}}),
+            ))
+            .unwrap();
+        let task_id = ultra["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .unwrap();
+        let cap = ultra["result"]["structuredContent"]["task_capability"]
+            .as_str()
+            .unwrap();
+        let epoch = ultra["result"]["structuredContent"]["lease"]["epoch"]
+            .as_u64()
+            .unwrap();
+        let arguments = json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch});
+        let started = server
+            .handle(rpc(
+                5,
+                "tools/call",
+                json!({"name":"rex_ultra_promote_start",
+            "arguments":arguments}),
+            ))
+            .unwrap();
+        assert_eq!(started["result"]["structuredContent"]["state"], "running");
+        let operation_id = started["result"]["structuredContent"]["operation_id"]
+            .as_str()
+            .unwrap();
+        let repeated = server
+            .handle(rpc(
+                6,
+                "tools/call",
+                json!({"name":"rex_ultra_promote_start",
+            "arguments":arguments}),
+            ))
+            .unwrap();
+        assert_eq!(
+            repeated["result"]["structuredContent"]["operation_id"],
+            operation_id
+        );
+        let unauthorized = server
+            .handle(rpc(
+                7,
+                "tools/call",
+                json!({"name":"rex_ultra_promote_status",
+            "arguments":{"task_id":task_id,"operation_id":operation_id,"capability":"wrong"}}),
+            ))
+            .unwrap();
+        assert_eq!(unauthorized["result"]["isError"], true);
+        let mut completed = false;
+        for _ in 0..100 {
+            let status = server
+                .handle(rpc(
+                    8,
+                    "tools/call",
+                    json!({"name":"rex_ultra_promote_status",
+                "arguments":{"task_id":task_id,"operation_id":operation_id,"capability":cap}}),
+                ))
+                .unwrap();
+            if status["result"]["structuredContent"]["state"] == "failed" {
+                assert!(status["result"]["structuredContent"]["error"]["code"].is_string());
+                completed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(completed, "promotion worker never reported its error");
+    }
+
     #[test]
     fn task_tool_result_links_back_to_custody_resources() {
         let result = tool_result(json!({"task_id":"task-123","state":"active"}));
@@ -1361,7 +1630,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 19);
+        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 21);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"], "active");
         let task_id = rows[2]["result"]["structuredContent"]["task_id"]
             .as_str()
@@ -1406,7 +1675,7 @@ mod tests {
             .unwrap();
         assert_eq!(ok["result"]["protocolVersion"], MCP_COMPAT_PROTOCOL_VERSION);
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 19);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 21);
         let unknown = s
             .handle(rpc(
                 4,
@@ -1562,7 +1831,7 @@ mod tests {
             .unwrap();
         assert!(ready.get("result").is_some());
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 19);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 21);
     }
     #[test]
     fn notifications_get_no_response() {
@@ -1570,5 +1839,36 @@ mod tests {
         assert!(s
             .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .is_none());
+    }
+}
+#[cfg(test)]
+mod promotion_status_tests {
+    use super::*;
+    use rex_daemon::DaemonPolicy;
+    use tempfile::tempdir;
+
+    #[test]
+    fn completed_promotion_returns_receipt_only_to_capability_holder() {
+        let d = tempdir().unwrap();
+        let daemon = HarnessDaemon::open(
+            d.path().join("state"),
+            DaemonPolicy::conservative(d.path().join("ws")),
+        ).unwrap();
+        let server = McpServer::new(daemon);
+        let receipt = json!({"state":"committed","bundle_hash":"verified"});
+        server.promotions.lock().unwrap().insert("task-1".into(), PromotionOperation {
+            operation_id: "promote-test".into(),
+            capability_hash: hex_sha256(b"secret"),
+            lease_epoch: 7,
+            result: Some(Ok(receipt.clone())),
+        });
+        let args = json!({"task_id":"task-1","operation_id":"promote-test","capability":"secret"});
+        let status = server.promotion_status(args.clone()).unwrap();
+        assert_eq!(status["state"], "succeeded");
+        assert_eq!(status["receipt"], receipt);
+        assert_eq!(status["operation_id"], "promote-test");
+        let mut wrong = args;
+        wrong["capability"] = json!("wrong");
+        assert_eq!(server.promotion_status(wrong).unwrap_err().code, ErrorCode::Unauthorized);
     }
 }

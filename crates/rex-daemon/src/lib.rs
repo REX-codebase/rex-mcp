@@ -1164,6 +1164,19 @@ impl HarnessDaemon {
         Ok(ultra_view(t.task_id.clone(), &view, plan))
     }
 
+    /// Fast authorization check for a host-visible asynchronous promotion.
+    /// The worker calls ultra_promote again so state changes after this check
+    /// still fail closed under the daemon's normal rules.
+    pub fn validate_ultra_promotion(
+        &self,
+        req: &rex_protocol::UltraPromoteRequest,
+    ) -> Result<(), ProtocolError> {
+        let task = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
+        require_agent(&task)?;
+        require_ultra(&task)?;
+        Ok(())
+    }
+
     /// Promote the qualified candidate into the task workspace. Live lease,
     /// agent-operated tasks only; the kernel must be completed and the
     /// rollback path is verified by the promotion store.
