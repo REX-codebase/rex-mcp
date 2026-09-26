@@ -416,6 +416,15 @@ impl McpServer {
                         "description": "An existing REX task ID.",
                         "required": true
                     }]
+                }, {
+                    "name": "rex_ultra_workflow",
+                    "title": "Run a REX Ultra task",
+                    "description": "Guide the host through Ultra candidate custody, deterministic gates, and promotion.",
+                    "arguments": [{
+                        "name": "task",
+                        "description": "The task to run in Ultra mode.",
+                        "required": true
+                    }]
                 }]
             })),
             "prompts/get" => self.require_initialized().and_then(|_| {
@@ -443,7 +452,7 @@ impl McpServer {
                         }]
                     }));
                 }
-                if name != "rex_task_workflow" {
+                if name != "rex_task_workflow" && name != "rex_ultra_workflow" {
                     return Err(ProtocolError::new(
                         ErrorCode::MalformedRequest, format!("unknown prompt: {name}")
                     ));
@@ -460,6 +469,18 @@ impl McpServer {
                             "non-empty task argument required",
                         )
                     })?;
+                if name == "rex_ultra_workflow" {
+                    return Ok(json!({
+                        "description": "Run a host-driven Ultra task under REX custody and deterministic gates.",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!("For this task: {task}\n\nCall rex_execute with a fresh request_id, this task, the host, operator_is_agent=true, and ultra=true. Keep the returned task_id, task_capability, and lease epoch. First rex_ultra_open needs a deterministic contract_draft with executable proofs; do not claim human-judged behavior as proof. Use the returned candidate requests to submit at least three sealed full-file bundles through rex_ultra_submit, then answer adversary, verifier, and visual evidence requests as applicable. REX runs the gates; follow the returned state rather than claiming success. When qualified, call rex_ultra_promote_start and poll rex_ultra_promote_status with its operation_id in the same MCP process until succeeded with a receipt or failed with an error. Running is not completion. If the MCP process is lost, inspect durable rex_status and rex_proof before any retry. Respect denied or stale leases and the host's user approval. The host controls continuation; REX cannot force more calls.")
+                            }
+                        }]
+                    }));
+                }
                 Ok(json!({
                     "description": "Use REX to keep a task's plan, tool outcomes, and continuation in durable custody.",
                     "messages": [{
@@ -1545,6 +1566,40 @@ mod tests {
         let list = s.handle(rpc(2, "prompts/list", json!({}))).unwrap();
         assert_eq!(list["result"]["prompts"][0]["name"], "rex_task_workflow");
         assert_eq!(list["result"]["prompts"][1]["name"], "rex_task_inspect");
+        assert_eq!(list["result"]["prompts"][2]["name"], "rex_ultra_workflow");
+        let ultra = s
+            .handle(rpc(
+                25,
+                "prompts/get",
+                json!({
+                    "name":"rex_ultra_workflow", "arguments":{"task":"fix parser"}
+                }),
+            ))
+            .unwrap();
+        let ultra_text = ultra["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        for phrase in [
+            "fix parser",
+            "ultra=true",
+            "contract_draft",
+            "rex_ultra_promote_start",
+            "rex_ultra_promote_status",
+            "Running is not completion",
+            "rex_proof",
+        ] {
+            assert!(ultra_text.contains(phrase), "missing Ultra step: {phrase}");
+        }
+        let ultra_missing = s
+            .handle(rpc(
+                26,
+                "prompts/get",
+                json!({
+                    "name":"rex_ultra_workflow", "arguments":{}
+                }),
+            ))
+            .unwrap();
+        assert_eq!(ultra_missing["error"]["code"], -32602);
         let inspect = s
             .handle(rpc(
                 21,
