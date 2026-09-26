@@ -23,6 +23,12 @@ Before coding, make a short ledger with one row per consequential state. Use the
 
 For each row, ask whether the user can tell what happened and recover without losing their work. Prioritize a broken task or inaccessible control over decoration. If the task is only a visual critique, use the ledger to name missing states instead of pretending they were implemented. When handing off code, distinguish states actually exercised in the rendered UI from those inferred from source or left untested.
 
+## Design decisions under pressure
+
+Do not settle on the first attractive direction. For a consequential page or flow, sketch two meaningfully different ways to organize the task, not two color schemes. Compare them against the brief: Can a new user locate the primary action? Can a returning user see what changed? Can someone recover from a mistake? Which version handles dense data and a narrow screen without hiding essential controls? Choose one and record the tradeoff that made it win. If the brief does not support a confident choice, show the decision to the product owner rather than inventing a user preference.
+
+Before final polish, run an adversarial pass on the chosen direction. Try a long name, sparse data, a permission error, a delayed response, keyboard-only navigation, zoomed text, and a narrow viewport. Keep the result tied to evidence: what was rendered and exercised, what failed, what changed, and what remains an assumption. Do not label a design superior to another product or skill without a shared task, comparable criteria, and actual results.
+
 ## Implement and verify
 
 Reuse components and tokens where possible. Use semantic elements, real labels, keyboard access, visible focus, sufficient contrast, sensible tab order, and usable touch targets. Check narrow, medium, and wide layouts instead of shrinking desktop. Handle long labels, zero results, and realistic data density; preserve routing and state behavior.
