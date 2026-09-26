@@ -596,7 +596,7 @@ impl McpServer {
                         "role": "user",
                         "content": {
                             "type": "text",
-                            "text": format!("For this product UI task: {task}\n\nFirst locate and read .agents/skills/rex-design/SKILL.md in this repository. If it is missing, say so rather than invent its contents. Follow its workflow: inspect the existing UI, map tasks and states, implement, then inspect rendered pixels across relevant states and viewports before reporting. This MCP prompt is a pointer, not a replacement for the skill or permission to claim unverified visual results.")
+                            "text": format!("For this product UI task: {task}\n\nFirst locate and read .agents/skills/rex-design/SKILL.md in this repository. If it is missing, say so rather than invent its contents. Follow its workflow: inspect the existing UI, map tasks and states, compare two structural directions for consequential flows, implement, then inspect rendered pixels and adversarial edge states across relevant states and viewports before reporting. This MCP prompt is a pointer, not a replacement for the skill or permission to claim unverified visual results.")
                         }
                     }]
                 }));
