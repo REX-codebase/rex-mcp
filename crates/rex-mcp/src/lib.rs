@@ -538,7 +538,16 @@ impl McpServer {
                         "required": true
                     }]
                 }, {
-                    "name": "rex_ultra_workflow",
+                    "name": "rex_design_workflow",
+                "title": "Design product UI with REX",
+                "description": "Find the original REX design skill and verify the rendered result.",
+                "arguments": [{
+                    "name": "task",
+                    "description": "The product UI task to work on.",
+                    "required": true
+                }]
+            }, {
+                "name": "rex_ultra_workflow",
                     "title": "Run a REX Ultra task",
                     "description": "Guide the host through Ultra candidate custody, deterministic gates, and promotion.",
                     "arguments": [{
@@ -573,7 +582,26 @@ impl McpServer {
                         }]
                     }));
                 }
-                if name != "rex_task_workflow" && name != "rex_ultra_workflow" {
+                if name == "rex_design_workflow" {
+                let task = request
+                    .get("params")
+                    .and_then(|p| p.get("arguments"))
+                    .and_then(|a| a.get("task"))
+                    .and_then(Value::as_str)
+                    .filter(|task| !task.trim().is_empty())
+                    .ok_or_else(|| ProtocolError::new(ErrorCode::MalformedRequest, "non-empty task argument required"))?;
+                return Ok(json!({
+                    "description": "Follow the repository's REX design skill for this product UI task.",
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!("For this product UI task: {task}\n\nFirst locate and read .agents/skills/rex-design/SKILL.md in this repository. If it is missing, say so rather than invent its contents. Follow its workflow: inspect the existing UI, map tasks and states, implement, then inspect rendered pixels across relevant states and viewports before reporting. This MCP prompt is a pointer, not a replacement for the skill or permission to claim unverified visual results.")
+                        }
+                    }]
+                }));
+            }
+            if name != "rex_task_workflow" && name != "rex_ultra_workflow" {
                     return Err(ProtocolError::new(
                         ErrorCode::MalformedRequest, format!("unknown prompt: {name}")
                     ));
@@ -1822,7 +1850,22 @@ mod tests {
         let list = s.handle(rpc(2, "prompts/list", json!({}))).unwrap();
         assert_eq!(list["result"]["prompts"][0]["name"], "rex_task_workflow");
         assert_eq!(list["result"]["prompts"][1]["name"], "rex_task_inspect");
-        assert_eq!(list["result"]["prompts"][2]["name"], "rex_ultra_workflow");
+        assert_eq!(list["result"]["prompts"][2]["name"], "rex_design_workflow");
+        assert_eq!(list["result"]["prompts"][3]["name"], "rex_ultra_workflow");
+        let design = s
+            .handle(rpc(
+                26,
+                "prompts/get",
+                json!({"name":"rex_design_workflow", "arguments":{"task":"improve settings"}}),
+            ))
+            .unwrap();
+        let design_text = design["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(design_text.contains(".agents/skills/rex-design/SKILL.md"));
+        assert!(design_text.contains("improve settings"));
+        assert!(design_text.contains("rendered pixels"));
+
         let ultra = s
             .handle(rpc(
                 25,
