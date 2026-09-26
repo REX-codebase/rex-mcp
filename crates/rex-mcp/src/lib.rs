@@ -57,10 +57,17 @@ impl McpServer {
                     "operation credentials differ",
                 ));
             }
-            return Ok(
-                json!({"task_id":req.task_id,"operation_id":existing.operation_id,
-                "state":if existing.result.is_some() { "finished" } else { "running" }}),
-            );
+            return Ok(match &existing.result {
+                None => {
+                    json!({"task_id":req.task_id,"operation_id":existing.operation_id,"state":"running"})
+                }
+                Some(Ok(receipt)) => {
+                    json!({"task_id":req.task_id,"operation_id":existing.operation_id,"state":"succeeded","receipt":receipt})
+                }
+                Some(Err(error)) => {
+                    json!({"task_id":req.task_id,"operation_id":existing.operation_id,"state":"failed","error":error})
+                }
+            });
         }
         // Reject unauthorized, stale, non-agent and non-Ultra requests on the
         // calling thread, before reporting that a background operation exists.
@@ -963,6 +970,20 @@ mod tests {
                 .unwrap();
             if status["result"]["structuredContent"]["state"] == "failed" {
                 assert!(status["result"]["structuredContent"]["error"]["code"].is_string());
+                let repeated = server
+                    .handle(rpc(
+                        9,
+                        "tools/call",
+                        json!({"name":"rex_ultra_promote_start","arguments":arguments}),
+                    ))
+                    .unwrap();
+                let repeated = &repeated["result"]["structuredContent"];
+                assert_eq!(repeated["state"], "failed");
+                assert_eq!(repeated["operation_id"], operation_id);
+                assert_eq!(
+                    repeated["error"],
+                    status["result"]["structuredContent"]["error"]
+                );
                 completed = true;
                 break;
             }
