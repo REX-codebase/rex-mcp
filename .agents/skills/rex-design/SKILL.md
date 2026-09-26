@@ -17,6 +17,12 @@ Map entry, decisions, primary action, outcomes, and recovery. Cover loading, emp
 
 Choose a visual direction tied to audience and product. Define a compact system for type, spacing, colors, surfaces, borders, and interaction states. Rank the primary action clearly. Use contrast, alignment, content order, and whitespace before decoration. Do not default to gradients, glass, oversized hero copy, generic AI imagery, or animation instead of hierarchy. Motion should explain state or direction and respect reduced-motion preferences.
 
+## State coverage ledger
+
+Before coding, make a short ledger with one row per consequential state. Use these columns: user intent, entry point, data condition, visible feedback, next action, narrow-screen behavior, and proof. At minimum cover first use, normal use, no results, invalid input, failure, and a long or crowded case where they apply. Mark a state not applicable only with a reason. This is a planning aid, not a checklist that substitutes for examining the product.
+
+For each row, ask whether the user can tell what happened and recover without losing their work. Prioritize a broken task or inaccessible control over decoration. If the task is only a visual critique, use the ledger to name missing states instead of pretending they were implemented. When handing off code, distinguish states actually exercised in the rendered UI from those inferred from source or left untested.
+
 ## Implement and verify
 
 Reuse components and tokens where possible. Use semantic elements, real labels, keyboard access, visible focus, sufficient contrast, sensible tab order, and usable touch targets. Check narrow, medium, and wide layouts instead of shrinking desktop. Handle long labels, zero results, and realistic data density; preserve routing and state behavior.
