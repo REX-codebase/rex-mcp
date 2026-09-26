@@ -2143,6 +2143,45 @@ mod promotion_status_tests {
         );
     }
     #[test]
+    fn promotion_status_does_not_claim_an_operation_from_another_process() {
+        let d = tempdir().unwrap();
+        let daemon = HarnessDaemon::open(
+            d.path().join("state"),
+            DaemonPolicy::conservative(d.path().join("ws")),
+        )
+        .unwrap();
+        let original = McpServer::new(daemon);
+        original.promotions.lock().unwrap().insert(
+            "task-1".into(),
+            PromotionOperation {
+                operation_id: "promote-old-process".into(),
+                capability_hash: hex_sha256(b"secret"),
+                lease_epoch: 7,
+                result: None,
+            },
+        );
+        let args =
+            json!({"task_id":"task-1","operation_id":"promote-old-process","capability":"secret"});
+        assert_eq!(
+            original.promotion_status(args.clone()).unwrap()["state"],
+            "running"
+        );
+
+        // A new server cannot report a worker that belonged to the old process.
+        let replacement = McpServer::new(
+            HarnessDaemon::open(
+                d.path().join("state"),
+                DaemonPolicy::conservative(d.path().join("ws")),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            replacement.promotion_status(args).unwrap_err().code,
+            ErrorCode::TaskNotFound
+        );
+    }
+
+    #[test]
     fn completed_promotion_returns_receipt_only_to_capability_holder() {
         let d = tempdir().unwrap();
         let daemon = HarnessDaemon::open(
