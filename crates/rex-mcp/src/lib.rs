@@ -2109,6 +2109,40 @@ mod promotion_status_tests {
     }
 
     #[test]
+    fn failed_promotion_exposes_error_only_to_capability_holder() {
+        let d = tempdir().unwrap();
+        let daemon = HarnessDaemon::open(
+            d.path().join("state"),
+            DaemonPolicy::conservative(d.path().join("ws")),
+        )
+        .unwrap();
+        let server = McpServer::new(daemon);
+        server.promotions.lock().unwrap().insert(
+            "task-1".into(),
+            PromotionOperation {
+                operation_id: "promote-failed".into(),
+                capability_hash: hex_sha256(b"secret"),
+                lease_epoch: 7,
+                result: Some(Err(ProtocolError::new(
+                    ErrorCode::Internal,
+                    "worker failed",
+                ))),
+            },
+        );
+        let args =
+            json!({"task_id":"task-1","operation_id":"promote-failed","capability":"secret"});
+        let status = server.promotion_status(args.clone()).unwrap();
+        assert_eq!(status["state"], "failed");
+        assert_eq!(status["operation_id"], "promote-failed");
+        assert_eq!(status["error"]["code"], json!(ErrorCode::Internal));
+        let mut wrong = args;
+        wrong["capability"] = json!("wrong");
+        assert_eq!(
+            server.promotion_status(wrong).unwrap_err().code,
+            ErrorCode::Unauthorized
+        );
+    }
+    #[test]
     fn completed_promotion_returns_receipt_only_to_capability_holder() {
         let d = tempdir().unwrap();
         let daemon = HarnessDaemon::open(
