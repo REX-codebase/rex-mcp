@@ -834,9 +834,18 @@ fn promotion_descriptors() -> Vec<Value> {
 
 fn promotion_output_schema() -> Value {
     json!({"type":"object","required":["task_id","operation_id","state"],
-        "properties":{"task_id":task_id_schema(),"operation_id":{"type":"string"},
-            "state":{"enum":["running","succeeded","failed"]},
-            "receipt":{"type":"object"},"error":{"type":"object"}}})
+    "properties":{"task_id":task_id_schema(),"operation_id":{"type":"string"},
+        "state":{"enum":["running","succeeded","failed"]},
+        "receipt":{"type":"object"},"error":{"type":"object"}},
+    "additionalProperties":false,
+    "oneOf":[
+        {"properties":{"state":{"const":"running"}},
+            "not":{"anyOf":[{"required":["receipt"]},{"required":["error"]}]}},
+        {"required":["receipt"],"properties":{"state":{"const":"succeeded"}},
+            "not":{"required":["error"]}},
+        {"required":["error"],"properties":{"state":{"const":"failed"}},
+            "not":{"required":["receipt"]}}
+    ]})
 }
 
 fn task_id_schema() -> Value {
@@ -1113,6 +1122,13 @@ mod tests {
             );
             assert_eq!(schema["properties"]["receipt"]["type"], "object");
             assert_eq!(schema["properties"]["error"]["type"], "object");
+            assert_eq!(schema["additionalProperties"], false);
+            assert_eq!(
+                schema["oneOf"][0]["properties"]["state"]["const"],
+                "running"
+            );
+            assert_eq!(schema["oneOf"][1]["required"], json!(["receipt"]));
+            assert_eq!(schema["oneOf"][2]["required"], json!(["error"]));
         }
         let (_d, mut server) = server();
         server
