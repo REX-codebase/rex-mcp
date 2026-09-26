@@ -22,10 +22,20 @@ pub struct McpServer {
     initialized: bool,
     promotions: Arc<Mutex<HashMap<String, PromotionOperation>>>,
     promotion_sequence: u64,
+    runs: Arc<Mutex<HashMap<String, RunOperation>>>,
 }
 
 // This registry is scoped to this stdio process. The custody receipt remains
 // durable in REX; a lost MCP process cannot promise an in-memory operation result.
+struct RunOperation {
+    task_id: String,
+    operation_id: String,
+    capability_hash: String,
+    lease_epoch: u64,
+    request: Value,
+    result: Option<Result<Value, ProtocolError>>,
+}
+
 struct PromotionOperation {
     operation_id: String,
     capability_hash: String,
@@ -40,7 +50,117 @@ impl McpServer {
             initialized: false,
             promotions: Arc::new(Mutex::new(HashMap::new())),
             promotion_sequence: 0,
+            runs: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn start_run(&mut self, args: Value) -> Result<Value, ProtocolError> {
+        let req: rex_protocol::RunRequest = serde_json::from_value(args.clone())
+            .map_err(|e| ProtocolError::new(ErrorCode::MalformedRequest, e.to_string()))?;
+        let hash = hex_sha256(req.capability.as_bytes());
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| ProtocolError::new(ErrorCode::Internal, "run registry unavailable"))?;
+        if let Some(op) = runs.values().find(|op| op.task_id == req.task_id) {
+            if op.capability_hash != hash || op.lease_epoch != req.lease_epoch {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "operation credentials differ",
+                ));
+            }
+            if op.request != args {
+                return Err(ProtocolError::new(
+                    ErrorCode::IdempotencyConflict,
+                    "run arguments differ",
+                ));
+            }
+            return Ok(run_state(op));
+        }
+        self.daemon.validate_run(&req)?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| ProtocolError::new(ErrorCode::Internal, e.to_string()))?
+            .as_nanos();
+        let operation_id = format!("run-{stamp}-{}", self.promotion_sequence);
+        self.promotion_sequence += 1;
+        runs.insert(
+            operation_id.clone(),
+            RunOperation {
+                task_id: req.task_id.clone(),
+                operation_id: operation_id.clone(),
+                capability_hash: hash,
+                lease_epoch: req.lease_epoch,
+                request: args.clone(),
+                result: None,
+            },
+        );
+        let registry = Arc::clone(&self.runs);
+        let daemon = Arc::clone(&self.daemon);
+        let worker_id = operation_id.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("rex-run".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    daemon.dispatch(ToolName::Run, args)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(ProtocolError::new(
+                        ErrorCode::Internal,
+                        "run worker panicked",
+                    ))
+                });
+                if let Ok(mut runs) = registry.lock() {
+                    if let Some(op) = runs.get_mut(&worker_id) {
+                        op.result = Some(result);
+                    }
+                }
+            })
+        {
+            runs.remove(&operation_id);
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                format!("cannot start run worker: {e}"),
+            ));
+        }
+        Ok(run_state(runs.get(&operation_id).unwrap()))
+    }
+
+    fn run_status(&self, args: Value) -> Result<Value, ProtocolError> {
+        let task_id = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|id| valid_task_id(id))
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "valid task_id required")
+            })?;
+        let operation_id = args
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "operation_id required")
+            })?;
+        let capability = args
+            .get("capability")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "capability required")
+            })?;
+        let runs = self
+            .runs
+            .lock()
+            .map_err(|_| ProtocolError::new(ErrorCode::Internal, "run registry unavailable"))?;
+        let op = runs.get(operation_id).filter(|op| op.task_id == task_id)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::TaskNotFound, "operation not found in this MCP process; inspect durable task status and proof"))?;
+        if op.capability_hash != hex_sha256(capability.as_bytes()) {
+            return Err(ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "invalid operation capability",
+            ));
+        }
+        Ok(run_state(op))
     }
 
     fn start_promotion(&mut self, args: Value) -> Result<Value, ProtocolError> {
@@ -273,6 +393,7 @@ impl McpServer {
             "tools/list" => self.require_initialized().map(|_| {
                 let mut tools = tool_descriptors();
                 tools.extend(promotion_descriptors());
+                tools.extend(run_descriptors());
                 json!({"tools":tools})
             }),
             "resources/list" => self.require_initialized().map(|_| json!({
@@ -499,12 +620,25 @@ impl McpServer {
                 })?;
                 let args = p.get("arguments").cloned().unwrap_or(json!({}));
                 match name {
+                    "rex_run_start" => self.start_run(args).map(tool_result),
+                    "rex_run_status" => self.run_status(args).map(tool_result),
                     "rex_ultra_promote_start" => self.start_promotion(args).map(tool_result),
                     "rex_ultra_promote_status" => self.promotion_status(args).map(tool_result),
                     _ => {
                         let tool = ToolName::from_wire_name(name).ok_or_else(|| {
                             ProtocolError::new(ErrorCode::UnknownTool, format!("unknown tool: {name}"))
                         })?;
+                        if tool == ToolName::Run {
+                            let task_id = args.get("task_id").and_then(Value::as_str);
+                            let runs = self.runs.lock().map_err(|_| {
+                                ProtocolError::new(ErrorCode::Internal, "run registry unavailable")
+                            })?;
+                            if task_id.is_some_and(|id| runs.values().any(|op| op.task_id == id && op.result.is_none())) {
+                                return Err(ProtocolError::new(ErrorCode::IdempotencyConflict,
+                                    "run already started here; use rex_run_status"));
+                            }
+                            drop(runs);
+                        }
                         if tool == ToolName::UltraPromote {
                             let task_id = args.get("task_id").and_then(Value::as_str);
                             let operations = self.promotions.lock().map_err(|_| {
@@ -841,6 +975,33 @@ pub fn tool_descriptors() -> Vec<Value> {
     }
     out
 }
+fn run_state(op: &RunOperation) -> Value {
+    match &op.result {
+        None => json!({"task_id":op.task_id,"operation_id":op.operation_id,"state":"running"}),
+        Some(Ok(receipt)) => {
+            json!({"task_id":op.task_id,"operation_id":op.operation_id,"state":"succeeded","receipt":receipt})
+        }
+        Some(Err(error)) => {
+            json!({"task_id":op.task_id,"operation_id":op.operation_id,"state":"failed","error":error})
+        }
+    }
+}
+
+fn run_descriptors() -> Vec<Value> {
+    vec![
+        json!({"name":"rex_run_start","title":"REX Run Start",
+            "description":"Start a policy-allowed command without blocking the MCP host. Keep this process alive; poll rex_run_status with the returned operation_id. The operation is process-local; consult durable task status and receipts after restart before retrying.",
+            "inputSchema":extend(task_epoch_schema(), json!({"argv":{"type":"array","items":{"type":"string"}},"timeout_ms":{"type":"integer"}}), &["argv"]),
+            "outputSchema":promotion_output_schema()}),
+        json!({"name":"rex_run_status","title":"REX Run Status",
+            "description":"Read a process-local command result or explicit error. After MCP restart inspect durable task status and proof instead.",
+            "inputSchema":{"type":"object","required":["task_id","capability","operation_id"],
+                "properties":{"task_id":task_id_schema(),"capability":{"type":"string"},"operation_id":{"type":"string"}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"openWorldHint":false},
+            "outputSchema":promotion_output_schema()}),
+    ]
+}
+
 fn promotion_descriptors() -> Vec<Value> {
     vec![
         json!({"name":"rex_ultra_promote_start","title":"REX Ultra Promote Start",
@@ -913,6 +1074,95 @@ mod tests {
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
     }
     #[test]
+    fn asynchronous_run_is_authorized_idempotent_and_pollable() {
+        let (_tmp, mut mcp) = server();
+        mcp.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ));
+        let created = mcp.handle(rpc(2, "tools/call", json!({"name":"rex_execute",
+            "arguments":{"request_id":"async-run","task":"inspect","host":"generic_agent","operator_is_agent":true}}))).unwrap();
+        let task_id = created["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .unwrap();
+        let capability = created["result"]["structuredContent"]["task_capability"]
+            .as_str()
+            .unwrap();
+        let epoch = created["result"]["structuredContent"]["lease"]["epoch"]
+            .as_u64()
+            .unwrap();
+        let args = json!({"task_id":task_id,"capability":capability,"lease_epoch":epoch,"argv":["cargo","--version"]});
+        let denied = mcp.handle(rpc(3, "tools/call", json!({"name":"rex_run_start",
+            "arguments":{"task_id":task_id,"capability":"wrong","lease_epoch":epoch,"argv":["cargo","--version"]}}))).unwrap();
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(mcp.runs.lock().unwrap().is_empty());
+        let started = mcp
+            .handle(rpc(
+                4,
+                "tools/call",
+                json!({"name":"rex_run_start","arguments":args}),
+            ))
+            .unwrap();
+        assert_eq!(
+            started["result"]["structuredContent"]["state"], "running",
+            "{started}"
+        );
+        let id = started["result"]["structuredContent"]["operation_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let repeated = mcp
+            .handle(rpc(
+                5,
+                "tools/call",
+                json!({"name":"rex_run_start","arguments":args}),
+            ))
+            .unwrap();
+        assert_eq!(repeated["result"]["structuredContent"]["operation_id"], id);
+        let conflict = mcp.handle(rpc(6, "tools/call", json!({"name":"rex_run_start",
+            "arguments":{"task_id":task_id,"capability":capability,"lease_epoch":epoch,"argv":["npm","--version"]}}))).unwrap();
+        assert_eq!(conflict["result"]["isError"], true);
+        let denied_status = mcp
+            .handle(rpc(
+                7,
+                "tools/call",
+                json!({"name":"rex_run_status",
+            "arguments":{"task_id":task_id,"capability":"wrong","operation_id":id}}),
+            ))
+            .unwrap();
+        assert_eq!(denied_status["result"]["isError"], true);
+        let status = mcp
+            .handle(rpc(
+                8,
+                "tools/call",
+                json!({"name":"rex_run_status",
+            "arguments":{"task_id":task_id,"capability":capability,"operation_id":id}}),
+            ))
+            .unwrap();
+        assert!(
+            status["result"]["structuredContent"]["state"] == "running"
+                || status["result"]["structuredContent"]["state"] == "succeeded"
+                || status["result"]["structuredContent"]["state"] == "failed"
+        );
+        let (_other_tmp, mut other) = server();
+        other.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ));
+        let lost = other
+            .handle(rpc(
+                9,
+                "tools/call",
+                json!({"name":"rex_run_status",
+            "arguments":{"task_id":task_id,"capability":capability,"operation_id":id}}),
+            ))
+            .unwrap();
+        assert_eq!(lost["result"]["isError"], true);
+    }
+
+    #[test]
     fn asynchronous_promotion_rejects_bad_scope_and_reports_worker_failure() {
         let (_tmp, mut server) = server();
         server.handle(rpc(
@@ -974,7 +1224,10 @@ mod tests {
             "arguments":arguments}),
             ))
             .unwrap();
-        assert_eq!(started["result"]["structuredContent"]["state"], "running");
+        assert_eq!(
+            started["result"]["structuredContent"]["state"], "running",
+            "{started}"
+        );
         let operation_id = started["result"]["structuredContent"]["operation_id"]
             .as_str()
             .unwrap();
@@ -1762,7 +2015,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 23);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"], "active");
         let task_id = rows[2]["result"]["structuredContent"]["task_id"]
             .as_str()
@@ -1807,7 +2060,7 @@ mod tests {
             .unwrap();
         assert_eq!(ok["result"]["protocolVersion"], MCP_COMPAT_PROTOCOL_VERSION);
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 23);
         let unknown = s
             .handle(rpc(
                 4,
@@ -1963,7 +2216,7 @@ mod tests {
             .unwrap();
         assert!(ready.get("result").is_some());
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 23);
     }
     #[test]
     fn notifications_get_no_response() {
