@@ -121,8 +121,12 @@ impl McpStdioClient {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
-        // Read until the matching id; notifications from the server are skipped.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // A command or test can legitimately run for the daemon's 120-second
+        // tool cap. Timing out at 30 seconds would kill the child while the
+        // daemon is still working and leave the host unsure whether a write
+        // landed. Keep a bounded margin for transport and custody persistence.
+        // Handshake and read-only inspection still fail promptly.
+        let deadline = Instant::now() + reply_timeout(method, &params);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let line = match self.replies.recv_timeout(remaining) {
@@ -158,6 +162,47 @@ impl McpStdioClient {
         self.stdin
             .flush()
             .map_err(|e| format!("rex-mcp flush: {e}"))
+    }
+}
+
+fn reply_timeout(method: &str, params: &Value) -> Duration {
+    if method == "tools/call"
+        && matches!(
+            params.get("name").and_then(Value::as_str),
+            Some(
+                "rex_execute"
+                    | "rex_run"
+                    | "rex_test"
+                    | "rex_ultra_open"
+                    | "rex_ultra_submit"
+                    | "rex_ultra_promote"
+                    | "rex_proof_verify"
+            )
+        )
+    {
+        Duration::from_secs(150)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_tool_calls_outlive_the_daemon_command_cap() {
+        for name in [
+            "rex_execute", "rex_run", "rex_test", "rex_ultra_open",
+            "rex_ultra_submit", "rex_ultra_promote", "rex_proof_verify",
+        ] {
+            assert!(reply_timeout("tools/call", &json!({"name": name}))
+                > Duration::from_secs(120));
+        }
+        for name in ["rex_status", "rex_events", "rex_result", "unknown"] {
+            assert_eq!(reply_timeout("tools/call", &json!({"name": name})), Duration::from_secs(30));
+        }
+        assert_eq!(reply_timeout("initialize", &json!({})), Duration::from_secs(30));
     }
 }
 
