@@ -624,7 +624,7 @@ impl HarnessDaemon {
             if prior != source_sha256 {
                 return Err(perr(
                     ErrorCode::IdempotencyConflict,
-                    "identical preview PNG was already bound to a different source revision; the digest alone cannot distinguish captures. Do not change the UI merely to force new pixels or reuse this capture as current-source proof. Start a fresh task for this revision, then recapture its evidence",
+                    "identical preview PNG was already bound to a different source revision; the digest alone cannot distinguish captures. Screenshot exports or videos saved inside the preview project can cause this even when UI pixels stay identical: keep review outputs outside that project. Do not change the UI merely to force new pixels or reuse this capture as current-source proof. Start a fresh task for this revision, then recapture its evidence",
                     task_id,
                 ));
             }
@@ -948,7 +948,7 @@ impl HarnessDaemon {
             };
             if captured_source.is_some_and(|known| known != source) {
                 return Err(format!(
-                    "{key}: mixed preview source revisions; recapture all states from one source"
+                    "{key}: mixed preview source revisions; keep screenshot exports, videos and other review outputs outside the preview project directory (they change its source hash), then recapture all six states from one source revision. Do not omit rendered UI assets from the project to silence the gate"
                 ));
             }
             captured_source = Some(source);
@@ -4207,6 +4207,7 @@ mod tests {
         assert_eq!(collision.code, ErrorCode::IdempotencyConflict);
         assert!(collision.message.contains("Start a fresh task"));
         assert!(collision.message.contains("Do not change the UI"));
+        assert!(collision.message.contains("outside that project"));
         let still_bound = daemon.load(&ex.task_id).unwrap();
         assert_eq!(
             still_bound.preview_sources[&stable_digest],
@@ -4221,10 +4222,9 @@ mod tests {
         daemon.persist(&t).unwrap();
         let mixed = daemon.submit(submission(evidence.clone())).unwrap();
         assert!(!mixed.accepted);
-        assert!(mixed
-            .repair
-            .unwrap()
-            .contains("mixed preview source revisions"));
+        let mixed_repair = mixed.repair.unwrap();
+        assert!(mixed_repair.contains("mixed preview source revisions"));
+        assert!(mixed_repair.contains("outside the preview project directory"));
         let mut t = daemon.load(&ex.task_id).unwrap();
         t.preview_sources
             .insert(changed_digest, ("a".repeat(64), action_id.clone()));
