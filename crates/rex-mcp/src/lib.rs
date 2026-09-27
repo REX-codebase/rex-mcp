@@ -2095,6 +2095,22 @@ mod tests {
             phone["result"]["structuredContent"]["items"][0]["width"],
             390
         );
+        for (step, interaction) in [
+            (84, json!({"kind":"pointer_move","x":25.0,"y":15.0})),
+            (85, json!({"kind":"pointer_down","button":"primary"})),
+            (86, json!({"kind":"pointer_up","button":"primary"})),
+        ] {
+            let result=mcp.handle(rpc(step,"tools/call",json!({"name":"rex_preview_action","arguments":{
+                "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,"action":interaction}}))).unwrap();
+            assert_eq!(result["result"]["isError"], false, "{result}");
+        }
+        let clicked=mcp.handle(rpc(87,"tools/call",json!({"name":"rex_preview_capture","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,"kind":"render.state.mid"}}))).unwrap();
+        assert_eq!(clicked["result"]["isError"], false, "{clicked}");
+        assert!(clicked["result"]["structuredContent"]["dom_text"]
+            .as_str()
+            .unwrap()
+            .contains("clicked"));
         let stopped = mcp
             .handle(rpc(
                 9,
