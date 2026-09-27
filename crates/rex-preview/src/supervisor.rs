@@ -4,6 +4,7 @@ use crate::{
     PORT_MAX, PORT_MIN,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs,
@@ -96,6 +97,7 @@ struct Runtime {
     stop: Arc<AtomicBool>,
     static_thread: Option<thread::JoinHandle<()>>,
     browser: Option<BrowserRuntime>,
+    project_root: PathBuf,
     iteration: PreviewSession,
 }
 
@@ -275,6 +277,7 @@ impl PreviewSupervisor {
             stop: Arc::new(AtomicBool::new(false)),
             static_thread: None,
             browser: None,
+            project_root: plan.cwd.clone(),
             iteration: PreviewSession::new(id.clone(), plan.clone(), SystemTime::now()),
         };
         runtime.iteration.start()?;
@@ -346,11 +349,16 @@ impl PreviewSupervisor {
         if r.browser.is_none() {
             r.browser = Some(BrowserRuntime::launch(&r.url)?);
         }
-        let evidence = r
+        let before = source_tree_sha256(&r.project_root)?;
+        let mut evidence = r
             .browser
             .as_mut()
             .ok_or(PreviewError::NotRunning)?
             .capture(&r.url)?;
+        if before != source_tree_sha256(&r.project_root)? {
+            return Err(PreviewError::SourceChanged);
+        }
+        evidence.source_sha256 = before;
         for item in evidence.items.iter().cloned() {
             r.iteration.push_evidence(item)?;
         }
@@ -421,6 +429,58 @@ impl PreviewSupervisor {
     }
 }
 
+/// Hash bounded, regular source files in canonical relative-path order.
+/// This is a local snapshot check, not proof of an external host or remote build.
+fn source_tree_sha256(root: &Path) -> Result<String, PreviewError> {
+    fn visit(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), PreviewError> {
+        for entry in fs::read_dir(dir).map_err(|_| PreviewError::SourceChanged)? {
+            let entry = entry.map_err(|_| PreviewError::SourceChanged)?;
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| PreviewError::PathEscape)?;
+            if rel.components().any(|c| {
+                matches!(
+                    c.as_os_str().to_str(),
+                    Some("node_modules" | ".git" | "target" | ".next" | "dist" | "build")
+                )
+            }) {
+                continue;
+            }
+            let meta = fs::symlink_metadata(&path).map_err(|_| PreviewError::SourceChanged)?;
+            if meta.file_type().is_symlink() {
+                return Err(PreviewError::SymlinkComponent);
+            }
+            if meta.is_dir() {
+                visit(root, &path, files)?;
+            } else if meta.is_file() {
+                files.push(path);
+                if files.len() > 4096 {
+                    return Err(PreviewError::EvidenceLimit);
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(root, root, &mut files)?;
+    files.sort();
+    let mut hash = Sha256::new();
+    for file in files {
+        let rel = file
+            .strip_prefix(root)
+            .map_err(|_| PreviewError::PathEscape)?;
+        let content = fs::read(&file).map_err(|_| PreviewError::SourceChanged)?;
+        if content.len() > 16 * 1024 * 1024 {
+            return Err(PreviewError::EvidenceLimit);
+        }
+        hash.update((rel.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+        hash.update(rel.as_os_str().as_encoded_bytes());
+        hash.update((content.len() as u64).to_le_bytes());
+        hash.update(&content);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
 fn reserve_port() -> Result<(TcpListener, u16), PreviewError> {
     for port in PORT_MIN..=PORT_MAX {
         if let Ok(l) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
@@ -690,6 +750,19 @@ mod tests {
         .unwrap();
         let second = sup.capture(&started.id).unwrap();
         assert!(second.dom_text.contains("clicked"));
+        assert_eq!(first.source_sha256, second.source_sha256);
+        fs::write(
+            app.join("index.html"),
+            "<!doctype html><p>revised source</p>",
+        )
+        .unwrap();
+        let revised = sup.capture(&started.id).unwrap();
+        assert_ne!(first.source_sha256, revised.source_sha256);
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><button id='b' onclick="this.textContent='clicked'">press</button>"#,
+        )
+        .unwrap();
         fs::write(app.join("motion.html"), "<!doctype html><style>body{background:#e34141}@media(prefers-reduced-motion:reduce){body{background:#3475e3}}</style><p>motion test</p>").unwrap();
         sup.action(
             &started.id,

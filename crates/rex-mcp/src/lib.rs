@@ -184,16 +184,23 @@ impl McpServer {
         }
         let artifact = self.daemon.artifact_put(rex_protocol::ArtifactPutRequest {
             task_id: task_id.clone(),
-            capability: cap,
+            capability: cap.clone(),
             lease_epoch: epoch,
             kind: kind.into(),
             bytes_base64: encoded.into(),
             candidate_id: None,
             round: None,
         })?;
+        self.daemon.bind_preview_source(
+            &task_id,
+            &cap,
+            epoch,
+            &artifact.sha256,
+            &captured.source_sha256,
+        )?;
         Ok(
             json!({"task_id":task_id,"preview_id":id,"kind":kind,"sha256":artifact.sha256,
-            "png_base64":encoded,"dom_text":captured.dom_text,"accessibility_text":captured.accessibility_text,
+            "source_sha256":captured.source_sha256,"png_base64":encoded,"dom_text":captured.dom_text,"accessibility_text":captured.accessibility_text,
             "items":captured.items,"bytes":bytes.len(),"engine":"local headless Chrome",
             "scope":"local preview only; not the hosted user shell", "settled_state_attested":false}),
         )
@@ -2074,6 +2081,8 @@ mod tests {
         let data = &shot["result"]["structuredContent"];
         assert_eq!(data["engine"], "local headless Chrome");
         assert!(data["png_base64"].as_str().unwrap().len() > 100);
+        let before_source = data["source_sha256"].as_str().unwrap().to_string();
+        assert_eq!(before_source.len(), 64);
         assert!(data["dom_text"].as_str().unwrap().contains("press"));
         let wrong_width=mcp.handle(rpc(81,"tools/call",json!({"name":"rex_preview_capture","arguments":{
             "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,"kind":"render.mobile390.first"}}))).unwrap();
@@ -2091,6 +2100,10 @@ mod tests {
         let phone=mcp.handle(rpc(83,"tools/call",json!({"name":"rex_preview_capture","arguments":{
             "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,"kind":"render.mobile390.first"}}))).unwrap();
         assert_eq!(phone["result"]["isError"], false, "{phone}");
+        assert_eq!(
+            phone["result"]["structuredContent"]["source_sha256"],
+            before_source
+        );
         assert_eq!(
             phone["result"]["structuredContent"]["items"][0]["width"],
             390
