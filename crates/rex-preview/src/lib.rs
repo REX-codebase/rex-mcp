@@ -68,6 +68,8 @@ pub enum PreviewError {
     SourceChanged,
     #[error("preview frame is blank or near-uniform")]
     BlankFrame,
+    #[error("requested preview condition did not take effect in the page")]
+    ConditionNotApplied,
     #[error("preview page has runtime errors or missing scene content")]
     BrokenPage,
     #[error("preview session is already terminal")]

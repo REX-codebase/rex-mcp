@@ -36,6 +36,7 @@ pub struct BrowserRuntime {
     width: u16,
     height: u16,
     scale: f32,
+    reduced_motion: Option<bool>,
     cursor_x: f32,
     cursor_y: f32,
     allowed_port: u16,
@@ -119,6 +120,7 @@ impl BrowserRuntime {
             width: 1280,
             height: 800,
             scale: 1.0,
+            reduced_motion: None,
             cursor_x: 0.0,
             cursor_y: 0.0,
             allowed_port: url::Url::parse(url)
@@ -246,6 +248,7 @@ impl BrowserRuntime {
                 )?;
                 self.command("Page.navigate", json!({"url":target.as_str()}))?;
                 self.wait_loaded()?;
+                self.verify_conditions()?;
             }
             BrowserAction::PointerMove { x, y } => {
                 self.cursor_x = *x;
@@ -282,6 +285,7 @@ impl BrowserRuntime {
                     "Emulation.setDeviceMetricsOverride",
                     json!({"width":width,"height":height,"deviceScaleFactor":scale,"mobile":false}),
                 )?;
+                self.verify_conditions()?;
             }
             BrowserAction::SetReducedMotion { enabled } => {
                 self.command(
@@ -291,7 +295,49 @@ impl BrowserRuntime {
                         "value":if *enabled {"reduce"} else {"no-preference"}}]
                     }),
                 )?;
+                self.reduced_motion = Some(*enabled);
+                self.verify_conditions()?;
             }
+        }
+        Ok(())
+    }
+
+    fn conditions_match(
+        probe: &Value,
+        width: u16,
+        height: u16,
+        scale: f32,
+        reduced_motion: Option<bool>,
+    ) -> bool {
+        probe["width"].as_u64() == Some(width as u64)
+            && probe["height"].as_u64() == Some(height as u64)
+            && probe["dpr"]
+                .as_f64()
+                .is_some_and(|dpr| (dpr - scale as f64).abs() < 0.01)
+            && reduced_motion.is_none_or(|wanted| probe["reduced"].as_bool() == Some(wanted))
+    }
+
+    fn verify_conditions(&mut self) -> Result<(), PreviewError> {
+        // A successful CDP command only confirms receipt, not adoption by the
+        // page. Probe the browsing context that will supply the pixels.
+        let result = self.command("Runtime.evaluate", json!({
+            "expression":"JSON.stringify({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,reduced:matchMedia('(prefers-reduced-motion: reduce)').matches})",
+            "returnByValue":true
+        }))?;
+        let value = result
+            .pointer("/result/result/value")
+            .and_then(Value::as_str)
+            .ok_or(PreviewError::ConditionNotApplied)?;
+        let probe: Value =
+            serde_json::from_str(value).map_err(|_| PreviewError::ConditionNotApplied)?;
+        if !Self::conditions_match(
+            &probe,
+            self.width,
+            self.height,
+            self.scale,
+            self.reduced_motion,
+        ) {
+            return Err(PreviewError::ConditionNotApplied);
         }
         Ok(())
     }
@@ -315,6 +361,7 @@ impl BrowserRuntime {
         if current_origin.host_str() != base.host_str() {
             return Err(PreviewError::UrlDenied);
         }
+        self.verify_conditions()?;
         let shot = self.command(
             "Page.captureScreenshot",
             json!({"format":"png","captureBeyondViewport":false,"fromSurface":true}),
@@ -600,5 +647,51 @@ fn key_name(k: SafeKey) -> &'static str {
         SafeKey::PageUp => "PageUp",
         SafeKey::PageDown => "PageDown",
         SafeKey::Space => " ",
+    }
+}
+
+#[cfg(test)]
+mod condition_tests {
+    use super::BrowserRuntime;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_only_effective_viewport_and_motion_probe() {
+        let actual = json!({"width":390,"height":844,"dpr":2.0,"reduced":true});
+        assert!(BrowserRuntime::conditions_match(
+            &actual,
+            390,
+            844,
+            2.0,
+            Some(true)
+        ));
+        assert!(!BrowserRuntime::conditions_match(
+            &actual,
+            390,
+            844,
+            2.0,
+            Some(false)
+        ));
+        assert!(!BrowserRuntime::conditions_match(
+            &actual,
+            390,
+            800,
+            2.0,
+            Some(true)
+        ));
+        assert!(!BrowserRuntime::conditions_match(
+            &actual,
+            390,
+            844,
+            1.0,
+            Some(true)
+        ));
+        assert!(!BrowserRuntime::conditions_match(
+            &json!({"width":390,"height":844}),
+            390,
+            844,
+            1.0,
+            Some(true)
+        ));
     }
 }
