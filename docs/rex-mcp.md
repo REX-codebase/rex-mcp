@@ -79,6 +79,8 @@ call; inspect the workspace and permissions first.
 4. `rex_status`, `rex_events`, `rex_result` inspect by task id;
    `rex_cancel` requires the per-task capability and ends the task.
 
+For visual work, finish all UI edits before the first cited preview capture. Keep exported screenshots and videos outside the preview project, then capture all six slots from the final source revision. A source edit after a capture makes that set mixed; recapture the entire set, and if identical pixels were previously bound to an older revision in this task, start a fresh task instead of forcing cosmetic changes. The quickstart resource now states this before the capture sequence.
+
 MCP hosts can also read the `rex://workflow/quickstart` resource and the
 `rex://task/{task_id}/status`, `events/{after_seq}`, and `result` resource
 templates. The `rex_task_workflow` prompt guides a new task; the
