@@ -233,6 +233,15 @@ impl BrowserRuntime {
                     json!({"width":width,"height":height,"deviceScaleFactor":scale,"mobile":false}),
                 )?;
             }
+            BrowserAction::SetReducedMotion { enabled } => {
+                self.command(
+                    "Emulation.setEmulatedMedia",
+                    json!({
+                        "features":[{"name":"prefers-reduced-motion",
+                        "value":if *enabled {"reduce"} else {"no-preference"}}]
+                    }),
+                )?;
+            }
         }
         Ok(())
     }

@@ -227,6 +227,7 @@ pub enum BrowserAction {
     Text { value: String },
     Scroll { delta_x: f32, delta_y: f32 },
     SetViewport { width: u16, height: u16, scale: f32 },
+    SetReducedMotion { enabled: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
