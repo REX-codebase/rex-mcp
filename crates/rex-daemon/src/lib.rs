@@ -2553,7 +2553,12 @@ fn visual_action(task: &str, action: &str) -> bool {
     let terms = [
         "visual",
         "user interface",
+        "product interface",
+        "interface design",
         "web page",
+        "webpage",
+        "web app",
+        "mobile app",
         "landing page",
         "website",
         "dashboard",
@@ -3650,7 +3655,14 @@ mod tests {
     fn visual_classification_is_word_bounded_for_ui() {
         assert!(visual_action("Create a UI", "write a screen"));
         assert!(visual_action("Build a landing page", "write"));
+        assert!(visual_action("Design a webpage", "write"));
+        assert!(visual_action("Design a mobile app", "write"));
+        assert!(visual_action("Build a web app", "write"));
+        assert!(visual_action("Create a product interface", "write"));
+        assert!(visual_action("Create an interface design", "write"));
         assert!(!visual_action("build a guild audit", "write"));
+        assert!(!visual_action("Build an application server", "write"));
+        assert!(!visual_action("Analyze app logs", "write a parser"));
     }
 
     #[test]
