@@ -188,6 +188,12 @@ impl BrowserRuntime {
             BrowserAction::Navigate { path } => {
                 let base = url::Url::parse(base_url).map_err(|_| PreviewError::UrlDenied)?;
                 let target = base.join(path).map_err(|_| PreviewError::UrlDenied)?;
+                // A slash-prefixed path is not enough: URL parsing may treat
+                // backslashes or encoded authority separators as a host change.
+                crate::validate_local_url(
+                    target.as_str(),
+                    base.port().ok_or(PreviewError::UrlDenied)?,
+                )?;
                 self.command("Page.navigate", json!({"url":target.as_str()}))?;
                 self.wait_loaded()?;
             }
