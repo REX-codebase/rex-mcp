@@ -272,6 +272,9 @@ pub struct TwoStateContract {
     pub end_text: String,
     /// CSS-pixel size floor for both result nodes.
     pub min_font_px: u8,
+    /// Optional creator-frozen visible facts for the settled end capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_fields: Option<Vec<MobileResultField>>,
 }
 
 /// rex_execute request: create or resume one durable task.

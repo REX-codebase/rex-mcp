@@ -751,6 +751,20 @@ impl HarnessDaemon {
                         task_id,
                     ));
                 }
+                if let Some(missing) = contract.end_fields.as_ref().and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|field| !visible_names.contains(&field.name))
+                }) {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        format!(
+                            "two-state end capture missing creator-frozen visible field: {}",
+                            missing.name
+                        ),
+                        task_id,
+                    ));
+                }
                 if !t
                     .preview_sources
                     .get(digest)
@@ -3016,6 +3030,37 @@ fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
         }
     }
     if let Some(c) = &r.two_state_contract {
+        if let Some(fields) = &c.end_fields {
+            let mut names = BTreeSet::new();
+            if fields.is_empty()
+                || fields.len() > 8
+                || fields.iter().any(|f| {
+                    f.name.trim().is_empty()
+                        || f.name.len() > 80
+                        || f.name == "state_start"
+                        || f.name == "state_end"
+                        || !names.insert(f.name.as_str())
+                        || f.kind != "text"
+                        || f.alternatives.is_empty()
+                        || f.alternatives.len() > 8
+                        || f.alternatives
+                            .iter()
+                            .any(|v| v.trim().is_empty() || v.len() > 120)
+                        || !matches!(
+                            f.match_mode.as_deref().unwrap_or("exact"),
+                            "exact" | "contains"
+                        )
+                        || f.min_font_px.is_some_and(|px| !(8..=32).contains(&px))
+                        || f.region.is_some()
+                        || f.min_count.is_some()
+                })
+            {
+                return Err(ProtocolError::new(
+                    ErrorCode::MalformedRequest,
+                    "invalid two-state end fields: provide 1-8 distinct visible text fields",
+                ));
+            }
+        }
         if r.ultra
             || !visual_action(&r.task, "")
             || !matches!(c.viewport.as_str(), "mobile390" | "desktop")
@@ -4156,10 +4201,42 @@ mod tests {
             start_text: "Example A".into(),
             end_text: "Example B".into(),
             min_font_px: 14,
+            end_fields: Some(vec![MobileResultField {
+                name: "order_unchanged".into(),
+                alternatives: vec!["Order unchanged".into()],
+                kind: "text".into(),
+                match_mode: None,
+                min_font_px: Some(14),
+                region: None,
+                min_count: None,
+            }]),
         });
         let ex = daemon.execute(r).unwrap();
         let cap = cap_of(&ex);
         let action = ex.next.as_ref().unwrap().action_id.clone();
+        let mut bad_fields = req("bad-two-state-end-fields");
+        bad_fields.ultra = false;
+        bad_fields.task = "Build a landing page".into();
+        bad_fields.two_state_contract = Some(TwoStateContract {
+            viewport: "mobile390".into(),
+            control: "#change".into(),
+            start_text: "Example A".into(),
+            end_text: "Example B".into(),
+            min_font_px: 14,
+            end_fields: Some(vec![MobileResultField {
+                name: "state_end".into(),
+                alternatives: vec!["false field".into()],
+                kind: "text".into(),
+                match_mode: None,
+                min_font_px: None,
+                region: None,
+                min_count: None,
+            }]),
+        });
+        assert_eq!(
+            daemon.execute(bad_fields).unwrap_err().code,
+            ErrorCode::MalformedRequest
+        );
         let mut changed = req("two-state-contract");
         changed.ultra = false;
         changed.task = "Build a landing page".into();
@@ -4171,6 +4248,7 @@ mod tests {
             start_text: "Example A".into(),
             end_text: "Example B".into(),
             min_font_px: 14,
+            end_fields: None,
         });
         assert_eq!(
             daemon.execute(changed).unwrap_err().code,
@@ -4189,6 +4267,7 @@ mod tests {
                 start_text: start.into(),
                 end_text: end.into(),
                 min_font_px: 14,
+                end_fields: None,
             });
             assert_eq!(
                 daemon.execute(invalid).unwrap_err().code,
@@ -4335,7 +4414,7 @@ mod tests {
             ErrorCode::GateFailed
         );
         assert!(!daemon.submit(submit(evidence.clone())).unwrap().accepted);
-        daemon
+        let missing = daemon
             .record_state_step(
                 &ex.task_id,
                 &cap,
@@ -4345,6 +4424,20 @@ mod tests {
                 Some(end),
                 Some(&"a".repeat(64)),
                 &["state_end".into()],
+            )
+            .unwrap_err();
+        assert_eq!(missing.code, ErrorCode::GateFailed);
+        assert!(missing.message.contains("order_unchanged"));
+        daemon
+            .record_state_step(
+                &ex.task_id,
+                &cap,
+                ex.lease.epoch,
+                "preview-a",
+                "end",
+                Some(end),
+                Some(&"a".repeat(64)),
+                &["state_end".into(), "order_unchanged".into()],
             )
             .unwrap();
         let mut swapped = evidence.clone();

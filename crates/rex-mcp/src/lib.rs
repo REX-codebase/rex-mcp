@@ -194,20 +194,22 @@ impl McpServer {
             None
         };
         let contract = if let (Some(c), Some(_step)) = (&state_contract, state_step) {
-            Some(
-                [("start", &c.start_text), ("end", &c.end_text)]
-                    .into_iter()
-                    .map(|(name, text)| rex_protocol::MobileResultField {
-                        name: format!("state_{name}"),
-                        alternatives: vec![text.clone()],
-                        kind: "text".into(),
-                        match_mode: None,
-                        min_font_px: Some(c.min_font_px),
-                        region: None,
-                        min_count: None,
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            let mut fields = [("start", &c.start_text), ("end", &c.end_text)]
+                .into_iter()
+                .map(|(name, text)| rex_protocol::MobileResultField {
+                    name: format!("state_{name}"),
+                    alternatives: vec![text.clone()],
+                    kind: "text".into(),
+                    match_mode: None,
+                    min_font_px: Some(c.min_font_px),
+                    region: None,
+                    min_count: None,
+                })
+                .collect::<Vec<_>>();
+            if state_step == Some("end") {
+                fields.extend(c.end_fields.iter().flatten().cloned());
+            }
+            Some(fields)
         } else {
             self.daemon.result_fields(&task_id, &cap, epoch, kind)?
         };
@@ -334,7 +336,7 @@ impl McpServer {
             json!({"task_id":task_id,"preview_id":id,"kind":kind,"sha256":artifact.sha256,
             "source_sha256":captured.source_sha256,"png_base64":encoded,"dom_text":captured.dom_text,"accessibility_text":captured.accessibility_text,
             "items":captured.items,"visible_result_fields":captured.visible_result_fields,"bytes":bytes.len(),"engine":"local headless Chrome",
-            "scope":"local preview only; not the hosted user shell", "settled_state_attested":false}),
+            "scope":"local preview only; not the hosted user shell", "settled_state_attested":false,"settled_state_note":"REX does not attest settling; inspect pixels and wait for animations where relevant"}),
         )
     }
     fn preview_stop(&mut self, args: Value) -> Result<Value, ProtocolError> {
@@ -1200,7 +1202,7 @@ pub fn tool_descriptors() -> Vec<Value> {
         let (description, mut schema) = match t {
             ToolName::Execute => ("Start or resume a durable REX task; plan and optional creator-supplied first-view and two_state_contract assertions are frozen at creation. For Standard visual tasks, each named field is checked against its first-party 390x650 or 1280x800 opening capture; this does not prove semantic or spatial truth.", json!({
                 "type":"object","required":["request_id","task","host","operator_is_agent"],
-                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string","minLength":1},"mobile_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"two_state_contract":{"type":"object","required":["viewport","control","start_text","end_text","min_font_px"],"properties":{"viewport":{"enum":["mobile390","desktop"]},"control":{"type":"string"},"start_text":{"type":"string"},"end_text":{"type":"string"},"min_font_px":{"type":"integer","minimum":8,"maximum":32}},"additionalProperties":false},"desktop_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"follow_up":{"type":"string"},
+                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string","minLength":1},"mobile_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"two_state_contract":{"type":"object","required":["viewport","control","start_text","end_text","min_font_px"],"properties":{"viewport":{"enum":["mobile390","desktop"]},"control":{"type":"string"},"start_text":{"type":"string"},"end_text":{"type":"string"},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"end_fields":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"const":"text"},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32}},"additionalProperties":false}}},"additionalProperties":false},"desktop_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"follow_up":{"type":"string"},
                 "host":{"enum":["human","claude_code","codex","open_code","hermes","antigravity","generic_agent"]},"operator_is_agent":{"type":"boolean"},"ultra":{"type":"boolean"},
                 "budgets":{"type":"object"},"proof":{"type":"string"},"plan":{"type":"array","items":{"type":"object","required":["instructions"],"properties":{"instructions":{"type":"string"},"acceptance":{"type":"string"}}}}},"additionalProperties":false})),
             ToolName::Next => ("Heartbeat and get the currently open action.", task_epoch_schema()),
@@ -1329,7 +1331,7 @@ fn preview_descriptors() -> Vec<Value> {
         json!({"name":"rex_critique_prompt","description":"MANDATORY before any check: receive the action-bound hardest-possible critique challenge. It invalidates an earlier critique for this action.","inputSchema":task_epoch_schema()}),
         json!({"name":"rex_critique_record","description":"Record concrete skeptical findings for the current action after requesting the challenge. REX requires this before checking or acceptance; prose cannot prove honesty.","inputSchema":extend(task_epoch_schema(),json!({"action_id":{"type":"string"},"findings":{"type":"string","minLength":80}}), &["action_id","findings"])}),
         json!({"name":"rex_preview_start","description":"Start a task-scoped local preview. Static HTML and supported app frameworks use an isolated loopback server; interaction/capture uses local headless Chrome, not the user's browser.","inputSchema":extend(task_epoch_schema(),json!({"project_dir":{"type":"string"}}),&["project_dir"])}),
-        json!({"name":"rex_preview_action","description":"Interact with the local preview after an action-bound critique: pointer, creator-frozen activate_control, key, text, scroll, explicit bounded wait_for_animations, navigation, viewport, reduced-motion media override or a fresh-navigation JavaScript-off condition. Re-enable after an off capture requires a fresh preview.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"action":{"type":"object"}}),&["preview_id","action"])}),
+        json!({"name":"rex_preview_action","description":"Interact with the local preview after an action-bound critique: pointer, activate_control only for the creator-frozen two_state_contract selector after its start capture, key, text, scroll, explicit bounded wait_for_animations, navigation, viewport, reduced-motion media override or a fresh-navigation JavaScript-off condition. Re-enable after an off capture requires a fresh preview.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"action":{"type":"object"}}),&["preview_id","action"])}),
         json!({"name":"rex_preview_capture","description":"Capture REX-owned headless-Chrome pixels and DOM/AX evidence, bound as an immutable task artifact. Contracted mobile/desktop results require exact 390x650/1280x800 and report visible_result_fields; inspect PNG pixels because this is not a semantic or spatial-truth verdict. Capture after the critique challenge and record.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"kind":{"enum":["render.desktop.first","render.mobile390.first","render.state.start","render.state.mid","render.state.end","render.state.reverse"]}}),&["preview_id","kind"])}),
         json!({"name":"rex_preview_stop","description":"Stop and clean up this task's local preview process tree.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"}}),&["preview_id"])}),
     ]
@@ -2270,7 +2272,7 @@ mod tests {
         std::fs::write(app.join("index.html"),r#"<!doctype html><style>
           body{background:#f4efe4;color:#222;font:20px sans-serif;margin:20px}
           button{font:inherit;padding:12px}</style>
-          <p id='result'>Example A</p><button id='change' onclick="document.getElementById('result').textContent='Example B'">Change example</button>"#).unwrap();
+          <p id='result'>Example A</p><p id='order'></p><button id='change' onclick="document.getElementById('result').textContent='Example B'; setTimeout(() => document.getElementById('order').textContent='Order unchanged', 150)">Change example</button>"#).unwrap();
         mcp.handle(rpc(
             1,
             "initialize",
@@ -2280,7 +2282,8 @@ mod tests {
         let started=mcp.handle(rpc(2,"tools/call",json!({"name":"rex_execute","arguments":{
             "request_id":"two-state-mcp","task":"Build a landing page","host":"generic_agent",
             "operator_is_agent":true,"two_state_contract":{"viewport":"mobile390","control":"#change",
-                "start_text":"Example A","end_text":"Example B","min_font_px":14}
+                "start_text":"Example A","end_text":"Example B","min_font_px":14,
+                "end_fields":[{"name":"review_result","kind":"text","alternatives":["Order unchanged"],"min_font_px":14}]}
         }}))).unwrap();
         assert_eq!(started["result"]["isError"], false, "{started}");
         let v = &started["result"]["structuredContent"];
@@ -2368,6 +2371,23 @@ mod tests {
             json!({"action":{"kind":"activate_control","selector":"#change"}}),
         );
         assert_eq!(click["result"]["isError"], false, "{click}");
+        let missing = call(
+            &mut mcp,
+            110,
+            "rex_preview_capture",
+            json!({"kind":"render.state.end"}),
+        );
+        assert_eq!(missing["result"]["isError"], true, "{missing}");
+        assert!(missing["result"].to_string().contains("review_result"));
+        // The omitted field is a late DOM update, not a changed source tree or new task.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let wait = call(
+            &mut mcp,
+            111,
+            "rex_preview_action",
+            json!({"action":{"kind":"wait_for_animations","timeout_ms":2000}}),
+        );
+        assert_eq!(wait["result"]["isError"], false, "{wait}");
         let end = call(
             &mut mcp,
             12,
@@ -2379,6 +2399,11 @@ mod tests {
             .as_str()
             .unwrap();
         assert_ne!(start_hash, end_hash);
+        assert!(end["result"]["structuredContent"]["visible_result_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "review_result"));
         // The creator named this control: an arbitrary real click elsewhere cannot complete the trace.
         let stored = mcp
             .daemon
