@@ -609,7 +609,7 @@ impl BrowserRuntime {
                 .and_then(Value::as_f64)
                 .is_none_or(|y| y.abs() > 2.0)
             {
-                return Err(PreviewError::EvidenceLimit);
+                return Err(PreviewError::FirstViewScrolled);
             }
             // Evaluate in the same live preview session, using client geometry,
             // not serialized DOM text. This still cannot prove semantic truth

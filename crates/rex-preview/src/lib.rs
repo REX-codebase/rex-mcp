@@ -78,6 +78,8 @@ pub enum PreviewError {
     Terminal,
     #[error("iteration budget exhausted")]
     IterationLimit,
+    #[error("capture with frozen first-view fields requires scroll at the top; scroll back to y=0 and recapture")]
+    FirstViewScrolled,
     #[error("evidence exceeded its bounded budget")]
     EvidenceLimit,
     #[error("scroll delta_x and delta_y must each be finite and within -10000..=10000 per action; use several smaller scroll actions for longer pages")]

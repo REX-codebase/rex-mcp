@@ -885,6 +885,21 @@ mod tests {
         assert!(!second.visible_result_fields.contains(&"delta".into()));
         assert!(!second.visible_result_fields.contains(&"reject".into()));
         assert!(!second.visible_result_fields.contains(&"secret".into()));
+        sup.action(
+            &started.id,
+            &BrowserAction::Scroll {
+                delta_x: 0.0,
+                delta_y: 520.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sup.capture_with_fields(&started.id, &fields).unwrap_err(),
+            PreviewError::FirstViewScrolled
+        );
+        sup.action(&started.id, &BrowserAction::Navigate { path: "/".into() })
+            .unwrap();
+        assert!(sup.capture_with_fields(&started.id, &fields).is_ok());
         let contains = [
             rex_protocol::MobileResultField {
                 name: "quantity".into(),
