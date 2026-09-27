@@ -690,6 +690,29 @@ mod tests {
         .unwrap();
         let second = sup.capture(&started.id).unwrap();
         assert!(second.dom_text.contains("clicked"));
+        fs::write(app.join("motion.html"), "<!doctype html><style>body{background:#e34141}@media(prefers-reduced-motion:reduce){body{background:#3475e3}}</style><p>motion test</p>").unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::Navigate {
+                path: "/motion.html".into(),
+            },
+        )
+        .unwrap();
+        let normal = sup.capture(&started.id).unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::SetReducedMotion { enabled: true },
+        )
+        .unwrap();
+        let reduced = sup.capture(&started.id).unwrap();
+        assert_ne!(normal.screenshot_data_url, reduced.screenshot_data_url);
+        sup.action(
+            &started.id,
+            &BrowserAction::SetReducedMotion { enabled: false },
+        )
+        .unwrap();
+        let restored = sup.capture(&started.id).unwrap();
+        assert_eq!(normal.screenshot_data_url, restored.screenshot_data_url);
         // A click navigates independently of the typed route action. Do not
         // bind its pixels as task evidence when it leaves the preview port.
         fs::write(
