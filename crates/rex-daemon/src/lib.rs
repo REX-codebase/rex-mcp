@@ -93,6 +93,10 @@ struct DurableTask {
     /// Harness-registered evidence ids (tool receipts, test evidence ids).
     /// A completion claim may only cite these.
     registered_evidence: BTreeSet<String>,
+    #[serde(default)]
+    critique_issued_for: Option<String>,
+    #[serde(default)]
+    critique_recorded_for: Option<String>,
     result: Option<String>,
     terminal_reason: Option<String>,
     #[serde(default = "default_branch_id")]
@@ -411,6 +415,8 @@ impl HarnessDaemon {
             proof: req.proof,
             evidence: BTreeMap::new(),
             registered_evidence: BTreeSet::new(),
+            critique_issued_for: None,
+            critique_recorded_for: None,
             result: None,
             terminal_reason: None,
             branch_id: "main".into(),
@@ -440,6 +446,114 @@ impl HarnessDaemon {
             Some(host_resume_handle),
             Some(task_capability),
         ))
+    }
+
+    pub fn require_live_task(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+    ) -> Result<(), ProtocolError> {
+        self.live(task_id, epoch, capability).map(|_| ())
+    }
+
+    pub fn workspace(&self) -> &Path {
+        &self.policy.workspace
+    }
+
+    /// Issue a challenge before checking the current action. The host must
+    /// respond to this exact action; earlier critiques cannot be carried over.
+    pub fn critique_prompt(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+    ) -> Result<Value, ProtocolError> {
+        let mut t = self.live(task_id, epoch, capability)?;
+        let action = t
+            .open_action
+            .as_ref()
+            .ok_or_else(|| perr(ErrorCode::TaskTerminal, "no open action", task_id))?
+            .clone();
+        t.critique_issued_for = Some(action.action_id.clone());
+        t.critique_recorded_for = None;
+        self.append_event(
+            &mut t,
+            "critique_prompt_issued",
+            json!({"action_id":action.action_id}),
+        )?;
+        self.persist(&t)?;
+        Ok(
+            json!({"task_id":task_id,"action_id":action.action_id,"prompt":format!(
+            "Attack this work as a skeptical expert before any check. Frozen task: {}. Current action: {}. Find the strongest ways it fails the brief, including misleading claims, bad pixels, broken interactions, accessibility, narrow viewport, missing/error/reverse states and false evidence. Inspect the real artifact. State at least one concrete defect or explain what you tried to break and could not. Do not grade generously or equate a receipt with a working result. Record what is unverified and repair before acceptance.", t.task, action.instructions)}),
+        )
+    }
+
+    pub fn critique_record(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+        action_id: &str,
+        findings: &str,
+    ) -> Result<Value, ProtocolError> {
+        let mut t = self.live(task_id, epoch, capability)?;
+        if t.open_action.as_ref().map(|a| a.action_id.as_str()) != Some(action_id)
+            || t.critique_issued_for.as_deref() != Some(action_id)
+        {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "request the critique prompt for the current action first",
+                task_id,
+            ));
+        }
+        if findings.trim().chars().count() < 80 || findings.len() > 16000 {
+            return Err(perr(
+                ErrorCode::MalformedRequest,
+                "critique findings must be 80-16000 characters",
+                task_id,
+            ));
+        }
+        t.critique_recorded_for = Some(action_id.to_string());
+        self.append_event(
+            &mut t,
+            "critique_recorded",
+            json!({"action_id":action_id,"findings":findings}),
+        )?;
+        self.persist(&t)?;
+        Ok(json!({"task_id":task_id,"action_id":action_id,"recorded":true}))
+    }
+
+    pub fn require_critique_issued(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+    ) -> Result<(), ProtocolError> {
+        let t = self.live(task_id, epoch, capability)?;
+        let action_id = t.open_action.as_ref().map(|a| a.action_id.as_str());
+        if action_id.is_none() || t.critique_issued_for.as_deref() != action_id {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "request rex_critique_prompt for the current action before preview checking",
+                task_id,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn require_critique(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+    ) -> Result<(), ProtocolError> {
+        let t = self.live(task_id, epoch, capability)?;
+        let action_id = t.open_action.as_ref().map(|a| a.action_id.as_str());
+        if t.critique_recorded_for.as_deref() != action_id || action_id.is_none() {
+            return Err(perr(ErrorCode::GateFailed, "request rex_critique_prompt and record findings for the current action before checking", task_id));
+        }
+        Ok(())
     }
 
     pub fn next(&self, req: NextRequest) -> Result<NextResponse, ProtocolError> {
@@ -532,6 +646,19 @@ impl HarnessDaemon {
 
     pub fn run(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
+        if visual_action(
+            &t.task,
+            t.open_action
+                .as_ref()
+                .map(|a| a.instructions.as_str())
+                .unwrap_or(""),
+        ) {
+            let action_id = t.open_action.as_ref().map(|a| a.action_id.as_str());
+            if t.critique_recorded_for.as_deref() != action_id || action_id.is_none() {
+                return Err(perr(ErrorCode::GateFailed,
+                    "record the current action's severe critique before running UI checks or build commands",&t.task_id));
+            }
+        }
         let out = self.call_tool(
             &mut t,
             ToolRequest::RunCommand {
@@ -551,6 +678,7 @@ impl HarnessDaemon {
     }
 
     pub fn test(&self, req: TestRequest) -> Result<TestResponse, ProtocolError> {
+        self.require_critique(&req.task_id, &req.capability, req.lease_epoch)?;
         let argv = match req.recipe.as_str() {
             "cargo-test" => vec!["cargo".into(), "test".into(), "--workspace".into()],
             "npm-test" => vec!["npm".into(), "test".into()],
@@ -662,6 +790,13 @@ impl HarnessDaemon {
             .open_action
             .clone()
             .ok_or_else(|| perr(ErrorCode::TaskTerminal, "no open action", &t.task_id))?;
+        if t.critique_recorded_for.as_deref() != Some(open.action_id.as_str()) {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "request rex_critique_prompt and record findings before acceptance",
+                &t.task_id,
+            ));
+        }
         if open.action_id != req.action_id {
             return Err(perr(
                 ErrorCode::LeaseConflict,
@@ -3025,6 +3160,155 @@ mod tests {
     }
 
     #[test]
+    fn visual_run_cannot_bypass_critique_and_nonvisual_build_remains_available() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut visual = req("visual-run-critique");
+        visual.ultra = false;
+        visual.task = "Build a visual UI page".into();
+        let ex = daemon.execute(visual).unwrap();
+        let run = RunRequest {
+            task_id: ex.task_id.clone(),
+            capability: cap_of(&ex),
+            lease_epoch: ex.lease.epoch,
+            argv: vec!["cargo".into(), "--version".into()],
+            timeout_ms: Some(5000),
+        };
+        assert_eq!(
+            daemon.run(run.clone()).unwrap_err().code,
+            ErrorCode::GateFailed
+        );
+        daemon
+            .critique_prompt(&ex.task_id, &cap_of(&ex), ex.lease.epoch)
+            .unwrap();
+        assert_eq!(
+            daemon.run(run.clone()).unwrap_err().code,
+            ErrorCode::GateFailed
+        );
+        daemon.critique_record(&ex.task_id,&cap_of(&ex),ex.lease.epoch,
+            &ex.next.as_ref().unwrap().action_id,
+            "The build command may pass while the UI remains white, cropped, inaccessible or inert. Check rendered desktop/mobile pixels and keyboard states before claiming success.").unwrap();
+        // The actual command may be denied by conservative launcher policy; the
+        // important boundary is that critique no longer blocks its dispatch.
+        assert_ne!(daemon.run(run).unwrap_err().code, ErrorCode::GateFailed);
+        let mut plain = req("plain-run");
+        plain.ultra = false;
+        plain.task = "Inspect source files".into();
+        let other = daemon.execute(plain).unwrap();
+        let ordinary = RunRequest {
+            task_id: other.task_id.clone(),
+            capability: cap_of(&other),
+            lease_epoch: other.lease.epoch,
+            argv: vec!["cargo".into(), "--version".into()],
+            timeout_ms: Some(5000),
+        };
+        assert_ne!(
+            daemon.run(ordinary).unwrap_err().code,
+            ErrorCode::GateFailed
+        );
+    }
+
+    #[test]
+    fn critique_gate_is_bound_to_action_and_cannot_be_skipped() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut r = req("critique-gate");
+        r.ultra = false;
+        r.plan = Some(vec![
+            PlanStep {
+                instructions: "first".into(),
+                acceptance: None,
+            },
+            PlanStep {
+                instructions: "second".into(),
+                acceptance: None,
+            },
+        ]);
+        let ex = daemon.execute(r).unwrap();
+        let cap = cap_of(&ex);
+        let first = ex.next.as_ref().unwrap().action_id.clone();
+        assert_eq!(
+            daemon
+                .require_critique(&ex.task_id, &cap, ex.lease.epoch)
+                .unwrap_err()
+                .code,
+            ErrorCode::GateFailed
+        );
+        let issued = daemon
+            .critique_prompt(&ex.task_id, &cap, ex.lease.epoch)
+            .unwrap();
+        assert_eq!(issued["action_id"], first);
+        assert_eq!(
+            daemon
+                .require_critique(&ex.task_id, &cap, ex.lease.epoch)
+                .unwrap_err()
+                .code,
+            ErrorCode::GateFailed
+        );
+        daemon.critique_record(&ex.task_id,&cap,ex.lease.epoch,&first,
+            "The source is untested and may not satisfy the brief. Try malformed input, a narrow viewport, keyboard use and failure recovery before accepting this action.").unwrap();
+        daemon
+            .require_critique(&ex.task_id, &cap, ex.lease.epoch)
+            .unwrap();
+        fs::write(w.join("proof.txt"), "a").unwrap();
+        let receipt = daemon
+            .read(ReadRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap.clone(),
+                lease_epoch: ex.lease.epoch,
+                path: "proof.txt".into(),
+                byte_range: None,
+            })
+            .unwrap()
+            .receipt
+            .unwrap();
+        let next = daemon
+            .submit(SubmitRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap.clone(),
+                lease_epoch: ex.lease.epoch,
+                action_id: first,
+                narrative: "First action inspected".into(),
+                evidence: [("read".into(), receipt.clone())].into(),
+            })
+            .unwrap();
+        let second = next.next.unwrap().action_id;
+        assert_eq!(
+            daemon
+                .require_critique(&ex.task_id, &cap, ex.lease.epoch)
+                .unwrap_err()
+                .code,
+            ErrorCode::GateFailed
+        );
+        let rejected = daemon
+            .submit(SubmitRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap.clone(),
+                lease_epoch: ex.lease.epoch,
+                action_id: second.clone(),
+                narrative: "Second without critique".into(),
+                evidence: [("read".into(), receipt)].into(),
+            })
+            .unwrap_err();
+        assert_eq!(rejected.code, ErrorCode::GateFailed);
+        assert_eq!(
+            daemon
+                .status(TaskRefRequest {
+                    task_id: ex.task_id
+                })
+                .unwrap()
+                .open_action
+                .unwrap()
+                .action_id,
+            second
+        );
+    }
+
+    #[test]
     fn standard_visual_action_rejects_source_receipt_and_invalid_render_artifacts() {
         let d = tempdir().unwrap();
         let w = d.path().join("ws");
@@ -3051,6 +3335,11 @@ mod tests {
             .receipt
             .unwrap();
         let action_id = ex.next.as_ref().unwrap().action_id.clone();
+        daemon
+            .critique_prompt(&ex.task_id, &cap_of(&ex), ex.lease.epoch)
+            .unwrap();
+        daemon.critique_record(&ex.task_id, &cap_of(&ex), ex.lease.epoch, &action_id,
+            "The source receipt says nothing about the rendered page. Probe desktop, mobile, start, middle, end and reverse pixels; missing screenshots should block acceptance.").unwrap();
         let submission = |evidence| SubmitRequest {
             task_id: ex.task_id.clone(),
             capability: cap_of(&ex),
@@ -4002,6 +4291,12 @@ mod tests {
             .unwrap()
             .receipt
             .unwrap();
+        let action_id = first.next.as_ref().unwrap().action_id.clone();
+        daemon
+            .critique_prompt(&first.task_id, &cap_of(&first), first.lease.epoch)
+            .unwrap();
+        daemon.critique_record(&first.task_id, &cap_of(&first), first.lease.epoch, &action_id,
+            "The file read proves a local source exists, not that an external process used it. Check the frozen contract, source bytes and remaining unknowns before acceptance.").unwrap();
         let completed = daemon
             .submit(SubmitRequest {
                 task_id: first.task_id.clone(),

@@ -111,7 +111,17 @@ fn full_caller_driven_lifecycle_over_stdio() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names.len(), 23);
+    assert_eq!(names.len(), 29);
+    for name in [
+        "rex_critique_prompt",
+        "rex_critique_record",
+        "rex_preview_start",
+        "rex_preview_action",
+        "rex_preview_capture",
+        "rex_preview_stop",
+    ] {
+        assert!(names.contains(&name), "missing {name}");
+    }
     assert!(names.contains(&"rex_human_stop"));
     assert!(names.contains(&"rex_execute") && names.contains(&"rex_submit"));
 
@@ -135,6 +145,14 @@ fn full_caller_driven_lifecycle_over_stdio() {
         json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,"path":"note.txt"}),
     );
     assert_eq!(read["content"], "hello rex");
+    let critique1 = s.tool(
+        "rex_critique_prompt",
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch}),
+    );
+    assert_eq!(critique1["action_id"], action1);
+    let findings1 = s.tool("rex_critique_record", json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
+        "action_id":action1,"findings":"Tried to break the read step: verify the returned bytes match the frozen task and do not claim a mutation. The note read matches; editing remains unverified."}));
+    assert_eq!(findings1["recorded"], true);
     let sub1 = s.tool(
         "rex_submit",
         json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
@@ -154,6 +172,15 @@ fn full_caller_driven_lifecycle_over_stdio() {
         "argv":["cat","note.txt"]}),
     );
     assert!(run["stdout"].as_str().unwrap().contains("world"));
+
+    let critique2 = s.tool(
+        "rex_critique_prompt",
+        json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch}),
+    );
+    assert_eq!(critique2["action_id"], action2);
+    let findings2 = s.tool("rex_critique_record", json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
+        "action_id":action2,"findings":"Tried to break the edit: the file can be changed without proving task completion, so require the exact edit receipt and a run result showing the appended line. No UI pixels apply."}));
+    assert_eq!(findings2["recorded"], true);
 
     // Fable completion gate: a final claim citing no harness evidence is
     // rejected with repair feedback, and the action stays open.
