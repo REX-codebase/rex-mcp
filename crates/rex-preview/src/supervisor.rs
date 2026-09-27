@@ -592,7 +592,18 @@ fn spawn_static(
                         root.join(rel)
                     };
                     let canonical = candidate.canonicalize().ok();
-                    if let Some(file) = canonical.filter(|p| p.starts_with(&root) && p.is_file()) {
+                    // These paths are excluded from the capture source hash.
+                    // A static preview must not serve untracked bytes as if
+                    // they belonged to the attested project snapshot.
+                    let excluded = Path::new(rel).components().any(|c| {
+                        matches!(
+                            c.as_os_str().to_str(),
+                            Some("node_modules" | ".git" | "target" | ".next")
+                        )
+                    });
+                    if let Some(file) =
+                        canonical.filter(|p| !excluded && p.starts_with(&root) && p.is_file())
+                    {
                         let data = fs::read(file).unwrap_or_default();
                         let _ = write!(
                             stream,
@@ -649,6 +660,34 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         p
     }
+    #[test]
+    fn static_preview_refuses_unhashed_resource_paths() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("unhashed-resource");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"), "<h1>visible</h1>").unwrap();
+        for dirname in ["node_modules", ".next", "target", ".git"] {
+            fs::create_dir(app.join(dirname)).unwrap();
+            fs::write(app.join(dirname).join("asset.css"), "body{color:red}").unwrap();
+        }
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        let addr = started
+            .url
+            .trim_start_matches("http://")
+            .trim_end_matches('/');
+        for dirname in ["node_modules", ".next", "target", ".git"] {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            write!(stream, "GET /{dirname}/asset.css HTTP/1.0\r\n\r\n").unwrap();
+            let mut body = String::new();
+            stream.read_to_string(&mut body).unwrap();
+            assert!(body.starts_with("HTTP/1.0 404"), "{dirname}: {body}");
+        }
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+
     #[test]
     fn static_preview_hash_includes_served_generated_assets() {
         let w = temp("static-asset-hash");
