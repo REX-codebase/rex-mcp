@@ -70,6 +70,8 @@ pub enum PreviewError {
     BlankFrame,
     #[error("requested preview condition did not take effect in the page")]
     ConditionNotApplied,
+    #[error("visible finite animations did not settle within the requested wait; capture may be in flight")]
+    AnimationNotSettled,
     #[error("preview page has runtime errors or missing scene content")]
     BrokenPage,
     #[error("preview session is already terminal")]
@@ -236,6 +238,7 @@ pub enum BrowserAction {
     Key { key: SafeKey, state: KeyState },
     Text { value: String },
     Scroll { delta_x: f32, delta_y: f32 },
+    WaitForAnimations { timeout_ms: u32 },
     SetViewport { width: u16, height: u16, scale: f32 },
     SetReducedMotion { enabled: bool },
     SetJavaScript { enabled: bool },
@@ -294,6 +297,9 @@ impl BrowserAction {
                     || delta_y.abs() > 10_000.0 =>
             {
                 Err(PreviewError::ScrollDeltaLimit)
+            }
+            Self::WaitForAnimations { timeout_ms } if *timeout_ms > 5000 => {
+                Err(PreviewError::EvidenceLimit)
             }
             Self::SetViewport {
                 width,
@@ -685,6 +691,14 @@ mod tests {
             assert!(error.to_string().contains("delta_x and delta_y"));
             assert!(error.to_string().contains("10000"));
         }
+        assert_eq!(
+            BrowserAction::WaitForAnimations { timeout_ms: 5000 }.validate(),
+            Ok(())
+        );
+        assert_eq!(
+            BrowserAction::WaitForAnimations { timeout_ms: 5001 }.validate(),
+            Err(PreviewError::EvidenceLimit)
+        );
         assert!(BrowserAction::Text {
             value: "x".repeat(20_000)
         }

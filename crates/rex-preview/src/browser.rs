@@ -277,6 +277,9 @@ impl BrowserRuntime {
             BrowserAction::Scroll { delta_x, delta_y } => {
                 self.command("Input.dispatchMouseEvent", json!({"type":"mouseWheel","x":self.cursor_x,"y":self.cursor_y,"deltaX":delta_x,"deltaY":delta_y}))?;
             }
+            BrowserAction::WaitForAnimations { timeout_ms } => {
+                self.wait_for_animations(*timeout_ms)?;
+            }
             BrowserAction::SetViewport {
                 width,
                 height,
@@ -338,6 +341,31 @@ impl BrowserRuntime {
             }
         }
         Ok(())
+    }
+
+    fn wait_for_animations(&mut self, timeout_ms: u32) -> Result<(), PreviewError> {
+        // The host requests this explicitly after an input, rather than all
+        // captures sleeping or mislabeling an in-flight frame as settled.
+        // Finite Web Animations (including CSS transitions) are observable;
+        // arbitrary JS drawing and infinite ambient loops are not certified.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        loop {
+            let result = self.command("Runtime.evaluate", json!({
+                "expression":"document.getAnimations({subtree:true}).filter(a=>a.playState==='running' && Number.isFinite(a.effect?.getComputedTiming().endTime)).length",
+                "returnByValue":true,
+            }))?;
+            let count = result
+                .pointer("/result/result/value")
+                .and_then(Value::as_u64)
+                .ok_or(PreviewError::ConditionNotApplied)?;
+            if count == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(PreviewError::AnimationNotSettled);
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
     }
 
     fn conditions_match(
