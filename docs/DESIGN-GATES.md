@@ -1,0 +1,7 @@
+# Design gates: what REX can and cannot prove
+
+The host's REX design skill asks for five distinct pre-build concepts, source-backed payoff, delivery-size proof, an evidence-led first view, and a one-scan comparison against a plain baseline. For Production agent/task pages it asks for one actual run timeline instead of a gallery of demo states. These are review instructions for the host, not deterministic daemon verdicts about taste. See `.agents/skills/rex-design/SKILL.md`, especially “Pre-build concept gate”, “First-view ownership gate” and “Production mode”.
+
+Standard visual custody mechanically requires an action-bound critique record before preview, test or submission, and six task-bound PNG captures from the local preview at desktop, 390px and four states. The daemon validates artifact binding, digests, PNG decoding, basic dimensions and source-tree coherence. It cannot authenticate the host's judgment, the independence or severity of critique, whether screenshots show meaningful settled behavior, or whether a candidate beats a plain design in one scan. A host must inspect pixels and compare the source and baseline honestly. See `docs/rex-mcp.md` (“Standard visual-action evidence gate” and “Local MCP preview and mandatory critique challenge”).
+
+Therefore a completed REX task is evidence of custody checks, not proof that a design is human-like or that a weak host would make the same keep/kill decision. Do not present a stopped study or a local mock as a shipped design.
