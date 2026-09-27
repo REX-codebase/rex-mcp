@@ -118,6 +118,12 @@ impl BrowserRuntime {
             cursor_x: 0.0,
             cursor_y: 0.0,
         };
+        b.command(
+            "Emulation.setDeviceMetricsOverride",
+            json!({
+                "width":b.width,"height":b.height,"deviceScaleFactor":b.scale,"mobile":false
+            }),
+        )?;
         b.command("Page.enable", json!({}))?;
         b.command("Runtime.enable", json!({}))?;
         b.command("Network.enable", json!({"maxTotalBufferSize": 1048576}))?;
@@ -274,6 +280,17 @@ impl BrowserRuntime {
             .decode(&encoded)
             .map_err(|_| PreviewError::EvidenceLimit)?;
         if bytes.len() > crate::MAX_SCREENSHOT_BYTES {
+            return Err(PreviewError::EvidenceLimit);
+        }
+        let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+        let info = decoder
+            .read_info()
+            .map_err(|_| PreviewError::EvidenceLimit)?;
+        // The viewport evidence must describe the actual raster, not a
+        // requested CDP size. A cropped capture is not desktop proof.
+        let expected_width = (self.width as f32 * self.scale).round() as u32;
+        let expected_height = (self.height as f32 * self.scale).round() as u32;
+        if info.info().width != expected_width || info.info().height != expected_height {
             return Err(PreviewError::EvidenceLimit);
         }
         let hash = format!("{:x}", Sha256::digest(&bytes));

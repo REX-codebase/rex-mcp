@@ -570,6 +570,7 @@ fn mime(p: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     // Several tests bind from the shared preview port range; serialize them
     // so a concurrently running test cannot occupy a port another test
     // expects to bind or skip.
@@ -649,6 +650,20 @@ mod tests {
         assert_eq!(sup.begin_iteration(&started.id).unwrap(), 1);
         let first = sup.capture(&started.id).unwrap();
         assert!(first.dom_text.contains("press"));
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(
+                first
+                    .screenshot_data_url
+                    .as_ref()
+                    .unwrap()
+                    .strip_prefix("data:image/png;base64,")
+                    .unwrap(),
+            )
+            .unwrap();
+        let reader = png::Decoder::new(std::io::Cursor::new(png))
+            .read_info()
+            .unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (1280, 800));
         assert!(first
             .screenshot_data_url
             .as_deref()
