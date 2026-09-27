@@ -525,6 +525,11 @@ impl HarnessDaemon {
         })
     }
 
+    pub fn validate_run(&self, req: &RunRequest) -> Result<(), ProtocolError> {
+        self.live(&req.task_id, req.lease_epoch, &req.capability)?;
+        Ok(())
+    }
+
     pub fn run(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         let out = self.call_tool(

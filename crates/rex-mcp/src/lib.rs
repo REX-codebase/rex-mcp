@@ -22,10 +22,20 @@ pub struct McpServer {
     initialized: bool,
     promotions: Arc<Mutex<HashMap<String, PromotionOperation>>>,
     promotion_sequence: u64,
+    runs: Arc<Mutex<HashMap<String, RunOperation>>>,
 }
 
 // This registry is scoped to this stdio process. The custody receipt remains
 // durable in REX; a lost MCP process cannot promise an in-memory operation result.
+struct RunOperation {
+    task_id: String,
+    operation_id: String,
+    capability_hash: String,
+    lease_epoch: u64,
+    request: Value,
+    result: Option<Result<Value, ProtocolError>>,
+}
+
 struct PromotionOperation {
     operation_id: String,
     capability_hash: String,
@@ -40,7 +50,117 @@ impl McpServer {
             initialized: false,
             promotions: Arc::new(Mutex::new(HashMap::new())),
             promotion_sequence: 0,
+            runs: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn start_run(&mut self, args: Value) -> Result<Value, ProtocolError> {
+        let req: rex_protocol::RunRequest = serde_json::from_value(args.clone())
+            .map_err(|e| ProtocolError::new(ErrorCode::MalformedRequest, e.to_string()))?;
+        let hash = hex_sha256(req.capability.as_bytes());
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| ProtocolError::new(ErrorCode::Internal, "run registry unavailable"))?;
+        if let Some(op) = runs.values().find(|op| op.task_id == req.task_id) {
+            if op.capability_hash != hash || op.lease_epoch != req.lease_epoch {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "operation credentials differ",
+                ));
+            }
+            if op.request != args {
+                return Err(ProtocolError::new(
+                    ErrorCode::IdempotencyConflict,
+                    "run arguments differ",
+                ));
+            }
+            return Ok(run_state(op));
+        }
+        self.daemon.validate_run(&req)?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| ProtocolError::new(ErrorCode::Internal, e.to_string()))?
+            .as_nanos();
+        let operation_id = format!("run-{stamp}-{}", self.promotion_sequence);
+        self.promotion_sequence += 1;
+        runs.insert(
+            operation_id.clone(),
+            RunOperation {
+                task_id: req.task_id.clone(),
+                operation_id: operation_id.clone(),
+                capability_hash: hash,
+                lease_epoch: req.lease_epoch,
+                request: args.clone(),
+                result: None,
+            },
+        );
+        let registry = Arc::clone(&self.runs);
+        let daemon = Arc::clone(&self.daemon);
+        let worker_id = operation_id.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("rex-run".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    daemon.dispatch(ToolName::Run, args)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(ProtocolError::new(
+                        ErrorCode::Internal,
+                        "run worker panicked",
+                    ))
+                });
+                if let Ok(mut runs) = registry.lock() {
+                    if let Some(op) = runs.get_mut(&worker_id) {
+                        op.result = Some(result);
+                    }
+                }
+            })
+        {
+            runs.remove(&operation_id);
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                format!("cannot start run worker: {e}"),
+            ));
+        }
+        Ok(run_state(runs.get(&operation_id).unwrap()))
+    }
+
+    fn run_status(&self, args: Value) -> Result<Value, ProtocolError> {
+        let task_id = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|id| valid_task_id(id))
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "valid task_id required")
+            })?;
+        let operation_id = args
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "operation_id required")
+            })?;
+        let capability = args
+            .get("capability")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "capability required")
+            })?;
+        let runs = self
+            .runs
+            .lock()
+            .map_err(|_| ProtocolError::new(ErrorCode::Internal, "run registry unavailable"))?;
+        let op = runs.get(operation_id).filter(|op| op.task_id == task_id)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::TaskNotFound, "operation not found in this MCP process; inspect durable task status and proof"))?;
+        if op.capability_hash != hex_sha256(capability.as_bytes()) {
+            return Err(ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "invalid operation capability",
+            ));
+        }
+        Ok(run_state(op))
     }
 
     fn start_promotion(&mut self, args: Value) -> Result<Value, ProtocolError> {
@@ -273,6 +393,7 @@ impl McpServer {
             "tools/list" => self.require_initialized().map(|_| {
                 let mut tools = tool_descriptors();
                 tools.extend(promotion_descriptors());
+                tools.extend(run_descriptors());
                 json!({"tools":tools})
             }),
             "resources/list" => self.require_initialized().map(|_| json!({
@@ -394,7 +515,7 @@ impl McpServer {
                 Ok(json!({"contents": [{
                     "uri": uri,
                     "mimeType": "text/plain",
-                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with evidence. For an existing task, use the rex_task_inspect prompt and task status/events/result resources for read-only inspection; read rex://task/{task_id}/events/0, then request rex://task/{task_id}/events/{last_seq} until a page is empty. Each page has at most 100 entries. Read rex://task/{task_id}/result only when available, and distinguish a terminal result from an active task. For Ultra, create with rex_execute and ultra: true; use rex_ultra_open with a deterministic contract, submit candidate bundles and gate evidence through rex_ultra_submit, then start long promotion with rex_ultra_promote_start. Poll rex_ultra_promote_status using the returned operation_id while this MCP process remains alive. A running response is not completion; only a succeeded response has a receipt. A failed response has an error. After process loss, inspect durable status and proof before retrying; do not assume a lost operation committed. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
+                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with an evidence object whose values are actual receipt or evidence_id strings returned by scoped tools, not descriptive prose; keep explanations in narrative. If accepted is false, read repair and resubmit the same open action with registered IDs. A resumed rex_execute rotates host_resume_handle and task_capability: persist the newly returned values immediately, and never retry with the old handle. After a lost handle, inspect status/events and stop rather than creating a replacement task as a bypass. For an existing task, use the rex_task_inspect prompt and task status/events/result resources for read-only inspection; read rex://task/{task_id}/events/0, then request rex://task/{task_id}/events/{last_seq} until a page is empty. Each page has at most 100 entries. Read rex://task/{task_id}/result only when available, and distinguish a terminal result from an active task. For Ultra, create with rex_execute and ultra: true; use rex_ultra_open with a deterministic contract, submit candidate bundles and gate evidence through rex_ultra_submit, then start long promotion with rex_ultra_promote_start. Poll rex_ultra_promote_status using the returned operation_id while this MCP process remains alive. A running response is not completion; only a succeeded response has a receipt. A failed response has an error. After process loss, inspect durable status and proof before retrying; do not assume a lost operation committed. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
                 }]}))
             }),
             "prompts/list" => self.require_initialized().map(|_| json!({
@@ -417,7 +538,16 @@ impl McpServer {
                         "required": true
                     }]
                 }, {
-                    "name": "rex_ultra_workflow",
+                    "name": "rex_design_workflow",
+                "title": "Design product UI with REX",
+                "description": "Find the original REX design skill and verify the rendered result.",
+                "arguments": [{
+                    "name": "task",
+                    "description": "The product UI task to work on.",
+                    "required": true
+                }]
+            }, {
+                "name": "rex_ultra_workflow",
                     "title": "Run a REX Ultra task",
                     "description": "Guide the host through Ultra candidate custody, deterministic gates, and promotion.",
                     "arguments": [{
@@ -452,7 +582,26 @@ impl McpServer {
                         }]
                     }));
                 }
-                if name != "rex_task_workflow" && name != "rex_ultra_workflow" {
+                if name == "rex_design_workflow" {
+                let task = request
+                    .get("params")
+                    .and_then(|p| p.get("arguments"))
+                    .and_then(|a| a.get("task"))
+                    .and_then(Value::as_str)
+                    .filter(|task| !task.trim().is_empty())
+                    .ok_or_else(|| ProtocolError::new(ErrorCode::MalformedRequest, "non-empty task argument required"))?;
+                return Ok(json!({
+                    "description": "Follow the repository's REX design skill for this product UI task.",
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!("For this product UI task: {task}\n\nFirst locate and read .agents/skills/rex-design/SKILL.md in this repository. If it is missing, say so rather than invent its contents. Read the task and choose Visual or Production mode using the skill's routing rules. A visually ambitious showcase or cinematic prompt routes to Visual; a real operational page routes to Production, and size alone is not visual ambition. State the reason and follow the corresponding workflow while preserving hard requirements. Inspect the existing UI, compare two structural directions, implement, then inspect rendered pixels and adversarial edge states across relevant viewports. In Production mode use a state coverage ledger; in Visual mode build an animated page and choose motion to suit its story. Use GSAP ScrollTrigger for scroll-led choreography when it fits, not as a default template for every page; record the choice. For scroll-led scenes, inspect trigger progress and rendered start/mid/end/reverse plus pin exit on desktop and mobile, with a static reduced-motion path. Verify actual start/middle/end playback and mobile scroll behavior, plus a separately rendered reduced-motion path. For timed Visual motion, keep the reduced-motion static equivalent readable beyond the original animation timer or until an explicit return action; do not flash it and auto-hide it. A static frame or CSS rule alone is not motion verification. For script-dependent controls, inspect a cache-fresh JS-disabled first viewport: show honest static content and no inert action, then reveal the control only after initialization. Check computed control visibility at mobile breakpoints too, since responsive CSS can override a script-off hidden rule. For long-running ambient Visual motion, provide a real pause/resume path; verify computed animation state and stable pixels while paused, resume and keyboard activation, and respect reduced-motion initialization and later preference changes. Hide script-dependent controls if JS never starts. For a continuous visual control, verify that its value matches visible progress at start, midpoint, end and reverse, with immediate state changes under reduced motion. For a multi-parameter Visual scene, test each axis separately and joint extremes, reverse them, and keep a textual readout aligned with the rendered art. For a reversible state-change metaphor, inspect opening, midpoint, final state and reverse path; align the toggle label and pressed state with the rendered art. CSS motion can fit without a library or canvas. Distinguish states exercised in the UI from states inferred from code or left unverified. Study verifiable examples, including X posts only when the original and rendered result can be inspected, then transfer task-relevant mechanisms rather than copying layouts or animation recipes. For Visual, map scene message, motion reason, mobile pacing and reduced-motion equivalent before coding. When 3D is appropriate, verify geometric depth, occlusion and a camera-change frame rather than accepting a flat disc merely because WebGL or Three.js is present; provide a static fallback. Test initial 3D load failure and later context loss so controls do not remain active on a dead scene. For Production, verify validation timing, corrected errors, retained input and accessible recovery after a failed submission. For optimistic writes, pending is not service-confirmed: do not show a success badge before the receipt, reconcile explicit rejection, and classify a lost response as unknown rather than failed. For concurrent edits, preserve the unsaved draft when the underlying revision changes, compare it with the newer record, invalidate the old local check, keep a reversible prior-draft route if copying newer text replaces the editor, and do not claim a save without a server-side conditional write. In-page undo is not durable reload recovery. A timed-out write has unknown outcome, not confirmed failure: retain the draft and request identity, check that operation before retry, and require a conclusive service status or real service idempotency for a same-key retry. An eventually consistent not-found response is not a confirmed failure. A retry must be a real path, not a permanently failing mock; distinguish a local check from a saved record, and exercise failure, retry and resulting state. For a multi-account action, show the selected account at review, bind the account, recipient and draft version, invalidate the check on account switch, discard late lookup results from the old account, and never carry an account-specific recipient into a different account as if it were the same audience. For attachment review, inspect retrievable bytes rather than trusting name or metadata; bind a digest to the exact selected version and invalidate on change. A local digest does not prove upload or delivery. For spreadsheet-bound exports of untrusted content, inspect formula-leading values after field parsing and serialization, including quote/separator tricks, and verify actual exported bytes rather than trusting a visual preview. For conflicting sources, compare provenance and revisions field by field; do not treat a later receipt time as blanket authority, and invalidate a local merge proposal when a source revision changes. For destructive actions, show exact target ID/revision and recovery limits, test wrong input and cancellation, and do not call an in-page restoration a service undo. Bind any consequential local review to exact values and source revision; a changed amount or revision invalidates it, and a local check is not owner approval or payment authority. For offline queues, distinguish editor draft, device-local storage, network attempt, unknown outcome and service receipt; a local queued item is not Sent, and reconnect alone does not authorize replay. For import previews, keep raw line values beside parsed rows, flag duplicates and invalid units, preserve zero as data, invalidate stale reviews on input changes, and never imply a local preview imported records. For priority ordering, move stable IDs with keyboard-reachable controls, preserve focus and announce position, invalidate prior review after a move, and distinguish local order from a saved server order. For cursor pagination, scope the cursor and in-flight request to its filter; discard old pages on filter change, ignore late responses, retain earlier rows on next-page failure, and never present shown count as total when unavailable. For a dense table/dashboard, test long labels, filtered counts, zero matches followed by a keyboard-reachable Clear filters control, preserved rows on failure, and a narrow layout that keeps each item status and next action together. For a partial bulk result, show each item ID with outcome and next step, preserve truthful aggregate counts, and retry only confirmed eligible items rather than replaying the entire batch. For a bulk review, bind exact selected IDs and statuses to a snapshot version; if the snapshot changes, clear or reconcile selection and invalidate the stale review before any action. A local demo without a backend must not offer a plausible bulk commit control. For async filter or refresh, label retained rows/counts as the previous snapshot while loading or after failure; reject superseded responses, and exercise rapid filter change, failure and a real retry. A local timer does not prove live freshness. For data visualizations, distinguish a recorded zero from missing data, keep exact values in an accessible table, and do not connect trends or compute adjacent-period changes across missing intervals; label provenance and denominators. If a narrow table needs two-dimensional layout, confine scrolling to the table; keep surrounding controls and individual cell text reflowed. Label the scroll, make the region keyboard-focusable only when it overflows, and remove it from tab order otherwise or in empty states. Inspect both table edges at 320 CSS pixels; a viewport proxy does not prove actual browser zoom. For timezone-sensitive scheduling, distinguish repeated fall-back times and nonexistent spring-forward times, show offsets and exact instants, and do not silently choose or create an event from an ambiguous wall-clock label. For session expiry during draft review, preserve input, stale the check, block writes, and never equate return to the draft with restored access or a completed service request. For branching multi-step work, hide inactive inputs, clear irrelevant errors, preserve recoverable draft values, invalidate a review on branch or value change, and do not present a local check as saved or delivered. For settings with dependent fields, test every branch, irrelevant errors, unsaved versus checked versus saved wording, and invalidate a past local check when the values change; for permission settings, compute effective access under every cap and explicit role rule, identify the limiting rule, and never call a local draft check a live entitlement test; put the task before an optional preview on narrow screens. Compare the finished design with the frozen REX task and acceptance: if the central behavior changed, receipt-backed file completion is not proof the original brief was met; report that mismatch. This MCP prompt is a pointer, not a replacement for the skill or permission to claim unverified visual results.")
+                        }
+                    }]
+                }));
+            }
+            if name != "rex_task_workflow" && name != "rex_ultra_workflow" {
                     return Err(ProtocolError::new(
                         ErrorCode::MalformedRequest, format!("unknown prompt: {name}")
                     ));
@@ -487,7 +636,7 @@ impl McpServer {
                         "role": "user",
                         "content": {
                             "type": "text",
-                            "text": format!("For this task: {task}\n\nCall rex_execute with a fresh request_id, this task, the host, and operator_is_agent=true. Keep the returned task_id, task_capability, and lease epoch. Use rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by the open action; submit evidence through rex_submit. Follow tool responses rather than guessing the next step. The host controls continuation and limits; REX does not force further calls.")
+                            "text": format!("For this task: {task}\n\nCall rex_execute with a fresh request_id, this task, the host, and operator_is_agent=true. Keep the returned task_id, task_capability, and lease epoch. Use rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by the open action; submit with rex_submit, setting evidence values to actual returned receipt or evidence_id strings, not prose. Put explanations in narrative. Check accepted and repair, not only isError; a rejected claim leaves the same action open for a repaired submission. On resume, persist the newly returned host_resume_handle and task_capability immediately because the old values rotate. A lost handle is not a reason to bypass custody with a new task. Follow tool responses rather than guessing the next step. The host controls continuation and limits; REX does not force further calls.")
                         }
                     }]
                 }))
@@ -499,12 +648,25 @@ impl McpServer {
                 })?;
                 let args = p.get("arguments").cloned().unwrap_or(json!({}));
                 match name {
+                    "rex_run_start" => self.start_run(args).map(tool_result),
+                    "rex_run_status" => self.run_status(args).map(tool_result),
                     "rex_ultra_promote_start" => self.start_promotion(args).map(tool_result),
                     "rex_ultra_promote_status" => self.promotion_status(args).map(tool_result),
                     _ => {
                         let tool = ToolName::from_wire_name(name).ok_or_else(|| {
                             ProtocolError::new(ErrorCode::UnknownTool, format!("unknown tool: {name}"))
                         })?;
+                        if tool == ToolName::Run {
+                            let task_id = args.get("task_id").and_then(Value::as_str);
+                            let runs = self.runs.lock().map_err(|_| {
+                                ProtocolError::new(ErrorCode::Internal, "run registry unavailable")
+                            })?;
+                            if task_id.is_some_and(|id| runs.values().any(|op| op.task_id == id && op.result.is_none())) {
+                                return Err(ProtocolError::new(ErrorCode::IdempotencyConflict,
+                                    "run already started here; use rex_run_status"));
+                            }
+                            drop(runs);
+                        }
                         if tool == ToolName::UltraPromote {
                             let task_id = args.get("task_id").and_then(Value::as_str);
                             let operations = self.promotions.lock().map_err(|_| {
@@ -841,6 +1003,33 @@ pub fn tool_descriptors() -> Vec<Value> {
     }
     out
 }
+fn run_state(op: &RunOperation) -> Value {
+    match &op.result {
+        None => json!({"task_id":op.task_id,"operation_id":op.operation_id,"state":"running"}),
+        Some(Ok(receipt)) => {
+            json!({"task_id":op.task_id,"operation_id":op.operation_id,"state":"succeeded","receipt":receipt})
+        }
+        Some(Err(error)) => {
+            json!({"task_id":op.task_id,"operation_id":op.operation_id,"state":"failed","error":error})
+        }
+    }
+}
+
+fn run_descriptors() -> Vec<Value> {
+    vec![
+        json!({"name":"rex_run_start","title":"REX Run Start",
+            "description":"Start a policy-allowed command without blocking the MCP host. Keep this process alive; poll rex_run_status with the returned operation_id. The operation is process-local; consult durable task status and receipts after restart before retrying.",
+            "inputSchema":extend(task_epoch_schema(), json!({"argv":{"type":"array","items":{"type":"string"}},"timeout_ms":{"type":"integer"}}), &["argv"]),
+            "outputSchema":promotion_output_schema()}),
+        json!({"name":"rex_run_status","title":"REX Run Status",
+            "description":"Read a process-local command result or explicit error. After MCP restart inspect durable task status and proof instead.",
+            "inputSchema":{"type":"object","required":["task_id","capability","operation_id"],
+                "properties":{"task_id":task_id_schema(),"capability":{"type":"string"},"operation_id":{"type":"string"}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"openWorldHint":false},
+            "outputSchema":promotion_output_schema()}),
+    ]
+}
+
 fn promotion_descriptors() -> Vec<Value> {
     vec![
         json!({"name":"rex_ultra_promote_start","title":"REX Ultra Promote Start",
@@ -913,6 +1102,95 @@ mod tests {
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
     }
     #[test]
+    fn asynchronous_run_is_authorized_idempotent_and_pollable() {
+        let (_tmp, mut mcp) = server();
+        mcp.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ));
+        let created = mcp.handle(rpc(2, "tools/call", json!({"name":"rex_execute",
+            "arguments":{"request_id":"async-run","task":"inspect","host":"generic_agent","operator_is_agent":true}}))).unwrap();
+        let task_id = created["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .unwrap();
+        let capability = created["result"]["structuredContent"]["task_capability"]
+            .as_str()
+            .unwrap();
+        let epoch = created["result"]["structuredContent"]["lease"]["epoch"]
+            .as_u64()
+            .unwrap();
+        let args = json!({"task_id":task_id,"capability":capability,"lease_epoch":epoch,"argv":["cargo","--version"]});
+        let denied = mcp.handle(rpc(3, "tools/call", json!({"name":"rex_run_start",
+            "arguments":{"task_id":task_id,"capability":"wrong","lease_epoch":epoch,"argv":["cargo","--version"]}}))).unwrap();
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(mcp.runs.lock().unwrap().is_empty());
+        let started = mcp
+            .handle(rpc(
+                4,
+                "tools/call",
+                json!({"name":"rex_run_start","arguments":args}),
+            ))
+            .unwrap();
+        assert_eq!(
+            started["result"]["structuredContent"]["state"], "running",
+            "{started}"
+        );
+        let id = started["result"]["structuredContent"]["operation_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let repeated = mcp
+            .handle(rpc(
+                5,
+                "tools/call",
+                json!({"name":"rex_run_start","arguments":args}),
+            ))
+            .unwrap();
+        assert_eq!(repeated["result"]["structuredContent"]["operation_id"], id);
+        let conflict = mcp.handle(rpc(6, "tools/call", json!({"name":"rex_run_start",
+            "arguments":{"task_id":task_id,"capability":capability,"lease_epoch":epoch,"argv":["npm","--version"]}}))).unwrap();
+        assert_eq!(conflict["result"]["isError"], true);
+        let denied_status = mcp
+            .handle(rpc(
+                7,
+                "tools/call",
+                json!({"name":"rex_run_status",
+            "arguments":{"task_id":task_id,"capability":"wrong","operation_id":id}}),
+            ))
+            .unwrap();
+        assert_eq!(denied_status["result"]["isError"], true);
+        let status = mcp
+            .handle(rpc(
+                8,
+                "tools/call",
+                json!({"name":"rex_run_status",
+            "arguments":{"task_id":task_id,"capability":capability,"operation_id":id}}),
+            ))
+            .unwrap();
+        assert!(
+            status["result"]["structuredContent"]["state"] == "running"
+                || status["result"]["structuredContent"]["state"] == "succeeded"
+                || status["result"]["structuredContent"]["state"] == "failed"
+        );
+        let (_other_tmp, mut other) = server();
+        other.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ));
+        let lost = other
+            .handle(rpc(
+                9,
+                "tools/call",
+                json!({"name":"rex_run_status",
+            "arguments":{"task_id":task_id,"capability":capability,"operation_id":id}}),
+            ))
+            .unwrap();
+        assert_eq!(lost["result"]["isError"], true);
+    }
+
+    #[test]
     fn asynchronous_promotion_rejects_bad_scope_and_reports_worker_failure() {
         let (_tmp, mut server) = server();
         server.handle(rpc(
@@ -974,7 +1252,10 @@ mod tests {
             "arguments":arguments}),
             ))
             .unwrap();
-        assert_eq!(started["result"]["structuredContent"]["state"], "running");
+        assert_eq!(
+            started["result"]["structuredContent"]["state"], "running",
+            "{started}"
+        );
         let operation_id = started["result"]["structuredContent"]["operation_id"]
             .as_str()
             .unwrap();
@@ -1326,12 +1607,15 @@ mod tests {
         for phrase in [
             "rex_ultra_promote_start",
             "rex_ultra_promote_status",
+            "receipt or evidence_id",
+            "accepted is false",
+            "resumed rex_execute rotates host_resume_handle",
             "process loss",
             "not completion",
         ] {
             assert!(
                 quickstart.contains(phrase),
-                "missing Ultra guidance: {phrase}"
+                "missing quickstart guidance: {phrase}"
             );
         }
         let bad = s
@@ -1569,7 +1853,97 @@ mod tests {
         let list = s.handle(rpc(2, "prompts/list", json!({}))).unwrap();
         assert_eq!(list["result"]["prompts"][0]["name"], "rex_task_workflow");
         assert_eq!(list["result"]["prompts"][1]["name"], "rex_task_inspect");
-        assert_eq!(list["result"]["prompts"][2]["name"], "rex_ultra_workflow");
+        assert_eq!(list["result"]["prompts"][2]["name"], "rex_design_workflow");
+        assert_eq!(list["result"]["prompts"][3]["name"], "rex_ultra_workflow");
+        let design = s
+            .handle(rpc(
+                26,
+                "prompts/get",
+                json!({"name":"rex_design_workflow", "arguments":{"task":"improve settings"}}),
+            ))
+            .unwrap();
+        let design_text = design["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(design_text.contains(".agents/skills/rex-design/SKILL.md"));
+        assert!(design_text.contains("improve settings"));
+        assert!(design_text.contains("rendered pixels"));
+        assert!(design_text.contains("compare two structural directions"));
+        assert!(design_text.contains("adversarial edge states"));
+        assert!(design_text.contains("state coverage ledger"));
+        assert!(design_text.contains("left unverified"));
+        assert!(design_text.contains("choose Visual or Production mode"));
+        assert!(design_text.contains("For a multi-account action"));
+        assert!(design_text.contains("visually ambitious showcase"));
+        assert!(design_text.contains("size alone is not visual ambition"));
+        assert!(design_text.contains("GSAP ScrollTrigger"));
+        assert!(design_text.contains("not as a default template"));
+        assert!(design_text.contains("start/middle/end playback"));
+        assert!(design_text.contains("reverse path"));
+        assert!(design_text.contains("reduced-motion path"));
+        assert!(design_text.contains("do not flash it and auto-hide it"));
+        assert!(design_text.contains("cache-fresh JS-disabled first viewport"));
+        assert!(design_text.contains("no inert action"));
+        assert!(design_text.contains("X posts only when"));
+        assert!(design_text.contains("transfer task-relevant mechanisms"));
+        assert!(design_text.contains("validation timing"));
+        assert!(design_text.contains("retained input"));
+        assert!(design_text.contains("server-side conditional write"));
+        assert!(design_text.contains("reversible prior-draft route"));
+        assert!(design_text.contains("A timed-out write has unknown outcome"));
+        assert!(design_text.contains("For a continuous visual control"));
+        assert!(design_text.contains("For long-running ambient Visual motion"));
+        assert!(design_text.contains("For a partial bulk result"));
+        assert!(design_text.contains("pending is not service-confirmed"));
+        assert!(design_text.contains("inspect trigger progress"));
+        assert!(design_text.contains("retry must be a real path"));
+        assert!(design_text.contains("local check from a saved record"));
+        assert!(design_text.contains("keyboard-reachable Clear filters"));
+        assert!(design_text.contains("preserved rows on failure"));
+        assert!(design_text.contains("invalidate the stale review"));
+        assert!(design_text.contains("reject superseded responses"));
+        assert!(design_text.contains("item status and next action together"));
+        assert!(design_text.contains("frozen REX task and acceptance"));
+        assert!(design_text.contains("invalidate a past local check"));
+        assert!(design_text.contains("effective access under every cap"));
+        assert!(design_text.contains("task before an optional preview"));
+        assert!(design_text.contains("invalidate a review on branch or value change"));
+        assert!(design_text.contains("never equate return to the draft with restored access"));
+        assert!(design_text.contains("never present shown count as total when unavailable"));
+        assert!(design_text.contains("test each axis separately and joint extremes"));
+        assert!(design_text.contains("move stable IDs with keyboard-reachable controls"));
+        assert!(design_text.contains("A local digest does not prove upload or delivery"));
+        assert!(design_text.contains("geometric depth, occlusion"));
+        assert!(design_text.contains("camera-change frame"));
+        assert!(design_text.contains("initial 3D load failure and later context loss"));
+        assert!(design_text.contains("recorded zero from missing data"));
+        assert!(design_text.contains("adjacent-period changes across missing intervals"));
+        assert!(design_text.contains("keyboard-focusable only when it overflows"));
+        let ambitious = s
+            .handle(rpc(
+                27,
+                "prompts/get",
+                json!({"name":"rex_design_workflow", "arguments":{"task":"Create a cinematic campaign page with a striking visual transformation"}}),
+            ))
+            .unwrap();
+        let ambitious_text = ambitious["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(ambitious_text.contains("cinematic campaign page"));
+        assert!(ambitious_text.contains("Visual or Production mode"));
+        let operational = s
+            .handle(rpc(
+                28,
+                "prompts/get",
+                json!({"name":"rex_design_workflow", "arguments":{"task":"Build a production billing settings page with errors and keyboard access"}}),
+            ))
+            .unwrap();
+        let operational_text = operational["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(operational_text.contains("production billing settings page"));
+        assert!(operational_text.contains("state coverage ledger"));
+
         let ultra = s
             .handle(rpc(
                 25,
@@ -1670,6 +2044,12 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("fix parser"));
+        let workflow = get["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(workflow.contains("receipt or evidence_id strings"));
+        assert!(workflow.contains("Check accepted and repair"));
+        assert!(workflow.contains("newly returned host_resume_handle"));
         let no_task = s
             .handle(rpc(4, "prompts/get", json!({"name":"rex_task_workflow"})))
             .unwrap();
@@ -1762,7 +2142,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 23);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"], "active");
         let task_id = rows[2]["result"]["structuredContent"]["task_id"]
             .as_str()
@@ -1807,7 +2187,7 @@ mod tests {
             .unwrap();
         assert_eq!(ok["result"]["protocolVersion"], MCP_COMPAT_PROTOCOL_VERSION);
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 23);
         let unknown = s
             .handle(rpc(
                 4,
@@ -1963,7 +2343,7 @@ mod tests {
             .unwrap();
         assert!(ready.get("result").is_some());
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 23);
     }
     #[test]
     fn notifications_get_no_response() {
