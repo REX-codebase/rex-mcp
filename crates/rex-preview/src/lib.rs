@@ -78,6 +78,8 @@ pub enum PreviewError {
     IterationLimit,
     #[error("evidence exceeded its bounded budget")]
     EvidenceLimit,
+    #[error("scroll delta_x and delta_y must each be finite and within -10000..=10000 per action; use several smaller scroll actions for longer pages")]
+    ScrollDeltaLimit,
     #[error("production gates have not passed")]
     GatesFailed,
 }
@@ -291,7 +293,7 @@ impl BrowserAction {
                     || delta_x.abs() > 10_000.0
                     || delta_y.abs() > 10_000.0 =>
             {
-                Err(PreviewError::EvidenceLimit)
+                Err(PreviewError::ScrollDeltaLimit)
             }
             Self::SetViewport {
                 width,
@@ -667,6 +669,22 @@ mod tests {
         }
         .validate()
         .is_err());
+        assert_eq!(
+            BrowserAction::Scroll {
+                delta_x: 0.0,
+                delta_y: 10_000.0
+            }
+            .validate(),
+            Ok(())
+        );
+        for (delta_x, delta_y) in [(10_000.1, 0.0), (0.0, -10_000.1), (f32::NAN, 0.0)] {
+            let error = BrowserAction::Scroll { delta_x, delta_y }
+                .validate()
+                .unwrap_err();
+            assert_eq!(error, PreviewError::ScrollDeltaLimit);
+            assert!(error.to_string().contains("delta_x and delta_y"));
+            assert!(error.to_string().contains("10000"));
+        }
         assert!(BrowserAction::Text {
             value: "x".repeat(20_000)
         }
