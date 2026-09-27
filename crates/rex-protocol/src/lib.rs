@@ -472,6 +472,15 @@ pub struct SubmitRequest {
     pub evidence: BTreeMap<String, String>,
 }
 
+/// Informational only: matching bytes do not establish whether a transition was tested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualCaptureCoverage {
+    pub action_id: String,
+    pub cited_slots: u8,
+    pub unique_frames: u8,
+    pub duplicate_slots: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitResponse {
     pub state: TaskState,
@@ -480,6 +489,9 @@ pub struct SubmitResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair: Option<String>,
     pub next: Option<ActionSpec>,
+    /// Present for an accepted Standard visual action, never a quality verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_capture_coverage: Option<VisualCaptureCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,6 +510,9 @@ pub struct StatusResponse {
     pub open_action: Option<ActionSpec>,
     pub budgets: BudgetView,
     pub last_event_seq: u64,
+    /// Latest accepted Standard visual action only; none before a visual submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_capture_coverage: Option<VisualCaptureCoverage>,
     #[serde(default)]
     pub operation: packets::OperationStatus,
     #[serde(default)]
