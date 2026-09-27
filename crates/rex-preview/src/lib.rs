@@ -263,7 +263,10 @@ impl BrowserAction {
     pub fn validate(&self) -> Result<(), PreviewError> {
         match self {
             Self::Navigate { path }
-                if !path.starts_with('/') || path.starts_with("//") || path.contains("..") =>
+                if !path.starts_with('/')
+                    || path.starts_with("//")
+                    || path.contains('\\')
+                    || path.contains("..") =>
             {
                 Err(PreviewError::UrlDenied)
             }
@@ -630,6 +633,13 @@ mod tests {
         .is_ok());
         assert!(BrowserAction::Navigate {
             path: "//evil.test".into()
+        }
+        .validate()
+        .is_err());
+        // URL parsers treat a backslash after the first slash like an
+        // authority delimiter for special schemes; reject it before CDP.
+        assert!(BrowserAction::Navigate {
+            path: "/\\evil.test".into()
         }
         .validate()
         .is_err());
