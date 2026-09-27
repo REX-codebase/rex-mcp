@@ -1010,6 +1010,42 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_enter_activates_native_button_and_space_reverses_it() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("keyboard-native-button");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"), r#"<!doctype html><button id='first' onclick="document.getElementById('out').textContent='first'">First</button><button id='second' onclick="document.getElementById('out').textContent='second'">Second</button><p id='out'>first</p>"#).unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        let press = |key| {
+            for state in [crate::KeyState::Down, crate::KeyState::Up] {
+                sup.action(&started.id, &BrowserAction::Key { key, state })
+                    .unwrap();
+            }
+        };
+        press(crate::SafeKey::Tab);
+        press(crate::SafeKey::Tab);
+        press(crate::SafeKey::Enter);
+        let after_enter = sup.capture(&started.id).unwrap();
+        assert!(
+            after_enter.dom_text.contains("<p id=\"out\">second</p>"),
+            "Enter must activate the focused native button, not merely move focus: {}",
+            after_enter.dom_text
+        );
+        press(crate::SafeKey::Tab);
+        press(crate::SafeKey::Tab);
+        press(crate::SafeKey::Space);
+        let after_space = sup.capture(&started.id).unwrap();
+        assert!(
+            after_space.dom_text.contains("<p id=\"out\">first</p>"),
+            "Space must restore the first result: {}",
+            after_space.dom_text
+        );
+        sup.cancel(&started.id).unwrap();
+    }
+
+    #[test]
     fn browser_capture_is_real_and_actions_reach_page() {
         let _port_guard = PORT_LOCK.lock().unwrap();
         let w = temp("browser");

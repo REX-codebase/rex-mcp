@@ -269,7 +269,12 @@ impl BrowserRuntime {
                 self.command("Input.dispatchMouseEvent", json!({"type":"mouseReleased","x":self.cursor_x,"y":self.cursor_y,"button":button_name(*button),"clickCount":1}))?;
             }
             BrowserAction::Key { key, state } => {
-                self.command("Input.dispatchKeyEvent", json!({"type": if *state == KeyState::Down {"keyDown"} else {"keyUp"},"key":key_name(*key)}))?;
+                let mut event = json!({"type": if *state == KeyState::Down {"keyDown"} else {"keyUp"},"key":key_name(*key)});
+                if *key == SafeKey::Enter && *state == KeyState::Down {
+                    event["text"] = json!("\r");
+                    event["unmodifiedText"] = json!("\r");
+                }
+                self.command("Input.dispatchKeyEvent", event)?;
             }
             BrowserAction::Text { value } => {
                 self.command("Input.insertText", json!({"text":value}))?;
