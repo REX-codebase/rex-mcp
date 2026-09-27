@@ -343,6 +343,19 @@ impl PreviewSupervisor {
             .ok_or(PreviewError::NotRunning)?
             .action(action, &r.url)
     }
+    pub fn visible_control(&self, id: &str, selector: &str) -> Result<bool, PreviewError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(id).ok_or(PreviewError::NotRunning)?;
+        if session.browser.is_none() {
+            session.browser = Some(BrowserRuntime::launch(&session.url)?);
+        }
+        session
+            .browser
+            .as_mut()
+            .ok_or(PreviewError::NotRunning)?
+            .visible_control(selector)
+    }
+
     pub fn capture(&self, id: &str) -> Result<crate::BrowserEvidence, PreviewError> {
         self.capture_with_fields(id, &[])
     }

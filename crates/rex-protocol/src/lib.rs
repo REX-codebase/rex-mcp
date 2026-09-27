@@ -258,6 +258,22 @@ pub struct MobileResultField {
     pub min_count: Option<u8>,
 }
 
+/// Creator-frozen, narrow two-state text and control contract. It checks
+/// co-occurrence after a real local preview activation, not causal truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoStateContract {
+    /// `mobile390` (390x650) or `desktop` (1280x800).
+    pub viewport: String,
+    /// Simple ID selector of the button/link to activate between captures.
+    pub control: String,
+    /// A visible exact text node before activation.
+    pub start_text: String,
+    /// A different visible exact text node after activation.
+    pub end_text: String,
+    /// CSS-pixel size floor for both result nodes.
+    pub min_font_px: u8,
+}
+
 /// rex_execute request: create or resume one durable task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteRequest {
@@ -270,6 +286,8 @@ pub struct ExecuteRequest {
     /// Independently frozen desktop first-view assertions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_result_fields: Option<Vec<MobileResultField>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_state_contract: Option<TwoStateContract>,
     /// Optional explicit task id for resume-by-id from a fresh session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -345,6 +363,8 @@ pub struct ExecuteResponse {
     /// Independently frozen desktop first-view assertions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_result_fields: Option<Vec<MobileResultField>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_state_contract: Option<TwoStateContract>,
     /// The Fable completion discipline every operator must honor. Host
     /// agents never see REX's system prompt, so the rules travel here.
     /// Added in protocol 1.0; absent means a pre-discipline daemon.
@@ -548,6 +568,8 @@ pub struct StatusResponse {
     /// Independently frozen desktop first-view assertions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_result_fields: Option<Vec<MobileResultField>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_state_contract: Option<TwoStateContract>,
     pub budgets: BudgetView,
     pub last_event_seq: u64,
     /// Latest accepted Standard visual action only; none before a visual submission.

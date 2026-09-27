@@ -233,6 +233,7 @@ pub fn validate_local_url(raw: &str, expected_port: u16) -> Result<Url, PreviewE
 pub enum BrowserAction {
     Navigate { path: String },
     PointerMove { x: f32, y: f32 },
+    ActivateControl { selector: String },
     PointerDown { button: PointerButton },
     PointerUp { button: PointerButton },
     Key { key: SafeKey, state: KeyState },
@@ -274,6 +275,17 @@ pub enum SafeKey {
     Space,
 }
 
+fn valid_simple_id(selector: &str) -> bool {
+    let Some(id) = selector.strip_prefix('#') else {
+        return false;
+    };
+    (1..=80).contains(&id.len())
+        && id.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 impl BrowserAction {
     pub fn validate(&self) -> Result<(), PreviewError> {
         match self {
@@ -284,6 +296,9 @@ impl BrowserAction {
                     || path.contains("..") =>
             {
                 Err(PreviewError::UrlDenied)
+            }
+            Self::ActivateControl { selector } if !valid_simple_id(selector) => {
+                Err(PreviewError::EvidenceLimit)
             }
             Self::PointerMove { x, y }
                 if !x.is_finite() || !y.is_finite() || *x < 0.0 || *y < 0.0 =>

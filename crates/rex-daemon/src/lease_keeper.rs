@@ -403,6 +403,7 @@ mod tests {
             task: "make hello".into(),
             mobile_result_fields: None,
             desktop_result_fields: None,
+            two_state_contract: None,
             task_id: None,
             resume_handle: None,
             follow_up: None,

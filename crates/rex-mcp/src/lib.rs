@@ -133,7 +133,35 @@ impl McpServer {
                 ProtocolError::new(ErrorCode::MalformedRequest, "action required")
             })?)
             .map_err(|e| ProtocolError::new(ErrorCode::MalformedRequest, e.to_string()))?;
+        if let BrowserAction::ActivateControl { selector } = &action {
+            let contract = self
+                .daemon
+                .two_state_contract(&task_id, &cap, epoch)?
+                .ok_or_else(|| {
+                    ProtocolError::new(ErrorCode::GateFailed, "no two-state contract")
+                })?;
+            if selector != &contract.control {
+                return Err(ProtocolError::new(
+                    ErrorCode::GateFailed,
+                    "creator-frozen two-state control selector required",
+                ));
+            }
+            self.daemon
+                .require_state_start(&task_id, &cap, epoch, &id)?;
+        }
         self.previews.action(&id, &action).map_err(preview_error)?;
+        if matches!(action, BrowserAction::ActivateControl { .. }) {
+            self.daemon.record_state_step(
+                &task_id,
+                &cap,
+                epoch,
+                &id,
+                "activate",
+                None,
+                None,
+                &[],
+            )?;
+        }
         Ok(json!({"task_id":task_id,"preview_id":id,"action":action,"applied":true}))
     }
     fn preview_capture(&mut self, args: Value) -> Result<Value, ProtocolError> {
@@ -157,11 +185,64 @@ impl McpServer {
             .ok_or_else(|| {
                 ProtocolError::new(ErrorCode::MalformedRequest, "known render kind required")
             })?;
-        let contract = self.daemon.result_fields(&task_id, &cap, epoch, kind)?;
+        let state_contract = self.daemon.two_state_contract(&task_id, &cap, epoch)?;
+        let state_step = if state_contract.is_some() && kind == "render.state.start" {
+            Some("start")
+        } else if state_contract.is_some() && kind == "render.state.end" {
+            Some("end")
+        } else {
+            None
+        };
+        let contract = if let (Some(c), Some(_step)) = (&state_contract, state_step) {
+            Some(
+                [("start", &c.start_text), ("end", &c.end_text)]
+                    .into_iter()
+                    .map(|(name, text)| rex_protocol::MobileResultField {
+                        name: format!("state_{name}"),
+                        alternatives: vec![text.clone()],
+                        kind: "text".into(),
+                        match_mode: None,
+                        min_font_px: Some(c.min_font_px),
+                        region: None,
+                        min_count: None,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            self.daemon.result_fields(&task_id, &cap, epoch, kind)?
+        };
         let captured = self
             .previews
             .capture_with_fields(&id, contract.as_deref().unwrap_or(&[]))
             .map_err(preview_error)?;
+        if state_step == Some("start") {
+            let selector = &state_contract.as_ref().expect("contract").control;
+            if !self
+                .previews
+                .visible_control(&id, selector)
+                .map_err(preview_error)?
+            {
+                return Err(ProtocolError::new(ErrorCode::GateFailed,
+                    "creator-frozen two-state control is not visible and enabled in the start viewport"));
+            }
+        }
+        if let Some(step) = state_step {
+            if !captured
+                .visible_result_fields
+                .iter()
+                .any(|name| name == &format!("state_{step}"))
+                || captured.visible_result_fields.iter().any(|name| {
+                    name == if step == "start" {
+                        "state_end"
+                    } else {
+                        "state_start"
+                    }
+                })
+            {
+                return Err(ProtocolError::new(ErrorCode::GateFailed,
+                    format!("two-state {step} capture must show its literal, not the opposite state's literal")));
+            }
+        }
         let encoded = captured
             .screenshot_data_url
             .as_deref()
@@ -185,6 +266,22 @@ impl McpServer {
                 ErrorCode::GateFailed,
                 format!("{kind} requires matching REX viewport, got {width}x{height}"),
             ));
+        }
+        if let (Some(c), Some(_)) = (&state_contract, state_step) {
+            let expected = if c.viewport == "mobile390" {
+                (390, 650)
+            } else {
+                (1280, 800)
+            };
+            if (width, height) != expected {
+                return Err(ProtocolError::new(
+                    ErrorCode::GateFailed,
+                    format!(
+                        "two-state contract requires exact {}x{} for start and end",
+                        expected.0, expected.1
+                    ),
+                ));
+            }
         }
         if contract.is_some()
             && ((kind == "render.mobile390.first" && (width != 390 || height != 650))
@@ -211,7 +308,7 @@ impl McpServer {
             &artifact.sha256,
             &captured.source_sha256,
         )?;
-        if contract.is_some() {
+        if contract.is_some() && state_step.is_none() {
             self.daemon.bind_mobile_fields(
                 &task_id,
                 &cap,
@@ -219,6 +316,18 @@ impl McpServer {
                 &artifact.sha256,
                 captured.visible_result_fields.clone(),
                 kind,
+            )?;
+        }
+        if let Some(step) = state_step {
+            self.daemon.record_state_step(
+                &task_id,
+                &cap,
+                epoch,
+                &id,
+                step,
+                Some(&artifact.sha256),
+                Some(&captured.source_sha256),
+                &captured.visible_result_fields,
             )?;
         }
         Ok(
@@ -1089,9 +1198,9 @@ pub fn tool_descriptors() -> Vec<Value> {
     let mut out = Vec::new();
     for t in ToolName::all() {
         let (description, mut schema) = match t {
-            ToolName::Execute => ("Start or resume a durable REX task; plan and optional creator-supplied mobile_result_fields and desktop_result_fields are frozen at creation. For Standard visual tasks, each named field is checked against its first-party 390x650 or 1280x800 opening capture; this does not prove semantic or spatial truth.", json!({
+            ToolName::Execute => ("Start or resume a durable REX task; plan and optional creator-supplied first-view and two_state_contract assertions are frozen at creation. For Standard visual tasks, each named field is checked against its first-party 390x650 or 1280x800 opening capture; this does not prove semantic or spatial truth.", json!({
                 "type":"object","required":["request_id","task","host","operator_is_agent"],
-                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string","minLength":1},"mobile_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"desktop_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"follow_up":{"type":"string"},
+                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string","minLength":1},"mobile_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"two_state_contract":{"type":"object","required":["viewport","control","start_text","end_text","min_font_px"],"properties":{"viewport":{"enum":["mobile390","desktop"]},"control":{"type":"string"},"start_text":{"type":"string"},"end_text":{"type":"string"},"min_font_px":{"type":"integer","minimum":8,"maximum":32}},"additionalProperties":false},"desktop_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"follow_up":{"type":"string"},
                 "host":{"enum":["human","claude_code","codex","open_code","hermes","antigravity","generic_agent"]},"operator_is_agent":{"type":"boolean"},"ultra":{"type":"boolean"},
                 "budgets":{"type":"object"},"proof":{"type":"string"},"plan":{"type":"array","items":{"type":"object","required":["instructions"],"properties":{"instructions":{"type":"string"},"acceptance":{"type":"string"}}}}},"additionalProperties":false})),
             ToolName::Next => ("Heartbeat and get the currently open action.", task_epoch_schema()),
@@ -1163,6 +1272,7 @@ pub fn tool_descriptors() -> Vec<Value> {
                     "open_action":{"type":["object","null"]},
                     "mobile_result_fields":{"type":"array","items":{"type":"object"}},
                     "desktop_result_fields":{"type":"array","items":{"type":"object"}},
+                    "two_state_contract":{"type":"object"},
                     "budgets":{"type":"object"},
                     "last_event_seq":{"type":"integer"},
                     "visual_capture_coverage":{"type":"object","required":["action_id","cited_slots","unique_frames","duplicate_slots"],"properties":{"action_id":{"type":"string"},"cited_slots":{"type":"integer"},"unique_frames":{"type":"integer"},"duplicate_slots":{"type":"integer"}}},
@@ -1219,7 +1329,7 @@ fn preview_descriptors() -> Vec<Value> {
         json!({"name":"rex_critique_prompt","description":"MANDATORY before any check: receive the action-bound hardest-possible critique challenge. It invalidates an earlier critique for this action.","inputSchema":task_epoch_schema()}),
         json!({"name":"rex_critique_record","description":"Record concrete skeptical findings for the current action after requesting the challenge. REX requires this before checking or acceptance; prose cannot prove honesty.","inputSchema":extend(task_epoch_schema(),json!({"action_id":{"type":"string"},"findings":{"type":"string","minLength":80}}), &["action_id","findings"])}),
         json!({"name":"rex_preview_start","description":"Start a task-scoped local preview. Static HTML and supported app frameworks use an isolated loopback server; interaction/capture uses local headless Chrome, not the user's browser.","inputSchema":extend(task_epoch_schema(),json!({"project_dir":{"type":"string"}}),&["project_dir"])}),
-        json!({"name":"rex_preview_action","description":"Interact with the local preview after an action-bound critique: pointer, key, text, scroll, explicit bounded wait_for_animations, navigation, viewport, reduced-motion media override or a fresh-navigation JavaScript-off condition. Re-enable after an off capture requires a fresh preview.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"action":{"type":"object"}}),&["preview_id","action"])}),
+        json!({"name":"rex_preview_action","description":"Interact with the local preview after an action-bound critique: pointer, creator-frozen activate_control, key, text, scroll, explicit bounded wait_for_animations, navigation, viewport, reduced-motion media override or a fresh-navigation JavaScript-off condition. Re-enable after an off capture requires a fresh preview.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"action":{"type":"object"}}),&["preview_id","action"])}),
         json!({"name":"rex_preview_capture","description":"Capture REX-owned headless-Chrome pixels and DOM/AX evidence, bound as an immutable task artifact. Contracted mobile/desktop results require exact 390x650/1280x800 and report visible_result_fields; inspect PNG pixels because this is not a semantic or spatial-truth verdict. Capture after the critique challenge and record.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"kind":{"enum":["render.desktop.first","render.mobile390.first","render.state.start","render.state.mid","render.state.end","render.state.reverse"]}}),&["preview_id","kind"])}),
         json!({"name":"rex_preview_stop","description":"Stop and clean up this task's local preview process tree.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"}}),&["preview_id"])}),
     ]
@@ -2149,6 +2259,147 @@ mod tests {
             .unwrap();
         assert!(!before.accepted);
         assert!(before.repair.unwrap().contains("render.desktop.first"));
+    }
+
+    #[test]
+    fn two_state_contract_requires_visible_start_click_and_changed_end() {
+        let (d, mut mcp) = server();
+        let app = d.path().join("ws/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("index.html"),r#"<!doctype html><style>
+          body{background:#f4efe4;color:#222;font:20px sans-serif;margin:20px}
+          button{font:inherit;padding:12px}</style>
+          <p id='result'>Example A</p><button id='change' onclick="document.getElementById('result').textContent='Example B'">Change example</button>"#).unwrap();
+        mcp.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ))
+        .unwrap();
+        let started=mcp.handle(rpc(2,"tools/call",json!({"name":"rex_execute","arguments":{
+            "request_id":"two-state-mcp","task":"Build a landing page","host":"generic_agent",
+            "operator_is_agent":true,"two_state_contract":{"viewport":"mobile390","control":"#change",
+                "start_text":"Example A","end_text":"Example B","min_font_px":14}
+        }}))).unwrap();
+        assert_eq!(started["result"]["isError"], false, "{started}");
+        let v = &started["result"]["structuredContent"];
+        let task = v["task_id"].as_str().unwrap();
+        let cap = v["task_capability"].as_str().unwrap();
+        let epoch = v["lease"]["epoch"].as_u64().unwrap();
+        let action = v["next"]["action_id"].as_str().unwrap();
+        let scope = json!({"task_id":task,"capability":cap,"lease_epoch":epoch});
+        mcp.handle(rpc(
+            3,
+            "tools/call",
+            json!({"name":"rex_critique_prompt","arguments":scope}),
+        ))
+        .unwrap();
+        let reviewed=mcp.handle(rpc(4,"tools/call",json!({"name":"rex_critique_record","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"action_id":action,
+            "findings":"Check that the creator-named click follows a visible start and that the result changes in a settled end capture."}}))).unwrap();
+        assert_eq!(reviewed["result"]["isError"], false, "{reviewed}");
+        let began = mcp
+            .handle(rpc(
+                5,
+                "tools/call",
+                json!({"name":"rex_preview_start","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"project_dir":"app"}}),
+            ))
+            .unwrap();
+        let id = began["result"]["structuredContent"]["preview_id"]
+            .as_str()
+            .unwrap();
+        let call = |mcp: &mut McpServer, seq, name: &str, extra: Value| {
+            let mut args =
+                json!({"task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            mcp.handle(rpc(
+                seq,
+                "tools/call",
+                json!({"name":name,"arguments":args}),
+            ))
+            .unwrap()
+        };
+        let no_start = call(
+            &mut mcp,
+            6,
+            "rex_preview_action",
+            json!({"action":{"kind":"activate_control","selector":"#change"}}),
+        );
+        assert_eq!(no_start["result"]["isError"], true);
+        let viewport = call(
+            &mut mcp,
+            7,
+            "rex_preview_action",
+            json!({"action":{"kind":"set_viewport","width":390,"height":650,"scale":1.0}}),
+        );
+        assert_eq!(viewport["result"]["isError"], false, "{viewport}");
+        let wrong_end = call(
+            &mut mcp,
+            8,
+            "rex_preview_capture",
+            json!({"kind":"render.state.end"}),
+        );
+        assert_eq!(wrong_end["result"]["isError"], true);
+        let start = call(
+            &mut mcp,
+            9,
+            "rex_preview_capture",
+            json!({"kind":"render.state.start"}),
+        );
+        assert_eq!(start["result"]["isError"], false, "{start}");
+        let start_hash = start["result"]["structuredContent"]["sha256"]
+            .as_str()
+            .unwrap();
+        let wrong_selector = call(
+            &mut mcp,
+            10,
+            "rex_preview_action",
+            json!({"action":{"kind":"activate_control","selector":"#other"}}),
+        );
+        assert_eq!(wrong_selector["result"]["isError"], true);
+        let click = call(
+            &mut mcp,
+            11,
+            "rex_preview_action",
+            json!({"action":{"kind":"activate_control","selector":"#change"}}),
+        );
+        assert_eq!(click["result"]["isError"], false, "{click}");
+        let end = call(
+            &mut mcp,
+            12,
+            "rex_preview_capture",
+            json!({"kind":"render.state.end"}),
+        );
+        assert_eq!(end["result"]["isError"], false, "{end}");
+        let end_hash = end["result"]["structuredContent"]["sha256"]
+            .as_str()
+            .unwrap();
+        assert_ne!(start_hash, end_hash);
+        // The creator named this control: an arbitrary real click elsewhere cannot complete the trace.
+        let stored = mcp
+            .daemon
+            .two_state_contract(task, cap, epoch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.control, "#change");
+        let trace = mcp
+            .daemon
+            .events(rex_protocol::EventsRequest {
+                task_id: task.into(),
+                after_seq: 0,
+                limit: None,
+            })
+            .unwrap();
+        let kinds: Vec<_> = trace
+            .events
+            .iter()
+            .filter(|e| e.kind == "two_state_step")
+            .map(|e| e.detail["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, ["start", "activate", "end"]);
     }
 
     #[test]
