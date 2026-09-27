@@ -350,7 +350,7 @@ impl PreviewSupervisor {
             .browser
             .as_mut()
             .ok_or(PreviewError::NotRunning)?
-            .capture()?;
+            .capture(&r.url)?;
         for item in evidence.items.iter().cloned() {
             r.iteration.push_evidence(item)?;
         }
@@ -675,6 +675,46 @@ mod tests {
         .unwrap();
         let second = sup.capture(&started.id).unwrap();
         assert!(second.dom_text.contains("clicked"));
+        // A click navigates independently of the typed route action. Do not
+        // bind its pixels as task evidence when it leaves the preview port.
+        fs::write(
+            app.join("escape.html"),
+            "<a href='http://example.invalid/'>leave</a>",
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::Navigate {
+                path: "/escape.html".into(),
+            },
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerMove { x: 20.0, y: 15.0 },
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerDown {
+                button: crate::PointerButton::Primary,
+            },
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerUp {
+                button: crate::PointerButton::Primary,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sup.capture(&started.id).unwrap_err(),
+            PreviewError::UrlDenied
+        );
+        sup.action(&started.id, &BrowserAction::Navigate { path: "/".into() })
+            .unwrap();
+        assert!(sup.capture(&started.id).unwrap().dom_text.contains("press"));
         sup.record_iteration(
             &started.id,
             crate::IterationReceipt {

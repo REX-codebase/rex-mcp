@@ -237,7 +237,21 @@ impl BrowserRuntime {
         Ok(())
     }
 
-    pub fn capture(&mut self) -> Result<BrowserEvidence, PreviewError> {
+    pub fn capture(&mut self, base_url: &str) -> Result<BrowserEvidence, PreviewError> {
+        // Page controls can navigate without going through rex_preview_action.
+        // A capture must not register pixels from an escaped preview origin.
+        let base = url::Url::parse(base_url).map_err(|_| PreviewError::UrlDenied)?;
+        let current = self.command(
+            "Runtime.evaluate",
+            json!({
+                "expression":"location.href", "returnByValue":true
+            }),
+        )?;
+        let current_url = current
+            .pointer("/result/result/value")
+            .and_then(Value::as_str)
+            .ok_or(PreviewError::UrlDenied)?;
+        crate::validate_local_url(current_url, base.port().ok_or(PreviewError::UrlDenied)?)?;
         let shot = self.command(
             "Page.captureScreenshot",
             json!({"format":"png","captureBeyondViewport":false,"fromSurface":true}),
