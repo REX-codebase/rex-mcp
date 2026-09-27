@@ -112,3 +112,7 @@ main. A passing run is evidence for that commit, not proof of integration
 with every installed host or publication readiness. Before any public release,
 review packaging targets, supply-chain scans, host setup and compatibility,
 then publish only with explicit approval.
+
+### Standard visual-action evidence gate
+
+For Standard tasks whose frozen task or current action names a visual/UI/website/landing-page/dashboard work item, `rex_submit` does not accept a source receipt alone. Each action must cite six task-bound PNG artifacts uploaded with `rex_artifact_put`, using matching `kind` and evidence-map keys: `render.desktop.first` (at least 760 CSS pixels wide), `render.mobile390.first` (390 pixels wide), and `render.state.start`, `.mid`, `.end`, `.reverse`. REX re-reads the immutable artifacts, verifies their digests, decodes PNG pixels and checks basic dimensions. A rejected action remains open with a repair message; it does not advance or complete. The host must include real viewport captures and report what the states show, not invented placeholder images. This gate cannot independently authenticate a host-supplied screenshot, its settled timing, the browser viewport scale, or its relation to current source; a trusted browser capture and visual inspection are still needed. The task text is frozen; a brief that omits all visual/UI terms can evade this classification, so this is not a universal proof of design quality.
