@@ -38,6 +38,8 @@ pub struct BrowserRuntime {
     scale: f32,
     cursor_x: f32,
     cursor_y: f32,
+    allowed_port: u16,
+    allowed_host: String,
 }
 
 impl BrowserRuntime {
@@ -119,6 +121,15 @@ impl BrowserRuntime {
             scale: 1.0,
             cursor_x: 0.0,
             cursor_y: 0.0,
+            allowed_port: url::Url::parse(url)
+                .map_err(|_| PreviewError::UrlDenied)?
+                .port()
+                .ok_or(PreviewError::UrlDenied)?,
+            allowed_host: url::Url::parse(url)
+                .map_err(|_| PreviewError::UrlDenied)?
+                .host_str()
+                .ok_or(PreviewError::UrlDenied)?
+                .to_string(),
         };
         b.command(
             "Emulation.setDeviceMetricsOverride",
@@ -129,13 +140,12 @@ impl BrowserRuntime {
         b.command("Page.enable", json!({}))?;
         b.command("Runtime.enable", json!({}))?;
         b.command("Network.enable", json!({"maxTotalBufferSize": 1048576}))?;
-        // Preview is local-only. Prevent project JS and assets from reaching
-        // remote hosts through the user's machine; loopback serves the app.
+        // Intercept subresources instead of a wildcard network block: the
+        // wildcard also blocks the local JS/CSS that the preview must run.
         b.command(
-            "Network.setBlockedURLs",
-            json!({"urls":["http://*","https://*"]}),
+            "Fetch.enable",
+            json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}]}),
         )?;
-
         b.command("Log.enable", json!({}))?;
         b.command("Page.navigate", json!({"url": url}))?;
         b.wait_loaded()?;
@@ -179,6 +189,38 @@ impl BrowserRuntime {
                         return Err(PreviewError::CommandDenied);
                     }
                     return Ok(v);
+                }
+                if v.get("method").and_then(Value::as_str) == Some("Fetch.requestPaused") {
+                    let request_id = v
+                        .pointer("/params/requestId")
+                        .and_then(Value::as_str)
+                        .ok_or(PreviewError::CommandDenied)?;
+                    let request_url = v
+                        .pointer("/params/request/url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let allowed = crate::validate_local_url(request_url, self.allowed_port)
+                        .is_ok_and(|u| u.host_str() == Some(self.allowed_host.as_str()));
+                    let request = if allowed {
+                        "Fetch.continueRequest"
+                    } else {
+                        "Fetch.failRequest"
+                    };
+                    let params = if allowed {
+                        json!({"requestId":request_id})
+                    } else {
+                        json!({"requestId":request_id,"errorReason":"BlockedByClient"})
+                    };
+                    let sub_id = self.next_id;
+                    self.next_id += 1;
+                    self.socket
+                        .send(tungstenite::Message::Text(
+                            json!({"id":sub_id,"method":request,"params":params})
+                                .to_string()
+                                .into(),
+                        ))
+                        .map_err(|_| PreviewError::NotRunning)?;
+                    continue;
                 }
                 if v.get("method").is_some() {
                     self.events.push_back(v);
@@ -268,7 +310,11 @@ impl BrowserRuntime {
             .pointer("/result/result/value")
             .and_then(Value::as_str)
             .ok_or(PreviewError::UrlDenied)?;
-        crate::validate_local_url(current_url, base.port().ok_or(PreviewError::UrlDenied)?)?;
+        let current_origin =
+            crate::validate_local_url(current_url, base.port().ok_or(PreviewError::UrlDenied)?)?;
+        if current_origin.host_str() != base.host_str() {
+            return Err(PreviewError::UrlDenied);
+        }
         let shot = self.command(
             "Page.captureScreenshot",
             json!({"format":"png","captureBeyondViewport":false,"fromSurface":true}),
@@ -295,6 +341,9 @@ impl BrowserRuntime {
         if info.info().width != expected_width || info.info().height != expected_height {
             return Err(PreviewError::EvidenceLimit);
         }
+        if near_uniform_png(&bytes)? {
+            return Err(PreviewError::BlankFrame);
+        }
         let hash = format!("{:x}", Sha256::digest(&bytes));
         let id = format!("shot-{}", &hash[..16]);
         let dom = self.command(
@@ -308,6 +357,22 @@ impl BrowserRuntime {
             .chars()
             .take(512 * 1024)
             .collect::<String>();
+        // Browsers repair some malformed HTML; this checks observable failure,
+        // not the author's intended structure.
+        let body = self.command(
+            "Runtime.evaluate",
+            json!({
+                "expression":"document.body?.innerText?.trim().length||0", "returnByValue":true
+            }),
+        )?;
+        if body
+            .pointer("/result/result/value")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0
+        {
+            return Err(PreviewError::BrokenPage);
+        }
         let dom_hash = format!("{:x}", Sha256::digest(dom_text.as_bytes()));
         let ax = self.command("Accessibility.getFullAXTree", json!({}))?;
         let accessibility_text =
@@ -317,6 +382,18 @@ impl BrowserRuntime {
             .pointer("/result/nodes")
             .and_then(Value::as_array)
             .map_or(0, |v| v.len() as u32);
+        if self.events.iter().any(|event| {
+            event.get("method").and_then(Value::as_str) == Some("Runtime.exceptionThrown")
+                || (event.get("method").and_then(Value::as_str) == Some("Log.entryAdded")
+                    && event.pointer("/params/entry/level").and_then(Value::as_str)
+                        == Some("error")
+                    && event
+                        .pointer("/params/entry/source")
+                        .and_then(Value::as_str)
+                        != Some("network"))
+        }) {
+            return Err(PreviewError::BrokenPage);
+        }
         let mut items = vec![
             Evidence::Viewport {
                 width: self.width,
@@ -404,6 +481,75 @@ impl Drop for BrowserRuntime {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.profile);
+    }
+}
+fn near_uniform_png(bytes: &[u8]) -> Result<bool, PreviewError> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .map_err(|_| PreviewError::EvidenceLimit)?;
+    let mut buffer = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or(PreviewError::EvidenceLimit)?
+    ];
+    let frame = reader
+        .next_frame(&mut buffer)
+        .map_err(|_| PreviewError::EvidenceLimit)?;
+    let channels = match frame.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        _ => return Ok(false),
+    };
+    let data = &buffer[..frame.buffer_size()];
+    let stride = frame.width as usize * channels;
+    let mut bins = std::collections::HashMap::new();
+    let mut total = 0usize;
+    // A regular grid rejects almost solid loading/error states, not varied
+    // but irrelevant pages. Judgment must still inspect the rendered pixels.
+    for y in (0..frame.height as usize).step_by((frame.height as usize / 50).max(1)) {
+        for x in (0..frame.width as usize).step_by((frame.width as usize / 50).max(1)) {
+            let i = y * stride + x * channels;
+            if i + 2 < data.len() {
+                *bins
+                    .entry((data[i] / 32, data[i + 1] / 32, data[i + 2] / 32))
+                    .or_insert(0usize) += 1;
+                total += 1;
+            }
+        }
+    }
+    let dominant = bins.values().copied().max().unwrap_or(0);
+    Ok(total > 0 && (bins.len() == 1 || dominant as f64 / total as f64 > 0.9995))
+}
+#[cfg(test)]
+mod evidence_quality_tests {
+    use super::*;
+    fn png_of(pixels: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&pixels).unwrap();
+        }
+        bytes
+    }
+    #[test]
+    fn rejects_uniform_and_near_uniform_but_keeps_visible_design() {
+        let w = 100;
+        let h = 100;
+        let mut flat = vec![235u8; w * h * 3];
+        assert!(near_uniform_png(&png_of(flat.clone(), w as u32, h as u32)).unwrap());
+        flat[0..3].copy_from_slice(&[20, 30, 40]);
+        assert!(near_uniform_png(&png_of(flat.clone(), w as u32, h as u32)).unwrap());
+        for y in 0..h {
+            for x in 0..w / 3 {
+                let i = (y * w + x) * 3;
+                flat[i..i + 3].copy_from_slice(&[20, 30, 40]);
+            }
+        }
+        assert!(!near_uniform_png(&png_of(flat, w as u32, h as u32)).unwrap());
     }
 }
 fn reserve_debug_port() -> Result<u16, PreviewError> {

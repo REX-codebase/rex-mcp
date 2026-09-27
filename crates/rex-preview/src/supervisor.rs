@@ -685,6 +685,50 @@ mod tests {
         let _ = fs::remove_dir_all(real);
     }
     #[test]
+    fn local_external_script_runs_but_other_loopback_port_is_blocked() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("local-script");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        let other = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        other.set_nonblocking(true).unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        fs::write(app.join("index.html"), format!(
+            "<!doctype html><style>body{{background:linear-gradient(45deg,#123,#789)}}</style><main id='scene'>Waiting for scene</main><script src='/scene.js'></script><script src='http://127.0.0.1:{other_port}/foreign.js'></script>"
+        )).unwrap();
+        fs::write(
+            app.join("scene.js"),
+            "document.querySelector('#scene').textContent='Local scene executed';",
+        )
+        .unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.begin_iteration(&started.id).unwrap();
+        let evidence = sup.capture(&started.id).unwrap();
+        assert!(evidence.accessibility_text.contains("Local scene executed"));
+        assert!(matches!(other.accept(), Err(ref e) if e.kind()==std::io::ErrorKind::WouldBlock));
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+    #[test]
+    fn broken_script_and_empty_body_cannot_be_capture_evidence() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("broken-evidence");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"),
+            "<!doctype html><style>body{background:linear-gradient(#123,#456)}</style><main>Visible wrapper but missing scene</main><script>throw Error('scene failed')</script>").unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.begin_iteration(&started.id).unwrap();
+        assert_eq!(
+            sup.capture(&started.id).unwrap_err(),
+            PreviewError::BrokenPage
+        );
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+    #[test]
     fn occupied_reserved_ports_are_skipped() {
         let _port_guard = PORT_LOCK.lock().unwrap();
         let guards: Vec<TcpListener> = (PORT_MIN..PORT_MIN + 3)
@@ -702,7 +746,7 @@ mod tests {
         fs::create_dir(&app).unwrap();
         fs::write(
             app.join("index.html"),
-            r#"<!doctype html><button id='b' onclick="this.textContent='clicked'">press</button>"#,
+            r#"<!doctype html><style>body{background:linear-gradient(45deg,#194c5b,#f0bb74)}</style><button id='b' onclick="this.textContent='clicked'">press</button>"#,
         )
         .unwrap();
         let sup = PreviewSupervisor::new(&w).unwrap();
@@ -753,17 +797,17 @@ mod tests {
         assert_eq!(first.source_sha256, second.source_sha256);
         fs::write(
             app.join("index.html"),
-            "<!doctype html><p>revised source</p>",
+            "<!doctype html><style>body{background:linear-gradient(45deg,#194c5b,#f0bb74)}</style><p>revised source</p>",
         )
         .unwrap();
         let revised = sup.capture(&started.id).unwrap();
         assert_ne!(first.source_sha256, revised.source_sha256);
         fs::write(
             app.join("index.html"),
-            r#"<!doctype html><button id='b' onclick="this.textContent='clicked'">press</button>"#,
+            r#"<!doctype html><style>body{background:linear-gradient(45deg,#194c5b,#f0bb74)}</style><button id='b' onclick="this.textContent='clicked'">press</button>"#,
         )
         .unwrap();
-        fs::write(app.join("motion.html"), "<!doctype html><style>body{background:#e34141}@media(prefers-reduced-motion:reduce){body{background:#3475e3}}</style><p>motion test</p>").unwrap();
+        fs::write(app.join("motion.html"), "<!doctype html><style>body{background:linear-gradient(45deg,#e34141,#e8b875)}@media(prefers-reduced-motion:reduce){body{background:linear-gradient(45deg,#3475e3,#e8b875)}}</style><p>motion test</p>").unwrap();
         sup.action(
             &started.id,
             &BrowserAction::Navigate {

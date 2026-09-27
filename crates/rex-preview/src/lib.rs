@@ -66,6 +66,10 @@ pub enum PreviewError {
     NotRunning,
     #[error("preview source changed while capturing; recapture this state")]
     SourceChanged,
+    #[error("preview frame is blank or near-uniform")]
+    BlankFrame,
+    #[error("preview page has runtime errors or missing scene content")]
+    BrokenPage,
     #[error("preview session is already terminal")]
     Terminal,
     #[error("iteration budget exhausted")]
