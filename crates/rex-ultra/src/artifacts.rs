@@ -121,10 +121,16 @@ impl ArtifactStore {
         let existing = self.bindings(task_id);
         for b in &existing {
             if b.sha256 == digest {
-                if b.candidate_id == candidate_id && b.round == round && b.kind == kind {
+                if b.candidate_id != candidate_id || b.round != round {
+                    return Err(ArtifactError::ReusedDigest { sha256: digest });
+                }
+                if b.kind == kind {
                     return Ok((b.clone(), false));
                 }
-                return Err(ArtifactError::ReusedDigest { sha256: digest });
+                // One unchanged frame can legitimately prove both start and
+                // reverse for a reversible control. Preserve each evidence
+                // kind binding while still rejecting cross-round reuse.
+                break;
             }
         }
         let binding = ArtifactBinding {
@@ -257,6 +263,20 @@ mod tests {
         assert!(f1 && !f2);
         assert_eq!(b1, b2);
         assert_eq!(s.bindings("task-1").len(), 1);
+    }
+
+    #[test]
+    fn same_frame_can_bind_two_kinds_in_one_round() {
+        let (_d, s) = store();
+        let (first, _) = s
+            .put("task-1", "render.state.start", b"same-frame", None, None)
+            .unwrap();
+        let (reverse, fresh) = s
+            .put("task-1", "render.state.reverse", b"same-frame", None, None)
+            .unwrap();
+        assert!(fresh);
+        assert_eq!(first.sha256, reverse.sha256);
+        assert_eq!(s.bindings("task-1").len(), 2);
     }
 
     #[test]

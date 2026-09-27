@@ -595,6 +595,56 @@ impl HarnessDaemon {
         })
     }
 
+    /// An evidence gate, not a renderer oracle: a host supplies these bytes.
+    /// We bind, decode and size-check them; authenticity and settled timing
+    /// still require a trusted capture integration or independent inspection.
+    fn validate_visual_evidence(
+        &self,
+        task_id: &str,
+        evidence: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let bindings = self.artifacts.bindings(task_id);
+        for (key, min_width, max_width) in [
+            ("render.desktop.first", 760, u32::MAX),
+            ("render.mobile390.first", 390, 390),
+            ("render.state.start", 1, u32::MAX),
+            ("render.state.mid", 1, u32::MAX),
+            ("render.state.end", 1, u32::MAX),
+            ("render.state.reverse", 1, u32::MAX),
+        ] {
+            let digest = evidence
+                .get(key)
+                .ok_or_else(|| format!("missing {key}: cite a task-bound rendered PNG artifact"))?;
+            let binding = bindings
+                .iter()
+                .find(|b| b.sha256 == *digest && b.kind == key)
+                .ok_or_else(|| format!("{key}: no matching task-bound artifact"))?;
+            let bytes = self
+                .artifacts
+                .get(&binding.sha256)
+                .map_err(|e| format!("{key}: artifact read failed: {e}"))?;
+            let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+            let mut reader = decoder
+                .read_info()
+                .map_err(|_| format!("{key}: invalid PNG"))?;
+            let info = reader.info();
+            let (w, h) = (info.width, info.height);
+            if w < min_width || w > max_width || h < 240 || h > 8192 || w > 8192 {
+                return Err(format!("{key}: invalid viewport dimensions {w}x{h}"));
+            }
+            let mut output = vec![
+                0;
+                reader
+                    .output_buffer_size()
+                    .ok_or_else(|| format!("{key}: invalid PNG size"))?
+            ];
+            reader
+                .next_frame(&mut output)
+                .map_err(|_| format!("{key}: PNG pixels did not decode"))?;
+        }
+        Ok(())
+    }
+
     pub fn submit(&self, req: SubmitRequest) -> Result<SubmitResponse, ProtocolError> {
         let t0 = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         // State-machine join (audit finding 2): an Ultra task can never
@@ -618,6 +668,18 @@ impl HarnessDaemon {
                 "action is stale or belongs to another task",
                 &t.task_id,
             ));
+        }
+        if visual_action(&t.task, &open.instructions) {
+            if let Err(repair) = self.validate_visual_evidence(&t.task_id, &req.evidence) {
+                self.append_event(&mut t, "visual_evidence_rejected", json!({"repair":repair}))?;
+                self.persist(&t)?;
+                return Ok(SubmitResponse {
+                    state: TaskState::Active,
+                    accepted: false,
+                    repair: Some(repair),
+                    next: Some(open),
+                });
+            }
         }
         t.state = TaskState::Verifying;
         let narrative = req.narrative.clone();
@@ -885,6 +947,9 @@ impl HarnessDaemon {
                     perr(ErrorCode::Internal, e.to_string(), &req.task_id)
                 }
             })?;
+        // The artifact's digest becomes a registered citation for this task.
+        // Validation still checks the binding, bytes and required evidence kind.
+        t.registered_evidence.insert(binding.sha256.clone());
         self.append_event(
             &mut t,
             "artifact_registered",
@@ -2228,6 +2293,25 @@ impl GateEvaluator for FinalEvaluator {
     }
 }
 
+fn visual_action(task: &str, action: &str) -> bool {
+    let text = format!("{task} {action}").to_ascii_lowercase();
+    let terms = [
+        "visual",
+        "user interface",
+        "web page",
+        "landing page",
+        "website",
+        "dashboard",
+        "screen design",
+        "animated page",
+        "animated landing",
+    ];
+    terms.iter().any(|term| text.contains(term))
+        || text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == "ui")
+}
+
 fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
     if r.request_id.is_empty() || r.request_id.len() > 200 || r.task.trim().is_empty() {
         return Err(ProtocolError::new(
@@ -2938,6 +3022,115 @@ mod tests {
             writer.write_image_data(&rgb).unwrap();
         }
         out
+    }
+
+    #[test]
+    fn standard_visual_action_rejects_source_receipt_and_invalid_render_artifacts() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut r = req("standard-visual-gate");
+        r.ultra = false;
+        r.task = "Build a landing page with a clarity dial".into();
+        r.plan = Some(vec![PlanStep {
+            instructions: "Write the landing page".into(),
+            acceptance: None,
+        }]);
+        let ex = daemon.execute(r).unwrap();
+        fs::write(w.join("source.txt"), "source").unwrap();
+        let receipt = daemon
+            .read(ReadRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                path: "source.txt".into(),
+                byte_range: None,
+            })
+            .unwrap()
+            .receipt
+            .unwrap();
+        let action_id = ex.next.as_ref().unwrap().action_id.clone();
+        let submission = |evidence| SubmitRequest {
+            task_id: ex.task_id.clone(),
+            capability: cap_of(&ex),
+            lease_epoch: ex.lease.epoch,
+            action_id: action_id.clone(),
+            narrative: "Rendered study".into(),
+            evidence,
+        };
+        let denied = daemon
+            .submit(submission([("source".into(), receipt.clone())].into()))
+            .unwrap();
+        assert!(!denied.accepted);
+        assert!(denied.repair.unwrap().contains("render.desktop.first"));
+        assert_eq!(denied.next.unwrap().action_id, action_id);
+        let wrong = daemon
+            .artifact_put(ArtifactPutRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+                kind: "render.desktop.first".into(),
+                bytes_base64: B64.encode(b"not-png"),
+                candidate_id: None,
+                round: None,
+            })
+            .unwrap();
+        let mut wrong_evidence: BTreeMap<String, String> =
+            [("source".into(), receipt.clone())].into();
+        for key in [
+            "render.desktop.first",
+            "render.mobile390.first",
+            "render.state.start",
+            "render.state.mid",
+            "render.state.end",
+            "render.state.reverse",
+        ] {
+            wrong_evidence.insert(key.into(), wrong.sha256.clone());
+        }
+        let rejected = daemon.submit(submission(wrong_evidence)).unwrap();
+        assert!(!rejected.accepted);
+        let repair = rejected.repair.unwrap();
+        assert!(
+            repair.contains("no matching task-bound artifact") || repair.contains("invalid PNG"),
+            "{repair}"
+        );
+        let keys = [
+            "render.desktop.first",
+            "render.mobile390.first",
+            "render.state.start",
+            "render.state.mid",
+            "render.state.end",
+            "render.state.reverse",
+        ];
+        let mut evidence: BTreeMap<String, String> = [("source".into(), receipt)].into();
+        for (i, key) in keys.iter().enumerate() {
+            let (width, height) = if i == 1 { (390, 844) } else { (1024, 768) };
+            let png = make_png(width, height, |x, y| {
+                [((x + i as u32) % 255) as u8, (y % 255) as u8, 33]
+            });
+            let artifact = daemon
+                .artifact_put(ArtifactPutRequest {
+                    task_id: ex.task_id.clone(),
+                    capability: cap_of(&ex),
+                    lease_epoch: ex.lease.epoch,
+                    kind: (*key).into(),
+                    bytes_base64: B64.encode(&png),
+                    candidate_id: None,
+                    round: None,
+                })
+                .unwrap();
+            evidence.insert((*key).into(), artifact.sha256);
+        }
+        let outcome = daemon.submit(submission(evidence)).unwrap();
+        assert!(outcome.accepted, "{:?}", outcome.repair);
+    }
+
+    #[test]
+    fn visual_classification_is_word_bounded_for_ui() {
+        assert!(visual_action("Create a UI", "write a screen"));
+        assert!(visual_action("Build a landing page", "write"));
+        assert!(!visual_action("build a guild audit", "write"));
     }
 
     #[test]
