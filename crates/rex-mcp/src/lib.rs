@@ -1940,13 +1940,9 @@ mod tests {
         assert!(ambitious_text.contains("same-crop rendered start/mid/end/reverse pixels"));
         assert!(ambitious_text.contains("wait for the state to settle"));
         assert!(ambitious_text.contains("host-framed endpoint pixels"));
-        assert!(ambitious_text.contains("horizontal slats must not yield vertical stripes"));
-        assert!(ambitious_text.contains("source, seam and receiving surface at 0/25/50/75/100"));
-        assert!(ambitious_text.contains("start/middle/end/reverse pixels for monotonic coverage"));
-        assert!(ambitious_text.contains("reveal a superset of the same projection"));
-        assert!(ambitious_text.contains("both shadow tangent rays"));
-        assert!(ambitious_text.contains("same camera/perspective transform"));
-        assert!(ambitious_text.contains("single floor-light polygon as one mask"));
+        assert!(ambitious_text.contains("Test general failure classes before polishing"));
+        assert!(ambitious_text.contains("shared coordinate and causal systems"));
+        assert!(ambitious_text.contains("Dogfood this MCP"));
         assert!(ambitious_text.contains("one dominant hero object"));
         assert!(ambitious_text.contains("scene and its primary control together"));
         let operational = s
