@@ -1140,6 +1140,7 @@ pub fn tool_descriptors() -> Vec<Value> {
                     "open_action":{"type":["object","null"]},
                     "budgets":{"type":"object"},
                     "last_event_seq":{"type":"integer"},
+                    "visual_capture_coverage":{"type":"object","required":["action_id","cited_slots","unique_frames","duplicate_slots"],"properties":{"action_id":{"type":"string"},"cited_slots":{"type":"integer"},"unique_frames":{"type":"integer"},"duplicate_slots":{"type":"integer"}}},
                     "operation":{"enum":["queued","prepared","committed","aborted","revoked","stale","conflict","external_host_required"]},
                     "packet":{"type":"object","required":["protocol_version","task_schema_version","kernel_schema_version","branch_id","lease_epoch","resume_nonce","idempotency_key"],"properties":{"protocol_version":{"type":"string"},"task_schema_version":{"type":"integer"},"kernel_schema_version":{"type":"integer"},"branch_id":{"type":"string"},"lease_epoch":{"type":"integer"},"resume_nonce":{"type":"integer"},"idempotency_key":{"type":"string"}}}
                 }
@@ -1580,6 +1581,11 @@ mod tests {
         assert_eq!(
             status_schema["properties"]["open_action"]["type"],
             json!(["object", "null"])
+        );
+        assert_eq!(
+            status_schema["properties"]["visual_capture_coverage"]["properties"]["duplicate_slots"]
+                ["type"],
+            "integer"
         );
         let events = &find("rex_events")["outputSchema"];
         assert_eq!(events["type"], "object");

@@ -97,6 +97,9 @@ struct DurableTask {
     /// Host-supplied artifacts carry no snapshot and cannot satisfy this gate.
     #[serde(default)]
     preview_sources: BTreeMap<String, (String, String)>,
+    /// Latest accepted visual action's six-slot digest summary, not a taste gate.
+    #[serde(default)]
+    visual_capture_coverage: Option<VisualCaptureCoverage>,
     #[serde(default)]
     critique_issued_for: Option<String>,
     #[serde(default)]
@@ -420,6 +423,7 @@ impl HarnessDaemon {
             evidence: BTreeMap::new(),
             registered_evidence: BTreeSet::new(),
             preview_sources: BTreeMap::new(),
+            visual_capture_coverage: None,
             critique_issued_for: None,
             critique_recorded_for: None,
             result: None,
@@ -847,6 +851,30 @@ impl HarnessDaemon {
         Ok(())
     }
 
+    fn capture_coverage(
+        action_id: &str,
+        evidence: &BTreeMap<String, String>,
+    ) -> VisualCaptureCoverage {
+        let hashes: Vec<&str> = [
+            "render.desktop.first",
+            "render.mobile390.first",
+            "render.state.start",
+            "render.state.mid",
+            "render.state.end",
+            "render.state.reverse",
+        ]
+        .iter()
+        .filter_map(|key| evidence.get(*key).map(String::as_str))
+        .collect();
+        let unique = hashes.iter().copied().collect::<BTreeSet<_>>().len();
+        VisualCaptureCoverage {
+            action_id: action_id.into(),
+            cited_slots: hashes.len() as u8,
+            unique_frames: unique as u8,
+            duplicate_slots: (hashes.len() - unique) as u8,
+        }
+    }
+
     pub fn submit(&self, req: SubmitRequest) -> Result<SubmitResponse, ProtocolError> {
         let t0 = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         // State-machine join (audit finding 2): an Ultra task can never
@@ -892,9 +920,15 @@ impl HarnessDaemon {
                     accepted: false,
                     repair: Some(repair),
                     next: Some(open),
+                    visual_capture_coverage: None,
                 });
             }
         }
+        let coverage = if visual_action(&t.task, &open.instructions) {
+            Some(Self::capture_coverage(&open.action_id, &req.evidence))
+        } else {
+            None
+        };
         t.state = TaskState::Verifying;
         let narrative = req.narrative.clone();
         let evidence = req.evidence.clone();
@@ -916,12 +950,14 @@ impl HarnessDaemon {
                 "action_accepted",
                 json!({"action_id":open.action_id}),
             )?;
+            t.visual_capture_coverage = coverage.clone();
             self.persist(&t)?;
             return Ok(SubmitResponse {
                 state: t.state,
                 accepted: true,
                 repair: None,
                 next: Some(next),
+                visual_capture_coverage: coverage.clone(),
             });
         }
         // Fable completion gate: the claim may only cite evidence the
@@ -942,6 +978,7 @@ impl HarnessDaemon {
                 accepted: false,
                 repair: Some(repair),
                 next: Some(open),
+                visual_capture_coverage: None,
             });
         }
         t.open_action = None;
@@ -960,6 +997,7 @@ impl HarnessDaemon {
                 t.state = TaskState::Completed;
                 t.result = Some(req.narrative);
                 t.terminal_reason = Some("verified completion".into());
+                t.visual_capture_coverage = coverage.clone();
                 let ev = t.evidence.clone();
                 self.append_event(&mut t, "task_completed", json!({"evidence":ev}))?;
                 self.persist(&t)?;
@@ -968,6 +1006,7 @@ impl HarnessDaemon {
                     accepted: true,
                     repair: None,
                     next: None,
+                    visual_capture_coverage: coverage.clone(),
                 })
             }
             Err(e) => {
@@ -985,6 +1024,7 @@ impl HarnessDaemon {
                     accepted: false,
                     repair: Some(e.to_string()),
                     next: Some(open),
+                    visual_capture_coverage: None,
                 })
             }
         }
@@ -1022,6 +1062,7 @@ impl HarnessDaemon {
                 used_wall_ms: used_wall,
             },
             last_event_seq: t.last_event_seq,
+            visual_capture_coverage: t.visual_capture_coverage,
             operation,
             packet,
         })
@@ -3527,6 +3568,63 @@ mod tests {
         daemon.persist(&t).unwrap();
         let outcome = daemon.submit(submission(evidence)).unwrap();
         assert!(outcome.accepted, "{:?}", outcome.repair);
+        let summary = outcome.visual_capture_coverage.unwrap();
+        assert_eq!(summary.action_id, action_id);
+        assert_eq!(
+            (
+                summary.cited_slots,
+                summary.unique_frames,
+                summary.duplicate_slots
+            ),
+            (6, 6, 0)
+        );
+        let durable = daemon
+            .status(TaskRefRequest {
+                task_id: ex.task_id,
+            })
+            .unwrap();
+        assert_eq!(durable.visual_capture_coverage.unwrap(), summary);
+    }
+
+    #[test]
+    fn capture_coverage_reports_identical_frames_without_rejecting_them() {
+        let evidence = [
+            ("render.desktop.first".into(), "desktop".into()),
+            ("render.mobile390.first".into(), "mobile".into()),
+            ("render.state.start".into(), "mobile".into()),
+            ("render.state.mid".into(), "mobile".into()),
+            ("render.state.end".into(), "desktop".into()),
+            ("render.state.reverse".into(), "desktop".into()),
+        ]
+        .into();
+        let coverage = HarnessDaemon::capture_coverage("action-1", &evidence);
+        assert_eq!(
+            (
+                coverage.cited_slots,
+                coverage.unique_frames,
+                coverage.duplicate_slots
+            ),
+            (6, 2, 4)
+        );
+        assert_eq!(coverage.action_id, "action-1");
+        let legacy: DurableTask = serde_json::from_value({
+            let d = tempdir().unwrap();
+            let w = d.path().join("ws");
+            let daemon =
+                HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w))
+                    .unwrap();
+            let ex = daemon
+                .execute(req("coverage-legacy-serialization"))
+                .unwrap();
+            let mut value = serde_json::to_value(daemon.load(&ex.task_id).unwrap()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("visual_capture_coverage");
+            value
+        })
+        .unwrap();
+        assert!(legacy.visual_capture_coverage.is_none());
     }
 
     #[test]
