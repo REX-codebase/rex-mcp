@@ -515,7 +515,7 @@ impl McpServer {
                 Ok(json!({"contents": [{
                     "uri": uri,
                     "mimeType": "text/plain",
-                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with evidence. For an existing task, use the rex_task_inspect prompt and task status/events/result resources for read-only inspection; read rex://task/{task_id}/events/0, then request rex://task/{task_id}/events/{last_seq} until a page is empty. Each page has at most 100 entries. Read rex://task/{task_id}/result only when available, and distinguish a terminal result from an active task. For Ultra, create with rex_execute and ultra: true; use rex_ultra_open with a deterministic contract, submit candidate bundles and gate evidence through rex_ultra_submit, then start long promotion with rex_ultra_promote_start. Poll rex_ultra_promote_status using the returned operation_id while this MCP process remains alive. A running response is not completion; only a succeeded response has a receipt. A failed response has an error. After process loss, inspect durable status and proof before retrying; do not assume a lost operation committed. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
+                    "text": "Start with rex_execute to create a durable task and follow its returned next action. Use the returned task_id, task_capability, and lease epoch for rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by that action. Then call rex_submit with an evidence object whose values are actual receipt or evidence_id strings returned by scoped tools, not descriptive prose; keep explanations in narrative. If accepted is false, read repair and resubmit the same open action with registered IDs. A resumed rex_execute rotates host_resume_handle and task_capability: persist the newly returned values immediately, and never retry with the old handle. After a lost handle, inspect status/events and stop rather than creating a replacement task as a bypass. For an existing task, use the rex_task_inspect prompt and task status/events/result resources for read-only inspection; read rex://task/{task_id}/events/0, then request rex://task/{task_id}/events/{last_seq} until a page is empty. Each page has at most 100 entries. Read rex://task/{task_id}/result only when available, and distinguish a terminal result from an active task. For Ultra, create with rex_execute and ultra: true; use rex_ultra_open with a deterministic contract, submit candidate bundles and gate evidence through rex_ultra_submit, then start long promotion with rex_ultra_promote_start. Poll rex_ultra_promote_status using the returned operation_id while this MCP process remains alive. A running response is not completion; only a succeeded response has a receipt. A failed response has an error. After process loss, inspect durable status and proof before retrying; do not assume a lost operation committed. Check rex_status to inspect state. Mutations require trusted launcher approval; denied or stale leases stop rather than bypassing custody. The MCP host controls its own continuation and limits; REX does not force further host calls."
                 }]}))
             }),
             "prompts/list" => self.require_initialized().map(|_| json!({
@@ -596,7 +596,7 @@ impl McpServer {
                         "role": "user",
                         "content": {
                             "type": "text",
-                            "text": format!("For this product UI task: {task}\n\nFirst locate and read .agents/skills/rex-design/SKILL.md in this repository. If it is missing, say so rather than invent its contents. Follow its workflow: inspect the existing UI, map tasks and build a state coverage ledger, compare two structural directions for consequential flows, implement, then inspect rendered pixels and adversarial edge states across relevant states and viewports before reporting. Distinguish states exercised in the UI from states inferred from code or left unverified. This MCP prompt is a pointer, not a replacement for the skill or permission to claim unverified visual results.")
+                            "text": format!("For this product UI task: {task}\n\nFirst locate and read .agents/skills/rex-design/SKILL.md in this repository. If it is missing, say so rather than invent its contents. Read the task and choose Visual or Production mode using the skill's routing rules. A visually ambitious showcase or cinematic prompt routes to Visual; a real operational page routes to Production, and size alone is not visual ambition. State the reason and follow the corresponding workflow while preserving hard requirements. Inspect the existing UI, compare two structural directions, implement, then inspect rendered pixels and adversarial edge states across relevant viewports. In Production mode use a state coverage ledger; in Visual mode build an animated page and choose motion to suit its story. Use GSAP ScrollTrigger for scroll-led choreography when it fits, not as a default template for every page; record the choice. For scroll-led scenes, inspect trigger progress and rendered start/mid/end/reverse plus pin exit on desktop and mobile, with a static reduced-motion path. Verify actual start/middle/end playback and mobile scroll behavior, plus a separately rendered reduced-motion path. For timed Visual motion, keep the reduced-motion static equivalent readable beyond the original animation timer or until an explicit return action; do not flash it and auto-hide it. A static frame or CSS rule alone is not motion verification. For script-dependent controls, inspect a cache-fresh JS-disabled first viewport: show honest static content and no inert action, then reveal the control only after initialization. Check computed control visibility at mobile breakpoints too, since responsive CSS can override a script-off hidden rule. For long-running ambient Visual motion, provide a real pause/resume path; verify computed animation state and stable pixels while paused, resume and keyboard activation, and respect reduced-motion initialization and later preference changes. Hide script-dependent controls if JS never starts. For a continuous visual control, verify that its value matches visible progress at start, midpoint, end and reverse, with immediate state changes under reduced motion. For a multi-parameter Visual scene, test each axis separately and joint extremes, reverse them, and keep a textual readout aligned with the rendered art. For a reversible state-change metaphor, inspect opening, midpoint, final state and reverse path; align the toggle label and pressed state with the rendered art. CSS motion can fit without a library or canvas. Distinguish states exercised in the UI from states inferred from code or left unverified. Study verifiable examples, including X posts only when the original and rendered result can be inspected, then transfer task-relevant mechanisms rather than copying layouts or animation recipes. For Visual, map scene message, motion reason, mobile pacing and reduced-motion equivalent before coding. When 3D is appropriate, verify geometric depth, occlusion and a camera-change frame rather than accepting a flat disc merely because WebGL or Three.js is present; provide a static fallback. Test initial 3D load failure and later context loss so controls do not remain active on a dead scene. For Production, verify validation timing, corrected errors, retained input and accessible recovery after a failed submission. For optimistic writes, pending is not service-confirmed: do not show a success badge before the receipt, reconcile explicit rejection, and classify a lost response as unknown rather than failed. For concurrent edits, preserve the unsaved draft when the underlying revision changes, compare it with the newer record, invalidate the old local check, keep a reversible prior-draft route if copying newer text replaces the editor, and do not claim a save without a server-side conditional write. In-page undo is not durable reload recovery. A timed-out write has unknown outcome, not confirmed failure: retain the draft and request identity, check that operation before retry, and require a conclusive service status or real service idempotency for a same-key retry. An eventually consistent not-found response is not a confirmed failure. A retry must be a real path, not a permanently failing mock; distinguish a local check from a saved record, and exercise failure, retry and resulting state. For a multi-account action, show the selected account at review, bind the account, recipient and draft version, invalidate the check on account switch, discard late lookup results from the old account, and never carry an account-specific recipient into a different account as if it were the same audience. For attachment review, inspect retrievable bytes rather than trusting name or metadata; bind a digest to the exact selected version and invalidate on change. A local digest does not prove upload or delivery. For spreadsheet-bound exports of untrusted content, inspect formula-leading values after field parsing and serialization, including quote/separator tricks, and verify actual exported bytes rather than trusting a visual preview. For conflicting sources, compare provenance and revisions field by field; do not treat a later receipt time as blanket authority, and invalidate a local merge proposal when a source revision changes. For destructive actions, show exact target ID/revision and recovery limits, test wrong input and cancellation, and do not call an in-page restoration a service undo. Bind any consequential local review to exact values and source revision; a changed amount or revision invalidates it, and a local check is not owner approval or payment authority. For offline queues, distinguish editor draft, device-local storage, network attempt, unknown outcome and service receipt; a local queued item is not Sent, and reconnect alone does not authorize replay. For import previews, keep raw line values beside parsed rows, flag duplicates and invalid units, preserve zero as data, invalidate stale reviews on input changes, and never imply a local preview imported records. For priority ordering, move stable IDs with keyboard-reachable controls, preserve focus and announce position, invalidate prior review after a move, and distinguish local order from a saved server order. For cursor pagination, scope the cursor and in-flight request to its filter; discard old pages on filter change, ignore late responses, retain earlier rows on next-page failure, and never present shown count as total when unavailable. For a dense table/dashboard, test long labels, filtered counts, zero matches followed by a keyboard-reachable Clear filters control, preserved rows on failure, and a narrow layout that keeps each item status and next action together. For a partial bulk result, show each item ID with outcome and next step, preserve truthful aggregate counts, and retry only confirmed eligible items rather than replaying the entire batch. For a bulk review, bind exact selected IDs and statuses to a snapshot version; if the snapshot changes, clear or reconcile selection and invalidate the stale review before any action. A local demo without a backend must not offer a plausible bulk commit control. For async filter or refresh, label retained rows/counts as the previous snapshot while loading or after failure; reject superseded responses, and exercise rapid filter change, failure and a real retry. A local timer does not prove live freshness. For data visualizations, distinguish a recorded zero from missing data, keep exact values in an accessible table, and do not connect trends or compute adjacent-period changes across missing intervals; label provenance and denominators. If a narrow table needs two-dimensional layout, confine scrolling to the table; keep surrounding controls and individual cell text reflowed. Label the scroll, make the region keyboard-focusable only when it overflows, and remove it from tab order otherwise or in empty states. Inspect both table edges at 320 CSS pixels; a viewport proxy does not prove actual browser zoom. For timezone-sensitive scheduling, distinguish repeated fall-back times and nonexistent spring-forward times, show offsets and exact instants, and do not silently choose or create an event from an ambiguous wall-clock label. For session expiry during draft review, preserve input, stale the check, block writes, and never equate return to the draft with restored access or a completed service request. For branching multi-step work, hide inactive inputs, clear irrelevant errors, preserve recoverable draft values, invalidate a review on branch or value change, and do not present a local check as saved or delivered. For settings with dependent fields, test every branch, irrelevant errors, unsaved versus checked versus saved wording, and invalidate a past local check when the values change; for permission settings, compute effective access under every cap and explicit role rule, identify the limiting rule, and never call a local draft check a live entitlement test; put the task before an optional preview on narrow screens. Compare the finished design with the frozen REX task and acceptance: if the central behavior changed, receipt-backed file completion is not proof the original brief was met; report that mismatch. This MCP prompt is a pointer, not a replacement for the skill or permission to claim unverified visual results.")
                         }
                     }]
                 }));
@@ -636,7 +636,7 @@ impl McpServer {
                         "role": "user",
                         "content": {
                             "type": "text",
-                            "text": format!("For this task: {task}\n\nCall rex_execute with a fresh request_id, this task, the host, and operator_is_agent=true. Keep the returned task_id, task_capability, and lease epoch. Use rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by the open action; submit evidence through rex_submit. Follow tool responses rather than guessing the next step. The host controls continuation and limits; REX does not force further calls.")
+                            "text": format!("For this task: {task}\n\nCall rex_execute with a fresh request_id, this task, the host, and operator_is_agent=true. Keep the returned task_id, task_capability, and lease epoch. Use rex_next and the scoped rex_read, rex_edit, rex_search, rex_run, or rex_test calls needed by the open action; submit with rex_submit, setting evidence values to actual returned receipt or evidence_id strings, not prose. Put explanations in narrative. Check accepted and repair, not only isError; a rejected claim leaves the same action open for a repaired submission. On resume, persist the newly returned host_resume_handle and task_capability immediately because the old values rotate. A lost handle is not a reason to bypass custody with a new task. Follow tool responses rather than guessing the next step. The host controls continuation and limits; REX does not force further calls.")
                         }
                     }]
                 }))
@@ -1607,12 +1607,15 @@ mod tests {
         for phrase in [
             "rex_ultra_promote_start",
             "rex_ultra_promote_status",
+            "receipt or evidence_id",
+            "accepted is false",
+            "resumed rex_execute rotates host_resume_handle",
             "process loss",
             "not completion",
         ] {
             assert!(
                 quickstart.contains(phrase),
-                "missing Ultra guidance: {phrase}"
+                "missing quickstart guidance: {phrase}"
             );
         }
         let bad = s
@@ -1869,6 +1872,77 @@ mod tests {
         assert!(design_text.contains("adversarial edge states"));
         assert!(design_text.contains("state coverage ledger"));
         assert!(design_text.contains("left unverified"));
+        assert!(design_text.contains("choose Visual or Production mode"));
+        assert!(design_text.contains("For a multi-account action"));
+        assert!(design_text.contains("visually ambitious showcase"));
+        assert!(design_text.contains("size alone is not visual ambition"));
+        assert!(design_text.contains("GSAP ScrollTrigger"));
+        assert!(design_text.contains("not as a default template"));
+        assert!(design_text.contains("start/middle/end playback"));
+        assert!(design_text.contains("reverse path"));
+        assert!(design_text.contains("reduced-motion path"));
+        assert!(design_text.contains("do not flash it and auto-hide it"));
+        assert!(design_text.contains("cache-fresh JS-disabled first viewport"));
+        assert!(design_text.contains("no inert action"));
+        assert!(design_text.contains("X posts only when"));
+        assert!(design_text.contains("transfer task-relevant mechanisms"));
+        assert!(design_text.contains("validation timing"));
+        assert!(design_text.contains("retained input"));
+        assert!(design_text.contains("server-side conditional write"));
+        assert!(design_text.contains("reversible prior-draft route"));
+        assert!(design_text.contains("A timed-out write has unknown outcome"));
+        assert!(design_text.contains("For a continuous visual control"));
+        assert!(design_text.contains("For long-running ambient Visual motion"));
+        assert!(design_text.contains("For a partial bulk result"));
+        assert!(design_text.contains("pending is not service-confirmed"));
+        assert!(design_text.contains("inspect trigger progress"));
+        assert!(design_text.contains("retry must be a real path"));
+        assert!(design_text.contains("local check from a saved record"));
+        assert!(design_text.contains("keyboard-reachable Clear filters"));
+        assert!(design_text.contains("preserved rows on failure"));
+        assert!(design_text.contains("invalidate the stale review"));
+        assert!(design_text.contains("reject superseded responses"));
+        assert!(design_text.contains("item status and next action together"));
+        assert!(design_text.contains("frozen REX task and acceptance"));
+        assert!(design_text.contains("invalidate a past local check"));
+        assert!(design_text.contains("effective access under every cap"));
+        assert!(design_text.contains("task before an optional preview"));
+        assert!(design_text.contains("invalidate a review on branch or value change"));
+        assert!(design_text.contains("never equate return to the draft with restored access"));
+        assert!(design_text.contains("never present shown count as total when unavailable"));
+        assert!(design_text.contains("test each axis separately and joint extremes"));
+        assert!(design_text.contains("move stable IDs with keyboard-reachable controls"));
+        assert!(design_text.contains("A local digest does not prove upload or delivery"));
+        assert!(design_text.contains("geometric depth, occlusion"));
+        assert!(design_text.contains("camera-change frame"));
+        assert!(design_text.contains("initial 3D load failure and later context loss"));
+        assert!(design_text.contains("recorded zero from missing data"));
+        assert!(design_text.contains("adjacent-period changes across missing intervals"));
+        assert!(design_text.contains("keyboard-focusable only when it overflows"));
+        let ambitious = s
+            .handle(rpc(
+                27,
+                "prompts/get",
+                json!({"name":"rex_design_workflow", "arguments":{"task":"Create a cinematic campaign page with a striking visual transformation"}}),
+            ))
+            .unwrap();
+        let ambitious_text = ambitious["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(ambitious_text.contains("cinematic campaign page"));
+        assert!(ambitious_text.contains("Visual or Production mode"));
+        let operational = s
+            .handle(rpc(
+                28,
+                "prompts/get",
+                json!({"name":"rex_design_workflow", "arguments":{"task":"Build a production billing settings page with errors and keyboard access"}}),
+            ))
+            .unwrap();
+        let operational_text = operational["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(operational_text.contains("production billing settings page"));
+        assert!(operational_text.contains("state coverage ledger"));
 
         let ultra = s
             .handle(rpc(
@@ -1970,6 +2044,12 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("fix parser"));
+        let workflow = get["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(workflow.contains("receipt or evidence_id strings"));
+        assert!(workflow.contains("Check accepted and repair"));
+        assert!(workflow.contains("newly returned host_resume_handle"));
         let no_task = s
             .handle(rpc(4, "prompts/get", json!({"name":"rex_task_workflow"})))
             .unwrap();
