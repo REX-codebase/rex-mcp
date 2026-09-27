@@ -2727,6 +2727,10 @@ fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
                 || field.name.len() > 80
                 || !names.insert(field.name.as_str())
                 || !matches!(field.kind.as_str(), "text" | "control")
+                || !matches!(
+                    field.match_mode.as_deref().unwrap_or("exact"),
+                    "exact" | "contains"
+                )
                 || field.alternatives.is_empty()
                 || field.alternatives.len() > 8
                 || field
@@ -3617,6 +3621,7 @@ mod tests {
             name: "movement".into(),
             alternatives: vec!["Chair squat".into()],
             kind: "text".into(),
+            match_mode: None,
         }]);
         r.plan = Some(vec![PlanStep {
             instructions: "Build landing page".into(),
@@ -3641,10 +3646,24 @@ mod tests {
             name: "category".into(),
             alternatives: vec!["Full-body basics".into()],
             kind: "text".into(),
+            match_mode: None,
         }]);
         assert_eq!(
             daemon.execute(changed).unwrap_err().code,
             ErrorCode::IdempotencyConflict
+        );
+        let mut invalid = req("invalid-match-mode");
+        invalid.ultra = false;
+        invalid.task = "Build a landing page".into();
+        invalid.mobile_result_fields = Some(vec![MobileResultField {
+            name: "ordered".into(),
+            alternatives: vec!["12".into()],
+            kind: "text".into(),
+            match_mode: Some("regex".into()),
+        }]);
+        assert_eq!(
+            daemon.execute(invalid).unwrap_err().code,
+            ErrorCode::MalformedRequest
         );
         daemon
             .critique_prompt(&ex.task_id, &cap_of(&ex), ex.lease.epoch)

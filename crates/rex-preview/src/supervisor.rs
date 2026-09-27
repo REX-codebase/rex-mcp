@@ -847,6 +847,7 @@ mod tests {
             name: name.into(),
             alternatives: vec![text.into()],
             kind: kind.into(),
+            match_mode: None,
         });
         let first = sup.capture_with_fields(&started.id, &fields).unwrap();
         assert_eq!(first.visible_result_fields, vec!["block"]);
@@ -868,6 +869,28 @@ mod tests {
         assert!(!second.visible_result_fields.contains(&"delta".into()));
         assert!(!second.visible_result_fields.contains(&"reject".into()));
         assert!(!second.visible_result_fields.contains(&"secret".into()));
+        let contains = [
+            rex_protocol::MobileResultField {
+                name: "quantity".into(),
+                alternatives: vec!["12".into()],
+                kind: "text".into(),
+                match_mode: Some("contains".into()),
+            },
+            rex_protocol::MobileResultField {
+                name: "action".into(),
+                alternatives: vec!["prov".into()],
+                kind: "control".into(),
+                match_mode: Some("contains".into()),
+            },
+            rex_protocol::MobileResultField {
+                name: "exact-fail".into(),
+                alternatives: vec!["12".into()],
+                kind: "text".into(),
+                match_mode: None,
+            },
+        ];
+        let third = sup.capture_with_fields(&started.id, &contains).unwrap();
+        assert_eq!(third.visible_result_fields, vec!["quantity", "action"]);
         sup.cancel(&started.id).unwrap();
         let _ = fs::remove_dir_all(w);
     }
