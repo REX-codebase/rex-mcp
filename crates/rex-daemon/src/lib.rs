@@ -97,6 +97,11 @@ struct DurableTask {
     /// Host-supplied artifacts carry no snapshot and cannot satisfy this gate.
     #[serde(default)]
     preview_sources: BTreeMap<String, (String, String)>,
+    /// Additional action bindings for a byte-identical frame from the SAME
+    /// source snapshot, captured again under a later open action. Legacy
+    /// preview_sources stays readable for existing durable tasks.
+    #[serde(default)]
+    preview_action_sources: BTreeMap<String, BTreeMap<String, String>>,
     /// Latest accepted visual action's six-slot digest summary, not a taste gate.
     #[serde(default)]
     visual_capture_coverage: Option<VisualCaptureCoverage>,
@@ -423,6 +428,7 @@ impl HarnessDaemon {
             evidence: BTreeMap::new(),
             registered_evidence: BTreeSet::new(),
             preview_sources: BTreeMap::new(),
+            preview_action_sources: BTreeMap::new(),
             visual_capture_coverage: None,
             critique_issued_for: None,
             critique_recorded_for: None,
@@ -507,16 +513,26 @@ impl HarnessDaemon {
             ));
         }
         if let Some((prior, prior_action)) = t.preview_sources.get(digest) {
-            if prior != source_sha256 || prior_action != &action {
+            if prior != source_sha256 {
                 return Err(perr(
                     ErrorCode::IdempotencyConflict,
-                    "identical preview PNG was already bound to a different source revision or action; the digest alone cannot distinguish captures. Do not change the UI merely to force new pixels or reuse this capture as current-source proof. Start a fresh task for this revision, then recapture its evidence",
+                    "identical preview PNG was already bound to a different source revision; the digest alone cannot distinguish captures. Do not change the UI merely to force new pixels or reuse this capture as current-source proof. Start a fresh task for this revision, then recapture its evidence",
                     task_id,
                 ));
             }
+            if prior_action != &action {
+                // The current action MUST capture it again: bind_preview_source
+                // is only reached from rex_preview_capture. We do not carry an
+                // earlier action's evidence forward or accept a host upload.
+                t.preview_action_sources
+                    .entry(action.clone())
+                    .or_default()
+                    .insert(digest.into(), source_sha256.into());
+            }
+        } else {
+            t.preview_sources
+                .insert(digest.into(), (source_sha256.into(), action.clone()));
         }
-        t.preview_sources
-            .insert(digest.into(), (source_sha256.into(), action.clone()));
         self.append_event(
             &mut t,
             "preview_source_bound",
@@ -795,6 +811,7 @@ impl HarnessDaemon {
         task_id: &str,
         action_id: &str,
         sources: &BTreeMap<String, (String, String)>,
+        action_sources: &BTreeMap<String, BTreeMap<String, String>>,
         evidence: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         let bindings = self.artifacts.bindings(task_id);
@@ -814,11 +831,13 @@ impl HarnessDaemon {
                 .iter()
                 .find(|b| b.sha256 == *digest && b.kind == key)
                 .ok_or_else(|| format!("{key}: no matching task-bound artifact"))?;
-            let (source, captured_action) = sources.get(digest)
-                .ok_or_else(|| format!("{key}: no first-party preview source binding; recapture with rex_preview_capture"))?;
-            if captured_action != action_id {
-                return Err(format!("{key}: capture belongs to another action"));
-            }
+            let source = match sources.get(digest) {
+                Some((source, captured_action)) if captured_action == action_id => source,
+                _ => action_sources
+                    .get(action_id)
+                    .and_then(|per_action| per_action.get(digest))
+                    .ok_or_else(|| format!("{key}: capture belongs to another action or has no first-party preview source binding; recapture with rex_preview_capture for this action"))?,
+            };
             if captured_source.is_some_and(|known| known != source) {
                 return Err(format!(
                     "{key}: mixed preview source revisions; recapture all states from one source"
@@ -911,6 +930,7 @@ impl HarnessDaemon {
                 &t.task_id,
                 &open.action_id,
                 &t.preview_sources,
+                &t.preview_action_sources,
                 &req.evidence,
             ) {
                 self.append_event(&mut t, "visual_evidence_rejected", json!({"repair":repair}))?;
@@ -3608,6 +3628,134 @@ mod tests {
             })
             .unwrap();
         assert_eq!(durable.visual_capture_coverage.unwrap(), summary);
+    }
+
+    #[test]
+    fn unchanged_visual_pixels_can_be_recaptured_for_a_later_action_but_not_reused() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut r = req("visual-multi-action-same-source");
+        r.ultra = false;
+        r.task = "Build a landing page".into();
+        r.plan = Some(vec![
+            PlanStep {
+                instructions: "Build the page".into(),
+                acceptance: None,
+            },
+            PlanStep {
+                instructions: "Review the same page in a second action".into(),
+                acceptance: None,
+            },
+        ]);
+        let ex = daemon.execute(r).unwrap();
+        let cap = cap_of(&ex);
+        let task = ex.task_id.clone();
+        let epoch = ex.lease.epoch;
+        let first_action = ex.next.as_ref().unwrap().action_id.clone();
+        let keys = [
+            "render.desktop.first",
+            "render.mobile390.first",
+            "render.state.start",
+            "render.state.mid",
+            "render.state.end",
+            "render.state.reverse",
+        ];
+        let mut evidence = BTreeMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            let width = if i == 1 { 390 } else { 1024 };
+            let png = make_png(width, 650, |x, y| {
+                [((x + i as u32) % 255) as u8, (y % 255) as u8, 33]
+            });
+            let artifact = daemon
+                .artifact_put(ArtifactPutRequest {
+                    task_id: task.clone(),
+                    capability: cap.clone(),
+                    lease_epoch: epoch,
+                    kind: (*key).into(),
+                    bytes_base64: B64.encode(&png),
+                    candidate_id: None,
+                    round: None,
+                })
+                .unwrap();
+            daemon
+                .bind_preview_source(&task, &cap, epoch, &artifact.sha256, &"a".repeat(64))
+                .unwrap();
+            evidence.insert((*key).into(), artifact.sha256);
+        }
+        daemon.critique_prompt(&task, &cap, epoch).unwrap();
+        daemon.critique_record(&task, &cap, epoch, &first_action, "Review source, viewport, and all captured states before claiming the first visual action complete; do not infer visual quality from receipt count.").unwrap();
+        let first = daemon
+            .submit(SubmitRequest {
+                task_id: task.clone(),
+                capability: cap.clone(),
+                lease_epoch: epoch,
+                action_id: first_action,
+                narrative: "First captured review".into(),
+                evidence: evidence.clone(),
+            })
+            .unwrap();
+        assert!(first.accepted);
+        let second_action = first.next.unwrap().action_id;
+        daemon.critique_prompt(&task, &cap, epoch).unwrap();
+        daemon
+            .critique_record(
+                &task,
+                &cap,
+                epoch,
+                &second_action,
+                "Recheck the unchanged page and recapture these states for this new action; the earlier action receipt cannot supply its visual evidence.",
+            )
+            .unwrap();
+        let second = || SubmitRequest {
+            task_id: task.clone(),
+            capability: cap.clone(),
+            lease_epoch: epoch,
+            action_id: second_action.clone(),
+            narrative: "Second action review".into(),
+            evidence: evidence.clone(),
+        };
+        let reused = daemon.submit(second()).unwrap();
+        assert!(!reused.accepted);
+        assert!(reused.repair.unwrap().contains("another action"));
+        // A changed source may not be laundered by re-capturing identical bytes.
+        let collision = daemon
+            .bind_preview_source(
+                &task,
+                &cap,
+                epoch,
+                &evidence["render.desktop.first"],
+                &"b".repeat(64),
+            )
+            .unwrap_err();
+        assert_eq!(collision.code, ErrorCode::IdempotencyConflict);
+        assert!(!daemon
+            .load(&task)
+            .unwrap()
+            .preview_action_sources
+            .contains_key(&second_action));
+        // Merely reusing the same digest in rex_submit cannot transfer a binding.
+        // Each byte-identical PNG must be captured again under this action.
+        for digest in evidence.values() {
+            daemon
+                .bind_preview_source(&task, &cap, epoch, digest, &"a".repeat(64))
+                .unwrap();
+        }
+        let rebound = daemon.load(&task).unwrap();
+        assert_eq!(rebound.preview_action_sources[&second_action].len(), 6);
+        let accepted = daemon.submit(second()).unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.repair);
+        assert_eq!(accepted.state, TaskState::Completed);
+        assert_eq!(accepted.visual_capture_coverage.unwrap().cited_slots, 6);
+        let collision = daemon.bind_preview_source(
+            &task,
+            &cap,
+            epoch,
+            &evidence["render.desktop.first"],
+            &"b".repeat(64),
+        );
+        assert!(collision.is_err()); // completed task is terminal
     }
 
     #[test]
