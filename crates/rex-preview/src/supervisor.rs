@@ -344,6 +344,14 @@ impl PreviewSupervisor {
             .action(action, &r.url)
     }
     pub fn capture(&self, id: &str) -> Result<crate::BrowserEvidence, PreviewError> {
+        self.capture_with_fields(id, &[])
+    }
+
+    pub fn capture_with_fields(
+        &self,
+        id: &str,
+        fields: &[rex_protocol::MobileResultField],
+    ) -> Result<crate::BrowserEvidence, PreviewError> {
         let mut s = self.sessions.lock().unwrap();
         let r = s.get_mut(id).ok_or(PreviewError::NotRunning)?;
         if r.browser.is_none() {
@@ -354,7 +362,7 @@ impl PreviewSupervisor {
             .browser
             .as_mut()
             .ok_or(PreviewError::NotRunning)?
-            .capture(&r.url)?;
+            .capture(&r.url, fields)?;
         if before != source_tree_sha256(&r.project_root, r.framework == Framework::StaticHtml)? {
             return Err(PreviewError::SourceChanged);
         }
@@ -803,6 +811,67 @@ mod tests {
         sup.cancel(&started.id).unwrap();
         let _ = fs::remove_dir_all(w);
     }
+    #[test]
+    fn mobile_result_observations_require_uncovered_first_view_elements() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("mobile-result-fields");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"), r#"<!doctype html><style>
+          body{background:#f5f1e7;color:#202020;margin:0;font:24px sans-serif}
+          main{padding:20px} button{font:inherit;padding:12px}
+          .far{margin-top:800px}.hidden{display:none}.overlay{position:fixed;inset:0;background:#fff;z-index:10}
+          </style><main><p>12 units</p><button>Approve</button><p class='far'>-2 units</p>
+          <button disabled>Reject</button><p class='hidden'>secret</p><div class='overlay'>Blocked</div></main>"#).unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.begin_iteration(&started.id).unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::SetViewport {
+                width: 390,
+                height: 650,
+                scale: 1.0,
+            },
+        )
+        .unwrap();
+        let fields = [
+            ("order", "12 units", "text"),
+            ("approve", "Approve", "control"),
+            ("delta", "-2 units", "text"),
+            ("reject", "Reject", "control"),
+            ("secret", "secret", "text"),
+            ("block", "Blocked", "text"),
+        ]
+        .map(|(name, text, kind)| rex_protocol::MobileResultField {
+            name: name.into(),
+            alternatives: vec![text.into()],
+            kind: kind.into(),
+        });
+        let first = sup.capture_with_fields(&started.id, &fields).unwrap();
+        assert_eq!(first.visible_result_fields, vec!["block"]);
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><style>
+          body{background:#f5f1e7;color:#202020;margin:0;font:24px sans-serif}
+          main{padding:20px} button{font:inherit;padding:12px}
+          .far{margin-top:800px}.hidden{display:none}</style>
+          <main><p>12 units</p><button>Approve</button><p class='far'>-2 units</p>
+          <button disabled>Reject</button><p class='hidden'>secret</p></main>"#,
+        )
+        .unwrap();
+        sup.action(&started.id, &BrowserAction::Navigate { path: "/".into() })
+            .unwrap();
+        let second = sup.capture_with_fields(&started.id, &fields).unwrap();
+        assert!(second.visible_result_fields.contains(&"order".into()));
+        assert!(second.visible_result_fields.contains(&"approve".into()));
+        assert!(!second.visible_result_fields.contains(&"delta".into()));
+        assert!(!second.visible_result_fields.contains(&"reject".into()));
+        assert!(!second.visible_result_fields.contains(&"secret".into()));
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+
     #[test]
     fn javascript_off_is_fresh_and_probe_verified() {
         let _port_guard = PORT_LOCK.lock().unwrap();

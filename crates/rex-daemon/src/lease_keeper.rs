@@ -401,6 +401,7 @@ mod tests {
         ExecuteRequest {
             request_id: id.into(),
             task: "make hello".into(),
+            mobile_result_fields: None,
             task_id: None,
             resume_handle: None,
             follow_up: None,
