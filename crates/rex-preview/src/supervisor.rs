@@ -736,6 +736,32 @@ mod tests {
         let _ = fs::remove_dir_all(w);
     }
     #[test]
+    fn in_project_symlinked_scene_cannot_be_captured_as_source_proof() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("symlinked-scene");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"), "<!doctype html><style>body{background:linear-gradient(#123,#678)}</style><main>Scene</main><script src='scene.js'></script>").unwrap();
+        fs::write(
+            app.join("actual.js"),
+            "document.querySelector('main').textContent='Loaded';",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(app.join("actual.js"), app.join("scene.js")).unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.begin_iteration(&started.id).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            sup.capture(&started.id).unwrap_err(),
+            PreviewError::SymlinkComponent
+        );
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+
+    #[test]
     fn symlinked_project_is_rejected() {
         let w = temp("link");
         let real = temp("outside");
