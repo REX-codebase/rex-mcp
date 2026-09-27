@@ -37,6 +37,8 @@ pub struct BrowserRuntime {
     height: u16,
     scale: f32,
     reduced_motion: Option<bool>,
+    javascript_enabled: Option<bool>,
+    script_probe_id: Option<String>,
     cursor_x: f32,
     cursor_y: f32,
     allowed_port: u16,
@@ -121,6 +123,8 @@ impl BrowserRuntime {
             height: 800,
             scale: 1.0,
             reduced_motion: None,
+            javascript_enabled: None,
+            script_probe_id: None,
             cursor_x: 0.0,
             cursor_y: 0.0,
             allowed_port: url::Url::parse(url)
@@ -298,6 +302,40 @@ impl BrowserRuntime {
                 self.reduced_motion = Some(*enabled);
                 self.verify_conditions()?;
             }
+            BrowserAction::SetJavaScript { enabled } => {
+                // Re-enabling in an already disabled target can return CDP
+                // success while the page remains inert. Fail closed and ask
+                // for a fresh preview rather than claiming the on state.
+                if *enabled && self.javascript_enabled == Some(false) {
+                    return Err(PreviewError::ConditionNotApplied);
+                }
+                if self.script_probe_id.is_none() {
+                    let installed = self.command("Page.addScriptToEvaluateOnNewDocument", json!({
+                        "source":"addEventListener('DOMContentLoaded',()=>document.documentElement.setAttribute('data-rex-script-probe','ran'))"
+                    }))?;
+                    self.script_probe_id = Some(
+                        installed
+                            .pointer("/result/identifier")
+                            .and_then(Value::as_str)
+                            .ok_or(PreviewError::ConditionNotApplied)?
+                            .to_string(),
+                    );
+                }
+                self.command(
+                    "Emulation.setScriptExecutionDisabled",
+                    json!({"value": !enabled}),
+                )?;
+                self.javascript_enabled = Some(*enabled);
+                // Fresh local document, not the already-executed page.
+                self.events.clear();
+                let mut fresh = url::Url::parse(base_url).map_err(|_| PreviewError::UrlDenied)?;
+                fresh
+                    .query_pairs_mut()
+                    .append_pair("rex_script_condition", if *enabled { "on" } else { "off" });
+                self.command("Page.navigate", json!({"url":fresh.as_str()}))?;
+                self.wait_loaded()?;
+                self.verify_conditions()?;
+            }
         }
         Ok(())
     }
@@ -338,6 +376,25 @@ impl BrowserRuntime {
             self.reduced_motion,
         ) {
             return Err(PreviewError::ConditionNotApplied);
+        }
+        if let Some(enabled) = self.javascript_enabled {
+            // Runtime.evaluate can execute even with page script execution
+            // disabled. The marker is installed for *new documents* and must
+            // only appear when ordinary page scripts were allowed to start.
+            let observed = self.command(
+                "Runtime.evaluate",
+                json!({
+                    "expression":"document.documentElement.getAttribute('data-rex-script-probe')",
+                    "returnByValue":true
+                }),
+            )?;
+            let ran = observed
+                .pointer("/result/result/value")
+                .and_then(Value::as_str)
+                == Some("ran");
+            if ran != enabled {
+                return Err(PreviewError::ConditionNotApplied);
+            }
         }
         Ok(())
     }
