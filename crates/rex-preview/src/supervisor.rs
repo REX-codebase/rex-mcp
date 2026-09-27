@@ -809,6 +809,55 @@ mod tests {
         let _ = fs::remove_dir_all(w);
     }
     #[test]
+    fn mobile_script_off_and_reduced_motion_are_real_capture_states() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("mobile-conditions");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"), r#"<!doctype html><style>body{background:linear-gradient(#123,#678)}@media(prefers-reduced-motion:reduce){body{background:linear-gradient(#3475e3,#e8b875)}}</style><main id='scene'>Script-off fallback</main><script>document.querySelector('#scene').textContent='Script ran'</script>"#).unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.begin_iteration(&started.id).unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::SetViewport {
+                width: 390,
+                height: 650,
+                scale: 1.0,
+            },
+        )
+        .unwrap();
+        let normal = sup.capture(&started.id).unwrap();
+        assert!(normal.dom_text.contains("Script ran"));
+        assert!(normal.items.iter().any(|item| matches!(
+            item,
+            crate::Evidence::Viewport {
+                width: 390,
+                height: 650,
+                ..
+            }
+        )));
+        sup.action(
+            &started.id,
+            &BrowserAction::SetReducedMotion { enabled: true },
+        )
+        .unwrap();
+        let reduced = sup.capture(&started.id).unwrap();
+        assert_ne!(normal.screenshot_data_url, reduced.screenshot_data_url);
+        sup.action(
+            &started.id,
+            &BrowserAction::SetJavaScript { enabled: false },
+        )
+        .unwrap();
+        let off = sup.capture(&started.id).unwrap();
+        assert!(off.dom_text.contains("Script-off fallback"));
+        assert!(!off.accessibility_text.contains("Script ran"));
+        assert_eq!(off.source_sha256, normal.source_sha256);
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+
+    #[test]
     fn missing_local_scene_asset_cannot_be_capture_evidence() {
         let _port_guard = PORT_LOCK.lock().unwrap();
         let w = temp("missing-scene");
