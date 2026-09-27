@@ -77,9 +77,13 @@ struct DurableTask {
     /// Frozen at creation; absent on legacy and uncontracted tasks.
     #[serde(default)]
     mobile_result_fields: Option<Vec<MobileResultField>>,
+    #[serde(default)]
+    desktop_result_fields: Option<Vec<MobileResultField>>,
     /// First-party mobile capture digest -> visible-field names for this action.
     #[serde(default)]
     mobile_field_captures: BTreeMap<String, (String, Vec<String>)>,
+    #[serde(default)]
+    desktop_field_captures: BTreeMap<String, (String, Vec<String>)>,
     cursor: usize,
     state: TaskState,
     open_action: Option<ActionSpec>,
@@ -262,10 +266,12 @@ impl HarnessDaemon {
             if task.task != req.task
                 || (req.mobile_result_fields.is_some()
                     && req.mobile_result_fields != task.mobile_result_fields)
+                || (req.desktop_result_fields.is_some()
+                    && req.desktop_result_fields != task.desktop_result_fields)
             {
                 return Err(perr(
                     ErrorCode::IdempotencyConflict,
-                    "task_id exists with different task text or frozen mobile result contract",
+                    "task_id exists with different task text or frozen result contract",
                     id,
                 ));
             }
@@ -420,7 +426,9 @@ impl HarnessDaemon {
             plan_hash: hash_json(&plan)?,
             plan,
             mobile_result_fields: req.mobile_result_fields,
+            desktop_result_fields: req.desktop_result_fields,
             mobile_field_captures: BTreeMap::new(),
+            desktop_field_captures: BTreeMap::new(),
             cursor: 0,
             state: TaskState::Active,
             open_action: Some(action),
@@ -498,6 +506,7 @@ impl HarnessDaemon {
         epoch: u64,
         digest: &str,
         visible_names: Vec<String>,
+        kind: &str,
     ) -> Result<(), ProtocolError> {
         let mut t = self.live(task_id, epoch, capability)?;
         let action = t
@@ -517,7 +526,7 @@ impl HarnessDaemon {
         {
             return Err(perr(
                 ErrorCode::GateFailed,
-                "mobile observation needs a current-action first-party preview binding",
+                "result observation needs a current-action first-party preview binding",
                 task_id,
             ));
         }
@@ -525,41 +534,56 @@ impl HarnessDaemon {
             .artifacts
             .bindings(task_id)
             .iter()
-            .any(|b| b.sha256 == digest && b.kind == "render.mobile390.first")
+            .any(|b| b.sha256 == digest && b.kind == kind)
         {
             return Err(perr(
                 ErrorCode::GateFailed,
-                "mobile observation needs the mobile390 render artifact",
+                "result observation needs its render artifact",
                 task_id,
             ));
         }
-        if let Some((prior_action, prior_names)) = t.mobile_field_captures.get(digest) {
+        let captures = if kind == "render.mobile390.first" {
+            &mut t.mobile_field_captures
+        } else if kind == "render.desktop.first" {
+            &mut t.desktop_field_captures
+        } else {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "invalid result render kind",
+                task_id,
+            ));
+        };
+        if let Some((prior_action, prior_names)) = captures.get(digest) {
             if prior_action == &action && prior_names != &visible_names {
                 return Err(perr(
                     ErrorCode::IdempotencyConflict,
-                    "identical mobile pixels cannot bind contradictory field observations",
+                    "identical pixels cannot bind contradictory field observations",
                     task_id,
                 ));
             }
         }
-        t.mobile_field_captures
-            .insert(digest.into(), (action.clone(), visible_names.clone()));
+        captures.insert(digest.into(), (action.clone(), visible_names.clone()));
         self.append_event(
             &mut t,
-            "mobile_fields_observed",
-            json!({"sha256":digest,"action_id":action,"visible_names":visible_names}),
+            "result_fields_observed",
+            json!({"sha256":digest,"action_id":action,"kind":kind,"visible_names":visible_names}),
         )?;
         self.persist(&t)
     }
 
-    pub fn mobile_result_fields(
+    pub fn result_fields(
         &self,
         task_id: &str,
         capability: &str,
         epoch: u64,
+        kind: &str,
     ) -> Result<Option<Vec<MobileResultField>>, ProtocolError> {
         let t = self.live(task_id, epoch, capability)?;
-        Ok(t.mobile_result_fields)
+        Ok(match kind {
+            "render.mobile390.first" => t.mobile_result_fields,
+            "render.desktop.first" => t.desktop_result_fields,
+            _ => None,
+        })
     }
 
     pub fn bind_preview_source(
@@ -1029,13 +1053,23 @@ impl HarnessDaemon {
             }
         }
         if visual_action(&t.task, &open.instructions) {
-            if let Some(fields) = &t.mobile_result_fields {
-                let digest = req
-                    .evidence
-                    .get("render.mobile390.first")
-                    .expect("validated render");
-                let observed = t
-                    .mobile_field_captures
+            let missing = [
+                (
+                    "render.mobile390.first",
+                    &t.mobile_result_fields,
+                    &t.mobile_field_captures,
+                ),
+                (
+                    "render.desktop.first",
+                    &t.desktop_result_fields,
+                    &t.desktop_field_captures,
+                ),
+            ]
+            .into_iter()
+            .find_map(|(kind, fields, captures)| {
+                let fields = fields.as_ref()?;
+                let digest = req.evidence.get(kind).expect("validated render");
+                let observed = captures
                     .get(digest)
                     .filter(|(action, _)| action == &open.action_id);
                 let missing: Vec<_> = fields
@@ -1043,18 +1077,19 @@ impl HarnessDaemon {
                     .filter(|f| !observed.is_some_and(|(_, names)| names.contains(&f.name)))
                     .map(|f| f.name.clone())
                     .collect();
-                if !missing.is_empty() {
-                    let repair = format!("mobile result contract missing visible fields: {}. Recapture the complete 390x650 first view", missing.join(", "));
-                    self.append_event(&mut t, "mobile_result_rejected", json!({"repair":repair}))?;
-                    self.persist(&t)?;
-                    return Ok(SubmitResponse {
-                        state: TaskState::Active,
-                        accepted: false,
-                        repair: Some(repair),
-                        next: Some(open),
-                        visual_capture_coverage: None,
-                    });
-                }
+                (!missing.is_empty()).then(|| (kind, missing))
+            });
+            if let Some((kind, missing)) = missing {
+                let repair = format!("{kind} result contract missing visible fields: {}. Recapture the complete first view", missing.join(", "));
+                self.append_event(&mut t, "result_fields_rejected", json!({"repair":repair}))?;
+                self.persist(&t)?;
+                return Ok(SubmitResponse {
+                    state: TaskState::Active,
+                    accepted: false,
+                    repair: Some(repair),
+                    next: Some(open),
+                    visual_capture_coverage: None,
+                });
             }
         }
         let coverage = if visual_action(&t.task, &open.instructions) {
@@ -1189,6 +1224,7 @@ impl HarnessDaemon {
             lease,
             open_action: t.open_action,
             mobile_result_fields: t.mobile_result_fields,
+            desktop_result_fields: t.desktop_result_fields,
             budgets: BudgetView {
                 max_tool_calls: t.max_tool_calls,
                 used_tool_calls: t.used_tool_calls,
@@ -2564,6 +2600,7 @@ impl HarnessDaemon {
             next: t.open_action.clone(),
             lease: lease_view(t),
             mobile_result_fields: t.mobile_result_fields.clone(),
+            desktop_result_fields: t.desktop_result_fields.clone(),
             discipline: Some(operator_discipline()),
         }
     }
@@ -2714,39 +2751,64 @@ fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
             "request_id and task are required",
         ));
     }
-    if let Some(fields) = &r.mobile_result_fields {
-        if r.ultra || !visual_action(&r.task, "") || fields.is_empty() || fields.len() > 24 {
-            return Err(ProtocolError::new(
-                ErrorCode::MalformedRequest,
-                "mobile result contract requires a Standard visual task and 1-24 fields",
-            ));
-        }
-        let mut names = BTreeSet::new();
-        for field in fields {
-            if field.name.trim().is_empty()
-                || field.name.len() > 80
-                || !names.insert(field.name.as_str())
-                || !matches!(field.kind.as_str(), "text" | "control")
-                || !matches!(
-                    field.match_mode.as_deref().unwrap_or("exact"),
-                    "exact" | "contains"
-                )
-                || field.alternatives.is_empty()
-                || field.alternatives.len() > 8
-                || field
-                    .alternatives
-                    .iter()
-                    .any(|v| v.trim().is_empty() || v.len() > 120)
-            {
+    for (surface, fields) in [
+        ("mobile", &r.mobile_result_fields),
+        ("desktop", &r.desktop_result_fields),
+    ] {
+        if let Some(fields) = fields {
+            if r.ultra || !visual_action(&r.task, "") || fields.is_empty() || fields.len() > 24 {
                 return Err(ProtocolError::new(
                     ErrorCode::MalformedRequest,
-                    "invalid mobile result field",
+                    format!(
+                        "{surface} result contract requires a Standard visual task and 1-24 fields"
+                    ),
                 ));
+            }
+            let mut names = BTreeSet::new();
+            for field in fields {
+                if field.name.trim().is_empty()
+                    || field.name.len() > 80
+                    || !names.insert(field.name.as_str())
+                    || !matches!(field.kind.as_str(), "text" | "control" | "list_count")
+                    || (field.kind == "list_count"
+                        && (field.min_count.is_none_or(|n| !(2..=12).contains(&n))
+                            || field.region.as_deref().is_none_or(|r| !valid_region_id(r))))
+                    || (field.kind != "list_count"
+                        && (field.min_count.is_some() || field.region.is_some()))
+                    || !matches!(
+                        field.match_mode.as_deref().unwrap_or("exact"),
+                        "exact" | "contains"
+                    )
+                    || field.min_font_px.is_some_and(|px| !(8..=32).contains(&px))
+                    || (field.kind == "list_count" && !field.alternatives.is_empty())
+                    || (field.kind != "list_count" && field.alternatives.is_empty())
+                    || field.alternatives.len() > 8
+                    || field
+                        .alternatives
+                        .iter()
+                        .any(|v| v.trim().is_empty() || v.len() > 120)
+                {
+                    return Err(ProtocolError::new(
+                        ErrorCode::MalformedRequest,
+                        format!("invalid {surface} result field"),
+                    ));
+                }
             }
         }
     }
     Ok(())
 }
+fn valid_region_id(region: &str) -> bool {
+    let Some(id) = region.strip_prefix('#') else {
+        return false;
+    };
+    (1..=80).contains(&id.len())
+        && id.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn capability_set(workspace: &Path) -> CapabilitySet {
     CapabilitySet {
         workspace_root: workspace.to_path_buf(),
@@ -3135,6 +3197,7 @@ mod tests {
             request_id: id.into(),
             task: "make hello".into(),
             mobile_result_fields: None,
+            desktop_result_fields: None,
             task_id: None,
             resume_handle: None,
             follow_up: None,
@@ -3480,6 +3543,22 @@ mod tests {
             daemon.run(run.clone()).unwrap_err().code,
             ErrorCode::GateFailed
         );
+        let mut invalid_list = req("invalid-list-region");
+        invalid_list.ultra = false;
+        invalid_list.task = "Build a landing page".into();
+        invalid_list.desktop_result_fields = Some(vec![MobileResultField {
+            name: "moves".into(),
+            alternatives: vec![],
+            kind: "list_count".into(),
+            match_mode: None,
+            min_font_px: Some(14),
+            region: Some("body .moves".into()),
+            min_count: Some(3),
+        }]);
+        assert_eq!(
+            daemon.execute(invalid_list).unwrap_err().code,
+            ErrorCode::MalformedRequest
+        );
         daemon
             .critique_prompt(&ex.task_id, &cap_of(&ex), ex.lease.epoch)
             .unwrap();
@@ -3622,6 +3701,9 @@ mod tests {
             alternatives: vec!["Chair squat".into()],
             kind: "text".into(),
             match_mode: None,
+            min_font_px: None,
+            region: None,
+            min_count: None,
         }]);
         r.plan = Some(vec![PlanStep {
             instructions: "Build landing page".into(),
@@ -3631,7 +3713,12 @@ mod tests {
         let action_id = ex.next.as_ref().unwrap().action_id.clone();
         assert_eq!(
             daemon
-                .mobile_result_fields(&ex.task_id, &cap_of(&ex), ex.lease.epoch)
+                .result_fields(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    "render.mobile390.first"
+                )
                 .unwrap()
                 .unwrap()[0]
                 .name,
@@ -3647,6 +3734,9 @@ mod tests {
             alternatives: vec!["Full-body basics".into()],
             kind: "text".into(),
             match_mode: None,
+            min_font_px: None,
+            region: None,
+            min_count: None,
         }]);
         assert_eq!(
             daemon.execute(changed).unwrap_err().code,
@@ -3660,9 +3750,28 @@ mod tests {
             alternatives: vec!["12".into()],
             kind: "text".into(),
             match_mode: Some("regex".into()),
+            min_font_px: None,
+            region: None,
+            min_count: None,
         }]);
         assert_eq!(
             daemon.execute(invalid).unwrap_err().code,
+            ErrorCode::MalformedRequest
+        );
+        let mut invalid_font = req("invalid-font-size");
+        invalid_font.ultra = false;
+        invalid_font.task = "Build a landing page".into();
+        invalid_font.desktop_result_fields = Some(vec![MobileResultField {
+            name: "source".into(),
+            alternatives: vec!["12".into()],
+            kind: "text".into(),
+            match_mode: Some("contains".into()),
+            min_font_px: Some(7),
+            region: None,
+            min_count: None,
+        }]);
+        assert_eq!(
+            daemon.execute(invalid_font).unwrap_err().code,
             ErrorCode::MalformedRequest
         );
         daemon
@@ -3724,10 +3833,18 @@ mod tests {
             ex.lease.epoch,
             &evidence["render.desktop.first"],
             vec!["movement".into()],
+            "render.mobile390.first",
         );
         assert_eq!(forged.unwrap_err().code, ErrorCode::GateFailed);
         daemon
-            .bind_mobile_fields(&ex.task_id, &cap_of(&ex), ex.lease.epoch, mobile, vec![])
+            .bind_mobile_fields(
+                &ex.task_id,
+                &cap_of(&ex),
+                ex.lease.epoch,
+                mobile,
+                vec![],
+                "render.mobile390.first",
+            )
             .unwrap();
         assert!(!daemon.submit(submit(evidence.clone())).unwrap().accepted);
         assert_eq!(
@@ -3737,7 +3854,8 @@ mod tests {
                     &cap_of(&ex),
                     ex.lease.epoch,
                     mobile,
-                    vec!["movement".into()]
+                    vec!["movement".into()],
+                    "render.mobile390.first"
                 )
                 .unwrap_err()
                 .code,
@@ -3774,9 +3892,183 @@ mod tests {
                 ex.lease.epoch,
                 &artifact.sha256,
                 vec!["movement".into()],
+                "render.mobile390.first",
             )
             .unwrap();
         evidence.insert("render.mobile390.first".into(), artifact.sha256);
+        assert!(daemon.submit(submit(evidence)).unwrap().accepted);
+    }
+
+    #[test]
+    fn desktop_result_contract_is_frozen_and_rejects_missing_first_view() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut r = req("desktop-result-contract");
+        r.ultra = false;
+        r.task = "Build a landing page".into();
+        r.desktop_result_fields = Some(vec![MobileResultField {
+            name: "source".into(),
+            alternatives: vec!["12".into()],
+            kind: "text".into(),
+            match_mode: Some("contains".into()),
+            min_font_px: Some(14),
+            region: None,
+            min_count: None,
+        }]);
+        let ex = daemon.execute(r).unwrap();
+        let cap = cap_of(&ex);
+        let action = ex.next.as_ref().unwrap().action_id.clone();
+        let mut changed = req("desktop-result-contract");
+        changed.ultra = false;
+        changed.task = "Build a landing page".into();
+        changed.task_id = Some(ex.task_id.clone());
+        changed.resume_handle = ex.host_resume_handle.clone();
+        changed.desktop_result_fields = Some(vec![MobileResultField {
+            name: "other".into(),
+            alternatives: vec!["10".into()],
+            kind: "text".into(),
+            match_mode: Some("contains".into()),
+            min_font_px: Some(14),
+            region: None,
+            min_count: None,
+        }]);
+        assert_eq!(
+            daemon.execute(changed).unwrap_err().code,
+            ErrorCode::IdempotencyConflict
+        );
+        daemon
+            .critique_prompt(&ex.task_id, &cap, ex.lease.epoch)
+            .unwrap();
+        daemon.critique_record(&ex.task_id, &cap, ex.lease.epoch, &action,
+            "Check desktop result visibility and refuse empty field observations even when six render captures exist.").unwrap();
+        let mut evidence = BTreeMap::new();
+        for (i, kind) in [
+            "render.desktop.first",
+            "render.mobile390.first",
+            "render.state.start",
+            "render.state.mid",
+            "render.state.end",
+            "render.state.reverse",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (width, height) = if i == 1 { (390, 650) } else { (1280, 800) };
+            let png = make_png(width, height, |x, y| {
+                [((x + i as u32) % 255) as u8, (y % 255) as u8, 33]
+            });
+            let artifact = daemon
+                .artifact_put(ArtifactPutRequest {
+                    task_id: ex.task_id.clone(),
+                    capability: cap.clone(),
+                    lease_epoch: ex.lease.epoch,
+                    kind: (*kind).into(),
+                    bytes_base64: B64.encode(&png),
+                    candidate_id: None,
+                    round: None,
+                })
+                .unwrap();
+            daemon
+                .bind_preview_source(
+                    &ex.task_id,
+                    &cap,
+                    ex.lease.epoch,
+                    &artifact.sha256,
+                    &"a".repeat(64),
+                )
+                .unwrap();
+            evidence.insert((*kind).into(), artifact.sha256);
+        }
+        let submit = |evidence| SubmitRequest {
+            task_id: ex.task_id.clone(),
+            capability: cap.clone(),
+            lease_epoch: ex.lease.epoch,
+            action_id: action.clone(),
+            narrative: "Rendered study".into(),
+            evidence,
+        };
+        let denied = daemon.submit(submit(evidence.clone())).unwrap();
+        assert!(!denied.accepted);
+        assert!(denied
+            .repair
+            .unwrap()
+            .contains("render.desktop.first result contract missing visible fields: source"));
+        let desktop = &evidence["render.desktop.first"];
+        assert_eq!(
+            daemon
+                .bind_mobile_fields(
+                    &ex.task_id,
+                    &cap,
+                    ex.lease.epoch,
+                    &evidence["render.mobile390.first"],
+                    vec!["source".into()],
+                    "render.desktop.first"
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::GateFailed
+        );
+        daemon
+            .bind_mobile_fields(
+                &ex.task_id,
+                &cap,
+                ex.lease.epoch,
+                desktop,
+                vec![],
+                "render.desktop.first",
+            )
+            .unwrap();
+        assert!(!daemon.submit(submit(evidence.clone())).unwrap().accepted);
+        assert_eq!(
+            daemon
+                .bind_mobile_fields(
+                    &ex.task_id,
+                    &cap,
+                    ex.lease.epoch,
+                    desktop,
+                    vec!["source".into()],
+                    "render.desktop.first"
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::IdempotencyConflict
+        );
+        let png = make_png(1280, 800, |x, y| {
+            [((x + 19) % 255) as u8, (y % 255) as u8, 33]
+        });
+        let artifact = daemon
+            .artifact_put(ArtifactPutRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap.clone(),
+                lease_epoch: ex.lease.epoch,
+                kind: "render.desktop.first".into(),
+                bytes_base64: B64.encode(&png),
+                candidate_id: None,
+                round: None,
+            })
+            .unwrap();
+        daemon
+            .bind_preview_source(
+                &ex.task_id,
+                &cap,
+                ex.lease.epoch,
+                &artifact.sha256,
+                &"a".repeat(64),
+            )
+            .unwrap();
+        daemon
+            .bind_mobile_fields(
+                &ex.task_id,
+                &cap,
+                ex.lease.epoch,
+                &artifact.sha256,
+                vec!["source".into()],
+                "render.desktop.first",
+            )
+            .unwrap();
+        evidence.insert("render.desktop.first".into(), artifact.sha256);
         assert!(daemon.submit(submit(evidence)).unwrap().accepted);
     }
 

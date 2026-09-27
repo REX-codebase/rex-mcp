@@ -247,6 +247,15 @@ pub struct MobileResultField {
     /// `exact` (default, including existing tasks) or `contains`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_mode: Option<String>,
+    /// Minimum computed font size in CSS pixels; absent preserves earlier contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_font_px: Option<u8>,
+    /// `list_count`: ID selector of the creator-named list region (e.g. #moves).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// `list_count`: minimum distinct, fully visible list items in region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_count: Option<u8>,
 }
 
 /// rex_execute request: create or resume one durable task.
@@ -258,6 +267,9 @@ pub struct ExecuteRequest {
     /// Optional execute-time acceptance fields frozen before any builder action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile_result_fields: Option<Vec<MobileResultField>>,
+    /// Independently frozen desktop first-view assertions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_result_fields: Option<Vec<MobileResultField>>,
     /// Optional explicit task id for resume-by-id from a fresh session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -330,6 +342,9 @@ pub struct ExecuteResponse {
     /// Frozen creator contract, returned so builders cannot silently omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile_result_fields: Option<Vec<MobileResultField>>,
+    /// Independently frozen desktop first-view assertions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_result_fields: Option<Vec<MobileResultField>>,
     /// The Fable completion discipline every operator must honor. Host
     /// agents never see REX's system prompt, so the rules travel here.
     /// Added in protocol 1.0; absent means a pre-discipline daemon.
@@ -530,6 +545,9 @@ pub struct StatusResponse {
     pub open_action: Option<ActionSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile_result_fields: Option<Vec<MobileResultField>>,
+    /// Independently frozen desktop first-view assertions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_result_fields: Option<Vec<MobileResultField>>,
     pub budgets: BudgetView,
     pub last_event_seq: u64,
     /// Latest accepted Standard visual action only; none before a visual submission.

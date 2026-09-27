@@ -848,6 +848,9 @@ mod tests {
             alternatives: vec![text.into()],
             kind: kind.into(),
             match_mode: None,
+            min_font_px: None,
+            region: None,
+            min_count: None,
         });
         let first = sup.capture_with_fields(&started.id, &fields).unwrap();
         assert_eq!(first.visible_result_fields, vec!["block"]);
@@ -875,22 +878,126 @@ mod tests {
                 alternatives: vec!["12".into()],
                 kind: "text".into(),
                 match_mode: Some("contains".into()),
+                min_font_px: None,
+                region: None,
+                min_count: None,
             },
             rex_protocol::MobileResultField {
                 name: "action".into(),
                 alternatives: vec!["prov".into()],
                 kind: "control".into(),
                 match_mode: Some("contains".into()),
+                min_font_px: None,
+                region: None,
+                min_count: None,
             },
             rex_protocol::MobileResultField {
                 name: "exact-fail".into(),
                 alternatives: vec!["12".into()],
                 kind: "text".into(),
                 match_mode: None,
+                min_font_px: None,
+                region: None,
+                min_count: None,
             },
         ];
         let third = sup.capture_with_fields(&started.id, &contains).unwrap();
         assert_eq!(third.visible_result_fields, vec!["quantity", "action"]);
+        // A substring in a tiny visible node is not enough when the creator
+        // explicitly sets a CSS-pixel legibility floor.
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><style>
+          body{background:#f5f1e7;color:#202020;margin:0;font:18px sans-serif}
+          main{padding:20px}.tiny{font-size:9px}button{font-size:10px}
+          </style><main><p class='tiny'>12 units</p><button>Approve</button></main>"#,
+        )
+        .unwrap();
+        sup.action(&started.id, &BrowserAction::Navigate { path: "/".into() })
+            .unwrap();
+        let sized = [
+            rex_protocol::MobileResultField {
+                name: "quantity".into(),
+                alternatives: vec!["12".into()],
+                kind: "text".into(),
+                match_mode: Some("contains".into()),
+                min_font_px: Some(14),
+                region: None,
+                min_count: None,
+            },
+            rex_protocol::MobileResultField {
+                name: "action".into(),
+                alternatives: vec!["Approve".into()],
+                kind: "control".into(),
+                match_mode: None,
+                min_font_px: Some(14),
+                region: None,
+                min_count: None,
+            },
+        ];
+        assert!(sup
+            .capture_with_fields(&started.id, &sized)
+            .unwrap()
+            .visible_result_fields
+            .is_empty());
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><style>
+          body{background:#f5f1e7;color:#202020;margin:0;font:18px sans-serif}
+          main{padding:20px}.tiny{font-size:15px}button{font-size:16px}
+          </style><main><p class='tiny'>12 units</p><button>Approve</button></main>"#,
+        )
+        .unwrap();
+        sup.action(&started.id, &BrowserAction::Navigate { path: "/".into() })
+            .unwrap();
+        assert_eq!(
+            sup.capture_with_fields(&started.id, &sized)
+                .unwrap()
+                .visible_result_fields,
+            vec!["quantity", "action"]
+        );
+        // The list count needs distinct, legible, complete items inside the
+        // creator-named region; duplicate or below-fold items do not count.
+        let list = rex_protocol::MobileResultField {
+            name: "moves".into(),
+            alternatives: vec![],
+            kind: "list_count".into(),
+            match_mode: None,
+            min_font_px: Some(14),
+            region: Some("#moves".into()),
+            min_count: Some(3),
+        };
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><style>
+          body{background:#f5f1e7;color:#202020;font:16px sans-serif}
+          .far{margin-top:800px}</style><main id='moves'><ul>
+          <li>Squat</li><li>Squat</li><li class='far'>Push-up</li></ul></main>"#,
+        )
+        .unwrap();
+        sup.action(&started.id, &BrowserAction::Navigate { path: "/".into() })
+            .unwrap();
+        assert!(sup
+            .capture_with_fields(&started.id, &[list.clone()])
+            .unwrap()
+            .visible_result_fields
+            .is_empty());
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><style>
+          body{background:#f5f1e7;color:#202020;font:16px sans-serif}
+          #moves{padding:20px}</style><main id='moves'><ul>
+          <li>Squat</li><li>Push-up</li><li>Plank</li></ul></main>"#,
+        )
+        .unwrap();
+        sup.action(&started.id, &BrowserAction::Navigate { path: "/".into() })
+            .unwrap();
+        assert_eq!(
+            sup.capture_with_fields(&started.id, &[list])
+                .unwrap()
+                .visible_result_fields,
+            vec!["moves"]
+        );
         sup.cancel(&started.id).unwrap();
         let _ = fs::remove_dir_all(w);
     }
