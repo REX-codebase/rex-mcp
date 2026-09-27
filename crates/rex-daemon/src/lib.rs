@@ -646,6 +646,19 @@ impl HarnessDaemon {
 
     pub fn run(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
+        if visual_action(
+            &t.task,
+            t.open_action
+                .as_ref()
+                .map(|a| a.instructions.as_str())
+                .unwrap_or(""),
+        ) {
+            let action_id = t.open_action.as_ref().map(|a| a.action_id.as_str());
+            if t.critique_recorded_for.as_deref() != action_id || action_id.is_none() {
+                return Err(perr(ErrorCode::GateFailed,
+                    "record the current action's severe critique before running UI checks or build commands",&t.task_id));
+            }
+        }
         let out = self.call_tool(
             &mut t,
             ToolRequest::RunCommand {
@@ -3144,6 +3157,57 @@ mod tests {
             writer.write_image_data(&rgb).unwrap();
         }
         out
+    }
+
+    #[test]
+    fn visual_run_cannot_bypass_critique_and_nonvisual_build_remains_available() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut visual = req("visual-run-critique");
+        visual.ultra = false;
+        visual.task = "Build a visual UI page".into();
+        let ex = daemon.execute(visual).unwrap();
+        let run = RunRequest {
+            task_id: ex.task_id.clone(),
+            capability: cap_of(&ex),
+            lease_epoch: ex.lease.epoch,
+            argv: vec!["cargo".into(), "--version".into()],
+            timeout_ms: Some(5000),
+        };
+        assert_eq!(
+            daemon.run(run.clone()).unwrap_err().code,
+            ErrorCode::GateFailed
+        );
+        daemon
+            .critique_prompt(&ex.task_id, &cap_of(&ex), ex.lease.epoch)
+            .unwrap();
+        assert_eq!(
+            daemon.run(run.clone()).unwrap_err().code,
+            ErrorCode::GateFailed
+        );
+        daemon.critique_record(&ex.task_id,&cap_of(&ex),ex.lease.epoch,
+            &ex.next.as_ref().unwrap().action_id,
+            "The build command may pass while the UI remains white, cropped, inaccessible or inert. Check rendered desktop/mobile pixels and keyboard states before claiming success.").unwrap();
+        // The actual command may be denied by conservative launcher policy; the
+        // important boundary is that critique no longer blocks its dispatch.
+        assert_ne!(daemon.run(run).unwrap_err().code, ErrorCode::GateFailed);
+        let mut plain = req("plain-run");
+        plain.ultra = false;
+        plain.task = "Inspect source files".into();
+        let other = daemon.execute(plain).unwrap();
+        let ordinary = RunRequest {
+            task_id: other.task_id.clone(),
+            capability: cap_of(&other),
+            lease_epoch: other.lease.epoch,
+            argv: vec!["cargo".into(), "--version".into()],
+            timeout_ms: Some(5000),
+        };
+        assert_ne!(
+            daemon.run(ordinary).unwrap_err().code,
+            ErrorCode::GateFailed
+        );
     }
 
     #[test]
