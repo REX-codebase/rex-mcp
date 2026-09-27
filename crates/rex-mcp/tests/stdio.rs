@@ -270,6 +270,10 @@ fn agent_execute_advertises_and_accepts_host_resume_handle() {
         "string"
     );
     assert_eq!(
+        execute_schema["inputSchema"]["properties"]["recovery_key"]["type"],
+        "string"
+    );
+    assert_eq!(
         execute_schema["inputSchema"]["properties"]["follow_up"]["type"],
         "string"
     );
