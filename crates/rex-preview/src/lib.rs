@@ -64,6 +64,8 @@ pub enum PreviewError {
     UrlDenied,
     #[error("preview session is not running")]
     NotRunning,
+    #[error("preview source changed while capturing; recapture this state")]
+    SourceChanged,
     #[error("preview session is already terminal")]
     Terminal,
     #[error("iteration budget exhausted")]

@@ -23,6 +23,8 @@ pub struct BrowserEvidence {
     pub screenshot_data_url: Option<String>,
     pub dom_text: String,
     pub accessibility_text: String,
+    /// Canonical hash of the captured project's supported local source tree.
+    pub source_sha256: String,
 }
 
 pub struct BrowserRuntime {
@@ -391,6 +393,7 @@ impl BrowserRuntime {
             screenshot_data_url: Some(format!("data:image/png;base64,{encoded}")),
             dom_text,
             accessibility_text,
+            source_sha256: String::new(), // supervisor binds a source tree around this capture
         })
     }
 }

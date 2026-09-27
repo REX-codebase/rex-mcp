@@ -93,6 +93,10 @@ struct DurableTask {
     /// Harness-registered evidence ids (tool receipts, test evidence ids).
     /// A completion claim may only cite these.
     registered_evidence: BTreeSet<String>,
+    /// First-party local preview frame digest -> (source snapshot, action).
+    /// Host-supplied artifacts carry no snapshot and cannot satisfy this gate.
+    #[serde(default)]
+    preview_sources: BTreeMap<String, (String, String)>,
     #[serde(default)]
     critique_issued_for: Option<String>,
     #[serde(default)]
@@ -415,6 +419,7 @@ impl HarnessDaemon {
             proof: req.proof,
             evidence: BTreeMap::new(),
             registered_evidence: BTreeSet::new(),
+            preview_sources: BTreeMap::new(),
             critique_issued_for: None,
             critique_recorded_for: None,
             result: None,
@@ -459,6 +464,61 @@ impl HarnessDaemon {
 
     pub fn workspace(&self) -> &Path {
         &self.policy.workspace
+    }
+
+    /// Bind a captured PNG to the local source snapshot and open action.
+    /// This does not authenticate host-supplied artifacts or a deployed shell.
+    pub fn bind_preview_source(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+        digest: &str,
+        source_sha256: &str,
+    ) -> Result<(), ProtocolError> {
+        let mut t = self.live(task_id, epoch, capability)?;
+        let action = t
+            .open_action
+            .as_ref()
+            .ok_or_else(|| perr(ErrorCode::TaskTerminal, "no open action", task_id))?
+            .action_id
+            .clone();
+        if !self
+            .artifacts
+            .bindings(task_id)
+            .iter()
+            .any(|b| b.sha256 == digest && b.kind.starts_with("render."))
+        {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "preview digest is not a task-bound render artifact",
+                task_id,
+            ));
+        }
+        if source_sha256.len() != 64 || !source_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(perr(
+                ErrorCode::MalformedRequest,
+                "invalid source snapshot digest",
+                task_id,
+            ));
+        }
+        if let Some((prior, prior_action)) = t.preview_sources.get(digest) {
+            if prior != source_sha256 || prior_action != &action {
+                return Err(perr(
+                    ErrorCode::IdempotencyConflict,
+                    "preview frame already bound to a different source or action",
+                    task_id,
+                ));
+            }
+        }
+        t.preview_sources
+            .insert(digest.into(), (source_sha256.into(), action.clone()));
+        self.append_event(
+            &mut t,
+            "preview_source_bound",
+            json!({"sha256":digest,"source_sha256":source_sha256,"action_id":action}),
+        )?;
+        self.persist(&t)
     }
 
     /// Issue a challenge before checking the current action. The host must
@@ -729,9 +789,12 @@ impl HarnessDaemon {
     fn validate_visual_evidence(
         &self,
         task_id: &str,
+        action_id: &str,
+        sources: &BTreeMap<String, (String, String)>,
         evidence: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         let bindings = self.artifacts.bindings(task_id);
+        let mut captured_source: Option<&str> = None;
         for (key, min_width, max_width) in [
             ("render.desktop.first", 760, u32::MAX),
             ("render.mobile390.first", 390, 390),
@@ -747,6 +810,17 @@ impl HarnessDaemon {
                 .iter()
                 .find(|b| b.sha256 == *digest && b.kind == key)
                 .ok_or_else(|| format!("{key}: no matching task-bound artifact"))?;
+            let (source, captured_action) = sources.get(digest)
+                .ok_or_else(|| format!("{key}: no first-party preview source binding; recapture with rex_preview_capture"))?;
+            if captured_action != action_id {
+                return Err(format!("{key}: capture belongs to another action"));
+            }
+            if captured_source.is_some_and(|known| known != source) {
+                return Err(format!(
+                    "{key}: mixed preview source revisions; recapture all states from one source"
+                ));
+            }
+            captured_source = Some(source);
             let bytes = self
                 .artifacts
                 .get(&binding.sha256)
@@ -805,7 +879,12 @@ impl HarnessDaemon {
             ));
         }
         if visual_action(&t.task, &open.instructions) {
-            if let Err(repair) = self.validate_visual_evidence(&t.task_id, &req.evidence) {
+            if let Err(repair) = self.validate_visual_evidence(
+                &t.task_id,
+                &open.action_id,
+                &t.preview_sources,
+                &req.evidence,
+            ) {
                 self.append_event(&mut t, "visual_evidence_rejected", json!({"repair":repair}))?;
                 self.persist(&t)?;
                 return Ok(SubmitResponse {
@@ -3377,6 +3456,15 @@ mod tests {
         ] {
             wrong_evidence.insert(key.into(), wrong.sha256.clone());
         }
+        daemon
+            .bind_preview_source(
+                &ex.task_id,
+                &cap_of(&ex),
+                ex.lease.epoch,
+                &wrong.sha256,
+                &"a".repeat(64),
+            )
+            .unwrap();
         let rejected = daemon.submit(submission(wrong_evidence)).unwrap();
         assert!(!rejected.accepted);
         let repair = rejected.repair.unwrap();
@@ -3409,8 +3497,34 @@ mod tests {
                     round: None,
                 })
                 .unwrap();
+            daemon
+                .bind_preview_source(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    &artifact.sha256,
+                    &"a".repeat(64),
+                )
+                .unwrap();
             evidence.insert((*key).into(), artifact.sha256);
         }
+        // The five other frames are from one source; a later source edit
+        // cannot be laundered by uploading the earlier desktop PNG again.
+        let changed_digest = evidence["render.state.end"].clone();
+        let mut t = daemon.load(&ex.task_id).unwrap();
+        t.preview_sources
+            .insert(changed_digest.clone(), ("b".repeat(64), action_id.clone()));
+        daemon.persist(&t).unwrap();
+        let mixed = daemon.submit(submission(evidence.clone())).unwrap();
+        assert!(!mixed.accepted);
+        assert!(mixed
+            .repair
+            .unwrap()
+            .contains("mixed preview source revisions"));
+        let mut t = daemon.load(&ex.task_id).unwrap();
+        t.preview_sources
+            .insert(changed_digest, ("a".repeat(64), action_id.clone()));
+        daemon.persist(&t).unwrap();
         let outcome = daemon.submit(submission(evidence)).unwrap();
         assert!(outcome.accepted, "{:?}", outcome.repair);
     }
