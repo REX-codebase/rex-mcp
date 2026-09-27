@@ -349,13 +349,13 @@ impl PreviewSupervisor {
         if r.browser.is_none() {
             r.browser = Some(BrowserRuntime::launch(&r.url)?);
         }
-        let before = source_tree_sha256(&r.project_root)?;
+        let before = source_tree_sha256(&r.project_root, r.framework == Framework::StaticHtml)?;
         let mut evidence = r
             .browser
             .as_mut()
             .ok_or(PreviewError::NotRunning)?
             .capture(&r.url)?;
-        if before != source_tree_sha256(&r.project_root)? {
+        if before != source_tree_sha256(&r.project_root, r.framework == Framework::StaticHtml)? {
             return Err(PreviewError::SourceChanged);
         }
         evidence.source_sha256 = before;
@@ -431,19 +431,27 @@ impl PreviewSupervisor {
 
 /// Hash bounded, regular source files in canonical relative-path order.
 /// This is a local snapshot check, not proof of an external host or remote build.
-fn source_tree_sha256(root: &Path) -> Result<String, PreviewError> {
-    fn visit(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), PreviewError> {
+fn source_tree_sha256(root: &Path, static_html: bool) -> Result<String, PreviewError> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        files: &mut Vec<PathBuf>,
+        static_html: bool,
+    ) -> Result<(), PreviewError> {
         for entry in fs::read_dir(dir).map_err(|_| PreviewError::SourceChanged)? {
             let entry = entry.map_err(|_| PreviewError::SourceChanged)?;
             let path = entry.path();
             let rel = path
                 .strip_prefix(root)
                 .map_err(|_| PreviewError::PathEscape)?;
+            // A static preview serves its project tree directly, including
+            // dist/build. Those are excluded for framework dev servers to
+            // avoid hashing volatile generated output and dependencies.
             if rel.components().any(|c| {
                 matches!(
                     c.as_os_str().to_str(),
-                    Some("node_modules" | ".git" | "target" | ".next" | "dist" | "build")
-                )
+                    Some("node_modules" | ".git" | "target" | ".next")
+                ) || (!static_html && matches!(c.as_os_str().to_str(), Some("dist" | "build")))
             }) {
                 continue;
             }
@@ -452,7 +460,7 @@ fn source_tree_sha256(root: &Path) -> Result<String, PreviewError> {
                 return Err(PreviewError::SymlinkComponent);
             }
             if meta.is_dir() {
-                visit(root, &path, files)?;
+                visit(root, &path, files, static_html)?;
             } else if meta.is_file() {
                 files.push(path);
                 if files.len() > 4096 {
@@ -463,7 +471,7 @@ fn source_tree_sha256(root: &Path) -> Result<String, PreviewError> {
         Ok(())
     }
     let mut files = Vec::new();
-    visit(root, root, &mut files)?;
+    visit(root, root, &mut files, static_html)?;
     files.sort();
     let mut hash = Sha256::new();
     for file in files {
@@ -641,6 +649,26 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         p
     }
+    #[test]
+    fn static_preview_hash_includes_served_generated_assets() {
+        let w = temp("static-asset-hash");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::create_dir(app.join("dist")).unwrap();
+        fs::write(
+            app.join("index.html"),
+            "<link rel='stylesheet' href='dist/theme.css'>",
+        )
+        .unwrap();
+        fs::write(app.join("dist/theme.css"), "body{color:#123}").unwrap();
+        let old = source_tree_sha256(&app, true).unwrap();
+        let framework_old = source_tree_sha256(&app, false).unwrap();
+        fs::write(app.join("dist/theme.css"), "body{color:#456}").unwrap();
+        assert_ne!(old, source_tree_sha256(&app, true).unwrap());
+        assert_eq!(framework_old, source_tree_sha256(&app, false).unwrap());
+        let _ = fs::remove_dir_all(w);
+    }
+
     #[test]
     fn static_preview_is_real_and_cancel_cleans_listener() {
         let _port_guard = PORT_LOCK.lock().unwrap();
