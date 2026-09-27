@@ -5,12 +5,15 @@
 
 pub mod client;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rex_custody::capability::hex_sha256;
 use rex_daemon::HarnessDaemon;
+use rex_preview::{BrowserAction, PreviewSupervisor};
 use rex_protocol::{ErrorCode, ProtocolError, ToolName, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +26,8 @@ pub struct McpServer {
     promotions: Arc<Mutex<HashMap<String, PromotionOperation>>>,
     promotion_sequence: u64,
     runs: Arc<Mutex<HashMap<String, RunOperation>>>,
+    previews: PreviewSupervisor,
+    preview_tasks: HashMap<String, String>,
 }
 
 // This registry is scoped to this stdio process. The custody receipt remains
@@ -45,13 +50,160 @@ struct PromotionOperation {
 
 impl McpServer {
     pub fn new(daemon: HarnessDaemon) -> Self {
+        let previews = PreviewSupervisor::new(daemon.workspace()).expect("validated REX workspace");
         Self {
             daemon: Arc::new(daemon),
             initialized: false,
             promotions: Arc::new(Mutex::new(HashMap::new())),
             promotion_sequence: 0,
             runs: Arc::new(Mutex::new(HashMap::new())),
+            previews,
+            preview_tasks: HashMap::new(),
         }
+    }
+
+    fn scoped(&self, args: &Value) -> Result<(String, String, u64), ProtocolError> {
+        let task_id = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|v| valid_task_id(v))
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "valid task_id required")
+            })?
+            .to_string();
+        let capability = args
+            .get("capability")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ProtocolError::new(ErrorCode::MalformedRequest, "capability required"))?
+            .to_string();
+        let epoch = args
+            .get("lease_epoch")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "lease_epoch required")
+            })?;
+        // Live custody check, not a status read: paused, terminal, wrong epoch
+        // and invalid capability all fail before touching a preview session.
+        self.daemon
+            .require_live_task(&task_id, &capability, epoch)?;
+        Ok((task_id, capability, epoch))
+    }
+    fn preview_start(&mut self, args: Value) -> Result<Value, ProtocolError> {
+        let (task_id, _, _) = self.scoped(&args)?;
+        let project = args
+            .get("project_dir")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "project_dir required")
+            })?;
+        let summary = self
+            .previews
+            .start(Path::new(project))
+            .map_err(preview_error)?;
+        self.preview_tasks
+            .insert(summary.id.clone(), task_id.clone());
+        Ok(
+            json!({"task_id":task_id,"preview_id":summary.id,"engine":"local headless Chrome", "framework":summary.framework,"state":summary.state}),
+        )
+    }
+    fn preview_id(&self, args: &Value, task_id: &str) -> Result<String, ProtocolError> {
+        let id = args
+            .get("preview_id")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "preview_id required")
+            })?;
+        if self.preview_tasks.get(id).map(String::as_str) != Some(task_id) {
+            return Err(ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "preview is not bound to this task",
+            ));
+        }
+        Ok(id.to_string())
+    }
+    fn preview_action(&mut self, args: Value) -> Result<Value, ProtocolError> {
+        let (task_id, cap, epoch) = self.scoped(&args)?;
+        self.daemon.require_critique_issued(&task_id, &cap, epoch)?;
+        let id = self.preview_id(&args, &task_id)?;
+        let action: BrowserAction =
+            serde_json::from_value(args.get("action").cloned().ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "action required")
+            })?)
+            .map_err(|e| ProtocolError::new(ErrorCode::MalformedRequest, e.to_string()))?;
+        self.previews.action(&id, &action).map_err(preview_error)?;
+        Ok(json!({"task_id":task_id,"preview_id":id,"action":action,"applied":true}))
+    }
+    fn preview_capture(&mut self, args: Value) -> Result<Value, ProtocolError> {
+        let (task_id, cap, epoch) = self.scoped(&args)?;
+        self.daemon.require_critique_issued(&task_id, &cap, epoch)?;
+        let id = self.preview_id(&args, &task_id)?;
+        let kind = args
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|s| {
+                matches!(
+                    *s,
+                    "render.desktop.first"
+                        | "render.mobile390.first"
+                        | "render.state.start"
+                        | "render.state.mid"
+                        | "render.state.end"
+                        | "render.state.reverse"
+                )
+            })
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::MalformedRequest, "known render kind required")
+            })?;
+        let captured = self.previews.capture(&id).map_err(preview_error)?;
+        let encoded = captured
+            .screenshot_data_url
+            .as_deref()
+            .and_then(|s| s.strip_prefix("data:image/png;base64,"))
+            .ok_or_else(|| ProtocolError::new(ErrorCode::Internal, "preview screenshot missing"))?;
+        let bytes = B64
+            .decode(encoded)
+            .map_err(|_| ProtocolError::new(ErrorCode::Internal, "preview PNG encoding failed"))?;
+        let (width, height) = captured
+            .items
+            .iter()
+            .find_map(|item| match item {
+                rex_preview::Evidence::Viewport { width, height, .. } => Some((*width, *height)),
+                _ => None,
+            })
+            .ok_or_else(|| ProtocolError::new(ErrorCode::Internal, "viewport evidence missing"))?;
+        if (kind == "render.mobile390.first" && (width != 390 || height < 240))
+            || (kind == "render.desktop.first" && width < 760)
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::GateFailed,
+                format!("{kind} requires matching REX viewport, got {width}x{height}"),
+            ));
+        }
+        let artifact = self.daemon.artifact_put(rex_protocol::ArtifactPutRequest {
+            task_id: task_id.clone(),
+            capability: cap,
+            lease_epoch: epoch,
+            kind: kind.into(),
+            bytes_base64: encoded.into(),
+            candidate_id: None,
+            round: None,
+        })?;
+        Ok(
+            json!({"task_id":task_id,"preview_id":id,"kind":kind,"sha256":artifact.sha256,
+            "png_base64":encoded,"dom_text":captured.dom_text,"accessibility_text":captured.accessibility_text,
+            "items":captured.items,"bytes":bytes.len(),"engine":"local headless Chrome",
+            "scope":"local preview only; not the hosted user shell", "settled_state_attested":false}),
+        )
+    }
+    fn preview_stop(&mut self, args: Value) -> Result<Value, ProtocolError> {
+        let (task_id, _, _) = self.scoped(&args)?;
+        let id = self.preview_id(&args, &task_id)?;
+        self.previews.teardown(&id).map_err(preview_error)?;
+        self.preview_tasks.remove(&id);
+        Ok(json!({"task_id":task_id,"preview_id":id,"stopped":true}))
     }
 
     fn start_run(&mut self, args: Value) -> Result<Value, ProtocolError> {
@@ -394,6 +546,7 @@ impl McpServer {
                 let mut tools = tool_descriptors();
                 tools.extend(promotion_descriptors());
                 tools.extend(run_descriptors());
+                tools.extend(preview_descriptors());
                 json!({"tools":tools})
             }),
             "resources/list" => self.require_initialized().map(|_| json!({
@@ -648,6 +801,16 @@ impl McpServer {
                 })?;
                 let args = p.get("arguments").cloned().unwrap_or(json!({}));
                 match name {
+                    "rex_critique_prompt" => {let (task_id,cap,epoch)=self.scoped(&args)?;
+                        self.daemon.critique_prompt(&task_id,&cap,epoch).map(tool_result)},
+                    "rex_critique_record" => {let (task_id,cap,epoch)=self.scoped(&args)?;
+                        let action=args.get("action_id").and_then(Value::as_str).unwrap_or("");
+                        let findings=args.get("findings").and_then(Value::as_str).unwrap_or("");
+                        self.daemon.critique_record(&task_id,&cap,epoch,action,findings).map(tool_result)},
+                    "rex_preview_start" => self.preview_start(args).map(tool_result),
+                    "rex_preview_action" => self.preview_action(args).map(tool_result),
+                    "rex_preview_capture" => self.preview_capture(args).map(tool_result),
+                    "rex_preview_stop" => self.preview_stop(args).map(tool_result),
                     "rex_run_start" => self.start_run(args).map(tool_result),
                     "rex_run_status" => self.run_status(args).map(tool_result),
                     "rex_ultra_promote_start" => self.start_promotion(args).map(tool_result),
@@ -823,6 +986,9 @@ fn read_frame<R: BufRead>(reader: &mut R) -> std::io::Result<Option<(Vec<u8>, bo
 
 // Keep host-facing task references aligned with the daemon's safe_id gate.
 // Reject control characters before interpolating IDs into prompt text or URIs.
+fn preview_error(e: rex_preview::PreviewError) -> ProtocolError {
+    ProtocolError::new(ErrorCode::GateFailed, format!("local preview: {e}"))
+}
 fn valid_task_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() < 200
@@ -1013,6 +1179,17 @@ fn run_state(op: &RunOperation) -> Value {
             json!({"task_id":op.task_id,"operation_id":op.operation_id,"state":"failed","error":error})
         }
     }
+}
+
+fn preview_descriptors() -> Vec<Value> {
+    vec![
+        json!({"name":"rex_critique_prompt","description":"MANDATORY before any check: receive the action-bound hardest-possible critique challenge. It invalidates an earlier critique for this action.","inputSchema":task_epoch_schema()}),
+        json!({"name":"rex_critique_record","description":"Record concrete skeptical findings for the current action after requesting the challenge. REX requires this before checking or acceptance; prose cannot prove honesty.","inputSchema":extend(task_epoch_schema(),json!({"action_id":{"type":"string"},"findings":{"type":"string","minLength":80}}), &["action_id","findings"])}),
+        json!({"name":"rex_preview_start","description":"Start a task-scoped local preview. Static HTML and supported app frameworks use an isolated loopback server; interaction/capture uses local headless Chrome, not the user's browser.","inputSchema":extend(task_epoch_schema(),json!({"project_dir":{"type":"string"}}),&["project_dir"])}),
+        json!({"name":"rex_preview_action","description":"Interact with the local preview after an action-bound critique: pointer, key, text, scroll, navigation or viewport.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"action":{"type":"object"}}),&["preview_id","action"])}),
+        json!({"name":"rex_preview_capture","description":"Capture REX-owned headless-Chrome pixels and DOM/AX evidence, bound as an immutable task artifact; response includes PNG base64 for the host to inspect. Capture after the critique challenge and record.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"kind":{"enum":["render.desktop.first","render.mobile390.first","render.state.start","render.state.mid","render.state.end","render.state.reverse"]}}),&["preview_id","kind"])}),
+        json!({"name":"rex_preview_stop","description":"Stop and clean up this task's local preview process tree.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"}}),&["preview_id"])}),
+    ]
 }
 
 fn run_descriptors() -> Vec<Value> {
@@ -1829,6 +2006,107 @@ mod tests {
     }
 
     #[test]
+    fn preview_is_scoped_and_critique_precedes_capture() {
+        let (d, mut mcp) = server();
+        let app = d.path().join("ws").join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("index.html"),
+            "<!doctype html><button onclick=\"this.textContent='clicked'\">press</button>",
+        )
+        .unwrap();
+        mcp.handle(rpc(
+            1,
+            "initialize",
+            json!({"protocolVersion":MCP_PROTOCOL_VERSION}),
+        ))
+        .unwrap();
+        let started=mcp.handle(rpc(2,"tools/call",json!({"name":"rex_execute","arguments":{
+            "request_id":"preview-critique","task":"Build a visual UI page","host":"generic_agent","operator_is_agent":true
+        }}))).unwrap();
+        let view = &started["result"]["structuredContent"];
+        let task = view["task_id"].as_str().unwrap();
+        let cap = view["task_capability"].as_str().unwrap();
+        let epoch = view["lease"]["epoch"].as_u64().unwrap();
+        let action = view["next"]["action_id"].as_str().unwrap();
+        let scope = json!({"task_id":task,"capability":cap,"lease_epoch":epoch});
+        let began = mcp
+            .handle(rpc(
+                3,
+                "tools/call",
+                json!({"name":"rex_preview_start","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"project_dir":"app"}}),
+            ))
+            .unwrap();
+        assert_eq!(began["result"]["isError"], false, "{began}");
+        let id = began["result"]["structuredContent"]["preview_id"]
+            .as_str()
+            .unwrap();
+        let capture = |mcp: &mut McpServer, seq| {
+            mcp.handle(rpc(seq,"tools/call",json!({"name":"rex_preview_capture","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,"kind":"render.desktop.first"}}))).unwrap()
+        };
+        let blocked = capture(&mut mcp, 4);
+        assert_eq!(blocked["result"]["isError"], true);
+        let issued = mcp
+            .handle(rpc(
+                5,
+                "tools/call",
+                json!({"name":"rex_critique_prompt","arguments":scope}),
+            ))
+            .unwrap();
+        assert!(issued["result"]["structuredContent"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Attack this work"));
+        let first_capture = capture(&mut mcp, 6);
+        assert_eq!(first_capture["result"]["isError"], false);
+        assert!(first_capture["result"]["structuredContent"]["dom_text"]
+            .as_str()
+            .unwrap()
+            .contains("press"));
+        let reviewed=mcp.handle(rpc(7,"tools/call",json!({"name":"rex_critique_record","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"action_id":action,
+            "findings":"The first source file is not a rendered proof. Inspect the actual local page, click the control, test mobile pixels, then record the strongest failure."}}))).unwrap();
+        assert_eq!(reviewed["result"]["isError"], false, "{reviewed}");
+        let shot = capture(&mut mcp, 8);
+        assert_eq!(shot["result"]["isError"], false, "{shot}");
+        let data = &shot["result"]["structuredContent"];
+        assert_eq!(data["engine"], "local headless Chrome");
+        assert!(data["png_base64"].as_str().unwrap().len() > 100);
+        assert!(data["dom_text"].as_str().unwrap().contains("press"));
+        let wrong_width=mcp.handle(rpc(81,"tools/call",json!({"name":"rex_preview_capture","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,"kind":"render.mobile390.first"}}))).unwrap();
+        assert_eq!(wrong_width["result"]["isError"], true);
+        let resized = mcp
+            .handle(rpc(
+                82,
+                "tools/call",
+                json!({"name":"rex_preview_action","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,
+            "action":{"kind":"set_viewport","width":390,"height":844,"scale":1.0}}}),
+            ))
+            .unwrap();
+        assert_eq!(resized["result"]["isError"], false, "{resized}");
+        let phone=mcp.handle(rpc(83,"tools/call",json!({"name":"rex_preview_capture","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,"kind":"render.mobile390.first"}}))).unwrap();
+        assert_eq!(phone["result"]["isError"], false, "{phone}");
+        assert_eq!(
+            phone["result"]["structuredContent"]["items"][0]["width"],
+            390
+        );
+        let stopped = mcp
+            .handle(rpc(
+                9,
+                "tools/call",
+                json!({"name":"rex_preview_stop","arguments":{
+            "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id}}),
+            ))
+            .unwrap();
+        assert_eq!(stopped["result"]["structuredContent"]["stopped"], true);
+    }
+
+    #[test]
     fn prompt_discovery_and_get_after_initialize() {
         let (_d, mut s) = server();
         let init = s
@@ -2156,7 +2434,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 23);
+        assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 29);
         assert_eq!(rows[2]["result"]["structuredContent"]["state"], "active");
         let task_id = rows[2]["result"]["structuredContent"]["task_id"]
             .as_str()
@@ -2201,7 +2479,7 @@ mod tests {
             .unwrap();
         assert_eq!(ok["result"]["protocolVersion"], MCP_COMPAT_PROTOCOL_VERSION);
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 23);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 29);
         let unknown = s
             .handle(rpc(
                 4,
@@ -2357,7 +2635,7 @@ mod tests {
             .unwrap();
         assert!(ready.get("result").is_some());
         let listed = s.handle(rpc(3, "tools/list", json!({}))).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 23);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 29);
     }
     #[test]
     fn notifications_get_no_response() {

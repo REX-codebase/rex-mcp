@@ -121,6 +121,13 @@ impl BrowserRuntime {
         b.command("Page.enable", json!({}))?;
         b.command("Runtime.enable", json!({}))?;
         b.command("Network.enable", json!({"maxTotalBufferSize": 1048576}))?;
+        // Preview is local-only. Prevent project JS and assets from reaching
+        // remote hosts through the user's machine; loopback serves the app.
+        b.command(
+            "Network.setBlockedURLs",
+            json!({"urls":["http://*","https://*"]}),
+        )?;
+
         b.command("Log.enable", json!({}))?;
         b.command("Page.navigate", json!({"url": url}))?;
         b.wait_loaded()?;

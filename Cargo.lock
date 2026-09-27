@@ -1323,6 +1323,7 @@ dependencies = [
 name = "rex-mcp"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "rex-custody",
  "rex-daemon",
  "rex-preview",
