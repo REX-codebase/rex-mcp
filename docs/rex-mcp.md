@@ -48,8 +48,18 @@ For example, an agent running in Codex might provide these *arguments* to the
 }
 ```
 
-This creates a durable task, even when file writes are disabled. Keep its
-returned task id, task capability, lease epoch and host resume handle. To allow file edits
+This creates a durable task, even when file writes are disabled. Persist the
+full creation request (including `plan`, `proof`, `budgets`, `ultra`, `host`, and
+`operator_is_agent` when supplied), plus the returned task id, task capability,
+lease epoch and host resume handle. A later `rex_execute` with the same
+`request_id` must repeat the *identical creation payload*, adding the current
+`resume_handle`; omitting a frozen field such as `plan` is an
+`idempotency_conflict`. Alternatively, resume by `task_id` with the same task
+text and current `resume_handle`; that route checks the task text and handle.
+Every successful resume rotates both the handle and task capability: store the
+new ones before the next operation. A stale or lost handle is not a reason to
+create a replacement task to bypass custody; inspect `rex_status` and events
+and stop if you cannot recover the current handle. To allow file edits
 and allowlisted commands, a *trusted launcher* must separately set
 `REX_APPROVE_TASK_MUTATIONS=1` for the intended workspace before starting
 the MCP server. It is not a `rex_execute` argument, and leaving it unset

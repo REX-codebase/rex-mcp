@@ -283,7 +283,7 @@ impl HarnessDaemon {
             if task.request_hash != request_hash(&req)? {
                 return Err(perr(
                     ErrorCode::IdempotencyConflict,
-                    "request_id was already used with another payload",
+                    "request_id was already used with another payload; resume with the identical full creation payload (including plan, proof, budgets, ultra, host and operator_is_agent) plus the current resume_handle, or use task_id with the unchanged task text and current resume_handle. Successful resume rotates the handle and task capability",
                     &task.task_id,
                 ));
             }
@@ -3052,6 +3052,14 @@ mod tests {
         let root = d.path().join("state");
         let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
         let a = daemon.execute(req("r1")).unwrap();
+        let mut missing_plan = req("r1");
+        missing_plan.plan = None;
+        missing_plan.resume_handle = a.host_resume_handle.clone();
+        let mismatch = daemon.execute(missing_plan).unwrap_err();
+        assert_eq!(mismatch.code, ErrorCode::IdempotencyConflict);
+        assert!(mismatch.message.contains("identical full creation payload"));
+        assert!(mismatch.message.contains("plan"));
+        assert!(mismatch.message.contains("task_id"));
         let mut replay = req("r1");
         replay.resume_handle = a.host_resume_handle.clone();
         let b = daemon.execute(replay).unwrap();
