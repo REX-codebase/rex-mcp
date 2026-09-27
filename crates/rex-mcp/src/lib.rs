@@ -2019,7 +2019,7 @@ mod tests {
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(
             app.join("index.html"),
-            "<!doctype html><button onclick=\"this.textContent='clicked'\">press</button>",
+            "<!doctype html><style>body{background:linear-gradient(45deg,#194c5b,#f0bb74)}</style><button onclick=\"this.textContent='clicked'\">press</button>",
         )
         .unwrap();
         mcp.handle(rpc(
