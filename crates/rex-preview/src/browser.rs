@@ -540,6 +540,7 @@ impl BrowserRuntime {
                 r#"(() => {{
               const fields = {serialized};
               const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              const matches = (s,w,f) => (f.match_mode || 'exact') === 'contains' ? s.includes(w) : s === w;
               const inside = r => r && r.width >= 8 && r.height >= 8 &&
                 r.left >= 0 && r.top >= 0 && r.right <= innerWidth && r.bottom <= innerHeight;
               const uncovered = (r, el) => {{
@@ -568,12 +569,12 @@ impl BrowserRuntime {
                   const el = controls.find(el => !unique.has(el) && shown(el) && !el.disabled &&
                     !el.closest('[inert]') && inside(el.getBoundingClientRect()) &&
                     uncovered(el.getBoundingClientRect(), el) &&
-                    norm(el.getAttribute('aria-label') || el.innerText || el.value) === want);
+                    matches(norm(el.getAttribute('aria-label') || el.innerText || el.value), want, f));
                   if (el) unique.add(el);
                   return !!el;
                 }}
                 const node = textNodes.find(node => {{
-                  if (unique.has(node) || !shown(node.parentElement) || norm(node.nodeValue) !== want) return false;
+                  if (unique.has(node) || !shown(node.parentElement) || !matches(norm(node.nodeValue), want, f)) return false;
                   const range = document.createRange(); range.selectNodeContents(node);
                   const rects = [...range.getClientRects()];
                   return rects.length > 0 && rects.every(r => inside(r) && uncovered(r, node.parentElement));

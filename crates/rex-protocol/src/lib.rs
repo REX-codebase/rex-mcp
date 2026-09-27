@@ -244,6 +244,9 @@ pub struct MobileResultField {
     pub alternatives: Vec<String>,
     /// `text` or `control` (button/link/form control).
     pub kind: String,
+    /// `exact` (default, including existing tasks) or `contains`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_mode: Option<String>,
 }
 
 /// rex_execute request: create or resume one durable task.
