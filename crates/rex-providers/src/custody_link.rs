@@ -613,7 +613,7 @@ mod tests {
         vec![
             call_turn(vec![
                 plan_call(vec![("1", "build page", "in_progress")]),
-                create_call("index.html", "<html><body>tea</body></html>"),
+                create_call("index.html", "<!doctype html><style>body{background:linear-gradient(45deg,#194c5b,#f0bb74)}</style><main>tea</main>"),
             ]),
             call_turn(vec![
                 plan_call(vec![("1", "build page", "done")]),
