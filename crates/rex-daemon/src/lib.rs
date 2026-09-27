@@ -62,6 +62,16 @@ impl DaemonPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateTrace {
+    action_id: String,
+    preview_id: String,
+    start_digest: String,
+    source_sha256: String,
+    activated: bool,
+    end_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableTask {
     protocol_version: String,
     task_id: String,
@@ -79,6 +89,10 @@ struct DurableTask {
     mobile_result_fields: Option<Vec<MobileResultField>>,
     #[serde(default)]
     desktop_result_fields: Option<Vec<MobileResultField>>,
+    #[serde(default)]
+    two_state_contract: Option<TwoStateContract>,
+    #[serde(default)]
+    state_trace: Option<StateTrace>,
     /// First-party mobile capture digest -> visible-field names for this action.
     #[serde(default)]
     mobile_field_captures: BTreeMap<String, (String, Vec<String>)>,
@@ -268,6 +282,8 @@ impl HarnessDaemon {
                     && req.mobile_result_fields != task.mobile_result_fields)
                 || (req.desktop_result_fields.is_some()
                     && req.desktop_result_fields != task.desktop_result_fields)
+                || (req.two_state_contract.is_some()
+                    && req.two_state_contract != task.two_state_contract)
             {
                 return Err(perr(
                     ErrorCode::IdempotencyConflict,
@@ -427,6 +443,8 @@ impl HarnessDaemon {
             plan,
             mobile_result_fields: req.mobile_result_fields,
             desktop_result_fields: req.desktop_result_fields,
+            two_state_contract: req.two_state_contract,
+            state_trace: None,
             mobile_field_captures: BTreeMap::new(),
             desktop_field_captures: BTreeMap::new(),
             cursor: 0,
@@ -584,6 +602,185 @@ impl HarnessDaemon {
             "render.desktop.first" => t.desktop_result_fields,
             _ => None,
         })
+    }
+
+    pub fn two_state_contract(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+    ) -> Result<Option<TwoStateContract>, ProtocolError> {
+        Ok(self.live(task_id, epoch, capability)?.two_state_contract)
+    }
+
+    pub fn require_state_start(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+        preview_id: &str,
+    ) -> Result<(), ProtocolError> {
+        let t = self.live(task_id, epoch, capability)?;
+        let action = t
+            .open_action
+            .as_ref()
+            .ok_or_else(|| perr(ErrorCode::TaskTerminal, "no open action", task_id))?;
+        if !t.state_trace.as_ref().is_some_and(|v| {
+            v.action_id == action.action_id
+                && v.preview_id == preview_id
+                && !v.activated
+                && v.end_digest.is_none()
+        }) {
+            return Err(perr(
+                ErrorCode::GateFailed,
+                "capture the two-state start in this preview before activation",
+                task_id,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Only MCP's successful first-party capture/activate paths call this.
+    pub fn record_state_step(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+        preview_id: &str,
+        kind: &str,
+        digest: Option<&str>,
+        source: Option<&str>,
+        visible_names: &[String],
+    ) -> Result<(), ProtocolError> {
+        let mut t = self.live(task_id, epoch, capability)?;
+        let contract = t
+            .two_state_contract
+            .clone()
+            .ok_or_else(|| perr(ErrorCode::GateFailed, "no two-state contract", task_id))?;
+        let action = t
+            .open_action
+            .as_ref()
+            .ok_or_else(|| perr(ErrorCode::TaskTerminal, "no open action", task_id))?
+            .action_id
+            .clone();
+        match kind {
+            "start" => {
+                let digest = digest
+                    .ok_or_else(|| perr(ErrorCode::GateFailed, "start digest required", task_id))?;
+                let source = source
+                    .ok_or_else(|| perr(ErrorCode::GateFailed, "start source required", task_id))?;
+                if !visible_names.contains(&"state_start".into()) {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "two-state start text is not fully visible",
+                        task_id,
+                    ));
+                }
+                if !self
+                    .artifacts
+                    .bindings(task_id)
+                    .iter()
+                    .any(|b| b.sha256 == digest && b.kind == "render.state.start")
+                {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "two-state start needs its first-party state.start artifact",
+                        task_id,
+                    ));
+                }
+                if !t
+                    .preview_sources
+                    .get(digest)
+                    .is_some_and(|(s, a)| s == source && a == &action)
+                {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "unbound two-state start capture",
+                        task_id,
+                    ));
+                }
+                t.state_trace = Some(StateTrace {
+                    action_id: action.clone(),
+                    preview_id: preview_id.into(),
+                    start_digest: digest.into(),
+                    source_sha256: source.into(),
+                    activated: false,
+                    end_digest: None,
+                });
+            }
+            "activate" => {
+                let trace = t
+                    .state_trace
+                    .as_mut()
+                    .filter(|v| {
+                        v.action_id == action
+                            && v.preview_id == preview_id
+                            && v.end_digest.is_none()
+                            && !v.activated
+                    })
+                    .ok_or_else(|| {
+                        perr(
+                            ErrorCode::GateFailed,
+                            "capture the two-state start in this preview before activation",
+                            task_id,
+                        )
+                    })?;
+                trace.activated = true;
+            }
+            "end" => {
+                let digest = digest
+                    .ok_or_else(|| perr(ErrorCode::GateFailed, "end digest required", task_id))?;
+                let source = source
+                    .ok_or_else(|| perr(ErrorCode::GateFailed, "end source required", task_id))?;
+                if !self
+                    .artifacts
+                    .bindings(task_id)
+                    .iter()
+                    .any(|b| b.sha256 == digest && b.kind == "render.state.end")
+                {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "two-state end needs its first-party state.end artifact",
+                        task_id,
+                    ));
+                }
+                if !visible_names.contains(&"state_end".into()) {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "two-state end text is not fully visible",
+                        task_id,
+                    ));
+                }
+                if !t
+                    .preview_sources
+                    .get(digest)
+                    .is_some_and(|(s, a)| s == source && a == &action)
+                {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "unbound two-state end capture",
+                        task_id,
+                    ));
+                }
+                let trace=t.state_trace.as_mut().filter(|v|v.action_id==action && v.preview_id==preview_id && v.activated && v.source_sha256==source && v.start_digest!=digest)
+                    .ok_or_else(||perr(ErrorCode::GateFailed,"two-state end needs a changed first-party frame after activation in the same preview and source revision",task_id))?;
+                trace.end_digest = Some(digest.into());
+            }
+            _ => {
+                return Err(perr(
+                    ErrorCode::MalformedRequest,
+                    "unknown two-state step",
+                    task_id,
+                ))
+            }
+        }
+        self.append_event(
+            &mut t,
+            "two_state_step",
+            json!({"action_id":action,"preview_id":preview_id,
+            "kind":kind,"sha256":digest,"control":contract.control}),
+        )?;
+        self.persist(&t)
     }
 
     pub fn bind_preview_source(
@@ -1092,6 +1289,26 @@ impl HarnessDaemon {
                 });
             }
         }
+        if visual_action(&t.task, &open.instructions) && t.two_state_contract.is_some() {
+            let valid = t.state_trace.as_ref().is_some_and(|trace| {
+                trace.action_id == open.action_id
+                    && trace.activated
+                    && trace.end_digest.as_ref() == req.evidence.get("render.state.end")
+                    && req.evidence.get("render.state.start") == Some(&trace.start_digest)
+            });
+            if !valid {
+                let repair="two-state contract requires cited start and end first-party captures from the same preview and source revision, with a successful creator-named control activation between them and distinct visible result literals".to_string();
+                self.append_event(&mut t, "two_state_rejected", json!({"repair":repair}))?;
+                self.persist(&t)?;
+                return Ok(SubmitResponse {
+                    state: TaskState::Active,
+                    accepted: false,
+                    repair: Some(repair),
+                    next: Some(open),
+                    visual_capture_coverage: None,
+                });
+            }
+        }
         let coverage = if visual_action(&t.task, &open.instructions) {
             Some(Self::capture_coverage(&open.action_id, &req.evidence))
         } else {
@@ -1225,6 +1442,7 @@ impl HarnessDaemon {
             open_action: t.open_action,
             mobile_result_fields: t.mobile_result_fields,
             desktop_result_fields: t.desktop_result_fields,
+            two_state_contract: t.two_state_contract,
             budgets: BudgetView {
                 max_tool_calls: t.max_tool_calls,
                 used_tool_calls: t.used_tool_calls,
@@ -2601,6 +2819,7 @@ impl HarnessDaemon {
             lease: lease_view(t),
             mobile_result_fields: t.mobile_result_fields.clone(),
             desktop_result_fields: t.desktop_result_fields.clone(),
+            two_state_contract: t.two_state_contract.clone(),
             discipline: Some(operator_discipline()),
         }
     }
@@ -2794,6 +3013,28 @@ fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
                     ));
                 }
             }
+        }
+    }
+    if let Some(c) = &r.two_state_contract {
+        if r.ultra
+            || !visual_action(&r.task, "")
+            || !matches!(c.viewport.as_str(), "mobile390" | "desktop")
+            || !valid_region_id(&c.control)
+            || !(8..=32).contains(&c.min_font_px)
+            || c.start_text.trim().is_empty()
+            || c.end_text.trim().is_empty()
+            || c.start_text.len() > 120
+            || c.end_text.len() > 120
+            || c.start_text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .eq_ignore_ascii_case(&c.end_text.split_whitespace().collect::<Vec<_>>().join(" "))
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::MalformedRequest,
+                "invalid two-state contract",
+            ));
         }
     }
     Ok(())
@@ -3198,6 +3439,7 @@ mod tests {
             task: "make hello".into(),
             mobile_result_fields: None,
             desktop_result_fields: None,
+            two_state_contract: None,
             task_id: None,
             resume_handle: None,
             follow_up: None,
@@ -3896,6 +4138,218 @@ mod tests {
             )
             .unwrap();
         evidence.insert("render.mobile390.first".into(), artifact.sha256);
+        assert!(daemon.submit(submit(evidence)).unwrap().accepted);
+    }
+
+    #[test]
+    fn two_state_contract_rejects_missing_trace_and_forged_order() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let daemon =
+            HarnessDaemon::open(d.path().join("state"), DaemonPolicy::conservative(&w)).unwrap();
+        let mut r = req("two-state-contract");
+        r.ultra = false;
+        r.task = "Build a landing page".into();
+        r.two_state_contract = Some(TwoStateContract {
+            viewport: "mobile390".into(),
+            control: "#change".into(),
+            start_text: "Example A".into(),
+            end_text: "Example B".into(),
+            min_font_px: 14,
+        });
+        let ex = daemon.execute(r).unwrap();
+        let cap = cap_of(&ex);
+        let action = ex.next.as_ref().unwrap().action_id.clone();
+        let mut changed = req("two-state-contract");
+        changed.ultra = false;
+        changed.task = "Build a landing page".into();
+        changed.task_id = Some(ex.task_id.clone());
+        changed.resume_handle = ex.host_resume_handle.clone();
+        changed.two_state_contract = Some(TwoStateContract {
+            viewport: "mobile390".into(),
+            control: "#other".into(),
+            start_text: "Example A".into(),
+            end_text: "Example B".into(),
+            min_font_px: 14,
+        });
+        assert_eq!(
+            daemon.execute(changed).unwrap_err().code,
+            ErrorCode::IdempotencyConflict
+        );
+        for (id, control, start, end) in [
+            ("bad-selector", "body .change", "A", "B"),
+            ("same-text", "#change", "A", " a "),
+        ] {
+            let mut invalid = req(id);
+            invalid.ultra = false;
+            invalid.task = "Build a landing page".into();
+            invalid.two_state_contract = Some(TwoStateContract {
+                viewport: "mobile390".into(),
+                control: control.into(),
+                start_text: start.into(),
+                end_text: end.into(),
+                min_font_px: 14,
+            });
+            assert_eq!(
+                daemon.execute(invalid).unwrap_err().code,
+                ErrorCode::MalformedRequest
+            );
+        }
+        daemon
+            .critique_prompt(&ex.task_id, &cap, ex.lease.epoch)
+            .unwrap();
+        daemon.critique_record(&ex.task_id,&cap,ex.lease.epoch,&action,
+            "A click trace must link a visible start and changed visible end in one preview at one source revision.").unwrap();
+        let mut evidence = BTreeMap::new();
+        for (i, key) in [
+            "render.desktop.first",
+            "render.mobile390.first",
+            "render.state.start",
+            "render.state.mid",
+            "render.state.end",
+            "render.state.reverse",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (width, height) = if i == 1 || i == 2 || i == 4 {
+                (390, 650)
+            } else {
+                (1280, 800)
+            };
+            let png = make_png(width, height, |x, y| {
+                [((x + i as u32) % 255) as u8, (y % 255) as u8, 33]
+            });
+            let artifact = daemon
+                .artifact_put(ArtifactPutRequest {
+                    task_id: ex.task_id.clone(),
+                    capability: cap.clone(),
+                    lease_epoch: ex.lease.epoch,
+                    kind: (*key).into(),
+                    bytes_base64: B64.encode(&png),
+                    candidate_id: None,
+                    round: None,
+                })
+                .unwrap();
+            daemon
+                .bind_preview_source(
+                    &ex.task_id,
+                    &cap,
+                    ex.lease.epoch,
+                    &artifact.sha256,
+                    &"a".repeat(64),
+                )
+                .unwrap();
+            evidence.insert((*key).into(), artifact.sha256);
+        }
+        let submit = |evidence| SubmitRequest {
+            task_id: ex.task_id.clone(),
+            capability: cap.clone(),
+            lease_epoch: ex.lease.epoch,
+            action_id: action.clone(),
+            narrative: "Two states".into(),
+            evidence,
+        };
+        let denied = daemon.submit(submit(evidence.clone())).unwrap();
+        assert!(!denied.accepted);
+        assert!(denied.repair.unwrap().contains("two-state contract"));
+        let start = &evidence["render.state.start"];
+        let end = &evidence["render.state.end"];
+        assert_eq!(
+            daemon
+                .require_state_start(&ex.task_id, &cap, ex.lease.epoch, "preview-a")
+                .unwrap_err()
+                .code,
+            ErrorCode::GateFailed
+        );
+        assert_eq!(
+            daemon
+                .record_state_step(
+                    &ex.task_id,
+                    &cap,
+                    ex.lease.epoch,
+                    "preview-a",
+                    "start",
+                    Some(start),
+                    Some(&"a".repeat(64)),
+                    &[]
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::GateFailed
+        );
+        daemon
+            .record_state_step(
+                &ex.task_id,
+                &cap,
+                ex.lease.epoch,
+                "preview-a",
+                "start",
+                Some(start),
+                Some(&"a".repeat(64)),
+                &["state_start".into()],
+            )
+            .unwrap();
+        assert_eq!(
+            daemon
+                .record_state_step(
+                    &ex.task_id,
+                    &cap,
+                    ex.lease.epoch,
+                    "preview-b",
+                    "activate",
+                    None,
+                    None,
+                    &[]
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::GateFailed
+        );
+        daemon
+            .record_state_step(
+                &ex.task_id,
+                &cap,
+                ex.lease.epoch,
+                "preview-a",
+                "activate",
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            daemon
+                .record_state_step(
+                    &ex.task_id,
+                    &cap,
+                    ex.lease.epoch,
+                    "preview-a",
+                    "end",
+                    Some(end),
+                    Some(&"a".repeat(64)),
+                    &[]
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::GateFailed
+        );
+        assert!(!daemon.submit(submit(evidence.clone())).unwrap().accepted);
+        daemon
+            .record_state_step(
+                &ex.task_id,
+                &cap,
+                ex.lease.epoch,
+                "preview-a",
+                "end",
+                Some(end),
+                Some(&"a".repeat(64)),
+                &["state_end".into()],
+            )
+            .unwrap();
+        let mut swapped = evidence.clone();
+        swapped.insert("render.state.end".into(), start.clone());
+        assert!(!daemon.submit(submit(swapped)).unwrap().accepted);
         assert!(daemon.submit(submit(evidence)).unwrap().accepted);
     }
 

@@ -257,6 +257,53 @@ impl BrowserRuntime {
                 self.wait_loaded()?;
                 self.verify_conditions()?;
             }
+            BrowserAction::ActivateControl { selector } => {
+                let quoted =
+                    serde_json::to_string(selector).map_err(|_| PreviewError::EvidenceLimit)?;
+                let expression = format!(
+                    r#"(() => {{
+                  const el = document.querySelector({quoted});
+                  if (!el || !el.matches('button,a[href],[role=button],[role=link]') ||
+                      el.disabled || el.closest('[inert]')) return null;
+                  for (let n=el; n; n=n.parentElement) {{
+                    const st=getComputedStyle(n);
+                    if (st.display==='none' || st.visibility!=='visible' || Number(st.opacity)<.05 ||
+                        n.hidden || n.getAttribute('aria-hidden')==='true') return null;
+                  }}
+                  const r=el.getBoundingClientRect(), x=r.left+r.width/2,y=r.top+r.height/2;
+                  if (r.width<8 || r.height<8 || r.left<0 || r.top<0 || r.right>innerWidth ||
+                      r.bottom>innerHeight || !el.contains(document.elementFromPoint(x,y))) return null;
+                  return [x,y];
+                }})()"#
+                );
+                let result = self.command(
+                    "Runtime.evaluate",
+                    json!({"expression":expression,"returnByValue":true}),
+                )?;
+                let coords = result
+                    .pointer("/result/result/value")
+                    .and_then(Value::as_array)
+                    .filter(|v| v.len() == 2)
+                    .ok_or(PreviewError::ConditionNotApplied)?;
+                let x = coords[0]
+                    .as_f64()
+                    .ok_or(PreviewError::ConditionNotApplied)?;
+                let y = coords[1]
+                    .as_f64()
+                    .ok_or(PreviewError::ConditionNotApplied)?;
+                self.command(
+                    "Input.dispatchMouseEvent",
+                    json!({"type":"mouseMoved","x":x,"y":y}),
+                )?;
+                self.command(
+                    "Input.dispatchMouseEvent",
+                    json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}),
+                )?;
+                self.command(
+                    "Input.dispatchMouseEvent",
+                    json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1}),
+                )?;
+            }
             BrowserAction::PointerMove { x, y } => {
                 self.cursor_x = *x;
                 self.cursor_y = *y;
@@ -433,6 +480,33 @@ impl BrowserRuntime {
             }
         }
         Ok(())
+    }
+
+    pub fn visible_control(&mut self, selector: &str) -> Result<bool, PreviewError> {
+        let quoted = serde_json::to_string(selector).map_err(|_| PreviewError::EvidenceLimit)?;
+        let expression = format!(
+            r#"(() => {{
+          const el=document.querySelector({quoted});
+          if (!el || !el.matches('button,a[href],[role=button],[role=link]') || el.disabled ||
+              el.closest('[inert]')) return false;
+          for (let n=el;n;n=n.parentElement) {{
+            const st=getComputedStyle(n);
+            if (st.display==='none'||st.visibility!=='visible'||Number(st.opacity)<.05||
+                n.hidden||n.getAttribute('aria-hidden')==='true') return false;
+          }}
+          const r=el.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+          return r.width>=8&&r.height>=8&&r.left>=0&&r.top>=0&&r.right<=innerWidth&&
+                 r.bottom<=innerHeight&&el.contains(document.elementFromPoint(x,y));
+        }})()"#
+        );
+        let result = self.command(
+            "Runtime.evaluate",
+            json!({"expression":expression,"returnByValue":true}),
+        )?;
+        result
+            .pointer("/result/result/value")
+            .and_then(Value::as_bool)
+            .ok_or(PreviewError::ConditionNotApplied)
     }
 
     pub fn capture(
