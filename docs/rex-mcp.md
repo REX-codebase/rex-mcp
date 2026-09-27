@@ -26,6 +26,36 @@ write files and run allowlisted commands inside `REX_WORKSPACE`. With it
 unset, writes and commands return `approval_required`; reads, search,
 status, events, execute, next, submit, result and cancel still work.
 
+## First `rex_execute` call
+
+Choose `host` for the client actually making the MCP call. Accepted values are
+`human`, `claude_code`, `codex`, `open_code`, `hermes`, `antigravity`, and
+`generic_agent`. `generic_agent` is for another agent client, not a default
+for every setup; a host's account or model is not inferred from this field.
+Set `operator_is_agent` to `true` when an agent operates the tools and to
+`false` for a human operator. It is a declaration, not an approval switch.
+Both fields are required; neither has an implicit default.
+
+For example, an agent running in Codex might provide these *arguments* to the
+`rex_execute` MCP tool (replace the task and use a fresh idempotency key):
+
+```json
+{
+  "request_id": "first-task-001",
+  "task": "Inspect the project and report what needs work",
+  "host": "codex",
+  "operator_is_agent": true
+}
+```
+
+This creates a durable task, even when file writes are disabled. Keep its
+returned task id, task capability, lease epoch and host resume handle. To allow file edits
+and allowlisted commands, a *trusted launcher* must separately set
+`REX_APPROVE_TASK_MUTATIONS=1` for the intended workspace before starting
+the MCP server. It is not a `rex_execute` argument, and leaving it unset
+does not make task creation read-only. Do not set it just to try the first
+call; inspect the workspace and permissions first.
+
 ## The caller-driven loop
 
 1. `rex_execute` with an idempotency `request_id`, the task, and an

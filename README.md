@@ -9,6 +9,12 @@ The stdio server negotiates MCP `2025-11-25` and `2025-06-18`. A client offering
 Pin `REX_STATE_DIR` and `REX_WORKSPACE` to the intended absolute paths. Without them, state defaults to `$HOME/.rex/harness` and workspace to the process current directory. Leave `REX_APPROVE_TASK_MUTATIONS` unset for read-only use; set it to `1` only when you intend to allow file edits and allowlisted commands in that workspace.
 
 For a cautious host-by-host check, see [manual host test](docs/HOST-TEST.md).
+The `rex_execute` call creates a durable task even with the mutation flag
+unset. Its required `host` identifies the actual client (for example `codex`,
+not `generic_agent` just because an agent is involved), and
+`operator_is_agent` declares whether an agent or human operates the tools.
+Neither field defaults. See the [first-call example](docs/rex-mcp.md)
+before copying values from a test harness.
 
 ### Ultra workflow from a host
 
