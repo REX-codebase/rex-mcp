@@ -147,6 +147,10 @@ struct DurableTask {
     /// never stored; it rotates on every accepted resume.
     #[serde(default)]
     host_resume_handle_hash: Option<String>,
+    /// Optional SHA-256 of the caller's precommitted one-time recovery key.
+    /// Cleared on first successful use. Legacy tasks cannot recover this way.
+    #[serde(default)]
+    recovery_key_hash: Option<String>,
     /// SHA-256 of the per-task operational capability (protocol 2.0). The
     /// capability itself is only ever held by the task's operator; every
     /// operational call must present it. Empty means a pre-2.0 record,
@@ -293,10 +297,14 @@ impl HarnessDaemon {
             }
             // Verify, gate, then rotate: a resume the lease gate refuses must
             // not burn the host's only resume handle.
-            self.verify_resume_handle(&task, &req)?;
+            let recovering = self.verify_resume_credential(&task, &req)?;
             let renewed = self.renew_lease_on_resume(&mut task)?;
             let handle = self.rotate_resume_handle(&mut task)?;
             let capability = self.rotate_capability(&mut task)?;
+            if recovering {
+                task.recovery_key_hash = None;
+                self.append_event(&mut task, "recovery_key_consumed", json!({}))?;
+            }
             if renewed {
                 self.append_event(&mut task, "lease_renewed_on_resume", json!({}))?;
             }
@@ -321,10 +329,14 @@ impl HarnessDaemon {
             let mut task = task;
             // Verify, gate, then rotate: a resume the lease gate refuses must
             // not burn the host's only resume handle.
-            self.verify_resume_handle(&task, &req)?;
+            let recovering = self.verify_resume_credential(&task, &req)?;
             let renewed = self.renew_lease_on_resume(&mut task)?;
             let handle = self.rotate_resume_handle(&mut task)?;
             let capability = self.rotate_capability(&mut task)?;
+            if recovering {
+                task.recovery_key_hash = None;
+                self.append_event(&mut task, "recovery_key_consumed", json!({}))?;
+            }
             if renewed {
                 self.append_event(&mut task, "lease_renewed_on_resume", json!({}))?;
             }
@@ -480,6 +492,10 @@ impl HarnessDaemon {
             },
             ultra_skill_plan_hash: None,
             host_resume_handle_hash: Some(hex_sha256(host_resume_handle.as_bytes())),
+            recovery_key_hash: req
+                .recovery_key
+                .as_ref()
+                .map(|key| hex_sha256(key.as_bytes())),
             task_capability_hash: hex_sha256(task_capability.as_bytes()),
             store_schema_version: STORE_SCHEMA_VERSION,
         };
@@ -2779,6 +2795,36 @@ impl HarnessDaemon {
         Ok(capability)
     }
 
+    fn verify_resume_credential(
+        &self,
+        t: &DurableTask,
+        req: &ExecuteRequest,
+    ) -> Result<bool, ProtocolError> {
+        if req.resume_handle.is_some() && req.recovery_key.is_some() {
+            return Err(perr(ErrorCode::ScopeDenied,
+                "present either the current resume handle or the precommitted recovery key, not both", &t.task_id));
+        }
+        if let Some(key) = req.recovery_key.as_deref() {
+            let expected = t.recovery_key_hash.as_deref().ok_or_else(|| {
+                perr(
+                    ErrorCode::ScopeDenied,
+                    "no unused precommitted recovery key for this task",
+                    &t.task_id,
+                )
+            })?;
+            if hex_sha256(key.as_bytes()) != expected {
+                return Err(perr(
+                    ErrorCode::ScopeDenied,
+                    "recovery key mismatch",
+                    &t.task_id,
+                ));
+            }
+            return Ok(true);
+        }
+        self.verify_resume_handle(t, req)?;
+        Ok(false)
+    }
+
     fn verify_resume_handle(
         &self,
         t: &DurableTask,
@@ -2812,7 +2858,6 @@ impl HarnessDaemon {
     fn rotate_resume_handle(&self, t: &mut DurableTask) -> Result<String, ProtocolError> {
         let rotated = format!("hrh-{}", random_hex(24));
         t.host_resume_handle_hash = Some(hex_sha256(rotated.as_bytes()));
-        self.persist(t)?;
         Ok(rotated)
     }
 
@@ -2983,6 +3028,17 @@ fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
             ErrorCode::MalformedRequest,
             "request_id and task are required",
         ));
+    }
+    if let Some(key) = &r.recovery_key {
+        if key.len() != 68
+            || !key.starts_with("rrk-")
+            || !key[4..].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::MalformedRequest,
+                "recovery_key must be caller-generated rrk- plus 64 hex digits (256 bits)",
+            ));
+        }
     }
     for (surface, fields) in [
         ("mobile", &r.mobile_result_fields),
@@ -3318,6 +3374,9 @@ fn request_hash(r: &ExecuteRequest) -> Result<String, ProtocolError> {
     // change the request hash or every resume would look like a conflict.
     let mut normalized = r.clone();
     normalized.resume_handle = None;
+    // The optional recovery key is separately hashed in durable state, never
+    // embedded in the request identity (which remains readable as a digest).
+    normalized.recovery_key = None;
     hash_json(&normalized)
 }
 fn hash_json<T: Serialize>(v: &T) -> Result<String, ProtocolError> {
@@ -3498,6 +3557,7 @@ mod tests {
             two_state_contract: None,
             task_id: None,
             resume_handle: None,
+            recovery_key: None,
             follow_up: None,
             host: HostKind::ClaudeCode,
             operator_is_agent: true,
@@ -5769,6 +5829,92 @@ mod tests {
         let err = daemon.proof_bundle(TaskRefRequest { task_id }).unwrap_err();
         assert!(format!("{err:?}").contains("frozen skill plan hash drift"));
     }
+    #[test]
+    fn precommitted_recovery_key_is_one_time_and_never_logged() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let key = format!("rrk-{}", "a".repeat(64));
+        let mut create = req("r-precommitted");
+        create.recovery_key = Some(key.clone());
+        let first = daemon.execute(create).unwrap();
+        let persisted =
+            fs::read_to_string(root.join("tasks").join(&first.task_id).join("task.json")).unwrap();
+        let events =
+            fs::read_to_string(root.join("tasks").join(&first.task_id).join("events.jsonl"))
+                .unwrap();
+        assert!(!persisted.contains(&key) && !events.contains(&key));
+        assert_eq!(
+            daemon.execute(req("r-precommitted")).unwrap_err().code,
+            ErrorCode::ScopeDenied
+        );
+        let mut forged = req("r-precommitted");
+        forged.recovery_key = Some(format!("rrk-{}", "b".repeat(64)));
+        assert_eq!(
+            daemon.execute(forged).unwrap_err().code,
+            ErrorCode::ScopeDenied
+        );
+        let mut both = req("r-precommitted");
+        both.recovery_key = Some(key.clone());
+        both.resume_handle = first.host_resume_handle.clone();
+        assert_eq!(
+            daemon.execute(both).unwrap_err().code,
+            ErrorCode::ScopeDenied
+        );
+        let mut recover = req("r-precommitted");
+        recover.recovery_key = Some(key.clone());
+        let second = daemon.execute(recover.clone()).unwrap();
+        assert!(second.resumed);
+        assert_eq!(second.task_id, first.task_id);
+        assert_ne!(second.host_resume_handle, first.host_resume_handle);
+        assert_ne!(second.task_capability, first.task_capability);
+        assert_eq!(
+            daemon.execute(recover).unwrap_err().code,
+            ErrorCode::ScopeDenied
+        );
+        let mut stale = req("r-precommitted");
+        stale.resume_handle = first.host_resume_handle.clone();
+        assert_eq!(
+            daemon.execute(stale).unwrap_err().code,
+            ErrorCode::ScopeDenied
+        );
+        let mut current = req("r-precommitted");
+        current.resume_handle = second.host_resume_handle.clone();
+        assert!(daemon.execute(current).unwrap().resumed);
+        let persisted =
+            fs::read_to_string(root.join("tasks").join(&first.task_id).join("task.json")).unwrap();
+        let events =
+            fs::read_to_string(root.join("tasks").join(&first.task_id).join("events.jsonl"))
+                .unwrap();
+        assert!(!persisted.contains(&key) && !events.contains(&key));
+        assert!(events.contains("recovery_key_consumed"));
+        let mut create_by_id = req("r-precommitted-id");
+        create_by_id.recovery_key = Some(key.clone());
+        let by_id = daemon.execute(create_by_id).unwrap();
+        let mut recover_by_id = req("another-request-id");
+        recover_by_id.task_id = Some(by_id.task_id.clone());
+        recover_by_id.recovery_key = Some(key.clone());
+        assert_eq!(
+            daemon.execute(recover_by_id).unwrap().task_id,
+            by_id.task_id
+        );
+        let old = daemon.execute(req("r-without-key")).unwrap();
+        let mut attempted = req("r-without-key");
+        attempted.task_id = Some(old.task_id);
+        attempted.recovery_key = Some(key.clone());
+        assert_eq!(
+            daemon.execute(attempted).unwrap_err().code,
+            ErrorCode::ScopeDenied
+        );
+        let mut invalid = req("r-invalid-key");
+        invalid.recovery_key = Some("rrk-short".into());
+        assert_eq!(
+            daemon.execute(invalid).unwrap_err().code,
+            ErrorCode::MalformedRequest
+        );
+    }
+
     #[test]
     fn host_resume_requires_and_rotates_the_handle() {
         let d = tempdir().unwrap();

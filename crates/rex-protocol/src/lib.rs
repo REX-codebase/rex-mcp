@@ -297,6 +297,10 @@ pub struct ExecuteRequest {
     /// Host resume handle issued at creation; required on every resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_handle: Option<String>,
+    /// Optional caller-generated 256-bit one-time recovery secret, precommitted
+    /// at task creation. Never returned or logged. Store outside the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_key: Option<String>,
     /// Optional human follow-up recorded against the same durable task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_up: Option<String>,

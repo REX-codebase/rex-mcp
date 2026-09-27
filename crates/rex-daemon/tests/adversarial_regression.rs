@@ -22,6 +22,7 @@ fn execute_ultra(daemon: &HarnessDaemon, id: &str, task: &str) -> ExecuteRespons
             two_state_contract: None,
             task_id: None,
             resume_handle: None,
+            recovery_key: None,
             follow_up: None,
             host: HostKind::ClaudeCode,
             operator_is_agent: true,
