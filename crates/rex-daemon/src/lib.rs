@@ -510,7 +510,7 @@ impl HarnessDaemon {
             if prior != source_sha256 || prior_action != &action {
                 return Err(perr(
                     ErrorCode::IdempotencyConflict,
-                    "preview frame already bound to a different source or action",
+                    "identical preview PNG was already bound to a different source revision or action; the digest alone cannot distinguish captures. Do not change the UI merely to force new pixels or reuse this capture as current-source proof. Start a fresh task for this revision, then recapture its evidence",
                     task_id,
                 ));
             }
@@ -3549,6 +3549,25 @@ mod tests {
                 .unwrap();
             evidence.insert((*key).into(), artifact.sha256);
         }
+        // Byte-identical pixels on another source revision cannot be rebound:
+        // a recapture of the same PNG digest has no per-capture identity here.
+        let stable_digest = evidence["render.desktop.first"].clone();
+        let collision = daemon.bind_preview_source(
+            &ex.task_id,
+            &cap_of(&ex),
+            ex.lease.epoch,
+            &stable_digest,
+            &"b".repeat(64),
+        );
+        let collision = collision.unwrap_err();
+        assert_eq!(collision.code, ErrorCode::IdempotencyConflict);
+        assert!(collision.message.contains("Start a fresh task"));
+        assert!(collision.message.contains("Do not change the UI"));
+        let still_bound = daemon.load(&ex.task_id).unwrap();
+        assert_eq!(
+            still_bound.preview_sources[&stable_digest],
+            ("a".repeat(64), action_id.clone())
+        );
         // The five other frames are from one source; a later source edit
         // cannot be laundered by uploading the earlier desktop PNG again.
         let changed_digest = evidence["render.state.end"].clone();
