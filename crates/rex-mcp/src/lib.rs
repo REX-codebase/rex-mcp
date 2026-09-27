@@ -157,11 +157,7 @@ impl McpServer {
             .ok_or_else(|| {
                 ProtocolError::new(ErrorCode::MalformedRequest, "known render kind required")
             })?;
-        let contract = if kind == "render.mobile390.first" {
-            self.daemon.mobile_result_fields(&task_id, &cap, epoch)?
-        } else {
-            None
-        };
+        let contract = self.daemon.result_fields(&task_id, &cap, epoch, kind)?;
         let captured = self
             .previews
             .capture_with_fields(&id, contract.as_deref().unwrap_or(&[]))
@@ -190,11 +186,13 @@ impl McpServer {
                 format!("{kind} requires matching REX viewport, got {width}x{height}"),
             ));
         }
-        if kind == "render.mobile390.first" && contract.is_some() && (width != 390 || height != 650)
+        if contract.is_some()
+            && ((kind == "render.mobile390.first" && (width != 390 || height != 650))
+                || (kind == "render.desktop.first" && (width != 1280 || height != 800)))
         {
             return Err(ProtocolError::new(
                 ErrorCode::GateFailed,
-                "mobile result contract requires an exact 390x650 preview capture",
+                format!("{kind} result contract requires an exact 390x650 mobile or 1280x800 desktop preview capture"),
             ));
         }
         let artifact = self.daemon.artifact_put(rex_protocol::ArtifactPutRequest {
@@ -213,13 +211,14 @@ impl McpServer {
             &artifact.sha256,
             &captured.source_sha256,
         )?;
-        if kind == "render.mobile390.first" && contract.is_some() {
+        if contract.is_some() {
             self.daemon.bind_mobile_fields(
                 &task_id,
                 &cap,
                 epoch,
                 &artifact.sha256,
                 captured.visible_result_fields.clone(),
+                kind,
             )?;
         }
         Ok(
@@ -1090,9 +1089,9 @@ pub fn tool_descriptors() -> Vec<Value> {
     let mut out = Vec::new();
     for t in ToolName::all() {
         let (description, mut schema) = match t {
-            ToolName::Execute => ("Start or resume a durable REX task; plan and optional creator-supplied mobile_result_fields are frozen at creation. For Standard visual tasks, each named text/control literal is checked against the first-party 390x650 opening capture; this does not prove semantic or spatial truth.", json!({
+            ToolName::Execute => ("Start or resume a durable REX task; plan and optional creator-supplied mobile_result_fields and desktop_result_fields are frozen at creation. For Standard visual tasks, each named field is checked against its first-party 390x650 or 1280x800 opening capture; this does not prove semantic or spatial truth.", json!({
                 "type":"object","required":["request_id","task","host","operator_is_agent"],
-                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string","minLength":1},"mobile_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control"]},"match_mode":{"enum":["exact","contains"]}},"additionalProperties":false}},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"follow_up":{"type":"string"},
+                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string","minLength":1},"mobile_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"desktop_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"follow_up":{"type":"string"},
                 "host":{"enum":["human","claude_code","codex","open_code","hermes","antigravity","generic_agent"]},"operator_is_agent":{"type":"boolean"},"ultra":{"type":"boolean"},
                 "budgets":{"type":"object"},"proof":{"type":"string"},"plan":{"type":"array","items":{"type":"object","required":["instructions"],"properties":{"instructions":{"type":"string"},"acceptance":{"type":"string"}}}}},"additionalProperties":false})),
             ToolName::Next => ("Heartbeat and get the currently open action.", task_epoch_schema()),
@@ -1163,6 +1162,7 @@ pub fn tool_descriptors() -> Vec<Value> {
                     "lease":{"type":"object","required":["epoch","expires_ms_from_now","heartbeat_interval_ms"],"properties":{"epoch":{"type":"integer"},"expires_ms_from_now":{"type":"integer"},"heartbeat_interval_ms":{"type":"integer"}}},
                     "open_action":{"type":["object","null"]},
                     "mobile_result_fields":{"type":"array","items":{"type":"object"}},
+                    "desktop_result_fields":{"type":"array","items":{"type":"object"}},
                     "budgets":{"type":"object"},
                     "last_event_seq":{"type":"integer"},
                     "visual_capture_coverage":{"type":"object","required":["action_id","cited_slots","unique_frames","duplicate_slots"],"properties":{"action_id":{"type":"string"},"cited_slots":{"type":"integer"},"unique_frames":{"type":"integer"},"duplicate_slots":{"type":"integer"}}},
@@ -1220,7 +1220,7 @@ fn preview_descriptors() -> Vec<Value> {
         json!({"name":"rex_critique_record","description":"Record concrete skeptical findings for the current action after requesting the challenge. REX requires this before checking or acceptance; prose cannot prove honesty.","inputSchema":extend(task_epoch_schema(),json!({"action_id":{"type":"string"},"findings":{"type":"string","minLength":80}}), &["action_id","findings"])}),
         json!({"name":"rex_preview_start","description":"Start a task-scoped local preview. Static HTML and supported app frameworks use an isolated loopback server; interaction/capture uses local headless Chrome, not the user's browser.","inputSchema":extend(task_epoch_schema(),json!({"project_dir":{"type":"string"}}),&["project_dir"])}),
         json!({"name":"rex_preview_action","description":"Interact with the local preview after an action-bound critique: pointer, key, text, scroll, explicit bounded wait_for_animations, navigation, viewport, reduced-motion media override or a fresh-navigation JavaScript-off condition. Re-enable after an off capture requires a fresh preview.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"action":{"type":"object"}}),&["preview_id","action"])}),
-        json!({"name":"rex_preview_capture","description":"Capture REX-owned headless-Chrome pixels and DOM/AX evidence, bound as an immutable task artifact. Contracted mobile results require 390x650 and report visible_result_fields; inspect PNG pixels because this is not a semantic or spatial-truth verdict. Capture after the critique challenge and record.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"kind":{"enum":["render.desktop.first","render.mobile390.first","render.state.start","render.state.mid","render.state.end","render.state.reverse"]}}),&["preview_id","kind"])}),
+        json!({"name":"rex_preview_capture","description":"Capture REX-owned headless-Chrome pixels and DOM/AX evidence, bound as an immutable task artifact. Contracted mobile/desktop results require exact 390x650/1280x800 and report visible_result_fields; inspect PNG pixels because this is not a semantic or spatial-truth verdict. Capture after the critique challenge and record.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"kind":{"enum":["render.desktop.first","render.mobile390.first","render.state.start","render.state.mid","render.state.end","render.state.reverse"]}}),&["preview_id","kind"])}),
         json!({"name":"rex_preview_stop","description":"Stop and clean up this task's local preview process tree.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"}}),&["preview_id"])}),
     ]
 }
@@ -2134,7 +2134,7 @@ mod tests {
         assert!(events
             .events
             .iter()
-            .any(|e| e.kind == "mobile_fields_observed"
+            .any(|e| e.kind == "result_fields_observed"
                 && e.detail["visible_names"] == json!(["ordered", "approve"])));
         let before = mcp
             .daemon

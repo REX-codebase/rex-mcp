@@ -18,6 +18,7 @@ fn execute_ultra(daemon: &HarnessDaemon, id: &str, task: &str) -> ExecuteRespons
             request_id: id.into(),
             task: task.into(),
             mobile_result_fields: None,
+            desktop_result_fields: None,
             task_id: None,
             resume_handle: None,
             follow_up: None,

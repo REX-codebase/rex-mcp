@@ -540,6 +540,7 @@ impl BrowserRuntime {
                 r#"(() => {{
               const fields = {serialized};
               const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              const legible = (el,f) => !f.min_font_px || parseFloat(getComputedStyle(el).fontSize) >= f.min_font_px;
               const matches = (s,w,f) => (f.match_mode || 'exact') === 'contains' ? s.includes(w) : s === w;
               const inside = r => r && r.width >= 8 && r.height >= 8 &&
                 r.left >= 0 && r.top >= 0 && r.right <= innerWidth && r.bottom <= innerHeight;
@@ -563,25 +564,42 @@ impl BrowserRuntime {
               while (walk.nextNode() && textNodes.length < 10000) {{
                 if (walk.currentNode.nodeValue.trim()) textNodes.push(walk.currentNode);
               }}
-              return fields.filter(f => f.alternatives.some(a => {{
+              return fields.filter(f => {{
+                if (f.kind === 'list_count') {{
+                  const region = document.querySelector(f.region);
+                  if (!region || !shown(region)) return false;
+                  const labels = new Set(), chosen = [];
+                  for (const el of region.querySelectorAll('li')) {{
+                    if (unique.has(el) || !shown(el) || !legible(el,f) || !inside(el.getBoundingClientRect()) ||
+                        !uncovered(el.getBoundingClientRect(),el)) continue;
+                    const label = norm(el.innerText);
+                    if (!label || labels.has(label)) continue;
+                    labels.add(label); chosen.push(el);
+                  }}
+                  if (chosen.length < f.min_count) return false;
+                  chosen.forEach(el => unique.add(el));
+                  return true;
+                }}
+                return f.alternatives.some(a => {{
                 const want = norm(a);
                 if (f.kind === 'control') {{
                   const el = controls.find(el => !unique.has(el) && shown(el) && !el.disabled &&
-                    !el.closest('[inert]') && inside(el.getBoundingClientRect()) &&
+                    !el.closest('[inert]') && legible(el,f) && inside(el.getBoundingClientRect()) &&
                     uncovered(el.getBoundingClientRect(), el) &&
                     matches(norm(el.getAttribute('aria-label') || el.innerText || el.value), want, f));
                   if (el) unique.add(el);
                   return !!el;
                 }}
                 const node = textNodes.find(node => {{
-                  if (unique.has(node) || !shown(node.parentElement) || !matches(norm(node.nodeValue), want, f)) return false;
+                  if (unique.has(node) || !shown(node.parentElement) || !legible(node.parentElement,f) || !matches(norm(node.nodeValue), want, f)) return false;
                   const range = document.createRange(); range.selectNodeContents(node);
                   const rects = [...range.getClientRects()];
                   return rects.length > 0 && rects.every(r => inside(r) && uncovered(r, node.parentElement));
                 }});
                 if (node) unique.add(node);
                 return !!node;
-              }})).map(f => f.name);
+                }});
+              }}).map(f => f.name);
             }})()"#
             );
             let result = self.command(
