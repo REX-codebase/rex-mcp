@@ -759,7 +759,7 @@ impl HarnessDaemon {
                     return Err(perr(
                         ErrorCode::GateFailed,
                         format!(
-                            "two-state end capture missing creator-frozen visible field: {}",
+                            "two-state end field '{}' not observed at the frozen viewport: its complete text node must match (exact by default, or contains when specified), be fully inside the viewport, unobscured, at least its CSS font floor, and distinct from nodes used by other fields. This result alone cannot identify which condition failed; inspect the capture and DOM before recapturing",
                             missing.name
                         ),
                         task_id,
@@ -3043,9 +3043,20 @@ fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
                         || f.kind != "text"
                         || f.alternatives.is_empty()
                         || f.alternatives.len() > 8
-                        || f.alternatives
-                            .iter()
-                            .any(|v| v.trim().is_empty() || v.len() > 120)
+                        || f.alternatives.iter().any(|v| {
+                            v.trim().is_empty()
+                                || v.len() > 120
+                                || (f.match_mode.as_deref().unwrap_or("exact") == "exact"
+                                    && v.split_whitespace()
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                        .eq_ignore_ascii_case(
+                                            &c.end_text
+                                                .split_whitespace()
+                                                .collect::<Vec<_>>()
+                                                .join(" "),
+                                        ))
+                        })
                         || !matches!(
                             f.match_mode.as_deref().unwrap_or("exact"),
                             "exact" | "contains"
@@ -3057,7 +3068,7 @@ fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
             {
                 return Err(ProtocolError::new(
                     ErrorCode::MalformedRequest,
-                    "invalid two-state end fields: provide 1-8 distinct visible text fields",
+                    "invalid two-state end fields: provide 1-8 distinct visible text fields; an exact end field must not duplicate end_text",
                 ));
             }
         }
@@ -4237,6 +4248,28 @@ mod tests {
             daemon.execute(bad_fields).unwrap_err().code,
             ErrorCode::MalformedRequest
         );
+        let mut duplicate = req("duplicate-two-state-end-text");
+        duplicate.ultra = false;
+        duplicate.task = "Build a landing page".into();
+        duplicate.two_state_contract = Some(TwoStateContract {
+            viewport: "mobile390".into(),
+            control: "#change".into(),
+            start_text: "Awaiting review".into(),
+            end_text: "Rejected, order unchanged".into(),
+            min_font_px: 14,
+            end_fields: Some(vec![MobileResultField {
+                name: "duplicate_outcome".into(),
+                alternatives: vec![" Rejected,   order unchanged ".into()],
+                kind: "text".into(),
+                match_mode: None,
+                min_font_px: Some(14),
+                region: None,
+                min_count: None,
+            }]),
+        });
+        let error = daemon.execute(duplicate).unwrap_err();
+        assert_eq!(error.code, ErrorCode::MalformedRequest);
+        assert!(error.message.contains("duplicate end_text"));
         let mut changed = req("two-state-contract");
         changed.ultra = false;
         changed.task = "Build a landing page".into();
