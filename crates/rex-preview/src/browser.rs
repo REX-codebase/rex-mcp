@@ -170,7 +170,7 @@ impl BrowserRuntime {
             )?;
             if v.pointer("/result/result/value")
                 .and_then(Value::as_str)
-                .is_some_and(|s| s == "complete" || s == "interactive")
+                .is_some_and(|s| s == "complete")
             {
                 return Ok(());
             }
@@ -319,7 +319,7 @@ impl BrowserRuntime {
                 self.command("Input.dispatchMouseEvent", json!({"type":"mouseReleased","x":self.cursor_x,"y":self.cursor_y,"button":button_name(*button),"clickCount":1}))?;
             }
             BrowserAction::Key { key, state } => {
-                let mut event = json!({"type": if *state == KeyState::Down {"keyDown"} else {"keyUp"},
+                let mut event = json!({"type": if *state == KeyState::Down && *key != SafeKey::Enter {"rawKeyDown"} else if *state == KeyState::Down {"keyDown"} else {"keyUp"},
                     "key":key_name(*key),"code":key_code(*key),"windowsVirtualKeyCode":key_vk(*key),
                     "nativeVirtualKeyCode":key_vk(*key)});
                 if *key == SafeKey::Enter && *state == KeyState::Down {
@@ -535,6 +535,10 @@ impl BrowserRuntime {
             return Err(PreviewError::UrlDenied);
         }
         self.verify_conditions()?;
+        // Capture after the document load and finite entrance animations.
+        // This does not certify arbitrary timers, canvas or backend state.
+        self.wait_loaded()?;
+        self.wait_for_animations(2000)?;
         let shot = self.command(
             "Page.captureScreenshot",
             json!({"format":"png","captureBeyondViewport":false,"fromSurface":true}),

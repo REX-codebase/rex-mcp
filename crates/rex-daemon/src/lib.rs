@@ -69,6 +69,10 @@ struct StateTrace {
     source_sha256: String,
     activated: bool,
     end_digest: Option<String>,
+    #[serde(default)]
+    reverse_action_observed: bool,
+    #[serde(default)]
+    reverse_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,6 +666,36 @@ impl HarnessDaemon {
     }
 
     /// Only MCP's successful first-party capture/activate paths call this.
+    /// Called only after an actual first-party pointer/key input succeeds in
+    /// the same preview after the settled end capture.
+    pub fn record_reverse_input(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+        preview_id: &str,
+    ) -> Result<(), ProtocolError> {
+        let mut t = self.live(task_id, epoch, capability)?;
+        let action = t
+            .open_action
+            .as_ref()
+            .ok_or_else(|| perr(ErrorCode::TaskTerminal, "no open action", task_id))?
+            .action_id
+            .clone();
+        if let Some(trace) = t.state_trace.as_mut().filter(|v| {
+            v.action_id == action && v.preview_id == preview_id && v.end_digest.is_some()
+        }) {
+            trace.reverse_action_observed = true;
+            self.append_event(
+                &mut t,
+                "reverse_input_observed",
+                json!({"action_id":action,"preview_id":preview_id}),
+            )?;
+            self.persist(&t)?;
+        }
+        Ok(())
+    }
+
     pub fn record_state_step(
         &self,
         task_id: &str,
@@ -727,6 +761,8 @@ impl HarnessDaemon {
                     source_sha256: source.into(),
                     activated: false,
                     end_digest: None,
+                    reverse_action_observed: false,
+                    reverse_digest: None,
                 });
             }
             "activate" => {
@@ -800,6 +836,51 @@ impl HarnessDaemon {
                 let trace=t.state_trace.as_mut().filter(|v|v.action_id==action && v.preview_id==preview_id && v.activated && v.source_sha256==source && v.start_digest!=digest)
                     .ok_or_else(||perr(ErrorCode::GateFailed,"two-state end needs a changed first-party frame after activation in the same preview and source revision",task_id))?;
                 trace.end_digest = Some(digest.into());
+            }
+            "reverse" => {
+                let digest = digest.ok_or_else(|| {
+                    perr(ErrorCode::GateFailed, "reverse digest required", task_id)
+                })?;
+                let source = source.ok_or_else(|| {
+                    perr(ErrorCode::GateFailed, "reverse source required", task_id)
+                })?;
+                if !visible_names.contains(&"state_reverse".into()) {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "two-state reverse text is not fully visible",
+                        task_id,
+                    ));
+                }
+                if !self
+                    .artifacts
+                    .bindings(task_id)
+                    .iter()
+                    .any(|b| b.sha256 == digest && b.kind == "render.state.reverse")
+                {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "two-state reverse needs its first-party reverse artifact",
+                        task_id,
+                    ));
+                }
+                if !t
+                    .preview_sources
+                    .get(digest)
+                    .is_some_and(|(s, a)| s == source && a == &action)
+                {
+                    return Err(perr(
+                        ErrorCode::GateFailed,
+                        "unbound two-state reverse capture",
+                        task_id,
+                    ));
+                }
+                let trace = t.state_trace.as_mut().filter(|v|
+                    v.action_id == action && v.preview_id == preview_id && v.activated &&
+                    v.source_sha256 == source && v.end_digest.as_deref().is_some_and(|end| end != digest) &&
+                    v.reverse_action_observed)
+                    .ok_or_else(|| perr(ErrorCode::GateFailed,
+                        "two-state reverse needs a different frame after a real pointer/key input, following end in the same preview and source revision", task_id))?;
+                trace.reverse_digest = Some(digest.into());
             }
             _ => {
                 return Err(perr(
@@ -1342,9 +1423,14 @@ impl HarnessDaemon {
                     && trace.activated
                     && trace.end_digest.as_ref() == req.evidence.get("render.state.end")
                     && req.evidence.get("render.state.start") == Some(&trace.start_digest)
+                    && t.two_state_contract.as_ref().is_none_or(|c| {
+                        c.reverse_text.is_none()
+                            || trace.reverse_digest.as_ref()
+                                == req.evidence.get("render.state.reverse")
+                    })
             });
             if !valid {
-                let repair="two-state contract requires cited start and end first-party captures from the same preview and source revision, with a successful creator-named control activation between them and distinct visible result literals".to_string();
+                let repair="two-state contract requires cited start and end first-party captures from the same preview and source revision, with a successful creator-named control activation and distinct visible result literals; if reverse_text was frozen, cite a reverse capture after a real input with its visible literal and a frame different from end".to_string();
                 self.append_event(&mut t, "two_state_rejected", json!({"repair":repair}))?;
                 self.persist(&t)?;
                 return Ok(SubmitResponse {
@@ -3154,6 +3240,16 @@ fn validate_execute(r: &ExecuteRequest) -> Result<(), ProtocolError> {
             || c.end_text.trim().is_empty()
             || c.start_text.len() > 120
             || c.end_text.len() > 120
+            || c.reverse_text.as_ref().is_some_and(|v| {
+                v.trim().is_empty()
+                    || v.len() > 120
+                    || v.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .eq_ignore_ascii_case(
+                            &c.end_text.split_whitespace().collect::<Vec<_>>().join(" "),
+                        )
+            })
             || c.start_text
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -4288,6 +4384,7 @@ mod tests {
             control: "#change".into(),
             start_text: "Example A".into(),
             end_text: "Example B".into(),
+            reverse_text: None,
             min_font_px: 14,
             end_fields: Some(vec![MobileResultField {
                 name: "order_unchanged".into(),
@@ -4310,6 +4407,7 @@ mod tests {
             control: "#change".into(),
             start_text: "Example A".into(),
             end_text: "Example B".into(),
+            reverse_text: None,
             min_font_px: 14,
             end_fields: Some(vec![MobileResultField {
                 name: "state_end".into(),
@@ -4333,6 +4431,7 @@ mod tests {
             control: "#change".into(),
             start_text: "Awaiting review".into(),
             end_text: "Rejected, order unchanged".into(),
+            reverse_text: None,
             min_font_px: 14,
             end_fields: Some(vec![MobileResultField {
                 name: "duplicate_outcome".into(),
@@ -4357,6 +4456,7 @@ mod tests {
             control: "#other".into(),
             start_text: "Example A".into(),
             end_text: "Example B".into(),
+            reverse_text: None,
             min_font_px: 14,
             end_fields: None,
         });
@@ -4376,6 +4476,7 @@ mod tests {
                 control: control.into(),
                 start_text: start.into(),
                 end_text: end.into(),
+                reverse_text: None,
                 min_font_px: 14,
                 end_fields: None,
             });
