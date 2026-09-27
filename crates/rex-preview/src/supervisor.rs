@@ -929,6 +929,87 @@ mod tests {
         drop(guards);
     }
     #[test]
+    fn explicit_animation_wait_reaches_css_end_state_and_reports_timeout() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("animation-wait");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"), r#"<!doctype html><style>body{background:linear-gradient(#135,#753)}#scene{opacity:0;transition:opacity .35s}#scene.done{opacity:1}</style><button onclick="document.querySelector('#scene').classList.add('done')">Reveal</button><main id="scene">Final scene</main>"#).unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::WaitForAnimations { timeout_ms: 0 },
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerMove { x: 35.0, y: 15.0 },
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerDown {
+                button: crate::PointerButton::Primary,
+            },
+        )
+        .unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::PointerUp {
+                button: crate::PointerButton::Primary,
+            },
+        )
+        .unwrap();
+        // We need to see the actual transition, not an inferred source class.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut saw_running = false;
+        while std::time::Instant::now() < deadline {
+            if sup.action(
+                &started.id,
+                &BrowserAction::WaitForAnimations { timeout_ms: 0 },
+            ) == Err(PreviewError::AnimationNotSettled)
+            {
+                saw_running = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_running, "CSS transition should run after the click");
+        sup.action(
+            &started.id,
+            &BrowserAction::WaitForAnimations { timeout_ms: 2000 },
+        )
+        .unwrap();
+        let frame = sup.capture(&started.id).unwrap();
+        assert!(
+            frame.dom_text.contains("class=\"done\""),
+            "{}",
+            frame.dom_text
+        );
+        sup.cancel(&started.id).unwrap();
+    }
+
+    #[test]
+    fn animation_wait_does_not_claim_ambient_loop_is_settled() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("animation-loop");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"), r#"<!doctype html><style>body{background:linear-gradient(#135,#753)}main{animation:pulse .2s infinite alternate}@keyframes pulse{to{opacity:.7}}</style><main>Ambient scene</main>"#).unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::WaitForAnimations { timeout_ms: 200 },
+        )
+        .unwrap();
+        let frame = sup.capture(&started.id).unwrap();
+        assert!(frame.dom_text.contains("infinite"));
+        sup.cancel(&started.id).unwrap();
+    }
+
+    #[test]
     fn browser_capture_is_real_and_actions_reach_page() {
         let _port_guard = PORT_LOCK.lock().unwrap();
         let w = temp("browser");
