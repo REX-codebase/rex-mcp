@@ -1016,6 +1016,97 @@ mod tests {
     }
 
     #[test]
+    fn native_labels_and_styled_inputs_are_visible_contract_controls() {
+        let _guard = PORT_LOCK.lock().unwrap();
+        let w = temp("native-control-labels");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><style>
+          body{background:#f5efe1;color:#222;font:18px sans-serif;padding:20px}
+          input[type=radio]{position:absolute;opacity:0;width:1px;height:1px}
+          label{display:inline-block;padding:16px;border:2px solid #222}
+          .far{margin-top:800px}</style>
+          <h1>Control choices</h1><p>Choose a visible, labeled input for the example.</p>
+          <input id='energy' type='radio' name='feel'><label for='energy'>Energy</label>
+          <input id='tone' type='radio' name='tone' aria-labelledby='tone-label'>
+          <span id='tone-label'>Tone</span>
+          <input id='secret' type='radio' aria-label='Invisible'>
+          <div class='far'><input id='offscreen' type='radio'><label for='offscreen'>Below fold</label></div>
+          <input id='gone' type='radio' style='display:none'><label for='gone'>Gone</label>"#,
+        )
+        .unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.action(
+            &started.id,
+            &BrowserAction::SetViewport {
+                width: 390,
+                height: 650,
+                scale: 1.0,
+            },
+        )
+        .unwrap();
+        let fields = [
+            ("energy", "Energy"),
+            ("tone", "Tone"),
+            ("invisible", "Invisible"),
+            ("offscreen", "Below fold"),
+            ("gone", "Gone"),
+        ]
+        .map(|(name, text)| rex_protocol::MobileResultField {
+            name: name.into(),
+            alternatives: vec![text.into()],
+            kind: "control".into(),
+            match_mode: None,
+            min_font_px: Some(14),
+            region: None,
+            min_count: None,
+        });
+        let capture = sup.capture_with_fields(&started.id, &fields).unwrap();
+        eprintln!("LABEL DEBUG {:?}", capture.visible_result_fields);
+        assert_eq!(capture.visible_result_fields, vec!["energy", "tone"]);
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+
+    #[test]
+    fn arrow_key_reaches_native_range_and_tab_moves_focus() {
+        let _guard = PORT_LOCK.lock().unwrap();
+        let w = temp("native-keycodes");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(
+            app.join("index.html"),
+            r#"<!doctype html><style>body{background:#eee;color:#111;font:20px sans-serif}</style>
+          <button id='first'>First</button><input id='range' type='range' min='0' max='10' value='5'
+          oninput="document.getElementById('out').textContent=this.value"><p id='out'>5</p>"#,
+        )
+        .unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        for key in [
+            crate::SafeKey::Tab,
+            crate::SafeKey::Tab,
+            crate::SafeKey::ArrowRight,
+        ] {
+            for state in [crate::KeyState::Down, crate::KeyState::Up] {
+                sup.action(&started.id, &BrowserAction::Key { key, state })
+                    .unwrap();
+            }
+        }
+        let frame = sup.capture(&started.id).unwrap();
+        assert!(
+            frame.dom_text.contains("<p id=\"out\">6</p>"),
+            "{}",
+            frame.dom_text
+        );
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+
+    #[test]
     fn javascript_off_is_fresh_and_probe_verified() {
         let _port_guard = PORT_LOCK.lock().unwrap();
         let w = temp("javascript-off");

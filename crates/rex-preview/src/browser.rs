@@ -319,7 +319,9 @@ impl BrowserRuntime {
                 self.command("Input.dispatchMouseEvent", json!({"type":"mouseReleased","x":self.cursor_x,"y":self.cursor_y,"button":button_name(*button),"clickCount":1}))?;
             }
             BrowserAction::Key { key, state } => {
-                let mut event = json!({"type": if *state == KeyState::Down {"keyDown"} else {"keyUp"},"key":key_name(*key)});
+                let mut event = json!({"type": if *state == KeyState::Down {"keyDown"} else {"keyUp"},
+                    "key":key_name(*key),"code":key_code(*key),"windowsVirtualKeyCode":key_vk(*key),
+                    "nativeVirtualKeyCode":key_vk(*key)});
                 if *key == SafeKey::Enter && *state == KeyState::Down {
                     event["text"] = json!("\r");
                     event["unmodifiedText"] = json!("\r");
@@ -623,6 +625,16 @@ impl BrowserRuntime {
                 const hit = document.elementFromPoint(x, y);
                 return !!hit && (hit === el || el.contains(hit) || hit.contains(el));
               }};
+              const visibleLabel = el => {{
+                const range=document.createRange(); range.selectNodeContents(el);
+                const rects=[...range.getClientRects()];
+                return rects.length>0 && rects.every(r => {{
+                  if (r.width<1 || r.height<1 || r.left<0 || r.top<0 ||
+                      r.right>innerWidth || r.bottom>innerHeight) return false;
+                  const x=r.left+r.width/2,y=r.top+r.height/2,hit=document.elementFromPoint(x,y);
+                  return !!hit && (el.contains(hit) || hit.contains(el));
+                }});
+              }};
               const shown = el => {{
                 for (let n = el; n && n.nodeType === 1; n = n.parentElement) {{
                   const st = getComputedStyle(n);
@@ -632,6 +644,20 @@ impl BrowserRuntime {
                 return true;
               }};
               const controls = [...document.querySelectorAll('button,a[href],input,select,textarea,[role=button],[role=link]')];
+              const labeled = el => {{
+                const aria=el.getAttribute('aria-label');
+                if (aria) return {{text:aria, anchor:el}};
+                const ids=(el.getAttribute('aria-labelledby') || '').trim().split(/\s+/).filter(Boolean);
+                if (ids.length) {{
+                  const nodes=ids.map(id => document.getElementById(id));
+                  if (nodes.every(n => n && shown(n)))
+                    return {{text:nodes.map(n => n.innerText || n.textContent).join(' '),anchors:nodes}};
+                  return {{text:'',anchor:el}};
+                }}
+                const label=[...(el.labels || [])].find(n => shown(n));
+                if (label) return {{text:label.innerText || label.textContent,anchors:[label]}};
+                return {{text:el.innerText || el.value || '',anchor:el}};
+              }};
               const unique = new Set();
               const textNodes = [];
               const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -657,10 +683,21 @@ impl BrowserRuntime {
                 return f.alternatives.some(a => {{
                 const want = norm(a);
                 if (f.kind === 'control') {{
-                  const el = controls.find(el => !unique.has(el) && shown(el) && !el.disabled &&
-                    !el.closest('[inert]') && legible(el,f) && inside(el.getBoundingClientRect()) &&
-                    uncovered(el.getBoundingClientRect(), el) &&
-                    matches(norm(el.getAttribute('aria-label') || el.innerText || el.value), want, f));
+                  const el = controls.find(el => {{
+                    if (unique.has(el) || el.disabled || el.closest('[inert]')) return false;
+                    const {{text,anchor,anchors}}=labeled(el);
+                    const visibleAnchors=anchors || [anchor];
+                    // A styled opacity:0 input can borrow its *visible* associated label,
+                    // never its hidden aria text as visual evidence. The label must be
+                    // spatially visible and the input must not be display:none/inert.
+                    const hiddenInput=el.matches('input') && visibleAnchors.some(n=>n!==el);
+                    const style=getComputedStyle(el);
+                    if (hiddenInput && (style.display==='none' || style.visibility!=='visible' || el.hidden ||
+                        el.getAttribute('aria-hidden')==='true' || el.closest('[hidden],[aria-hidden="true"]'))) return false;
+                    return visibleAnchors.every(n => shown(n) && legible(n,f) &&
+                      (n===el ? inside(n.getBoundingClientRect()) && uncovered(n.getBoundingClientRect(),n) :
+                        visibleLabel(n))) && matches(norm(text),want,f);
+                  }});
                   if (el) unique.add(el);
                   return !!el;
                 }}
@@ -916,6 +953,30 @@ fn key_name(k: SafeKey) -> &'static str {
         SafeKey::PageUp => "PageUp",
         SafeKey::PageDown => "PageDown",
         SafeKey::Space => " ",
+    }
+}
+
+fn key_code(k: SafeKey) -> &'static str {
+    match k {
+        SafeKey::Space => "Space",
+        _ => key_name(k),
+    }
+}
+fn key_vk(k: SafeKey) -> u8 {
+    match k {
+        SafeKey::Backspace => 8,
+        SafeKey::Tab => 9,
+        SafeKey::Enter => 13,
+        SafeKey::Escape => 27,
+        SafeKey::Space => 32,
+        SafeKey::PageUp => 33,
+        SafeKey::PageDown => 34,
+        SafeKey::End => 35,
+        SafeKey::Home => 36,
+        SafeKey::ArrowLeft => 37,
+        SafeKey::ArrowUp => 38,
+        SafeKey::ArrowRight => 39,
+        SafeKey::ArrowDown => 40,
     }
 }
 
