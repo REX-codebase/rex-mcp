@@ -711,6 +711,23 @@ mod tests {
         let _ = fs::remove_dir_all(w);
     }
     #[test]
+    fn missing_local_scene_asset_cannot_be_capture_evidence() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("missing-scene");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"),"<!doctype html><style>body{background:linear-gradient(#123,#456)}</style><main>Scene not loaded</main><script src='/missing-scene.js'></script>").unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.begin_iteration(&started.id).unwrap();
+        assert_eq!(
+            sup.capture(&started.id).unwrap_err(),
+            PreviewError::BrokenPage
+        );
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+    #[test]
     fn broken_script_and_empty_body_cannot_be_capture_evidence() {
         let _port_guard = PORT_LOCK.lock().unwrap();
         let w = temp("broken-evidence");

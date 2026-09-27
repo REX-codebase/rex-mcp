@@ -383,7 +383,23 @@ impl BrowserRuntime {
             .and_then(Value::as_array)
             .map_or(0, |v| v.len() as u32);
         if self.events.iter().any(|event| {
-            event.get("method").and_then(Value::as_str) == Some("Runtime.exceptionThrown")
+            let local_resource_failed = event.get("method").and_then(Value::as_str)
+                == Some("Network.responseReceived")
+                && event
+                    .pointer("/params/response/status")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|s| s >= 400)
+                && event
+                    .pointer("/params/response/url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| {
+                        crate::validate_local_url(url, self.allowed_port).is_ok_and(|u| {
+                            u.host_str() == Some(self.allowed_host.as_str())
+                                && !u.path().ends_with("/favicon.ico")
+                        })
+                    });
+            local_resource_failed
+                || event.get("method").and_then(Value::as_str) == Some("Runtime.exceptionThrown")
                 || (event.get("method").and_then(Value::as_str) == Some("Log.entryAdded")
                     && event.pointer("/params/entry/level").and_then(Value::as_str)
                         == Some("error")
