@@ -2100,7 +2100,10 @@ mod tests {
         let phone=mcp.handle(rpc(83,"tools/call",json!({"name":"rex_preview_capture","arguments":{
             "task_id":task,"capability":cap,"lease_epoch":epoch,"preview_id":id,"kind":"render.mobile390.first"}}))).unwrap();
         assert_eq!(phone["result"]["isError"], false, "{phone}");
-        assert_eq!(phone["result"]["structuredContent"]["source_sha256"], before_source);
+        assert_eq!(
+            phone["result"]["structuredContent"]["source_sha256"],
+            before_source
+        );
         assert_eq!(
             phone["result"]["structuredContent"]["items"][0]["width"],
             390
