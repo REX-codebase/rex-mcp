@@ -117,6 +117,10 @@ struct DurableTask {
     /// Harness-registered evidence ids (tool receipts, test evidence ids).
     /// A completion claim may only cite these.
     registered_evidence: BTreeSet<String>,
+    /// Active source generation for first-party preview evidence. A new source
+    /// invalidates every earlier render binding and observation.
+    #[serde(default)]
+    preview_source_generation: Option<String>,
     /// First-party local preview frame digest -> (source snapshot, action).
     /// Host-supplied artifacts carry no snapshot and cannot satisfy this gate.
     #[serde(default)]
@@ -476,6 +480,7 @@ impl HarnessDaemon {
             proof: req.proof,
             evidence: BTreeMap::new(),
             registered_evidence: BTreeSet::new(),
+            preview_source_generation: None,
             preview_sources: BTreeMap::new(),
             preview_action_sources: BTreeMap::new(),
             visual_capture_coverage: None,
@@ -847,18 +852,30 @@ impl HarnessDaemon {
                 task_id,
             ));
         }
+        // Only the MCP first-party capture path calls this after hashing the
+        // project tree before and after the browser frame. The content-addressed
+        // PNG alone cannot distinguish a fresh capture of unchanged desktop
+        // pixels after a mobile-only edit. Start a new evidence generation and
+        // discard all earlier bindings, observations and two-state trace.
+        if t.preview_source_generation.as_deref() != Some(source_sha256) {
+            t.preview_sources.clear();
+            t.preview_action_sources.clear();
+            t.mobile_field_captures.clear();
+            t.desktop_field_captures.clear();
+            t.state_trace = None;
+            t.preview_source_generation = Some(source_sha256.into());
+        }
         if let Some((prior, prior_action)) = t.preview_sources.get(digest) {
             if prior != source_sha256 {
                 return Err(perr(
                     ErrorCode::IdempotencyConflict,
-                    "identical preview PNG was already bound to a different source revision; the digest alone cannot distinguish captures. Screenshot exports or videos saved inside the preview project can cause this even when UI pixels stay identical: keep review outputs outside that project. Do not change the UI merely to force new pixels or reuse this capture as current-source proof. Start a fresh task for this revision, then recapture its evidence",
+                    "preview binding conflicts with the current source generation",
                     task_id,
                 ));
             }
             if prior_action != &action {
-                // The current action MUST capture it again: bind_preview_source
-                // is only reached from rex_preview_capture. We do not carry an
-                // earlier action's evidence forward or accept a host upload.
+                // A fresh first-party capture under this action may reuse the
+                // immutable PNG bytes, but an old artifact ID cannot mint it.
                 t.preview_action_sources
                     .entry(action.clone())
                     .or_default()
@@ -4833,42 +4850,42 @@ mod tests {
                 .unwrap();
             evidence.insert((*key).into(), artifact.sha256);
         }
-        // Byte-identical pixels on another source revision cannot be rebound:
-        // a recapture of the same PNG digest has no per-capture identity here.
+        // A fresh first-party recapture may bind identical desktop bytes to
+        // the new source. All other old slots are invalidated, not carried.
         let stable_digest = evidence["render.desktop.first"].clone();
-        let collision = daemon.bind_preview_source(
-            &ex.task_id,
-            &cap_of(&ex),
-            ex.lease.epoch,
-            &stable_digest,
-            &"b".repeat(64),
-        );
-        let collision = collision.unwrap_err();
-        assert_eq!(collision.code, ErrorCode::IdempotencyConflict);
-        assert!(collision.message.contains("Start a fresh task"));
-        assert!(collision.message.contains("Do not change the UI"));
-        assert!(collision.message.contains("outside that project"));
-        let still_bound = daemon.load(&ex.task_id).unwrap();
+        daemon
+            .bind_preview_source(
+                &ex.task_id,
+                &cap_of(&ex),
+                ex.lease.epoch,
+                &stable_digest,
+                &"b".repeat(64),
+            )
+            .unwrap();
+        let rebound = daemon.load(&ex.task_id).unwrap();
+        assert!(rebound.mobile_field_captures.is_empty());
+        assert!(rebound.desktop_field_captures.is_empty());
+        assert!(rebound.state_trace.is_none());
+        assert_eq!(rebound.preview_source_generation, Some("b".repeat(64)));
+        assert_eq!(rebound.preview_sources.len(), 1);
         assert_eq!(
-            still_bound.preview_sources[&stable_digest],
-            ("a".repeat(64), action_id.clone())
+            rebound.preview_sources[&stable_digest],
+            ("b".repeat(64), action_id.clone())
         );
-        // The five other frames are from one source; a later source edit
-        // cannot be laundered by uploading the earlier desktop PNG again.
-        let changed_digest = evidence["render.state.end"].clone();
-        let mut t = daemon.load(&ex.task_id).unwrap();
-        t.preview_sources
-            .insert(changed_digest.clone(), ("b".repeat(64), action_id.clone()));
-        daemon.persist(&t).unwrap();
-        let mixed = daemon.submit(submission(evidence.clone())).unwrap();
-        assert!(!mixed.accepted);
-        let mixed_repair = mixed.repair.unwrap();
-        assert!(mixed_repair.contains("mixed preview source revisions"));
-        assert!(mixed_repair.contains("outside the preview project directory"));
-        let mut t = daemon.load(&ex.task_id).unwrap();
-        t.preview_sources
-            .insert(changed_digest, ("a".repeat(64), action_id.clone()));
-        daemon.persist(&t).unwrap();
+        let missing = daemon.submit(submission(evidence.clone())).unwrap();
+        assert!(!missing.accepted);
+        assert!(missing.repair.unwrap().contains("recapture"));
+        for digest in keys.iter().map(|key| &evidence[*key]) {
+            daemon
+                .bind_preview_source(
+                    &ex.task_id,
+                    &cap_of(&ex),
+                    ex.lease.epoch,
+                    digest,
+                    &"b".repeat(64),
+                )
+                .unwrap();
+        }
         let outcome = daemon.submit(submission(evidence)).unwrap();
         assert!(outcome.accepted, "{:?}", outcome.repair);
         let summary = outcome.visual_capture_coverage.unwrap();
@@ -4978,8 +4995,9 @@ mod tests {
         let reused = daemon.submit(second()).unwrap();
         assert!(!reused.accepted);
         assert!(reused.repair.unwrap().contains("another action"));
-        // A changed source may not be laundered by re-capturing identical bytes.
-        let collision = daemon
+        // A new revision invalidates old action bindings. An old artifact ID
+        // in submit alone cannot transfer it; each slot needs a fresh capture.
+        daemon
             .bind_preview_source(
                 &task,
                 &cap,
@@ -4987,22 +5005,18 @@ mod tests {
                 &evidence["render.desktop.first"],
                 &"b".repeat(64),
             )
-            .unwrap_err();
-        assert_eq!(collision.code, ErrorCode::IdempotencyConflict);
-        assert!(!daemon
-            .load(&task)
-            .unwrap()
-            .preview_action_sources
-            .contains_key(&second_action));
-        // Merely reusing the same digest in rex_submit cannot transfer a binding.
-        // Each byte-identical PNG must be captured again under this action.
-        for digest in evidence.values() {
+            .unwrap();
+        let revised = daemon.submit(second()).unwrap();
+        assert!(!revised.accepted);
+        assert!(revised.repair.unwrap().contains("recapture"));
+        for digest in keys.iter().map(|key| &evidence[*key]) {
             daemon
-                .bind_preview_source(&task, &cap, epoch, digest, &"a".repeat(64))
+                .bind_preview_source(&task, &cap, epoch, digest, &"b".repeat(64))
                 .unwrap();
         }
         let rebound = daemon.load(&task).unwrap();
-        assert_eq!(rebound.preview_action_sources[&second_action].len(), 6);
+        assert_eq!(rebound.preview_sources.len(), 6);
+        assert!(!rebound.preview_action_sources.contains_key(&second_action));
         let accepted = daemon.submit(second()).unwrap();
         assert!(accepted.accepted, "{:?}", accepted.repair);
         assert_eq!(accepted.state, TaskState::Completed);
