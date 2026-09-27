@@ -25,6 +25,9 @@ pub struct BrowserEvidence {
     pub accessibility_text: String,
     /// Canonical hash of the captured project's supported local source tree.
     pub source_sha256: String,
+    /// First-party computed visibility in this local capture viewport.
+    #[serde(default)]
+    pub visible_result_fields: Vec<String>,
 }
 
 pub struct BrowserRuntime {
@@ -432,7 +435,11 @@ impl BrowserRuntime {
         Ok(())
     }
 
-    pub fn capture(&mut self, base_url: &str) -> Result<BrowserEvidence, PreviewError> {
+    pub fn capture(
+        &mut self,
+        base_url: &str,
+        fields: &[rex_protocol::MobileResultField],
+    ) -> Result<BrowserEvidence, PreviewError> {
         // Page controls can navigate without going through rex_preview_action.
         // A capture must not register pixels from an escaped preview origin.
         let base = url::Url::parse(base_url).map_err(|_| PreviewError::UrlDenied)?;
@@ -510,6 +517,84 @@ impl BrowserRuntime {
         {
             return Err(PreviewError::BrokenPage);
         }
+        let visible_result_fields = if fields.is_empty() {
+            Vec::new()
+        } else {
+            let scroll = self.command("Runtime.evaluate", json!({
+                "expression":"Math.max(window.scrollY, document.scrollingElement?.scrollTop || 0)",
+                "returnByValue":true
+            }))?;
+            if scroll
+                .pointer("/result/result/value")
+                .and_then(Value::as_f64)
+                .is_none_or(|y| y.abs() > 2.0)
+            {
+                return Err(PreviewError::EvidenceLimit);
+            }
+            // Evaluate in the same live preview session, using client geometry,
+            // not serialized DOM text. This still cannot prove semantic truth
+            // or a spatial relationship between illustration and words.
+            let serialized =
+                serde_json::to_string(fields).map_err(|_| PreviewError::EvidenceLimit)?;
+            let expression = format!(
+                r#"(() => {{
+              const fields = {serialized};
+              const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              const inside = r => r && r.width >= 8 && r.height >= 8 &&
+                r.left >= 0 && r.top >= 0 && r.right <= innerWidth && r.bottom <= innerHeight;
+              const uncovered = (r, el) => {{
+                const x = r.left + r.width / 2, y = r.top + r.height / 2;
+                const hit = document.elementFromPoint(x, y);
+                return !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+              }};
+              const shown = el => {{
+                for (let n = el; n && n.nodeType === 1; n = n.parentElement) {{
+                  const st = getComputedStyle(n);
+                  if (st.display === 'none' || st.visibility !== 'visible' ||
+                      Number(st.opacity) < 0.05 || n.hidden || n.getAttribute('aria-hidden') === 'true') return false;
+                }}
+                return true;
+              }};
+              const controls = [...document.querySelectorAll('button,a[href],input,select,textarea,[role=button],[role=link]')];
+              const unique = new Set();
+              const textNodes = [];
+              const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+              while (walk.nextNode() && textNodes.length < 10000) {{
+                if (walk.currentNode.nodeValue.trim()) textNodes.push(walk.currentNode);
+              }}
+              return fields.filter(f => f.alternatives.some(a => {{
+                const want = norm(a);
+                if (f.kind === 'control') {{
+                  const el = controls.find(el => !unique.has(el) && shown(el) && !el.disabled &&
+                    !el.closest('[inert]') && inside(el.getBoundingClientRect()) &&
+                    uncovered(el.getBoundingClientRect(), el) &&
+                    norm(el.getAttribute('aria-label') || el.innerText || el.value) === want);
+                  if (el) unique.add(el);
+                  return !!el;
+                }}
+                const node = textNodes.find(node => {{
+                  if (unique.has(node) || !shown(node.parentElement) || norm(node.nodeValue) !== want) return false;
+                  const range = document.createRange(); range.selectNodeContents(node);
+                  const rects = [...range.getClientRects()];
+                  return rects.length > 0 && rects.every(r => inside(r) && uncovered(r, node.parentElement));
+                }});
+                if (node) unique.add(node);
+                return !!node;
+              }})).map(f => f.name);
+            }})()"#
+            );
+            let result = self.command(
+                "Runtime.evaluate",
+                json!({"expression":expression,"returnByValue":true}),
+            )?;
+            serde_json::from_value(
+                result
+                    .pointer("/result/result/value")
+                    .cloned()
+                    .ok_or(PreviewError::EvidenceLimit)?,
+            )
+            .map_err(|_| PreviewError::EvidenceLimit)?
+        };
         let dom_hash = format!("{:x}", Sha256::digest(dom_text.as_bytes()));
         let ax = self.command("Accessibility.getFullAXTree", json!({}))?;
         let accessibility_text =
@@ -624,6 +709,7 @@ impl BrowserRuntime {
             dom_text,
             accessibility_text,
             source_sha256: String::new(), // supervisor binds a source tree around this capture
+            visible_result_fields,
         })
     }
 }

@@ -235,12 +235,26 @@ pub struct ActionSpec {
     pub max_wall_ms: u64,
 }
 
+/// Creator-supplied, frozen, literal mobile first-view assertions. This is not
+/// an AI interpretation of the brief or proof of spatial/semantic correctness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileResultField {
+    pub name: String,
+    /// Literal visible text, or one of the literal alternatives.
+    pub alternatives: Vec<String>,
+    /// `text` or `control` (button/link/form control).
+    pub kind: String,
+}
+
 /// rex_execute request: create or resume one durable task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     /// Idempotency key. Same key + same task text resumes the same task.
     pub request_id: String,
     pub task: String,
+    /// Optional execute-time acceptance fields frozen before any builder action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mobile_result_fields: Option<Vec<MobileResultField>>,
     /// Optional explicit task id for resume-by-id from a fresh session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -310,6 +324,9 @@ pub struct ExecuteResponse {
     pub task_capability: Option<String>,
     pub next: Option<ActionSpec>,
     pub lease: LeaseView,
+    /// Frozen creator contract, returned so builders cannot silently omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mobile_result_fields: Option<Vec<MobileResultField>>,
     /// The Fable completion discipline every operator must honor. Host
     /// agents never see REX's system prompt, so the rules travel here.
     /// Added in protocol 1.0; absent means a pre-discipline daemon.
@@ -508,6 +525,8 @@ pub struct StatusResponse {
     pub host: HostKind,
     pub lease: LeaseView,
     pub open_action: Option<ActionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mobile_result_fields: Option<Vec<MobileResultField>>,
     pub budgets: BudgetView,
     pub last_event_seq: u64,
     /// Latest accepted Standard visual action only; none before a visual submission.
