@@ -1892,8 +1892,8 @@ mod tests {
         assert!(design_text.contains("reversible prior-draft route"));
         assert!(design_text.contains("A timed-out write has unknown outcome"));
         assert!(design_text.contains("For a continuous visual control"));
-        assert!(design_text.contains("Responsive geometry drift"));
-        assert!(design_text.contains("Dogfood the REX MCP itself"));
+        assert!(design_text.contains("viewport-invariant focal and dependent geometry"));
+        assert!(design_text.contains("Dogfood this MCP"));
         assert!(design_text.contains("For long-running ambient Visual motion"));
         assert!(design_text.contains("For type-led Visual work"));
         assert!(design_text.contains("When a design runs embedded"));
