@@ -128,6 +128,18 @@ impl McpServer {
         let (task_id, cap, epoch) = self.scoped(&args)?;
         self.daemon.require_critique_issued(&task_id, &cap, epoch)?;
         let id = self.preview_id(&args, &task_id)?;
+        if args
+            .get("action")
+            .and_then(|v| v.as_object())
+            .is_some_and(|m| {
+                m.get("kind").and_then(Value::as_str) == Some("navigate") && m.contains_key("url")
+            })
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::MalformedRequest,
+                "navigate uses action.path (a slash-prefixed local path), not url",
+            ));
+        }
         let action: BrowserAction =
             serde_json::from_value(args.get("action").cloned().ok_or_else(|| {
                 ProtocolError::new(ErrorCode::MalformedRequest, "action required")
@@ -150,6 +162,17 @@ impl McpServer {
                 .require_state_start(&task_id, &cap, epoch, &id)?;
         }
         self.previews.action(&id, &action).map_err(preview_error)?;
+        if matches!(
+            action,
+            BrowserAction::PointerUp { .. }
+                | BrowserAction::Key {
+                    state: rex_preview::KeyState::Up,
+                    ..
+                }
+        ) {
+            self.daemon
+                .record_reverse_input(&task_id, &cap, epoch, &id)?;
+        }
         if matches!(action, BrowserAction::ActivateControl { .. }) {
             self.daemon.record_state_step(
                 &task_id,
@@ -190,11 +213,28 @@ impl McpServer {
             Some("start")
         } else if state_contract.is_some() && kind == "render.state.end" {
             Some("end")
+        } else if state_contract
+            .as_ref()
+            .is_some_and(|c| c.reverse_text.is_some())
+            && kind == "render.state.reverse"
+        {
+            Some("reverse")
         } else {
             None
         };
         let contract = if let (Some(c), Some(_step)) = (&state_contract, state_step) {
-            let mut fields = [("start", &c.start_text), ("end", &c.end_text)]
+            let named = if state_step == Some("reverse") {
+                vec![
+                    (
+                        "reverse",
+                        c.reverse_text.as_ref().expect("reverse contract"),
+                    ),
+                    ("end", &c.end_text),
+                ]
+            } else {
+                vec![("start", &c.start_text), ("end", &c.end_text)]
+            };
+            let mut fields = named
                 .into_iter()
                 .map(|(name, text)| rex_protocol::MobileResultField {
                     name: format!("state_{name}"),
@@ -1200,9 +1240,9 @@ pub fn tool_descriptors() -> Vec<Value> {
     let mut out = Vec::new();
     for t in ToolName::all() {
         let (description, mut schema) = match t {
-            ToolName::Execute => ("Start or resume a durable REX task; plan and optional creator-supplied first-view and two_state_contract assertions are frozen at creation. two_state_contract.end_fields requires field objects {name,kind:'text',alternatives:[literal],match_mode?,min_font_px?}, not a string array; end_text itself already checks that outcome. For Standard visual tasks, fields are checked against first-party exact-viewport captures; this does not prove semantic or spatial truth.", json!({
+            ToolName::Execute => ("Start or resume a durable REX task; plan and optional creator-supplied first-view and two_state_contract assertions are frozen at creation. two_state_contract.reverse_text optionally freezes a visible post-reversal literal and requires a real input after end; two_state_contract.end_fields requires field objects {name,kind:'text',alternatives:[literal],match_mode?,min_font_px?}, not a string array; end_text itself already checks that outcome. For Standard visual tasks, fields are checked against first-party exact-viewport captures; this does not prove semantic or spatial truth.", json!({
                 "type":"object","required":["request_id","task","host","operator_is_agent"],
-                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string","minLength":1},"mobile_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"two_state_contract":{"type":"object","required":["viewport","control","start_text","end_text","min_font_px"],"properties":{"viewport":{"enum":["mobile390","desktop"]},"control":{"type":"string"},"start_text":{"type":"string"},"end_text":{"type":"string"},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"end_fields":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"const":"text"},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32}},"additionalProperties":false}}},"additionalProperties":false},"desktop_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"recovery_key":{"type":"string","pattern":"^rrk-[a-fA-F0-9]{64}$"},"follow_up":{"type":"string"},
+                "properties":{"request_id":{"type":"string","minLength":1,"maxLength":200},"task":{"type":"string","minLength":1},"mobile_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"two_state_contract":{"type":"object","required":["viewport","control","start_text","end_text","min_font_px"],"properties":{"viewport":{"enum":["mobile390","desktop"]},"control":{"type":"string"},"start_text":{"type":"string"},"end_text":{"type":"string"},"reverse_text":{"type":"string"},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"end_fields":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"const":"text"},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32}},"additionalProperties":false}}},"additionalProperties":false},"desktop_result_fields":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","required":["name","alternatives","kind"],"properties":{"name":{"type":"string"},"alternatives":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}},"kind":{"enum":["text","control","list_count"]},"match_mode":{"enum":["exact","contains"]},"min_font_px":{"type":"integer","minimum":8,"maximum":32},"region":{"type":"string"},"min_count":{"type":"integer","minimum":2,"maximum":12}},"additionalProperties":false}},"task_id":task_id_schema(),"resume_handle":{"type":"string"},"recovery_key":{"type":"string","pattern":"^rrk-[a-fA-F0-9]{64}$"},"follow_up":{"type":"string"},
                 "host":{"enum":["human","claude_code","codex","open_code","hermes","antigravity","generic_agent"]},"operator_is_agent":{"type":"boolean"},"ultra":{"type":"boolean"},
                 "budgets":{"type":"object"},"proof":{"type":"string"},"plan":{"type":"array","items":{"type":"object","required":["instructions"],"properties":{"instructions":{"type":"string"},"acceptance":{"type":"string"}}}}},"additionalProperties":false})),
             ToolName::Next => ("Heartbeat and get the currently open action.", task_epoch_schema()),
@@ -1331,7 +1371,7 @@ fn preview_descriptors() -> Vec<Value> {
         json!({"name":"rex_critique_prompt","description":"MANDATORY before any check: receive the action-bound hardest-possible critique challenge. It invalidates an earlier critique for this action.","inputSchema":task_epoch_schema()}),
         json!({"name":"rex_critique_record","description":"Record concrete skeptical findings for the current action after requesting the challenge. REX requires this before checking or acceptance; prose cannot prove honesty.","inputSchema":extend(task_epoch_schema(),json!({"action_id":{"type":"string"},"findings":{"type":"string","minLength":80}}), &["action_id","findings"])}),
         json!({"name":"rex_preview_start","description":"Start a task-scoped local preview. Static HTML and supported app frameworks use an isolated loopback server; interaction/capture uses local headless Chrome, not the user's browser.","inputSchema":extend(task_epoch_schema(),json!({"project_dir":{"type":"string"}}),&["project_dir"])}),
-        json!({"name":"rex_preview_action","description":"Interact with the local preview after an action-bound critique: pointer, activate_control only for the creator-frozen two_state_contract selector after its start capture, key, text, scroll, explicit bounded wait_for_animations, navigation, viewport, reduced-motion media override or a fresh-navigation JavaScript-off condition. Re-enable after an off capture requires a fresh preview.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"action":{"type":"object"}}),&["preview_id","action"])}),
+        json!({"name":"rex_preview_action","description":"Interact with the local preview after an action-bound critique: pointer, activate_control only for the creator-frozen two_state_contract selector after its start capture, key, text, scroll, explicit bounded wait_for_animations, navigation with action.path (not url), viewport, reduced-motion media override or a fresh-navigation JavaScript-off condition. Re-enable after an off capture requires a fresh preview.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"action":{"type":"object"}}),&["preview_id","action"])}),
         json!({"name":"rex_preview_capture","description":"Capture REX-owned headless-Chrome pixels and DOM/AX evidence, bound as an immutable task artifact. Contracted mobile/desktop results require exact 390x650/1280x800 and report visible_result_fields; inspect PNG pixels because this is not a semantic or spatial-truth verdict. Capture after the critique challenge and record.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"},"kind":{"enum":["render.desktop.first","render.mobile390.first","render.state.start","render.state.mid","render.state.end","render.state.reverse"]}}),&["preview_id","kind"])}),
         json!({"name":"rex_preview_stop","description":"Stop and clean up this task's local preview process tree.","inputSchema":extend(task_epoch_schema(),json!({"preview_id":{"type":"string"}}),&["preview_id"])}),
     ]
@@ -2272,7 +2312,7 @@ mod tests {
         std::fs::write(app.join("index.html"),r#"<!doctype html><style>
           body{background:#f4efe4;color:#222;font:20px sans-serif;margin:20px}
           button{font:inherit;padding:12px}</style>
-          <p id='result'>Example A</p><p id='order'></p><button id='change' onclick="document.getElementById('result').textContent='Example B'; setTimeout(() => document.getElementById('order').textContent='Order unchanged', 150)">Change example</button>"#).unwrap();
+          <p id='result'>Example A</p><p id='order'></p><button id='change' onclick="document.getElementById('result').textContent='Example B'; setTimeout(() => document.getElementById('order').textContent='Order unchanged', 150)">Change example</button><button id='reset' onclick="document.getElementById('result').textContent='Example A'">Reset</button>"#).unwrap();
         mcp.handle(rpc(
             1,
             "initialize",
@@ -2282,7 +2322,7 @@ mod tests {
         let started=mcp.handle(rpc(2,"tools/call",json!({"name":"rex_execute","arguments":{
             "request_id":"two-state-mcp","task":"Build a landing page","host":"generic_agent",
             "operator_is_agent":true,"two_state_contract":{"viewport":"mobile390","control":"#change",
-                "start_text":"Example A","end_text":"Example B","min_font_px":14,
+                "start_text":"Example A","end_text":"Example B","reverse_text":"Example A","min_font_px":14,
                 "end_fields":[{"name":"review_result","kind":"text","alternatives":["Order unchanged"],"min_font_px":14}]}
         }}))).unwrap();
         assert_eq!(started["result"]["isError"], false, "{started}");
@@ -2404,6 +2444,56 @@ mod tests {
             .unwrap()
             .iter()
             .any(|name| name == "review_result"));
+        let reverse_without_input = call(
+            &mut mcp,
+            120,
+            "rex_preview_capture",
+            json!({"kind":"render.state.reverse"}),
+        );
+        assert_eq!(reverse_without_input["result"]["isError"], true);
+        assert!(
+            reverse_without_input
+                .to_string()
+                .contains("opposite state's literal")
+                || reverse_without_input.to_string().contains("reverse")
+        );
+        // The creator-named click leaves focus on Change; Tab reaches Reset.
+        let tab = call(
+            &mut mcp,
+            121,
+            "rex_preview_action",
+            json!({"action":{"kind":"key","key":"Tab","state":"down"}}),
+        );
+        assert_eq!(tab["result"]["isError"], false, "{tab}");
+        let tab_up = call(
+            &mut mcp,
+            122,
+            "rex_preview_action",
+            json!({"action":{"kind":"key","key":"Tab","state":"up"}}),
+        );
+        assert_eq!(tab_up["result"]["isError"], false, "{tab_up}");
+        let enter = call(
+            &mut mcp,
+            123,
+            "rex_preview_action",
+            json!({"action":{"kind":"key","key":"Enter","state":"down"}}),
+        );
+        assert_eq!(enter["result"]["isError"], false, "{enter}");
+        let enter_up = call(
+            &mut mcp,
+            124,
+            "rex_preview_action",
+            json!({"action":{"kind":"key","key":"Enter","state":"up"}}),
+        );
+        assert_eq!(enter_up["result"]["isError"], false, "{enter_up}");
+        let reversed = call(
+            &mut mcp,
+            128,
+            "rex_preview_capture",
+            json!({"kind":"render.state.reverse"}),
+        );
+        assert_eq!(reversed["result"]["isError"], false, "{reversed}");
+        assert_ne!(reversed["result"]["structuredContent"]["sha256"], end_hash);
         // The creator named this control: an arbitrary real click elsewhere cannot complete the trace.
         let stored = mcp
             .daemon
@@ -2425,7 +2515,17 @@ mod tests {
             .filter(|e| e.kind == "two_state_step")
             .map(|e| e.detail["kind"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(kinds, ["start", "activate", "end"]);
+        assert_eq!(kinds, ["start", "activate", "end", "reverse"]);
+        let bad_navigation = call(
+            &mut mcp,
+            13,
+            "rex_preview_action",
+            json!({"action":{"kind":"navigate","url":"/"}}),
+        );
+        assert!(
+            bad_navigation.to_string().contains("action.path"),
+            "{bad_navigation}"
+        );
     }
 
     #[test]

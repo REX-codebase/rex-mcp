@@ -270,6 +270,9 @@ pub struct TwoStateContract {
     pub start_text: String,
     /// A different visible exact text node after activation.
     pub end_text: String,
+    /// Optional creator-frozen visible text after a real reverse input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse_text: Option<String>,
     /// CSS-pixel size floor for both result nodes.
     pub min_font_px: u8,
     /// Optional creator-frozen visible facts for the settled end capture.
