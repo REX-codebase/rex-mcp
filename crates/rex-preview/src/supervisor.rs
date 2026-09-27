@@ -711,6 +711,37 @@ mod tests {
         let _ = fs::remove_dir_all(w);
     }
     #[test]
+    fn javascript_off_is_fresh_and_probe_verified() {
+        let _port_guard = PORT_LOCK.lock().unwrap();
+        let w = temp("javascript-off");
+        let app = w.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("index.html"), r#"<!doctype html><style>body{background:linear-gradient(#123,#678)}</style><main id='scene'>Script-off fallback</main><script>document.querySelector('#scene').textContent='Script ran'</script>"#).unwrap();
+        let sup = PreviewSupervisor::new(&w).unwrap();
+        let started = sup.start(Path::new("app")).unwrap();
+        sup.begin_iteration(&started.id).unwrap();
+        assert!(sup
+            .capture(&started.id)
+            .unwrap()
+            .dom_text
+            .contains("Script ran"));
+        sup.action(
+            &started.id,
+            &BrowserAction::SetJavaScript { enabled: false },
+        )
+        .unwrap();
+        let off = sup.capture(&started.id).unwrap();
+        assert!(off.dom_text.contains("Script-off fallback"));
+        assert!(!off.accessibility_text.contains("Script ran"));
+        assert_eq!(
+            sup.action(&started.id, &BrowserAction::SetJavaScript { enabled: true })
+                .unwrap_err(),
+            PreviewError::ConditionNotApplied
+        );
+        sup.cancel(&started.id).unwrap();
+        let _ = fs::remove_dir_all(w);
+    }
+    #[test]
     fn missing_local_scene_asset_cannot_be_capture_evidence() {
         let _port_guard = PORT_LOCK.lock().unwrap();
         let w = temp("missing-scene");
