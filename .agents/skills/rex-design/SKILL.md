@@ -1,6 +1,6 @@
 ---
 name: rex-design
-description: Design and improve user interfaces, including landing pages, dashboards, tables, forms, and multi-step flows. Use for UI design, redesign, implementation, and visual review.
+description: Design, redesign, implement, and visually review user interfaces, including art-directed Visual experiences and dependable Production workflows. Use for landing pages, dashboards, tables, forms, multi-step flows, or any UI task where hierarchy, interaction, responsiveness, or visual quality matters.
 ---
 
 # REX Design
@@ -12,6 +12,17 @@ Choose the right job for the prompt before designing. Visual mode makes a distin
 Read the full prompt and identify its *intended outcome*, not just a keyword. Choose one mode before writing code and state the reason in the review record. Explicit audience, functional constraints, and real product requirements override a generic request for polish. If the brief names a launch, campaign, portfolio, editorial story, showcase, striking hero, art direction, cinematic motion, or a visually ambitious concept, choose **Visual** even when it also says "page" or "dashboard". If the brief asks people to complete a real workflow, inspect data, configure a product, recover from errors, or use a page in production, choose **Production** even if it asks to look good. A request can be ambitious because of its business scope or number of features without being visually ambitious: do not route it to Visual for size alone. When both are present, preserve hard functional requirements, then use Visual only if visual impact is explicitly the primary success criterion; otherwise use Production. If neither is clear, default to Production and record the assumption. Ask only if a wrong choice changes the purpose or audience and the prompt cannot resolve it.
 
 Visual is not a shortcut around production basics, and Production is not a ban on original art direction. Mode changes where design effort and review attention concentrate, not whether accessibility and honest state behavior matter. Do not call a mode a quality rating.
+
+## Fast execution path
+
+Use this as a route through the detailed guidance, not as another checklist or a requirement to create duplicate artifacts. Keep one concise review record; select the gates that fit the task, and mark untested states honestly.
+
+1. **Frame the brief:** identify the audience, task or intended experience, constraints, supplied evidence, unknowns, and next action. Inspect existing routes, assets, tokens, and working flows before proposing a redesign. See [Brief and audit](#brief-and-audit).
+2. **Choose a mode:** select Visual or Production from the person's primary success criterion and record why; do not infer mode from page size or the word “polish.”
+3. **Prove the concept before code:** compare two structurally different ideas using the same truthful content at desktop and a host-framed 390×650 crop. Name the useful payoff and compare the survivor with a plain, well-typeset baseline. Use the [pre-build concept gate](#pre-build-concept-gate) and the result-contract check in [landing-page craft](#landing-page-craft-from-observed-pages) when the brief promises choices or outcomes.
+4. **Plan only relevant behavior:** map the promised interaction and recovery states; if the experience is static, do not add controls for novelty. Choose the appropriate [Visual](#visual-mode-an-art-directed-experience) or [Production](#production-mode-dependable-pages) guidance and apply relevant items from [failure classes](#failure-classes-to-test-before-polishing), rather than trying to satisfy every example.
+5. **Build and inspect the delivered experience:** implement only claims and behavior supported by the brief or clearly labeled authored examples. Render the real host frame at relevant widths and settled states; exercise the primary path plus applicable divergent, failure, keyboard, and reduced-motion states. Compare pixels, not just source code or capture counts.
+6. **Handoff evidence, not confidence:** report the direction and tradeoff, changed files, rendered paths/states actually checked, and remaining assumptions or defects. Distinguish observed behavior from anything inferred or untested; see [Evidence and review](#evidence-and-review) and [Handoff](#handoff).
 
 ## Landing-page craft from observed pages
 
