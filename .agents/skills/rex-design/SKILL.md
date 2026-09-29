@@ -152,6 +152,8 @@ Compare two treatments only for a greenfield or major redesign, or a focal CTA. 
 
 Give icon-only buttons accessible names. Make disabled and loading states reflect real behavior and semantics, not decoration. Verify keyboard focus-visible, hover, pressed, and relevant disabled/loading states, plus adequate target size and spacing at narrow touch widths.
 
+Use buttons for actions and links for navigation. Label each button with its action and outcome; for destructive actions, name the affected item and consequence in text—never rely on color alone.
+
 ## State coverage ledger
 
 Before coding, make a short ledger with one row per consequential state. Use these columns: user intent, entry point, data condition, visible feedback, next action, narrow-screen behavior, and proof. At minimum cover first use, normal use, no results, invalid input, failure, and a long or crowded case where they apply. Mark a state not applicable only with a reason. This is a planning aid, not a checklist that substitutes for examining the product.
