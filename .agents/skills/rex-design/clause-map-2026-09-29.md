@@ -1,9 +1,9 @@
-# Clause-to-clause preservation map: rex-design rework (pass 4)
+# Clause-to-clause preservation map: rex-design rework (pass 5)
 
 **Base:** `REX-codebase/rex-mcp` main @ `7616c7b0c79017e83cb2c2d20d430f83b82685c2` (`.agents/skills/rex-design/SKILL.md` 193 content lines / 12,273 words; `references/visual-review-cases.md` 40 content lines / 2,309 words).
-**Counting convention (reconciles the pass-1 41/42/43 confusion):** "content lines" exclude the repository's trailing blank line; every committed markdown file carries that blank, so `wc -l` = content + 1. Base VRC = 41 by `wc -l` / 40 content; pass-1 VRC = 42 / 41; pass-2 VRC = 79 / 78; pass-3 VRC = 82 / 81; pass-4 VRC = 84 / 83. Base SKILL = 194 / 193; pass-1 through pass-4 SKILL = 210 / 209.
-**Result (pass 4):** SKILL.md 209 content lines / 12,088 words; visual-review-cases.md 83 content lines / 4,375 words.
-**Method:** the pass-1 map was completed before prose cuts. Pass 2, pass 3 and pass 4 implement successive Critic + Red Team NO-MERGE findings; every finding maps to an edit in the change logs below. Status: kept = verbatim or near-verbatim; clarified = same requirement, wording improved; merged = combined with an overlapping clause, all requirements retained; moved = relocated, text intact; strengthened = trigger/evidence/exception made stricter; added = new clause; restored = base clause that pass 1 silently dropped, put back in pass 2.
+**Counting convention (reconciles the pass-1 41/42/43 confusion):** "content lines" exclude the repository's trailing blank line; every committed markdown file carries that blank, so `wc -l` = content + 1. Base VRC = 41 by `wc -l` / 40 content; pass-1 VRC = 42 / 41; pass-2 VRC = 79 / 78; pass-3 VRC = 82 / 81; pass-4 and pass-5 VRC = 84 / 83. Base SKILL = 194 / 193; pass-1 through pass-5 SKILL = 210 / 209.
+**Result (pass 5):** SKILL.md 209 content lines / 12,352 words; visual-review-cases.md 83 content lines / 4,375 words (unchanged in pass 5).
+**Method:** the pass-1 map was completed before prose cuts. Pass 2, pass 3 and pass 4 implement successive Critic + Red Team NO-MERGE findings; pass 5 implements the blind-validation and USGS-reviewer defect list; every finding maps to an edit in the change logs below. Status: kept = verbatim or near-verbatim; clarified = same requirement, wording improved; merged = combined with an overlapping clause, all requirements retained; moved = relocated, text intact; strengthened = trigger/evidence/exception made stricter; added = new clause; restored = base clause that pass 1 silently dropped, put back in pass 2.
 
 ## Pass-2 change log (review finding -> edit)
 
@@ -44,6 +44,23 @@
 | Critic 1 (HIGH) | B's record trigger now includes the full-gate material triggers verbatim - "a material change to the first-view organizing idea, the primary task hierarchy, or the promised outcome - the same changes that force the full concept gate" - so a material change can no longer force the full gate (L22/63/177) while skipping the B record | SKILL L31 |
 | Critic 2 (MED) | The result-contract heading is closed before the dogfooding paragraph; the six general cases (dogfooding, landing hero, causal behavior, continuous controls, responsive/fallback, compact regression) now sit under their own heading "### Composition, behavior, and resilience cases", so match-only loading of the result-contract section no longer swallows them | VRC L35 (new heading); former L35-45 shift to L37-47 |
 | Critic 3 (LOW) | The fragment-count parenthesis now lists exactly which 8 of the 16 opener-bearing sentences were folded into case names; the other 8 stand verbatim or after normalization only (see Checks) | this file, Checks |
+
+
+## Pass-5 change log (blind validation + USGS reviewer defects -> edits)
+
+Pass 5 adds guidance only; no existing clause was weakened or removed, and the sections the blind validation scored as wins (art direction, drawn illustrative sequences, task recovery, data semantics, custody depth) were not touched.
+
+| Finding | Edit | Where |
+|---|---|---|
+| Pico loss: tall product photo squeezed beside text on phone (imagery 5.8, responsive 5.8) | Tall imagery goes full width above or below its text at phone widths, never a narrow side column; crop and orientation chosen per breakpoint, rendered crop inspected at each declared width | SKILL L187 (Image semantics and delivery) |
+| Pico loss: 768 host width fell into the phone layout | Breakpoints derived from the content column inside the actual host shell (padding, sidebars, chrome), never the raw window width | SKILL L189 (Implement and verify) |
+| Chips/table cells wrap to two lines at desktop widths incl. 1920; USGS: "Clear filter"-style button labels must not wrap | Status chips, badges, button labels and table cells hold content on one line at every declared width up to the widest; deliberate truncation with accessible full text instead of mid-label wrapping | SKILL L120 (Production mode) |
+| Code/JSON wraps mid-token at 320 | Code, JSON and long identifiers scroll horizontally at narrow widths; wrapping only at token boundaries | SKILL L120 |
+| Quake-tool loss: base skill won typography and spacing | Type scale kept clearly subordinate to display type; dead-band rule (existing L135 seam rule) reinforced for header/banner/list gaps | SKILL L193 (Typography), L120 |
+| Counters ignored stress-fixture rows | Every displayed count reconciles to the rows actually rendered, including stress-fixture rows; a disagreement fails | SKILL L120 |
+| USGS: simulated failure messages need role=alert | Failure messages, including simulated ones, announce assertively (`role="alert"`), not via a polite status region | SKILL L120 |
+| USGS: fixture copies must not inherit the source row's local review state | A copied/duplicated fixture row starts with its own clean state; no inherited review, check or approval (extends the L128 review-binding rule) | SKILL L120 |
+| USGS: ~90px empty bands between header, banners and lists | Headers, banners and lists keep purposeful spacing; an unexplained empty band between them fails the density check | SKILL L120 |
 
 
 ## Mandatory rows (named by the plan)
@@ -228,13 +245,14 @@ Unchanged from the pass-1 map: craft-system subsection (added, L131-135), collec
 - Repository total 15,482 -> 16,249 words (+767), all additions traceable above.
 - Pass 3: SKILL.md 11,880 -> 12,062 words (+182: material-change gate restriction, adversary scoping, record-section trigger honesty, imperative reference load, provisional-verdict acceptance item). visual-review-cases.md unchanged in words (4,369); +3 lines from the promoted result-contract heading (81 content lines).
 - Pass 4: SKILL.md 12,062 -> 12,088 words (B trigger extended with the full-gate material triggers). visual-review-cases.md 4,369 -> 4,375 words (+6, the new general heading), 81 -> 83 content lines.
+- Pass 5: SKILL.md 12,088 -> 12,352 words (+264: six blind-validation defects and four USGS-reviewer findings, all additions in L120, L187, L189, L193). visual-review-cases.md unchanged (83 content lines / 4,375 words).
 
 ## Checks (pass 2, local, script-verified)
 
 - Interaction-paragraph preservation, reproducible method: base L125's paragraph split into 96 sentences at sentence boundaries; each sentence checked against SKILL.md + the reference. Result: 77 stand verbatim, 11 stand after whitespace/case/apostrophe normalization only, 8 stand with their opener clause folded into a bold case name exactly these 8 of the 16 opener-bearing sentences: "For paged or cursor-based results,", "For destructive flows,", "For offline or queued work,", "For a multi-account action,", "For collaborative edits,", "Settings pages also need", "When a session expires during a draft or review," and "For branching multi-step work," - each folded into the bold case name of its reference case, with the operative clause standing verbatim there; the other 8 opener-bearing sentences stand verbatim (77-count) or after normalization (11-count), 0 missing. (The pass-2 figure "88 verbatim, 8 folded" conflated normalized matches with verbatim and undercounted folded openers; Red Team's independent count of 77 exact matches is confirmed.)
 - 13 internal anchors in SKILL.md resolve against the new heading set; the `references/visual-review-cases.md` relative link and the reference's `../SKILL.md` pointer are intact.
 - All 10 external URLs byte-identical to base; two (W3C Reflow, OWASP CSV Injection) relocated with their cases into the reference.
-- Pass 2: untouched SKILL.md lines byte-identical to the pass-1 file (full-file line diff). Pass 3: only the ten lines named in the pass-3 log changed in SKILL.md; in the reference, the L3 header, the promoted result-contract heading, and line shifts from that promotion. Pass 4: only L31 changed in SKILL.md; in the reference, only the inserted "### Composition, behavior, and resilience cases" heading (with its blank line) at L35, shifting former L35-81 to L37-83.
+- Pass 2: untouched SKILL.md lines byte-identical to the pass-1 file (full-file line diff). Pass 3: only the ten lines named in the pass-3 log changed in SKILL.md; in the reference, the L3 header, the promoted result-contract heading, and line shifts from that promotion. Pass 4: only L31 changed in SKILL.md; in the reference, only the inserted "### Composition, behavior, and resilience cases" heading (with its blank line) at L35, shifting former L35-81 to L37-83. Pass 5: only four paragraphs changed in SKILL.md (L120, L187, L189, L193 - sentence appends, no deletions); the reference is untouched.
 - All 22 failure classes verbatim, plus mandatory phrases; KEEP items verified present: Visual/Production route, truthful result contract, async stale / real-run receipts, input-to-mark ledger, real zoom vs proxy, host-shell checks, phone crop with chrome, no forced motion, anti-house-style craft system, the freeze-width rule, KEEP preservation, the independent critic, the 22 failure classes.
 - **No fixed tokens, universal proof hero, obligatory animation, mechanical score, forced subtraction, or six separate records were introduced.**
 
