@@ -144,6 +144,14 @@ Before choosing type or colors, consider whether a central behavior lets the per
 
 Use external examples to challenge the bar, not to copy art direction. Compare only like-for-like evidence: same task and rendered states for a skill benchmark. If the reference has only a polished desktop image, judge visual presentation against that image, but do not infer its mobile, keyboard, error, or live-product behavior. Record where our build is weaker, where it is stronger, and which dimensions remain unknown. Fix the weakest actionable gap in the next build rather than adding decorative effects.
 
+## Button design
+
+Inspect the product's design system, existing buttons, tokens, and usage first. Preserve its button family and improve role and hierarchy within it; do not add novelty for its own sake. When no system exists, choose form, weight, scale, spacing, typography, and states from the action's consequence, hierarchy, product's visual thesis, and interaction context—not a reusable default or a color/radius swap. Keep primary, secondary, quiet, and destructive roles coherent within the product; pills are valid when they fit, not a requirement.
+
+Compare two treatments only for a greenfield or major redesign, or a focal CTA. Hold the action, label, role, and context constant; vary only one or two design variables. Choose the treatment that best fits hierarchy, product identity, and recognizable affordance—not the one that is merely more unique. When prior rendered examples from unrelated projects are available to inspect, compare their primary buttons side by side: if form, weight, scale, spacing, and type repeat without a task- or brand-based reason, challenge the default; then check that each product's button roles still read as one family. If none are available, do not claim cross-project variation or infer unseen history; state the current brief's action/context rationale instead.
+
+Give icon-only buttons accessible names. Make disabled and loading states reflect real behavior and semantics, not decoration. Verify keyboard focus-visible, hover, pressed, and relevant disabled/loading states, plus adequate target size and spacing at narrow touch widths.
+
 ## State coverage ledger
 
 Before coding, make a short ledger with one row per consequential state. Use these columns: user intent, entry point, data condition, visible feedback, next action, narrow-screen behavior, and proof. At minimum cover first use, normal use, no results, invalid input, failure, and a long or crowded case where they apply. Mark a state not applicable only with a reason. This is a planning aid, not a checklist that substitutes for examining the product.
