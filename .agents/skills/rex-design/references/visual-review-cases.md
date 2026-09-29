@@ -46,6 +46,8 @@ Implement responsive compositions rather than shrinking the desktop scene. Make 
 
 A compact regression set for any responsive review: right-edge code clipping at the declared wide width, code or labels that fall below readable size at phone width, and an empty band between sections that signals no next content job. These three recur across unrelated briefs; check them at the frozen widths before polishing, alongside the reduced-motion and failure checks above.
 
+Phone first-view gate, worked example (a Pico 2 landing page that failed it): the desktop hero cropped the tall board photo vertically, and at 390×650 the same crop shrank to a short strip covering about 12% of the first viewport while the primary button's bottom edge measured 712px - both fail the gate (hero at least about 35% of the viewport area, primary action's bottom edge at or above 650px with host chrome counted). The fix that passed: rotate the tall photo 90 degrees so it fills the width, move the button into the payoff bundle above the fold, and re-measure at 390×650 and 320×650 inside the real host frame. Record the verdict with its numbers in REVIEW.md - "phone first-view gate: FAIL (CTA bottom 712px, hero 12%)" - until both measurements pass. When the same width shows different image crops across captures, the captures were not settled or the crop is not deterministic: re-capture from one settled revision before scoring.
+
 ## Interaction workflow cases
 
 Load this section only when the work touches one of these workflows; apply the matching cases, not the whole list. The general interaction guidance - state coverage, async snapshots, provenance, review invalidation, and honest write controls - lives in `../SKILL.md`.
