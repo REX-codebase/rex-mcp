@@ -1,9 +1,9 @@
-# Clause-to-clause preservation map: rex-design rework (pass 2)
+# Clause-to-clause preservation map: rex-design rework (pass 4)
 
 **Base:** `REX-codebase/rex-mcp` main @ `7616c7b0c79017e83cb2c2d20d430f83b82685c2` (`.agents/skills/rex-design/SKILL.md` 193 content lines / 12,273 words; `references/visual-review-cases.md` 40 content lines / 2,309 words).
-**Counting convention (reconciles the pass-1 41/42/43 confusion):** "content lines" exclude the repository's trailing blank line; every committed markdown file carries that blank, so `wc -l` = content + 1. Base VRC = 41 by `wc -l` / 40 content; pass-1 VRC = 42 / 41; pass-2 VRC = 79 / 78; pass-3 VRC = 82 / 81. Base SKILL = 194 / 193; pass-1 and pass-2 SKILL = 210 / 209.
-**Result (pass 3):** SKILL.md 209 content lines / 12,062 words; visual-review-cases.md 81 content lines / 4,369 words.
-**Method:** the pass-1 map was completed before prose cuts. Pass 2 and pass 3 implement successive Critic + Red Team NO-MERGE findings; every finding maps to an edit in the change logs below. Status: kept = verbatim or near-verbatim; clarified = same requirement, wording improved; merged = combined with an overlapping clause, all requirements retained; moved = relocated, text intact; strengthened = trigger/evidence/exception made stricter; added = new clause; restored = base clause that pass 1 silently dropped, put back in pass 2.
+**Counting convention (reconciles the pass-1 41/42/43 confusion):** "content lines" exclude the repository's trailing blank line; every committed markdown file carries that blank, so `wc -l` = content + 1. Base VRC = 41 by `wc -l` / 40 content; pass-1 VRC = 42 / 41; pass-2 VRC = 79 / 78; pass-3 VRC = 82 / 81; pass-4 VRC = 84 / 83. Base SKILL = 194 / 193; pass-1 through pass-4 SKILL = 210 / 209.
+**Result (pass 4):** SKILL.md 209 content lines / 12,088 words; visual-review-cases.md 83 content lines / 4,375 words.
+**Method:** the pass-1 map was completed before prose cuts. Pass 2, pass 3 and pass 4 implement successive Critic + Red Team NO-MERGE findings; every finding maps to an edit in the change logs below. Status: kept = verbatim or near-verbatim; clarified = same requirement, wording improved; merged = combined with an overlapping clause, all requirements retained; moved = relocated, text intact; strengthened = trigger/evidence/exception made stricter; added = new clause; restored = base clause that pass 1 silently dropped, put back in pass 2.
 
 ## Pass-2 change log (review finding -> edit)
 
@@ -36,6 +36,15 @@
 | Red Team 2 (H) | Load rule changed to "without either trigger" in both files; match-and-load made imperative with the link at the interaction core | SKILL L114, L128; VRC L3 |
 | Red Team 3 (M) | Interaction-paragraph preservation count corrected with a reproducible method (see Checks) | this file |
 | Red Team 4 (L) | A provisional verdict (no non-builder) is not a completed quality pass; independent review carries into the handoff as an open acceptance item | SKILL L203 |
+
+## Pass-4 change log (final re-review findings -> edits)
+
+| Finding | Edit | Where |
+|---|---|---|
+| Critic 1 (HIGH) | B's record trigger now includes the full-gate material triggers verbatim - "a material change to the first-view organizing idea, the primary task hierarchy, or the promised outcome - the same changes that force the full concept gate" - so a material change can no longer force the full gate (L22/63/177) while skipping the B record | SKILL L31 |
+| Critic 2 (MED) | The result-contract heading is closed before the dogfooding paragraph; the six general cases (dogfooding, landing hero, causal behavior, continuous controls, responsive/fallback, compact regression) now sit under their own heading "### Composition, behavior, and resilience cases", so match-only loading of the result-contract section no longer swallows them | VRC L35 (new heading); former L35-45 shift to L37-47 |
+| Critic 3 (LOW) | The fragment-count parenthesis now lists exactly which 8 of the 16 opener-bearing sentences were folded into case names; the other 8 stand verbatim or after normalization only (see Checks) | this file, Checks |
+
 
 ## Mandatory rows (named by the plan)
 
@@ -187,13 +196,13 @@ Unchanged from the pass-1 map: craft-system subsection (added, L131-135), collec
 | L5 heading + L7 intro | L5, L7 | Verbatim (transferable failure classes; not a pass certificate) | kept |
 | L9-30 all 22 failure classes | L8-29 | Verbatim: verdict strength/negative geometry, evidence drift, coordinate/causal mismatch, responsive geometry drift, control-semantic drift, scene identity under selection, promised consequence, idea substitution, plausibility/state integrity, transformation custody, material-vocabulary break, stock-icon payoff, house-style convergence, light/shadow source break, decorative/content collision, weak resolved state, reveal spoilers, interaction-form convergence, agency without outcome space, feedback away from action, evidence-set coherence, state coverage vs capture count | kept verbatim |
 | (none) | "### Result-contract worked examples (choice-and-result briefs)" (L31) | The workout-specific illustrations moved from SKILL L45: time-axis rescaling and plan renaming, dose information for named movements, equipment/household supports under a "none" choice, unreconciled segment without scale/denominator/remainder, comparison by usable contents. Pass 3: promoted from a failure-class bullet to its own heading (Critic 5) | added (pass 2), own heading (pass 3) |
-| L32 dogfood paragraph | L35 | Verbatim | kept |
-| L34 landing hero paragraph | L37 | Pass 2: quiet-index / document / multi-route exception appended (P1-3) | clarified (pass 1) + extended (pass 2) |
-| L36 claimed-behavior-from-source | L38 | Verbatim | kept |
-| L38 continuous-control pixel-delta | L40 | Verbatim | kept |
-| L40 responsive/fallback paragraph | L43 | Tightened in pass 1, all checks retained | kept |
-| (none) | L45 regression example | Compact responsive regression set | added (pass 1) |
-| (none) | L47-81 "Interaction workflow cases" | 16 triggered cases holding the moved interaction catalogs from base L125 (mapping in the L125 row above): tables/reflow, sequence editing, paged results, bulk actions, reconciliation, destructive flows, approvals, offline/queued, sensitive records, multi-account, import/export, collaborative/optimistic writes, settings/permissions/dependent controls, time-zone instants, session expiry, branching multi-step. Intro limits loading to matching cases and points back to `../SKILL.md` for the general interaction guidance | added (pass 2, P1-1) |
+| L32 dogfood paragraph | L37 | Verbatim | kept |
+| L34 landing hero paragraph | L39 | Pass 2: quiet-index / document / multi-route exception appended (P1-3) | clarified (pass 1) + extended (pass 2) |
+| L36 claimed-behavior-from-source | L40 | Verbatim | kept |
+| L38 continuous-control pixel-delta | L42 | Verbatim | kept |
+| L40 responsive/fallback paragraph | L45 | Tightened in pass 1, all checks retained | kept |
+| (none) | L47 regression example | Compact responsive regression set | added (pass 1) |
+| (none) | L49-83 "Interaction workflow cases" | 16 triggered cases holding the moved interaction catalogs from base L125 (mapping in the L125 row above): tables/reflow, sequence editing, paged results, bulk actions, reconciliation, destructive flows, approvals, offline/queued, sensitive records, multi-account, import/export, collaborative/optimistic writes, settings/permissions/dependent controls, time-zone instants, session expiry, branching multi-step. Intro limits loading to matching cases and points back to `../SKILL.md` for the general interaction guidance | added (pass 2, P1-1) |
 
 ## What actually left (honest removal list - Red Team H1 fix)
 
@@ -208,7 +217,7 @@ Unchanged from the pass-1 map: craft-system subsection (added, L131-135), collec
 - SKILL L47's "Hold the underlying facts and words constant across both sketches and draw them at delivery size, at the same desktop and short-phone crop." - duplicate of L69's study mechanics ("using the same honest product evidence and real words. Include both desktop and short-phone crops at delivery size"), which stands.
 - SKILL L47's "A photographed material, a physical cause-and-effect scene, a legible work record or a distinct editorial treatment may carry the idea; no one form is required." - folded: the same coverage stands at L43 (proof object is one candidate evidence form; material, object or work record) and L49 (editorial-cut examples).
 - SKILL L128's case opener phrases ("For paged or cursor-based results,", "For destructive flows,", "For offline or queued work,", "For a multi-account action,", "For collaborative edits,", "Settings pages also need", "When a session expires during a draft or review,", "For branching multi-step work,", "For a table needing two-dimensional layout,", "For priority or sequence editing,", "For a partial bulk result,", "When reconciling disagreeing sources,", "For approvals, quotes or other consequential decisions,", "For a screen with sensitive record details,", "For an import preview,", "For a task interface that converts a local date and time to an instant,") - folded into the bold case names of the reference's Interaction workflow cases; the operative sentences stand verbatim there.
-- SKILL L45's workout-specific illustrations - MOVED, not dropped: they stand in the reference's Result-contract worked examples case (VRC L30). The general tests they illustrated remain in L45.
+- SKILL L45's workout-specific illustrations - MOVED, not dropped: they stand in the reference's Result-contract worked examples case (VRC L33). The general tests they illustrated remain in L45.
 - A-F record bullets: D's restated ledger columns replaced by a pointer to State coverage ledger; E's restated system components replaced by a pointer to Choose a craft system; F's restated review protocol condensed to record contents.
 - Nothing else. No test, guard, external link, or failure class was deleted in pass 2.
 
@@ -218,13 +227,14 @@ Unchanged from the pass-1 map: craft-system subsection (added, L131-135), collec
 - visual-review-cases.md 2,391 -> 4,369 words (+1,978): Interaction workflow cases +1,766; Result-contract worked examples +158; dual-trigger header +~40; quiet-index exception +~32.
 - Repository total 15,482 -> 16,249 words (+767), all additions traceable above.
 - Pass 3: SKILL.md 11,880 -> 12,062 words (+182: material-change gate restriction, adversary scoping, record-section trigger honesty, imperative reference load, provisional-verdict acceptance item). visual-review-cases.md unchanged in words (4,369); +3 lines from the promoted result-contract heading (81 content lines).
+- Pass 4: SKILL.md 12,062 -> 12,088 words (B trigger extended with the full-gate material triggers). visual-review-cases.md 4,369 -> 4,375 words (+6, the new general heading), 81 -> 83 content lines.
 
 ## Checks (pass 2, local, script-verified)
 
-- Interaction-paragraph preservation, reproducible method: base L125's paragraph split into 96 sentences at sentence boundaries; each sentence checked against SKILL.md + the reference. Result: 77 stand verbatim, 11 stand after whitespace/case/apostrophe normalization only, 8 stand with their opener clause folded into a bold case name (the seven "For/When" openers listed above plus "Settings pages also need" -> "settings pages need"), 0 missing. (The pass-2 figure "88 verbatim, 8 folded" conflated normalized matches with verbatim and undercounted folded openers; Red Team's independent count of 77 exact matches is confirmed.)
+- Interaction-paragraph preservation, reproducible method: base L125's paragraph split into 96 sentences at sentence boundaries; each sentence checked against SKILL.md + the reference. Result: 77 stand verbatim, 11 stand after whitespace/case/apostrophe normalization only, 8 stand with their opener clause folded into a bold case name exactly these 8 of the 16 opener-bearing sentences: "For paged or cursor-based results,", "For destructive flows,", "For offline or queued work,", "For a multi-account action,", "For collaborative edits,", "Settings pages also need", "When a session expires during a draft or review," and "For branching multi-step work," - each folded into the bold case name of its reference case, with the operative clause standing verbatim there; the other 8 opener-bearing sentences stand verbatim (77-count) or after normalization (11-count), 0 missing. (The pass-2 figure "88 verbatim, 8 folded" conflated normalized matches with verbatim and undercounted folded openers; Red Team's independent count of 77 exact matches is confirmed.)
 - 13 internal anchors in SKILL.md resolve against the new heading set; the `references/visual-review-cases.md` relative link and the reference's `../SKILL.md` pointer are intact.
 - All 10 external URLs byte-identical to base; two (W3C Reflow, OWASP CSV Injection) relocated with their cases into the reference.
-- Pass 2: untouched SKILL.md lines byte-identical to the pass-1 file (full-file line diff). Pass 3: only the ten lines named in the pass-3 log changed in SKILL.md; in the reference, the L3 header, the promoted result-contract heading, and line shifts from that promotion.
+- Pass 2: untouched SKILL.md lines byte-identical to the pass-1 file (full-file line diff). Pass 3: only the ten lines named in the pass-3 log changed in SKILL.md; in the reference, the L3 header, the promoted result-contract heading, and line shifts from that promotion. Pass 4: only L31 changed in SKILL.md; in the reference, only the inserted "### Composition, behavior, and resilience cases" heading (with its blank line) at L35, shifting former L35-81 to L37-83.
 - All 22 failure classes verbatim, plus mandatory phrases; KEEP items verified present: Visual/Production route, truthful result contract, async stale / real-run receipts, input-to-mark ledger, real zoom vs proxy, host-shell checks, phone crop with chrome, no forced motion, anti-house-style craft system, the freeze-width rule, KEEP preservation, the independent critic, the 22 failure classes.
 - **No fixed tokens, universal proof hero, obligatory animation, mechanical score, forced subtraction, or six separate records were introduced.**
 
