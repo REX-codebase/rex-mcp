@@ -87,6 +87,17 @@ choosing calls and honoring its user's approval.
 Continuation is cooperative: REX cannot force a host to keep working, and
 a host cannot force REX to accept a claim. Either side stops cleanly.
 
+## Shared-state lock latency
+
+Daemons sharing a state directory serialize task updates and custody decisions
+with blocking file locks. The custody store lock stays held across tool execution
+so Stop cannot slip between the final authority check and an effect. Stop and
+lease renewal may therefore wait for an in-flight tool to finish, up to the tool's
+allowed duration. Independent two-process testing measured about 4 seconds of
+waiting behind a 4-second hold. Stop is a terminal fence after it acquires the
+lock, not immediate preemption of an already-running command. Different tasks
+also share the custody lock, so long tools can delay upkeep for other tasks.
+
 ## Security contract
 
 - Work calls need a live lease and the per-task capability; stale epochs return

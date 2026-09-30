@@ -546,3 +546,89 @@ fn separate_processes_serialize_typed_task_calls() {
     assert_eq!(grant.lease.next_seq, 21);
     assert_eq!(registry.audit_chain(&grant.grant_id).unwrap().len(), 21);
 }
+
+#[test]
+fn simultaneous_fresh_open_and_proof_keys_across_processes() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    if let Some(role) = std::env::var_os("REX_BOOTSTRAP_CHILD") {
+        let root = std::path::PathBuf::from(std::env::var_os("REX_BOOTSTRAP_ROOT").unwrap());
+        let ws = root.with_extension("workspace");
+        let ready = root.with_extension(format!("ready-{}", role.to_string_lossy()));
+        let gate = root.with_extension("go");
+        std::fs::write(ready, b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !gate.exists() {
+            assert!(Instant::now() < deadline, "bootstrap gate timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(ws)).unwrap();
+        let token = std::fs::read_to_string(root.join("human-stop-token")).unwrap();
+        assert_eq!(token.len(), 68);
+        let ex = execute_ultra(&daemon, &role.to_string_lossy(), "make hello");
+        let bundle = daemon
+            .proof_bundle(TaskRefRequest {
+                task_id: ex.task_id.clone(),
+            })
+            .unwrap();
+        let verdict = daemon
+            .verify_proof_bundle(TaskRefRequest {
+                task_id: ex.task_id,
+            })
+            .unwrap();
+        assert!(
+            verdict.mac_valid && verdict.content_hash_consistent,
+            "fresh proof must verify: {verdict:?}"
+        );
+        assert!(!bundle.bundle_hash.is_empty());
+        return;
+    }
+    let d = tempdir().unwrap();
+    for iteration in 0..40 {
+        let root = d.path().join(format!("fresh-{iteration}"));
+        let mut children = Vec::new();
+        for role in ["one", "two"] {
+            children.push(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "simultaneous_fresh_open_and_proof_keys_across_processes",
+                        "--nocapture",
+                    ])
+                    .env("REX_BOOTSTRAP_CHILD", role)
+                    .env("REX_BOOTSTRAP_ROOT", &root)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !root.with_extension("ready-one").exists()
+            || !root.with_extension("ready-two").exists()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "children failed to reach bootstrap gate"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::write(root.with_extension("go"), b"go").unwrap();
+        for child in &mut children {
+            assert!(
+                child.wait().unwrap().success(),
+                "bootstrap iteration {iteration} failed"
+            );
+        }
+        for path in [root.join("human-stop-token"), root.join("proofs/hmac-key")] {
+            assert_eq!(std::fs::read_to_string(&path).unwrap().len(), 68);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+}

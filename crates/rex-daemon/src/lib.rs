@@ -3707,44 +3707,51 @@ fn atomic_json<T: Serialize>(path: &Path, v: &T) -> Result<(), ProtocolError> {
 /// human authority boundary: only the trusted local launcher can read a
 /// 0600 file in the daemon state dir; a remote MCP host cannot mint one.
 fn load_or_create_human_token(root: &Path) -> Result<String, ProtocolError> {
-    let path = root.join("human-stop-token");
-    if let Ok(existing) = fs::read_to_string(&path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return Ok(hex_sha256(trimmed.as_bytes()));
-        }
-    }
-    let token = format!("hst-{}", random_hex(32));
-    {
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&path).map_err(internal)?;
-        f.write_all(token.as_bytes()).map_err(internal)?;
-        f.sync_all().map_err(internal)?;
-    }
+    let token = load_or_create_secret(&root.join("human-stop-token"), "hst-")?;
     Ok(hex_sha256(token.as_bytes()))
 }
 
-/// Load or create the daemon-held proof-bundle MAC key. Same authority
-/// boundary as the human-stop token: a 0600 file in the daemon state dir a
-/// remote MCP host cannot read, so it cannot mint a valid bundle MAC.
+/// Load or create the daemon-held proof-bundle MAC key under the same
+/// atomic publication and first-writer serialization as the Stop token.
 fn load_or_create_proof_key(root: &Path) -> Result<String, ProtocolError> {
     let dir = root.join("proofs");
     fs::create_dir_all(&dir).map_err(internal)?;
-    let path = dir.join("hmac-key");
-    if let Ok(existing) = fs::read_to_string(&path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    let key = format!("prk-{}", random_hex(32));
+    load_or_create_secret(&dir.join("hmac-key"), "prk-")
+}
+
+/// All readers take a stable sidecar lock. Never publish a partially
+/// written authority key, and never replace a corrupt existing key.
+fn load_or_create_secret(path: &Path, prefix: &str) -> Result<String, ProtocolError> {
+    let mut lock_opts = OpenOptions::new();
+    lock_opts.write(true).create(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_opts.mode(0o600);
+    }
+    let lock = lock_opts
+        .open(path.with_extension("lock"))
+        .map_err(internal)?;
+    lock.lock().map_err(internal)?;
+    match fs::read_to_string(path) {
+        Ok(existing) => {
+            let key = existing.trim();
+            if key
+                .strip_prefix(prefix)
+                .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Ok(key.to_string());
+            }
+            return Err(internal(
+                "invalid durable authority key; refusing replacement",
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(internal(e)),
+    }
+    let key = format!("{prefix}{}", random_hex(32));
+    let tmp = path.with_extension(format!("{}.tmp", random_hex(16)));
+    let written = (|| -> std::io::Result<()> {
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -3752,10 +3759,18 @@ fn load_or_create_proof_key(root: &Path) -> Result<String, ProtocolError> {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&path).map_err(internal)?;
-        f.write_all(key.as_bytes()).map_err(internal)?;
-        f.sync_all().map_err(internal)?;
+        let mut file = opts.open(&tmp)?;
+        file.write_all(key.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        // Persist the directory entry as well as the key bytes.
+        fs::File::open(path.parent().expect("authority key has parent"))?.sync_all()?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    written.map_err(internal)?;
     Ok(key)
 }
 
