@@ -20,13 +20,11 @@
 //! per transition in the shared upkeep ledger `<root>/lease-keeper.jsonl` with
 //! `"actor":"lease_failsafe"`; and, only from the MCP thread, the task's own
 //! `events.jsonl` and `task.json`. A background pass never writes `task.json` or
-//! `events.jsonl`: the MCP thread owns those files and does unlocked
-//! load-modify-persist on them.
+//! `events.jsonl`; the task writer holds a stable per-task lock.
 //!
-//! `pause.json` has two in-process writers, the keeper pass and the MCP
-//! thread. Every read-modify-write of it happens under the custody lock, and
-//! each write goes through a temp file unique to its writer, so neither can
-//! overwrite a newer record with one decided from a stale read.
+//! `pause.json` is shared by the keeper pass and the MCP thread. Every
+//! read-modify-write follows task lock then custody store lock, and each
+//! atomic write uses a unique temp file.
 //!
 //! What it never does: it never resumes a task without the host's current resume
 //! handle (reacquire always goes through the verified `rex_execute` resume path
@@ -35,14 +33,9 @@
 //! task terminal when the grace window passes. Grace expiry only marks the pause
 //! record `expired`; the task state is a separate decision.
 //!
-//! Known limitation, two processes on one state dir: the default state dir is
-//! shared by every rex-mcp a host agent launches, and each process holds its own
-//! in-memory `CustodyRegistry`. Lease upkeep is single-owner
-//! (`<root>/lease-keeper.lock`, see `lease_keeper`), but tasks created by a
-//! standby process are not in the owner's in-memory registry, so the owner
-//! cannot renew them. They lapse, and their own process pauses them on its next
-//! call (the MCP-thread path in `live`). The real fix is a cross-process custody
-//! store lock or one daemon per state dir, which is out of scope here.
+//! Multiple processes share the default state directory. Lease upkeep remains
+//! single-owner (`<root>/lease-keeper.lock`), while the owner refreshes custody
+//! under the cross-process store lock before renewing tasks from other hosts.
 
 use rex_custody::{CustodyError, CustodyGrant, CustodyPhase, CustodyRegistry, ReleaseReason};
 use rex_protocol::packets::OperationStatus;
@@ -339,6 +332,17 @@ pub(crate) fn pause_lapsed(
     dirs.sort();
     let mut swept = false;
     for dir in dirs {
+        let Some(id) = dir.file_name().and_then(|n| n.to_str()) else {
+            report.skipped += 1;
+            continue;
+        };
+        let _task_lock = match super::lock_task_at(root, id) {
+            Ok(lock) => lock,
+            Err(e) => {
+                report.errors.push(format!("{id}: {e}"));
+                continue;
+            }
+        };
         let facts = match read_pause_facts(&dir.join("task.json")) {
             Some(facts) => facts,
             None => {
@@ -358,6 +362,17 @@ pub(crate) fn pause_lapsed(
                 break;
             }
         };
+        let _store_lock = match reg.lock_store() {
+            Ok(lock) => lock,
+            Err(e) => {
+                report.errors.push(format!("{}: {e}", facts.task_id));
+                break;
+            }
+        };
+        if let Err(e) = reg.refresh() {
+            report.errors.push(format!("{}: {e}", facts.task_id));
+            break;
+        }
         // Read, decide and write under one hold of the custody lock: a resume
         // on the MCP thread cannot land between the read and the write, so
         // this pass never overwrites a newer record with a stale decision.
@@ -488,6 +503,8 @@ impl HarnessDaemon {
     ) -> Result<PauseRecord, ProtocolError> {
         let now = now_ms();
         let mut reg = self.lock_custody()?;
+        let _store_lock = reg.lock_store().map_err(custody_err)?;
+        reg.refresh().map_err(custody_err)?;
         if let Some(rec) = self.read_pause_record(&t.task_id)? {
             if rec.status == PauseStatus::Paused {
                 return Ok(rec);
@@ -524,10 +541,12 @@ impl HarnessDaemon {
     /// Whether custody holds this task's grant suspended right now: the
     /// failsafe (or a restart sweep) has already paused it.
     pub(crate) fn grant_suspended(&self, t: &DurableTask) -> Result<bool, ProtocolError> {
-        let reg = self
+        let mut reg = self
             .custody
             .lock()
             .map_err(|_| internal("custody registry poisoned"))?;
+        let _store_lock = reg.lock_store().map_err(custody_err)?;
+        reg.refresh().map_err(custody_err)?;
         Ok(matches!(
             reg.grant(&t.grant_id).map(|g| g.phase),
             Some(CustodyPhase::Suspended)
@@ -546,6 +565,8 @@ impl HarnessDaemon {
             .custody
             .lock()
             .map_err(|_| internal("custody registry poisoned"))?;
+        let _store_lock = reg.lock_store().map_err(custody_err)?;
+        reg.refresh().map_err(custody_err)?;
         let (epoch_before, secret) = match reg.grant(&t.grant_id) {
             Some(g) if g.phase == CustodyPhase::Suspended => {
                 (g.lease.epoch, g.resume_secret.clone())
@@ -608,7 +629,9 @@ impl HarnessDaemon {
         t: &mut DurableTask,
         epoch_before: u64,
     ) -> Result<Option<PauseRecord>, ProtocolError> {
-        let reg = self.lock_custody()?;
+        let mut reg = self.lock_custody()?;
+        let _store_lock = reg.lock_store().map_err(custody_err)?;
+        reg.refresh().map_err(custody_err)?;
         let Some(mut rec) = self.read_pause_record(&t.task_id)? else {
             return Ok(None);
         };
@@ -667,7 +690,9 @@ impl HarnessDaemon {
     /// `events.jsonl` and `task.json` have exactly one writer. The record's
     /// `absorbed` marker keeps the event to exactly one per pause.
     pub(crate) fn absorb_pause(&self, t: &mut DurableTask) -> Result<(), ProtocolError> {
-        let reg = self.lock_custody()?;
+        let mut reg = self.lock_custody()?;
+        let _store_lock = reg.lock_store().map_err(custody_err)?;
+        reg.refresh().map_err(custody_err)?;
         let Some(mut rec) = self.read_pause_record(&t.task_id)? else {
             return Ok(());
         };

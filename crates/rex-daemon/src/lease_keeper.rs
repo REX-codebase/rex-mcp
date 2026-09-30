@@ -116,6 +116,17 @@ fn renew_due(
         .collect();
     dirs.sort();
     for dir in dirs {
+        let Some(id) = dir.file_name().and_then(|n| n.to_str()) else {
+            report.skipped += 1;
+            continue;
+        };
+        let _task_lock = match super::lock_task_at(root, id) {
+            Ok(lock) => lock,
+            Err(e) => {
+                report.errors.push(format!("{id}: {e}"));
+                continue;
+            }
+        };
         let facts = match read_facts(&dir.join("task.json")) {
             Some(facts) => facts,
             None => {
@@ -134,6 +145,20 @@ fn renew_due(
                 break;
             }
         };
+        // The owner may have started before this task was created by a
+        // different host process. Refresh only under the store lock so an
+        // audit chain or lease update cannot be read midway through a write.
+        let _store_lock = match reg.lock_store() {
+            Ok(lock) => lock,
+            Err(e) => {
+                report.errors.push(format!("{}: {e}", facts.task_id));
+                break;
+            }
+        };
+        if let Err(e) = reg.refresh() {
+            report.errors.push(format!("{}: {e}", facts.task_id));
+            break;
+        }
         let outcome = renew_locked(&mut reg, &facts, now_ms, cfg.renew_ahead_ms);
         drop(reg);
         match outcome {
@@ -267,10 +292,12 @@ impl super::HarnessDaemon {
         t: &mut super::DurableTask,
     ) -> Result<(), ProtocolError> {
         let synced = {
-            let reg = self
+            let mut reg = self
                 .custody
                 .lock()
                 .map_err(|_| internal("custody registry poisoned"))?;
+            let _store_lock = reg.lock_store().map_err(super::custody_err)?;
+            reg.refresh().map_err(super::custody_err)?;
             reg.grant(&t.grant_id)
                 .filter(|g| g.lease.epoch == t.lease_epoch)
                 .map(|g| (g.lease.expires_ms, g.lease.next_seq))
@@ -450,6 +477,26 @@ mod tests {
     fn ledger_has_line(path: &Path) -> bool {
         let text = fs::read_to_string(path).unwrap_or_default();
         text.lines().any(|l| l.contains("lease_keeper"))
+    }
+
+    #[test]
+    fn keeper_sees_grants_created_by_another_daemon() {
+        let d = tempdir().unwrap();
+        let root = d.path().join("state");
+        let w = d.path().join("ws");
+        let owner = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let other = HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap();
+        let ex = other.execute(req("cross-daemon-keeper")).unwrap();
+        rewrite_u64(&root, &ex.task_id, "max_wall_ms", DAY_MS);
+        let original = grant_of(&other, &ex.task_id);
+        let cfg = LeaseKeeperConfig {
+            tick_ms: 10_000,
+            renew_ahead_ms: 120_000,
+        };
+        let report = owner.renew_due_leases(&cfg, original.lease.expires_ms - 60_000);
+        assert_eq!(report.renewed.len(), 1, "{report:?}");
+        assert_eq!(report.renewed[0].grant_id, original.grant_id);
+        assert!(report.errors.is_empty(), "{report:?}");
     }
 
     #[test]

@@ -784,3 +784,37 @@ fn apply_patch_needs_its_own_grant_and_every_path_in_scope() {
         .permits(&patch("*** Add File: a.txt\n+x"))
         .is_err());
 }
+
+#[test]
+fn stopped_by_another_host_before_execution_denies_prepared_effect() {
+    let c = ctx();
+    let mut creator = CustodyRegistry::open(c.root.clone()).unwrap();
+    let (token, grant) = offer_and_accept(
+        &mut creator,
+        "task-remote-stop",
+        agent(),
+        full_caps(&c.workspace),
+        T0,
+    );
+    drop(creator);
+    let worker_registry = Arc::new(Mutex::new(CustodyRegistry::open(c.root.clone()).unwrap()));
+    let tools = CustodiedToolRuntime::new(ToolRuntime::new(&c.workspace).unwrap(), worker_registry);
+    let prepared = tools
+        .prepare(
+            &token,
+            ToolRequest::CreateFile {
+                path: "must-not-exist.txt".into(),
+                content: "unsafe".into(),
+                overwrite: false,
+            },
+            T0 + 1,
+        )
+        .unwrap();
+    let mut other_host = CustodyRegistry::open(c.root.clone()).unwrap();
+    other_host
+        .transact(|reg| reg.human_stop(&grant.grant_id, T0 + 2))
+        .unwrap();
+    let result = tools.execute(&token, &prepared.call_id, T0 + 3);
+    assert!(!result.ok, "released grant must block prepared effect");
+    assert!(!c.workspace.join("must-not-exist.txt").exists());
+}

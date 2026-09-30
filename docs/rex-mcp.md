@@ -87,6 +87,28 @@ choosing calls and honoring its user's approval.
 Continuation is cooperative: REX cannot force a host to keep working, and
 a host cannot force REX to accept a claim. Either side stops cleanly.
 
+## Shared-state lock latency
+
+Daemons sharing a state directory serialize task updates and custody decisions
+with blocking file locks. The custody store lock stays held across tool execution
+so Stop cannot slip between the final authority check and an effect. Stop and
+lease renewal may therefore wait for an in-flight tool to finish, up to the tool's
+allowed duration. Independent two-process testing measured about 4 seconds of
+waiting behind a 4-second hold. Stop is a terminal fence after it acquires the
+lock, not immediate preemption of an already-running command. Different tasks
+also share the custody lock, so long tools can delay upkeep for other tasks.
+A long custody lock hold in any process can block keeper renewals and durably
+pause a healthy task in another process with `lease_lapsed`; verified resume
+recovers the paused task. Independent testing reproduced this with a 6-second
+hold.
+
+Empty or corrupt authority keys fail closed until the file is manually removed
+or restored by the trusted local operator. An invalid `human-stop-token` prevents
+daemon boot; an invalid `proofs/hmac-key` refuses proof generation/verification
+when that key is accessed. Repeated calls do not replace either key. Removing a
+key causes a new one to be created and invalidates the old Stop token or proof
+MACs, so do not remove one just to bypass an error without checking its cause.
+
 ## Security contract
 
 - Work calls need a live lease and the per-task capability; stale epochs return
