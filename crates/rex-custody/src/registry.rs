@@ -29,8 +29,9 @@ use crate::state::{CustodyGrant, CustodyPhase, ReleaseReason, Violation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tombstone {
@@ -88,6 +89,15 @@ pub struct CustodyRegistry {
 
 const DEFAULT_OFFER_TTL_MS: u64 = 10 * 60 * 1000;
 
+// `File::lock` is cross-process, but same-process threads also need one
+// acquisition gate before consulting their separate registry snapshots.
+static STORE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub struct StoreGuard {
+    _local: MutexGuard<'static, ()>,
+    _file: File,
+}
+
 impl CustodyRegistry {
     pub fn open(root: PathBuf) -> Result<Self, CustodyError> {
         fs::create_dir_all(root.join("grants")).map_err(ioe)?;
@@ -96,7 +106,8 @@ impl CustodyRegistry {
             Ok(bytes) => {
                 serde_json::from_slice(&bytes).map_err(|e| CustodyError::Io(e.to_string()))?
             }
-            Err(_) => Index::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Index::default(),
+            Err(e) => return Err(ioe(e)),
         };
         let mut grants = HashMap::new();
         let mut audits = HashMap::new();
@@ -123,11 +134,51 @@ impl CustodyRegistry {
         })
     }
 
+    /// Lock the shared custody store for an entire reload/decision/write.
+    /// A process may not make a decision from its startup snapshot.
+    pub fn lock_store(&self) -> Result<StoreGuard, CustodyError> {
+        let local = STORE_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| CustodyError::Io("custody store lock poisoned".into()))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(self.root.join("custody.lock"))
+            .map_err(ioe)?;
+        file.lock().map_err(ioe)?;
+        Ok(StoreGuard {
+            _local: local,
+            _file: file,
+        })
+    }
+
+    /// One serialized operation over the current durable registry. The
+    /// in-memory offer map survives refresh because offers are not persisted.
+    pub fn transact<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, CustodyError>,
+    ) -> Result<R, CustodyError> {
+        let _held = self.lock_store()?;
+        self.refresh()?;
+        f(self)
+    }
+
+    /// Reload grants and audit heads while the caller holds `lock_store`.
+    /// Preserve pending, unaccepted offers, which exist only in memory.
+    pub fn refresh(&mut self) -> Result<(), CustodyError> {
+        let offers = self.offers.clone();
+        let mut fresh = Self::open(self.root.clone())?;
+        fresh.offers = offers;
+        *self = fresh;
+        Ok(())
+    }
+
     fn persist_grant(&self, grant: &CustodyGrant) -> Result<(), CustodyError> {
-        let tmp = self
-            .root
-            .join("grants")
-            .join(format!("{}.json.tmp", grant.grant_id));
+        let tmp =
+            self.root
+                .join("grants")
+                .join(format!("{}.{}.json.tmp", grant.grant_id, random_hex(8)));
         let fin = self
             .root
             .join("grants")
@@ -137,18 +188,26 @@ impl CustodyRegistry {
             serde_json::to_vec_pretty(grant).expect("grant serializes"),
         )
         .map_err(ioe)?;
-        fs::rename(&tmp, &fin).map_err(ioe)
+        let result = fs::rename(&tmp, &fin);
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result.map_err(ioe)
     }
 
     fn persist_index(&self) -> Result<(), CustodyError> {
-        let tmp = self.root.join("index.json.tmp");
+        let tmp = self.root.join(format!("index.{}.json.tmp", random_hex(8)));
         let fin = self.root.join("index.json");
         fs::write(
             &tmp,
             serde_json::to_vec_pretty(&self.index).expect("index serializes"),
         )
         .map_err(ioe)?;
-        fs::rename(&tmp, &fin).map_err(ioe)
+        let result = fs::rename(&tmp, &fin);
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result.map_err(ioe)
     }
 
     fn audit(
@@ -782,6 +841,17 @@ impl CustodyRegistry {
 
     /// Crash recovery: reload and reconcile against the clock.
     pub fn recover(root: PathBuf, now_ms: u128) -> Result<Self, CustodyError> {
+        fs::create_dir_all(&root).map_err(ioe)?;
+        let _local = STORE_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| CustodyError::Io("custody store lock poisoned".into()))?;
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(root.join("custody.lock"))
+            .map_err(ioe)?;
+        lock_file.lock().map_err(ioe)?;
         let mut reg = Self::open(root)?;
         reg.sweep(now_ms)?;
         Ok(reg)

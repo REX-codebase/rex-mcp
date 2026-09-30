@@ -193,7 +193,11 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
 
     /// Current custody phase for a grant, for shell polling.
     pub fn phase_of(&self, grant_id: &str) -> Option<CustodyPhase> {
-        self.custody.lock().ok()?.grant(grant_id).map(|g| g.phase)
+        self.custody
+            .lock()
+            .ok()?
+            .transact(|c| Ok(c.grant(grant_id).map(|g| g.phase)))
+            .ok()?
     }
 
     /// Offer, accept and start a custodied managed-model task. The caller
@@ -209,6 +213,12 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
             .custody
             .lock()
             .map_err(|_| "custody poisoned".to_string())?;
+        let _store_lock = custody
+            .lock_store()
+            .map_err(|e| format!("custody lock refused: {e}"))?;
+        custody
+            .refresh()
+            .map_err(|e| format!("custody refresh refused: {e}"))?;
         let offer = custody
             .offer(
                 &req.task_id,
@@ -233,6 +243,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
         let (token, grant) = custody
             .accept(&acceptance, now)
             .map_err(|e| format!("custody handshake failed: {e}"))?;
+        drop(_store_lock);
         drop(custody);
 
         // The run never gets more than the grant allows.
@@ -263,8 +274,9 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
             .map_err(|e| {
                 // The run never started; release custody honestly.
                 let _ = self.custody.lock().map(|mut c| {
-                    let _ =
-                        c.declare_failure(&token, &format!("run failed to start: {e}"), now_ms());
+                    let _ = c.transact(|c| {
+                        c.declare_failure(&token, &format!("run failed to start: {e}"), now_ms())
+                    });
                 });
                 format!("run refused: {e}")
             })?;
@@ -282,10 +294,14 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
         // the canonical confinement, custody the scope equality.
         self.custody
             .lock()
-            .map(|c| {
-                c.grant(grant_id)
-                    .map(|g| g.capabilities.workspace_root.clone())
-                    .unwrap_or_else(|| PathBuf::from("."))
+            .map(|mut c| {
+                c.transact(|c| {
+                    Ok(c.grant(grant_id)
+                        .map(|g| g.capabilities.workspace_root.clone()))
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| PathBuf::from("."))
             })
             .unwrap_or_else(|_| PathBuf::from("."))
     }
@@ -296,7 +312,7 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
             .custody
             .lock()
             .map_err(|_| "custody poisoned".to_string())?
-            .human_stop(grant_id, now_ms())
+            .transact(|c| c.human_stop(grant_id, now_ms()))
             .map_err(|e| format!("stop refused: {e}"))?;
         let _ = self.runs.cancel(run_id);
         Ok(reason)
@@ -324,7 +340,17 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
                         Ok(c) => c,
                         Err(_) => return,
                     };
-                    seq += 1;
+                    let _store_lock = match c.lock_store() {
+                        Ok(lock) => lock,
+                        Err(_) => return,
+                    };
+                    if c.refresh().is_err() {
+                        return;
+                    }
+                    seq = c
+                        .grant(&grant_id)
+                        .map(|g| g.lease.next_seq)
+                        .unwrap_or(seq + 1);
                     if c.heartbeat(&token, seq, now_ms()).is_err() {
                         return; // custody gone (stopped/quarantined); run cancel raced in
                     }
@@ -350,6 +376,13 @@ impl<S: SecretStore + 'static, T: Transport + 'static> CustodyRunService<S, T> {
                     Ok(c) => c,
                     Err(_) => return,
                 };
+                let _store_lock = match c.lock_store() {
+                    Ok(lock) => lock,
+                    Err(_) => return,
+                };
+                if c.refresh().is_err() {
+                    return;
+                }
                 let now = now_ms();
                 match snap.terminal_reason.clone() {
                     Some(TerminalReason::Completed) => {

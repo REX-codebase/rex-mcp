@@ -243,10 +243,120 @@ impl HarnessDaemon {
         Ok(daemon)
     }
 
+    // Typed callers take the same transaction path as MCP dispatch. Core
+    // methods below run only while dispatch holds the per-task lock.
+    pub fn human_stop(&self, req: HumanStopRequest) -> Result<CancelResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::HumanStop, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn execute(&self, req: ExecuteRequest) -> Result<ExecuteResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Execute, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn next(&self, req: NextRequest) -> Result<NextResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Next, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn read(&self, req: ReadRequest) -> Result<ReadResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Read, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn edit(&self, req: EditRequest) -> Result<EditResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Edit, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn search(&self, req: SearchRequest) -> Result<SearchResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Search, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn run(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Run, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn test(&self, req: TestRequest) -> Result<TestResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Test, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn submit(&self, req: SubmitRequest) -> Result<SubmitResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Submit, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn status(&self, req: TaskRefRequest) -> Result<StatusResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Status, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn events(&self, req: EventsRequest) -> Result<EventsResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Events, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn result(&self, req: TaskRefRequest) -> Result<ResultResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Result, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn cancel(&self, req: CancelRequest) -> Result<CancelResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Cancel, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn artifact_put(
+        &self,
+        req: ArtifactPutRequest,
+    ) -> Result<ArtifactPutResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::ArtifactPut, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn ultra_open(&self, req: UltraOpenRequest) -> Result<UltraViewResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::UltraOpen, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn ultra_submit(
+        &self,
+        req: UltraSubmitRequest,
+    ) -> Result<UltraViewResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::UltraSubmit, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn ultra_promote(
+        &self,
+        req: rex_protocol::UltraPromoteRequest,
+    ) -> Result<rex_protocol::UltraPromoteResponse, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::UltraPromote, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn proof_bundle(&self, req: TaskRefRequest) -> Result<TaskProofBundle, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::Proof, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+    pub fn verify_proof_bundle(
+        &self,
+        req: TaskRefRequest,
+    ) -> Result<ProofVerificationReport, ProtocolError> {
+        let args = serde_json::to_value(req).map_err(internal)?;
+        let result = self.dispatch(ToolName::ProofVerify, args)?;
+        serde_json::from_value(result).map_err(internal)
+    }
+
     /// The final human Stop: terminal fence for any task, gated on the
     /// human-stop token that only the trusted local launcher can read.
     /// Distinct from operator `cancel`, which requires the task capability.
-    pub fn human_stop(&self, req: HumanStopRequest) -> Result<CancelResponse, ProtocolError> {
+    fn human_stop_inner(&self, req: HumanStopRequest) -> Result<CancelResponse, ProtocolError> {
         if hex_sha256(req.human_token.as_bytes()) != self.human_token_hash {
             return Err(perr(
                 ErrorCode::Unauthorized,
@@ -267,6 +377,8 @@ impl HarnessDaemon {
                 .custody
                 .lock()
                 .map_err(|_| internal("custody registry poisoned"))?;
+            let _store_lock = reg.lock_store().map_err(custody_err)?;
+            reg.refresh().map_err(custody_err)?;
             // The human stop is final in every phase, never gated on the
             // operator's state, even for an agent-operated task.
             reg.human_stop(&t.grant_id, now_ms()).map_err(custody_err)?;
@@ -285,7 +397,7 @@ impl HarnessDaemon {
         })
     }
 
-    pub fn execute(&self, req: ExecuteRequest) -> Result<ExecuteResponse, ProtocolError> {
+    fn execute_inner(&self, req: ExecuteRequest) -> Result<ExecuteResponse, ProtocolError> {
         validate_execute(&req)?;
         if let Some(id) = &req.task_id {
             let mut task = self.load(id)?;
@@ -360,6 +472,9 @@ impl HarnessDaemon {
         }
         let now = now_ms();
         let task_id = format!("task-{}", random_id());
+        // Keep creation under the same per-task lock that the keeper and
+        // failsafe use when scanning a newly created task.
+        let _new_task_lock = self.lock_task(&task_id)?;
         let host_resume_handle = format!("hrh-{}", random_hex(24));
         let task_capability = format!("cap-{}", random_hex(24));
         let plan = req
@@ -428,6 +543,8 @@ impl HarnessDaemon {
                 .custody
                 .lock()
                 .map_err(|_| internal("custody registry poisoned"))?;
+            let _store_lock = reg.lock_store().map_err(custody_err)?;
+            reg.refresh().map_err(custody_err)?;
             let offer = reg
                 .offer(
                     &task_id,
@@ -531,6 +648,7 @@ impl HarnessDaemon {
         capability: &str,
         epoch: u64,
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         self.live(task_id, epoch, capability).map(|_| ())
     }
 
@@ -551,6 +669,7 @@ impl HarnessDaemon {
         visible_names: Vec<String>,
         kind: &str,
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let mut t = self.live(task_id, epoch, capability)?;
         let action = t
             .open_action
@@ -621,6 +740,7 @@ impl HarnessDaemon {
         epoch: u64,
         kind: &str,
     ) -> Result<Option<Vec<MobileResultField>>, ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let t = self.live(task_id, epoch, capability)?;
         Ok(match kind {
             "render.mobile390.first" => t.mobile_result_fields,
@@ -635,6 +755,7 @@ impl HarnessDaemon {
         capability: &str,
         epoch: u64,
     ) -> Result<Option<TwoStateContract>, ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         Ok(self.live(task_id, epoch, capability)?.two_state_contract)
     }
 
@@ -645,6 +766,7 @@ impl HarnessDaemon {
         epoch: u64,
         preview_id: &str,
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let t = self.live(task_id, epoch, capability)?;
         let action = t
             .open_action
@@ -675,6 +797,7 @@ impl HarnessDaemon {
         epoch: u64,
         preview_id: &str,
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let mut t = self.live(task_id, epoch, capability)?;
         let action = t
             .open_action
@@ -707,6 +830,7 @@ impl HarnessDaemon {
         source: Option<&str>,
         visible_names: &[String],
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let mut t = self.live(task_id, epoch, capability)?;
         let contract = t
             .two_state_contract
@@ -907,6 +1031,7 @@ impl HarnessDaemon {
         digest: &str,
         source_sha256: &str,
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let mut t = self.live(task_id, epoch, capability)?;
         let action = t
             .open_action
@@ -982,6 +1107,7 @@ impl HarnessDaemon {
         capability: &str,
         epoch: u64,
     ) -> Result<Value, ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let mut t = self.live(task_id, epoch, capability)?;
         let action = t
             .open_action
@@ -1010,6 +1136,7 @@ impl HarnessDaemon {
         action_id: &str,
         findings: &str,
     ) -> Result<Value, ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let mut t = self.live(task_id, epoch, capability)?;
         if t.open_action.as_ref().map(|a| a.action_id.as_str()) != Some(action_id)
             || t.critique_issued_for.as_deref() != Some(action_id)
@@ -1043,6 +1170,7 @@ impl HarnessDaemon {
         capability: &str,
         epoch: u64,
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
         let t = self.live(task_id, epoch, capability)?;
         let action_id = t.open_action.as_ref().map(|a| a.action_id.as_str());
         if action_id.is_none() || t.critique_issued_for.as_deref() != action_id {
@@ -1061,6 +1189,16 @@ impl HarnessDaemon {
         capability: &str,
         epoch: u64,
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(task_id)?;
+        self.require_critique_inner(task_id, capability, epoch)
+    }
+
+    fn require_critique_inner(
+        &self,
+        task_id: &str,
+        capability: &str,
+        epoch: u64,
+    ) -> Result<(), ProtocolError> {
         let t = self.live(task_id, epoch, capability)?;
         let action_id = t.open_action.as_ref().map(|a| a.action_id.as_str());
         if t.critique_recorded_for.as_deref() != action_id || action_id.is_none() {
@@ -1069,7 +1207,7 @@ impl HarnessDaemon {
         Ok(())
     }
 
-    pub fn next(&self, req: NextRequest) -> Result<NextResponse, ProtocolError> {
+    fn next_inner(&self, req: NextRequest) -> Result<NextResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         self.heartbeat(&mut t)?;
         self.persist(&t)?;
@@ -1080,7 +1218,7 @@ impl HarnessDaemon {
         })
     }
 
-    pub fn read(&self, req: ReadRequest) -> Result<ReadResponse, ProtocolError> {
+    fn read_inner(&self, req: ReadRequest) -> Result<ReadResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         let result = self.call_tool(
             &mut t,
@@ -1106,7 +1244,7 @@ impl HarnessDaemon {
         })
     }
 
-    pub fn edit(&self, req: EditRequest) -> Result<EditResponse, ProtocolError> {
+    fn edit_inner(&self, req: EditRequest) -> Result<EditResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         let tool = if req.create {
             ToolRequest::CreateFile {
@@ -1134,7 +1272,7 @@ impl HarnessDaemon {
         })
     }
 
-    pub fn search(&self, req: SearchRequest) -> Result<SearchResponse, ProtocolError> {
+    fn search_inner(&self, req: SearchRequest) -> Result<SearchResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         let out = self.call_tool(
             &mut t,
@@ -1153,11 +1291,12 @@ impl HarnessDaemon {
     }
 
     pub fn validate_run(&self, req: &RunRequest) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(&req.task_id)?;
         self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         Ok(())
     }
 
-    pub fn run(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
+    fn run_inner(&self, req: RunRequest) -> Result<RunResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         if visual_action(
             &t.task,
@@ -1190,8 +1329,8 @@ impl HarnessDaemon {
         })
     }
 
-    pub fn test(&self, req: TestRequest) -> Result<TestResponse, ProtocolError> {
-        self.require_critique(&req.task_id, &req.capability, req.lease_epoch)?;
+    fn test_inner(&self, req: TestRequest) -> Result<TestResponse, ProtocolError> {
+        self.require_critique_inner(&req.task_id, &req.capability, req.lease_epoch)?;
         let argv = match req.recipe.as_str() {
             "cargo-test" => vec!["cargo".into(), "test".into(), "--workspace".into()],
             "npm-test" => vec!["npm".into(), "test".into()],
@@ -1202,7 +1341,7 @@ impl HarnessDaemon {
                 ))
             }
         };
-        let run = self.run(RunRequest {
+        let run = self.run_inner(RunRequest {
             task_id: req.task_id.clone(),
             capability: req.capability.clone(),
             lease_epoch: req.lease_epoch,
@@ -1327,7 +1466,7 @@ impl HarnessDaemon {
         }
     }
 
-    pub fn submit(&self, req: SubmitRequest) -> Result<SubmitResponse, ProtocolError> {
+    fn submit_inner(&self, req: SubmitRequest) -> Result<SubmitResponse, ProtocolError> {
         let t0 = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         // State-machine join (audit finding 2): an Ultra task can never
         // complete, or advance, through the Standard submission path. Its
@@ -1508,7 +1647,7 @@ impl HarnessDaemon {
             .custody
             .lock()
             .map_err(|_| internal("custody registry poisoned"))?
-            .claim_completion(&t.token, &claim, &evaluator, now_ms());
+            .transact(|reg| reg.claim_completion(&t.token, &claim, &evaluator, now_ms()));
         match completion {
             Ok(_) => {
                 t.operation_status = OperationStatus::Committed;
@@ -1548,7 +1687,7 @@ impl HarnessDaemon {
         }
     }
 
-    pub fn status(&self, req: TaskRefRequest) -> Result<StatusResponse, ProtocolError> {
+    fn status_inner(&self, req: TaskRefRequest) -> Result<StatusResponse, ProtocolError> {
         let mut t = self.load(&req.task_id)?;
         self.sync_lease_from_custody(&mut t)?;
         let lease = lease_view(&t);
@@ -1589,7 +1728,7 @@ impl HarnessDaemon {
         })
     }
 
-    pub fn events(&self, req: EventsRequest) -> Result<EventsResponse, ProtocolError> {
+    fn events_inner(&self, req: EventsRequest) -> Result<EventsResponse, ProtocolError> {
         let t = self.load(&req.task_id)?;
         let path = self.task_dir(&t.task_id).join("events.jsonl");
         let data = fs::read_to_string(path).unwrap_or_default();
@@ -1606,7 +1745,7 @@ impl HarnessDaemon {
         })
     }
 
-    pub fn result(&self, req: TaskRefRequest) -> Result<ResultResponse, ProtocolError> {
+    fn result_inner(&self, req: TaskRefRequest) -> Result<ResultResponse, ProtocolError> {
         let t = self.load(&req.task_id)?;
         if !t.state.is_terminal() {
             return Err(perr(
@@ -1628,7 +1767,7 @@ impl HarnessDaemon {
         })
     }
 
-    pub fn cancel(&self, req: CancelRequest) -> Result<CancelResponse, ProtocolError> {
+    fn cancel_inner(&self, req: CancelRequest) -> Result<CancelResponse, ProtocolError> {
         // Operator cancellation: the per-task capability is the authority.
         // The distinct final human Stop is `human_stop`, a separate route.
         let t0 = self.load(&req.task_id)?;
@@ -1654,6 +1793,8 @@ impl HarnessDaemon {
                 .custody
                 .lock()
                 .map_err(|_| internal("custody registry poisoned"))?;
+            let _store_lock = reg.lock_store().map_err(custody_err)?;
+            reg.refresh().map_err(custody_err)?;
             if t.operator_is_agent {
                 reg.operator_cancel(&t.token, now_ms())
                     .map_err(custody_err)?;
@@ -1684,7 +1825,7 @@ impl HarnessDaemon {
     /// alter it afterwards, and reusing one digest across candidates or
     /// rounds is rejected. Later gates cite the returned digest and the
     /// daemon re-hashes stored bytes when resolving it.
-    pub fn artifact_put(
+    fn artifact_put_inner(
         &self,
         req: ArtifactPutRequest,
     ) -> Result<ArtifactPutResponse, ProtocolError> {
@@ -1750,6 +1891,45 @@ impl HarnessDaemon {
     }
 
     pub fn dispatch(&self, tool: ToolName, args: Value) -> Result<Value, ProtocolError> {
+        // A task's MCP call is a read/modify/write transaction across the
+        // task record and event chain. Distinct hosts on one state directory
+        // must never load the same revision and then both persist.
+        // The lock file is stable and survives a task.json rename.
+        let task_id = args.get("task_id").and_then(Value::as_str).or_else(|| {
+            args.get("execute")
+                .and_then(|v| v.get("task_id"))
+                .and_then(Value::as_str)
+        });
+        let _request_lock = if tool == ToolName::Execute {
+            let request_id = args.get("request_id").and_then(Value::as_str).unwrap_or("");
+            let key = hex_sha256(request_id.as_bytes());
+            let dir = self.root.join("requests");
+            fs::create_dir_all(&dir).map_err(internal)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(dir.join(format!("{key}.lock")))
+                .map_err(internal)?;
+            file.lock().map_err(internal)?;
+            Some(file)
+        } else {
+            None
+        };
+        // An idempotent execute without task_id can still resume a task
+        // found by request_id. Serialize that task as well as the request
+        // lookup; otherwise an explicit task_id call can rotate the same
+        // handle concurrently.
+        let replay_task_id = if tool == ToolName::Execute && task_id.is_none() {
+            self.find_task_id_by_request(
+                args.get("request_id").and_then(Value::as_str).unwrap_or(""),
+            )?
+        } else {
+            None
+        };
+        let _task_lock = task_id
+            .or(replay_task_id.as_deref())
+            .map(|id| self.lock_task(id))
+            .transpose()?;
         fn parse<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, ProtocolError> {
             serde_json::from_value(v).map_err(|e| {
                 ProtocolError::new(ErrorCode::MalformedRequest, format!("bad arguments: {e}"))
@@ -1762,32 +1942,32 @@ impl HarnessDaemon {
             }};
         }
         match tool {
-            ToolName::Execute => go!(args, execute),
-            ToolName::Next => go!(args, next),
-            ToolName::Read => go!(args, read),
-            ToolName::Edit => go!(args, edit),
-            ToolName::Search => go!(args, search),
-            ToolName::Run => go!(args, run),
-            ToolName::Test => go!(args, test),
-            ToolName::Submit => go!(args, submit),
-            ToolName::Status => go!(args, status),
-            ToolName::Events => go!(args, events),
-            ToolName::Result => go!(args, result),
-            ToolName::Cancel => go!(args, cancel),
-            ToolName::UltraOpen => go!(args, ultra_open),
-            ToolName::UltraSubmit => go!(args, ultra_submit),
-            ToolName::UltraPromote => go!(args, ultra_promote),
-            ToolName::Proof => go!(args, proof_bundle),
-            ToolName::ProofVerify => go!(args, verify_proof_bundle),
-            ToolName::HumanStop => go!(args, human_stop),
-            ToolName::ArtifactPut => go!(args, artifact_put),
+            ToolName::Execute => go!(args, execute_inner),
+            ToolName::Next => go!(args, next_inner),
+            ToolName::Read => go!(args, read_inner),
+            ToolName::Edit => go!(args, edit_inner),
+            ToolName::Search => go!(args, search_inner),
+            ToolName::Run => go!(args, run_inner),
+            ToolName::Test => go!(args, test_inner),
+            ToolName::Submit => go!(args, submit_inner),
+            ToolName::Status => go!(args, status_inner),
+            ToolName::Events => go!(args, events_inner),
+            ToolName::Result => go!(args, result_inner),
+            ToolName::Cancel => go!(args, cancel_inner),
+            ToolName::UltraOpen => go!(args, ultra_open_inner),
+            ToolName::UltraSubmit => go!(args, ultra_submit_inner),
+            ToolName::UltraPromote => go!(args, ultra_promote_inner),
+            ToolName::Proof => go!(args, proof_bundle_inner),
+            ToolName::ProofVerify => go!(args, verify_proof_bundle_inner),
+            ToolName::HumanStop => go!(args, human_stop_inner),
+            ToolName::ArtifactPut => go!(args, artifact_put_inner),
         }
     }
 
     /// Open the Ultra external-host loop for a live agent-operated task.
     /// The first open attaches the host at the task's lease epoch; later
     /// opens are pure views over the durable kernel.
-    pub fn ultra_open(&self, req: UltraOpenRequest) -> Result<UltraViewResponse, ProtocolError> {
+    fn ultra_open_inner(&self, req: UltraOpenRequest) -> Result<UltraViewResponse, ProtocolError> {
         let mut t = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         require_agent(&t)?;
         require_ultra(&t)?;
@@ -1910,7 +2090,7 @@ impl HarnessDaemon {
 
     /// Submit one candidate response or one adversary/verifier evidence item.
     /// The kernel alone decides whether the evidence gates a transition.
-    pub fn ultra_submit(
+    fn ultra_submit_inner(
         &self,
         req: UltraSubmitRequest,
     ) -> Result<UltraViewResponse, ProtocolError> {
@@ -2017,6 +2197,7 @@ impl HarnessDaemon {
         &self,
         req: &rex_protocol::UltraPromoteRequest,
     ) -> Result<(), ProtocolError> {
+        let _task_lock = self.lock_task(&req.task_id)?;
         let task = self.live(&req.task_id, req.lease_epoch, &req.capability)?;
         require_agent(&task)?;
         require_ultra(&task)?;
@@ -2026,7 +2207,7 @@ impl HarnessDaemon {
     /// Promote the qualified candidate into the task workspace. Live lease,
     /// agent-operated tasks only; the kernel must be completed and the
     /// rollback path is verified by the promotion store.
-    pub fn ultra_promote(
+    fn ultra_promote_inner(
         &self,
         req: rex_protocol::UltraPromoteRequest,
     ) -> Result<rex_protocol::UltraPromoteResponse, ProtocolError> {
@@ -2326,7 +2507,7 @@ impl HarnessDaemon {
     /// promotion path underneath it landed with phase F, and the join
     /// itself is exercised directly.
     #[allow(dead_code)]
-    pub(crate) fn promote_and_join(
+    fn promote_and_join(
         &self,
         req: &rex_protocol::UltraPromoteRequest,
     ) -> Result<rex_ultra::promotion::PromotionReceipt, ProtocolError> {
@@ -2394,6 +2575,9 @@ impl HarnessDaemon {
         };
         for entry in read.flatten() {
             let id = entry.file_name().to_string_lossy().into_owned();
+            let Ok(_task_lock) = self.lock_task(&id) else {
+                continue;
+            };
             let Ok(mut t) = self.load(&id) else {
                 continue;
             };
@@ -2401,12 +2585,12 @@ impl HarnessDaemon {
         }
     }
 
-    pub fn proof_bundle(&self, req: TaskRefRequest) -> Result<TaskProofBundle, ProtocolError> {
+    fn proof_bundle_inner(&self, req: TaskRefRequest) -> Result<TaskProofBundle, ProtocolError> {
         let bundle = self.assemble_proof_bundle(&req.task_id)?;
         let dir = self.root.join("proofs");
         fs::create_dir_all(&dir).map_err(internal)?;
         let path = dir.join(format!("{}.json", bundle.task_id));
-        let temporary = path.with_extension("json.tmp");
+        let temporary = path.with_extension(format!("{}.json.tmp", random_hex(8)));
         fs::write(
             &temporary,
             serde_json::to_vec_pretty(&bundle).map_err(internal)?,
@@ -2555,7 +2739,7 @@ impl HarnessDaemon {
             .to_string()
         });
         let mut events = self
-            .events(EventsRequest {
+            .events_inner(EventsRequest {
                 task_id: t.task_id.clone(),
                 after_seq: 0,
                 limit: None,
@@ -2601,7 +2785,7 @@ impl HarnessDaemon {
     /// records must reproduce the same hash (the proof is deterministic
     /// and bound to the frozen plan), and every recorded candidate
     /// response hash must match the stored content.
-    pub fn verify_proof_bundle(
+    fn verify_proof_bundle_inner(
         &self,
         req: TaskRefRequest,
     ) -> Result<ProofVerificationReport, ProtocolError> {
@@ -2717,14 +2901,16 @@ impl HarnessDaemon {
         self.custody
             .lock()
             .map_err(|_| internal("custody registry poisoned"))?
-            .consume(
-                &t.token,
-                Consumption {
-                    tool_calls: 1,
-                    ..Default::default()
-                },
-                now_ms(),
-            )
+            .transact(|reg| {
+                reg.consume(
+                    &t.token,
+                    Consumption {
+                        tool_calls: 1,
+                        ..Default::default()
+                    },
+                    now_ms(),
+                )
+            })
             .map_err(custody_err)?;
         self.append_event(
             t,
@@ -2794,7 +2980,7 @@ impl HarnessDaemon {
         self.custody
             .lock()
             .map_err(|_| internal("custody registry poisoned"))?
-            .verify_token(&t.token, now)
+            .transact(|reg| reg.verify_token(&t.token, now).map(|_| ()))
             .map_err(custody_err)?;
         Ok(t)
     }
@@ -2808,6 +2994,8 @@ impl HarnessDaemon {
                 .custody
                 .lock()
                 .map_err(|_| internal("custody registry poisoned"))?;
+            let _store_lock = reg.lock_store().map_err(custody_err)?;
+            reg.refresh().map_err(custody_err)?;
             let seq = match reg.grant(&t.grant_id) {
                 Some(g) => g.lease.next_seq,
                 None => t.heartbeat_seq,
@@ -2863,11 +3051,11 @@ impl HarnessDaemon {
             return Ok(false);
         }
         let phase = {
-            let reg = self
-                .custody
+            self.custody
                 .lock()
-                .map_err(|_| internal("custody registry poisoned"))?;
-            reg.grant(&t.grant_id).map(|g| g.phase)
+                .map_err(|_| internal("custody registry poisoned"))?
+                .transact(|reg| Ok(reg.grant(&t.grant_id).map(|g| g.phase)))
+                .map_err(custody_err)?
         };
         match phase {
             Some(rex_custody::CustodyPhase::Active) => {
@@ -2988,6 +3176,11 @@ impl HarnessDaemon {
     fn task_dir(&self, id: &str) -> PathBuf {
         self.root.join("tasks").join(id)
     }
+    /// Stable per-task lock. Acquire before the custody store lock whenever
+    /// both task state and custody need to be consulted or changed.
+    fn lock_task(&self, id: &str) -> Result<std::fs::File, ProtocolError> {
+        lock_task_at(&self.root, id)
+    }
     fn persist(&self, t: &DurableTask) -> Result<(), ProtocolError> {
         let dir = self.task_dir(&t.task_id);
         fs::create_dir_all(&dir).map_err(internal)?;
@@ -3036,19 +3229,24 @@ impl HarnessDaemon {
         }
         Ok(t)
     }
-    fn find_by_request(&self, request_id: &str) -> Result<Option<DurableTask>, ProtocolError> {
+    fn find_task_id_by_request(&self, request_id: &str) -> Result<Option<String>, ProtocolError> {
         let dirs = fs::read_dir(self.root.join("tasks")).map_err(internal)?;
         for ent in dirs.flatten() {
             if let Ok(bytes) = fs::read(ent.path().join("task.json")) {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     if v.get("request_id").and_then(|r| r.as_str()) == Some(request_id) {
-                        let id = v.get("task_id").and_then(|i| i.as_str()).unwrap_or("task");
-                        return self.parse_task(&bytes, id).map(Some);
+                        return Ok(v.get("task_id").and_then(|i| i.as_str()).map(str::to_owned));
                     }
                 }
             }
         }
         Ok(None)
+    }
+    fn find_by_request(&self, request_id: &str) -> Result<Option<DurableTask>, ProtocolError> {
+        match self.find_task_id_by_request(request_id)? {
+            Some(id) => self.load(&id).map(Some),
+            None => Ok(None),
+        }
     }
     fn append_event(
         &self,
@@ -3498,9 +3696,12 @@ fn hash_json<T: Serialize>(v: &T) -> Result<String, ProtocolError> {
 }
 fn atomic_json<T: Serialize>(path: &Path, v: &T) -> Result<(), ProtocolError> {
     let bytes = serde_json::to_vec_pretty(v).map_err(internal)?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).map_err(internal)?;
-    fs::rename(tmp, path).map_err(internal)
+    let tmp = path.with_extension(format!("{}.tmp", random_hex(8)));
+    let written = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(internal)
 }
 /// Load or create the daemon's human-stop token. The token file is the
 /// human authority boundary: only the trusted local launcher can read a
@@ -3556,6 +3757,24 @@ fn load_or_create_proof_key(root: &Path) -> Result<String, ProtocolError> {
         f.sync_all().map_err(internal)?;
     }
     Ok(key)
+}
+
+fn lock_task_at(root: &Path, id: &str) -> Result<std::fs::File, ProtocolError> {
+    if !safe_id(id) {
+        return Err(ProtocolError::new(
+            ErrorCode::MalformedRequest,
+            "invalid task id",
+        ));
+    }
+    let dir = root.join("tasks").join(id);
+    fs::create_dir_all(&dir).map_err(internal)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(dir.join("task.lock"))
+        .map_err(internal)?;
+    file.lock().map_err(internal)?;
+    Ok(file)
 }
 
 fn safe_id(s: &str) -> bool {
@@ -3726,6 +3945,201 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::VersionMismatch);
     }
+    #[test]
+    fn parallel_hosts_cannot_duplicate_a_request_id() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let a = Arc::new(HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap());
+        let b = Arc::new(HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [a, b]
+            .into_iter()
+            .map(|daemon| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    daemon.dispatch(
+                        ToolName::Execute,
+                        serde_json::to_value(req("same-request")).unwrap(),
+                    )
+                })
+            })
+            .collect();
+        let mut created = 0;
+        for thread in threads {
+            match thread.join().unwrap() {
+                Ok(_) => created += 1,
+                Err(error) => assert!(
+                    matches!(error.code, ErrorCode::ScopeDenied | ErrorCode::Unauthorized),
+                    "{error:?}"
+                ),
+            }
+        }
+        assert_eq!(created, 1, "only one host may mint this request id");
+        let task_count = fs::read_dir(root.join("tasks"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().join("task.json").exists())
+            .count();
+        assert_eq!(task_count, 1);
+        CustodyRegistry::open(root.join("custody")).unwrap();
+    }
+
+    #[test]
+    fn parallel_hosts_serialize_task_events_and_heartbeats() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let a = Arc::new(HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap());
+        let b = Arc::new(HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap());
+        let ex = a
+            .dispatch(
+                ToolName::Execute,
+                serde_json::to_value(req("next-race")).unwrap(),
+            )
+            .unwrap();
+        let id = ex["task_id"].as_str().unwrap().to_owned();
+        let cap = ex["task_capability"].as_str().unwrap().to_owned();
+        let epoch = ex["lease"]["epoch"].as_u64().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [a, b]
+            .into_iter()
+            .map(|daemon| {
+                let barrier = Arc::clone(&barrier);
+                let id = id.clone();
+                let cap = cap.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    daemon.dispatch(
+                        ToolName::Next,
+                        json!({"task_id":id,"capability":cap,"lease_epoch":epoch}),
+                    )
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let task: Value = serde_json::from_slice(
+            &fs::read(root.join("tasks").join(&id).join("task.json")).unwrap(),
+        )
+        .unwrap();
+        let reg = CustodyRegistry::open(root.join("custody")).unwrap();
+        let grant = reg.grant(task["grant_id"].as_str().unwrap()).unwrap();
+        assert_eq!(task["heartbeat_seq"].as_u64(), Some(grant.lease.next_seq));
+        assert_eq!(
+            grant.lease.next_seq, 3,
+            "initial sequence plus two serial heartbeats"
+        );
+        CustodyRegistry::open(root.join("custody"))
+            .unwrap()
+            .audit_chain(&grant.grant_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn parallel_stop_and_next_leave_terminal_task_and_released_grant() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let a = Arc::new(HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap());
+        let b = Arc::new(HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap());
+        let ex = a
+            .dispatch(
+                ToolName::Execute,
+                serde_json::to_value(req("stop-race")).unwrap(),
+            )
+            .unwrap();
+        let id = ex["task_id"].as_str().unwrap().to_owned();
+        let cap = ex["task_capability"].as_str().unwrap().to_owned();
+        let epoch = ex["lease"]["epoch"].as_u64().unwrap();
+        let token = fs::read_to_string(root.join("human-stop-token")).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let id1 = id.clone();
+        let next = std::thread::spawn(move || {
+            b1.wait();
+            a.dispatch(
+                ToolName::Next,
+                json!({"task_id":id1,"capability":cap,"lease_epoch":epoch}),
+            )
+        });
+        let b2 = Arc::clone(&barrier);
+        let id2 = id.clone();
+        let stop = std::thread::spawn(move || {
+            b2.wait();
+            b.dispatch(
+                ToolName::HumanStop,
+                json!({"task_id":id2,"human_token":token,"reason":"stop"}),
+            )
+        });
+        let _ = next.join().unwrap();
+        stop.join().unwrap().unwrap();
+        let task: Value = serde_json::from_slice(
+            &fs::read(root.join("tasks").join(&id).join("task.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task["state"], "cancelled");
+        let reg = CustodyRegistry::open(root.join("custody")).unwrap();
+        assert_eq!(
+            reg.grant(task["grant_id"].as_str().unwrap()).unwrap().phase,
+            rex_custody::CustodyPhase::Released
+        );
+        let events: Vec<_> = fs::read_to_string(root.join("tasks").join(&id).join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect();
+        assert_eq!(events.last().unwrap()["kind"], "human_stop");
+    }
+
+    #[test]
+    fn replay_by_request_and_explicit_task_id_cannot_both_rotate() {
+        let d = tempdir().unwrap();
+        let w = d.path().join("ws");
+        let root = d.path().join("state");
+        let a = Arc::new(HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap());
+        let b = Arc::new(HarnessDaemon::open(&root, DaemonPolicy::conservative(&w)).unwrap());
+        let ex = a
+            .dispatch(
+                ToolName::Execute,
+                serde_json::to_value(req("replay-race")).unwrap(),
+            )
+            .unwrap();
+        let id = ex["task_id"].as_str().unwrap().to_string();
+        let handle = ex["host_resume_handle"].as_str().unwrap().to_string();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [(a, None), (b, Some(id.clone()))]
+            .into_iter()
+            .map(|(daemon, task_id)| {
+                let barrier = Arc::clone(&barrier);
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    let mut replay = req("replay-race");
+                    replay.task_id = task_id;
+                    replay.resume_handle = Some(handle);
+                    barrier.wait();
+                    daemon.dispatch(ToolName::Execute, serde_json::to_value(replay).unwrap())
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        let task: Value = serde_json::from_slice(
+            &fs::read(root.join("tasks").join(id).join("task.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task["last_event_seq"].as_u64(), Some(1));
+    }
+
     #[test]
     fn idempotency_and_recovery() {
         let d = tempdir().unwrap();

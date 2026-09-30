@@ -463,3 +463,86 @@ fn artifacts_cannot_be_rebound_across_candidates() {
         "one digest cannot be reused across candidates"
     );
 }
+
+#[test]
+fn separate_processes_serialize_typed_task_calls() {
+    use std::process::Command;
+    if std::env::var_os("REX_RACE_CHILD").is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("REX_RACE_ROOT").unwrap());
+        let workspace = std::path::PathBuf::from(std::env::var_os("REX_RACE_WORKSPACE").unwrap());
+        let id = std::env::var("REX_RACE_TASK_ID").unwrap();
+        let cap = std::env::var("REX_RACE_CAPABILITY").unwrap();
+        let epoch = std::env::var("REX_RACE_EPOCH").unwrap().parse().unwrap();
+        let gate = std::path::PathBuf::from(std::env::var_os("REX_RACE_GATE").unwrap());
+        let ready = std::path::PathBuf::from(std::env::var_os("REX_RACE_READY").unwrap());
+        let daemon = HarnessDaemon::open(root, DaemonPolicy::conservative(workspace)).unwrap();
+        std::fs::write(ready, b"ready").unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !gate.exists() {
+            assert!(
+                std::time::Instant::now() < until,
+                "parent did not release child"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for _ in 0..10 {
+            daemon
+                .next(NextRequest {
+                    task_id: id.clone(),
+                    capability: cap.clone(),
+                    lease_epoch: epoch,
+                })
+                .unwrap();
+        }
+        return;
+    }
+    let d = tempdir().unwrap();
+    let root = d.path().join("state");
+    let workspace = d.path().join("ws");
+    let daemon = HarnessDaemon::open(&root, DaemonPolicy::conservative(&workspace)).unwrap();
+    let ex = execute_ultra(&daemon, "process-race", "make hello");
+    let gate = d.path().join("gate");
+    let ready = d.path().join("ready");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("separate_processes_serialize_typed_task_calls")
+        .arg("--nocapture")
+        .env("REX_RACE_CHILD", "1")
+        .env("REX_RACE_ROOT", &root)
+        .env("REX_RACE_WORKSPACE", &workspace)
+        .env("REX_RACE_TASK_ID", &ex.task_id)
+        .env("REX_RACE_CAPABILITY", cap_of(&ex))
+        .env("REX_RACE_EPOCH", ex.lease.epoch.to_string())
+        .env("REX_RACE_GATE", &gate)
+        .env("REX_RACE_READY", &ready)
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "child did not initialize"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::fs::write(&gate, b"go").unwrap();
+    for _ in 0..10 {
+        daemon
+            .next(NextRequest {
+                task_id: ex.task_id.clone(),
+                capability: cap_of(&ex),
+                lease_epoch: ex.lease.epoch,
+            })
+            .unwrap();
+    }
+    assert!(child.wait().unwrap().success());
+    let task: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("tasks").join(&ex.task_id).join("task.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(task["heartbeat_seq"].as_u64(), Some(21));
+    let registry = rex_custody::CustodyRegistry::open(root.join("custody")).unwrap();
+    let grant = registry.grant(task["grant_id"].as_str().unwrap()).unwrap();
+    assert_eq!(grant.lease.next_seq, 21);
+    assert_eq!(registry.audit_chain(&grant.grant_id).unwrap().len(), 21);
+}

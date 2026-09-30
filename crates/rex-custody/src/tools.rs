@@ -53,6 +53,8 @@ impl CustodiedToolRuntime {
             .registry
             .lock()
             .map_err(|_| CustodyToolError::Custody(CustodyError::Io("registry poisoned".into())))?;
+        let _store_lock = reg.lock_store().map_err(CustodyToolError::Custody)?;
+        reg.refresh().map_err(CustodyToolError::Custody)?;
         let grant = reg
             .verify_token(token, now_ms)
             .map_err(CustodyToolError::Custody)?;
@@ -90,19 +92,25 @@ impl CustodiedToolRuntime {
     /// Execute a prepared call. Token is re-verified at execution: a grant
     /// released or quarantined between prepare and execute stops the call.
     pub fn execute(&self, token: &CapabilityToken, call_id: &str, now_ms: u128) -> ToolResult {
-        let checked = {
-            let mut reg = match self.registry.lock() {
-                Ok(r) => r,
-                Err(_) => {
-                    return custody_blocked_result(call_id, "registry poisoned");
-                }
-            };
-            reg.verify_token(token, now_ms)
+        let mut reg = match self.registry.lock() {
+            Ok(reg) => reg,
+            Err(_) => return custody_blocked_result(call_id, "registry poisoned"),
         };
-        match checked {
-            Ok(_) => self.inner.execute(call_id),
-            Err(e) => custody_blocked_result(call_id, &format!("custody refused execution: {e}")),
+        let _store_lock = match reg.lock_store() {
+            Ok(lock) => lock,
+            Err(e) => {
+                return custody_blocked_result(call_id, &format!("custody lock unavailable: {e}"))
+            }
+        };
+        if let Err(e) = reg.refresh() {
+            return custody_blocked_result(call_id, &format!("custody refresh failed: {e}"));
         }
+        if let Err(e) = reg.verify_token(token, now_ms) {
+            return custody_blocked_result(call_id, &format!("custody refused execution: {e}"));
+        }
+        // Hold both locks across execution so a concurrent stop cannot
+        // interleave between the final token check and the tool effect.
+        self.inner.execute(call_id)
     }
 }
 
