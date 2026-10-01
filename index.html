@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REX MCP — Make your agent prove it</title>
+<meta name="description" content="REX MCP is a local stdio bridge into REX custody: scoped workspaces, five-minute leases, sealed evidence, signed receipts. The agent does the work; REX makes it unable to fake having done it.">
+<!--
+================================================================================
+PRE-PIXEL RECORD — REX MCP marketing page (skill: rex-design, mode: VISUAL)
+Routing reason: launch/marketing page whose primary success criterion is visual
+persuasion (a developer grasps the concept in ~10 seconds and installs). Not a
+production workflow. Production basics (a11y, honest states, keyboard) still apply.
+
+BRIEF ANSWERS (Norman: discoverability + understanding)
+- Who acts: a developer running AI coding agents, tired of agents claiming
+  "done" without proof. Decision: is REX MCP worth installing? Success: they
+  understand custody in ~10 seconds and reach the install command. Worst
+  failure: they bounce thinking it's another vague "agent framework," or
+  install expecting magic and find plumbing.
+- Data provenance: REAL — product facts from the repo/task brief (local stdio
+  MCP bridge; durable tasks with resume handles; capability-scoped workspaces;
+  5-minute leases with heartbeats; sealed evidence; signed receipts;
+  adversarial red-team review; Ultra workflow; install from source via
+  `bash scripts/rex-mcp-install.sh`; npm launcher NOT published yet;
+  "REX is the body, Fable is the brain"; "unable to fake having done the
+  work"; "MCP at Ultra's level"). REPRESENTATIVE-BUT-FAKE, LABELED: the
+  on-page custody ledger and its demo digest (labeled "demonstration, not REX
+  output"). NOT YET KNOWN: repo public timing, rex-mcp.au domain status —
+  neither claimed on the page. NEVER INVENTED: no testimonials, metrics, user
+  counts, reviews, or "trusted by" logos.
+- Constraints: single self-contained HTML, zero external requests (no webfonts;
+  system stack defended below), honest install story (source today, npm later).
+  Safe completion: visitor understands custody and finds the install command.
+- Assumptions (marked): none material; every product claim traces to the brief.
+
+VISUAL THESIS (one sentence)
+The page IS a REX custody receipt being sealed live: each section is a custody
+event appended to a ledger, and the visitor seals the final receipt themselves.
+
+SKETCH A — "The receipt" (PICKED)
+Hero is a stamped task record; scrolling appends custody events
+(task.opened → workspace.granted → lease.heartbeat → evidence.sealed →
+redteam.verdict → receipt.signed) to a visible ledger with a hash chain; the
+page ends with the visitor pressing "Seal the receipt," which digests the
+ledger into one demo hash and slams a rubber stamp. The product's promise is
+"unable to fake having done the work" — a receipt is the most characteristic
+object in REX's world, so the page is made of receipts.
+
+SKETCH B — "The leash" (REJECTED)
+An interactive capability-scope demo: a mini terminal where the visitor tries
+to touch files outside the granted workspace and gets denied. Strong demo of
+one feature, but the fence metaphor can't sustain six sections without
+collapsing into generic cards, and "try to break the sandbox" is a known
+marketing pattern. Rejected for the message, not the fashion.
+
+REFERENCE TRANSFER TEST: none used — no outside example was borrowed; the
+receipt/ledger mechanism is translated from the product's own custody model
+(task records, sealed evidence, signed receipts).
+
+ONE PRODUCT-SPECIFIC INTERACTION — "Seal the receipt"
+- Visible object: the custody ledger (sticky rail, desktop; stacked, mobile).
+- Governing rule: one section viewed = one custody event appended and chained.
+- One meaningful interaction: "Seal the receipt" digests the full ledger text
+  into a demo hash (cyrb53, labeled illustrative) and slams a SEALED stamp.
+- Sparse/wrong/delayed data: static page, no data layer — one-line honest note
+  suffices (the ledger is labeled a demonstration; the digest is labeled a
+  demo hash, not a real REX seal). No-JS: the ledger is fully rendered in HTML;
+  the seal button hides until JS initializes, leaving a readable static page.
+
+CRAFT-SYSTEM TOKENS
+- Type scale (ratio 1.25, "clear"): --s0 .8rem / --s1 1rem / --s2 1.25rem /
+  --s3 1.5625rem / --s4 1.9531rem / --s5 2.4414rem / --s6 3.0518rem. Fluid
+  display: clamp(var(--s4), 8vw, var(--s6)) — endpoints are scale steps.
+  Faces (defended system stack, zero requests): display = system-ui 800,
+  -0.02em (receipt-form starkness); data = ui-monospace (receipt tape);
+  pairing contrasts weight and genre, one dimension at a time. Body 1.55
+  unitless, max-width 66ch; headings 1.05; ALL CAPS labels tracked 0.08em
+  (functional labels only — section kickers, ledger ids).
+- Grid: hierarchical 12-col; gutters 24px; margins > gutters. ONE DELIBERATE
+  BREAK: the hero headline bleeds past the text column (negative right margin,
+  desktop) and the SEALED stamp overlaps the section edge — committed once.
+- Palette (material test): receipt paper #f6f4ee (paper is the physical
+  material of receipts — the product's own artifact), tinted ink #1c1a16,
+  stamp red #b3372a used like salt (seal, one headline word, ledger accents).
+  Combination check: paper + grotesque + mono + stamp red matches no named
+  wave (not cream+serif+terracotta, not near-black+acid). Hierarchy reads in
+  grayscale; accent = the stamp and the semantic pivot only.
+- Spacing: 4/8/12/16/24/32/48/64/96; structural gaps on multiples of 8.
+- Easing: one family — cubic-bezier(.2,.7,.2,1). Signature moment: the stamp
+  slam on seal (scale 1.6→1, hard stop, -8°). Scroll reveals are brief
+  transitions; reduced-motion path renders the page fully static.
+- Deletions recorded: icon-card feature grid; testimonials; "trusted by" logo
+  strip; count-up stats; decorative gradient blob; changelog ticker.
+
+ANTI-TEMPLATE PASS (diagnostic: "would I have arrived here for any similar
+page?" — applied to layout, palette, and chrome separately)
+- First-order: no gradients; hero left-aligned, one primary CTA + text link
+  (not centered headline + 2 buttons + 3 cards); no glassmorphism/blobs/emoji;
+  system fonts defended, not defaulted.
+- Second-order: paper ground carries grotesque + mono (breaks the
+  cream+serif+terracotta cluster); dark used only inside code blocks
+  (functional, not "tools look cool dark"); ledger indices are functional
+  event numbers, not decorative 01/02/03; one kicker, functional, used once;
+  headline color earned once on the semantic pivot ("prove it").
+- Third-wave guard: no faux-handmade grain/collage to "look human" — the
+  receipt texture comes from the product's artifact, not an anti-AI reflex.
+================================================================================
+-->
+<style>
+:root{
+  --paper:#f6f4ee; --paper-2:#ede9dd; --ink:#1c1a16; --ink-2:#5f594d;
+  --line:#d9d2c0; --red:#b3372a; --red-deep:#8f281e;
+  --s0:.8rem; --s1:1rem; --s2:1.25rem; --s3:1.5625rem; --s4:1.9531rem;
+  --s5:2.4414rem; --s6:3.0518rem;
+  --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px; --sp5:24px; --sp6:32px;
+  --sp8:48px; --sp10:64px; --sp12:96px;
+  --ease:cubic-bezier(.2,.7,.2,1);
+  --ui:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+body{
+  font-family:var(--ui); background:var(--paper); color:var(--ink);
+  font-size:var(--s1); line-height:1.55; -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--red);color:var(--paper)}
+a{color:inherit}
+:focus-visible{outline:3px solid var(--red);outline-offset:3px;border-radius:2px}
+.skip{position:absolute;left:-9999px;top:0;background:var(--ink);color:var(--paper);
+  padding:var(--sp3) var(--sp4);z-index:50;font-family:var(--mono);font-size:var(--s0)}
+.skip:focus{left:var(--sp4);top:var(--sp4)}
+.wrap{max-width:1200px;margin:0 auto;padding:0 var(--sp5)}
+@media(min-width:760px){.wrap{padding:0 var(--sp6)}}
+
+/* ---------- header ---------- */
+.site-head{border-bottom:1px solid var(--line);background:var(--paper);
+  position:sticky;top:0;z-index:20}
+.site-head .wrap{display:flex;align-items:center;justify-content:space-between;
+  padding-top:var(--sp4);padding-bottom:var(--sp4)}
+.brand{font-family:var(--mono);font-weight:700;font-size:var(--s1);
+  letter-spacing:-.01em;text-decoration:none}
+.brand b{color:var(--red)}
+.site-nav{display:flex;gap:var(--sp5);align-items:center;
+  font-family:var(--mono);font-size:var(--s0)}
+.site-nav a{text-decoration:none;color:var(--ink-2)}
+.site-nav a:hover{color:var(--ink);text-decoration:underline;
+  text-underline-offset:4px}
+@media(max-width:560px){.site-nav a.nav-hide{display:none}}
+
+/* ---------- hero ---------- */
+.hero{padding:var(--sp12) 0 var(--sp10);position:relative;overflow:hidden}
+.kicker{font-family:var(--mono);font-size:var(--s0);letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ink-2);margin-bottom:var(--sp5)}
+.hero h1{
+  font-weight:800;letter-spacing:-.02em;line-height:1.05;
+  font-size:clamp(var(--s4),8vw,var(--s6));
+  max-width:12ch;margin-bottom:var(--sp5);
+}
+@media(min-width:1000px){.hero h1{margin-right:calc(var(--sp12) * -1)}}
+.hero h1 .pivot{color:var(--red)}
+.lede{font-size:var(--s2);line-height:1.5;max-width:38ch;color:var(--ink);
+  margin-bottom:var(--sp4)}
+.lede strong{font-weight:700}
+.hero-actions{display:flex;gap:var(--sp5);align-items:baseline;flex-wrap:wrap;
+  margin:var(--sp6) 0 var(--sp4)}
+.btn{display:inline-block;background:var(--ink);color:var(--paper);
+  font-weight:700;font-size:var(--s1);padding:var(--sp4) var(--sp6);
+  text-decoration:none;border-radius:6px;transition:transform .18s var(--ease),
+  background .18s var(--ease)}
+.btn:hover{background:var(--red);transform:translateY(-2px)}
+.textlink{font-family:var(--mono);font-size:var(--s0);color:var(--ink-2);
+  text-decoration:underline;text-underline-offset:4px}
+.textlink:hover{color:var(--red)}
+.hero-note{font-family:var(--mono);font-size:var(--s0);color:var(--ink-2);
+  max-width:66ch}
+.hero-rule{margin-top:var(--sp10);border:0;border-top:1px solid var(--line)}
+
+/* ---------- sections ---------- */
+section{padding:var(--sp10) 0}
+.sec-kicker{font-family:var(--mono);font-size:var(--s0);letter-spacing:.08em;
+  text-transform:uppercase;color:var(--red);margin-bottom:var(--sp4)}
+h2{font-weight:800;letter-spacing:-.02em;line-height:1.05;
+  font-size:clamp(var(--s3),5vw,var(--s5));max-width:16ch;margin-bottom:var(--sp4)}
+.sec-intro{font-size:var(--s2);max-width:60ch;color:var(--ink-2);
+  margin-bottom:var(--sp8)}
+.sec-intro strong{color:var(--ink)}
+
+/* ---------- custody: events + ledger ---------- */
+.custody-grid{display:grid;gap:var(--sp8)}
+@media(min-width:1000px){
+  .custody-grid{grid-template-columns:7fr 5fr;gap:var(--sp6);align-items:start}
+}
+.event{padding:var(--sp6) 0;border-top:1px solid var(--line)}
+.event:last-child{border-bottom:1px solid var(--line)}
+.event-id{font-family:var(--mono);font-size:var(--s0);letter-spacing:.08em;
+  color:var(--red);margin-bottom:var(--sp2)}
+.event h3{font-size:var(--s3);font-weight:800;letter-spacing:-.015em;
+  line-height:1.1;margin-bottom:var(--sp2)}
+.event p{max-width:56ch;color:var(--ink-2)}
+.event p strong{color:var(--ink)}
+.ledger{position:sticky;top:96px;background:var(--paper-2);
+  border-radius:8px;padding:var(--sp6)}
+@media(max-width:999px){.ledger{position:static}}
+.ledger-head{font-family:var(--mono);font-size:var(--s0);letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ink-2);margin-bottom:var(--sp4);
+  display:flex;justify-content:space-between;align-items:center}
+.ledger-head .dot{width:8px;height:8px;border-radius:50%;background:var(--red);
+  display:inline-block;margin-right:var(--sp2)}
+.ledger ol{list-style:none;font-family:var(--mono);font-size:var(--s0)}
+.ledger li{padding:var(--sp3) 0;border-top:1px dashed var(--line);color:var(--ink-2);
+  display:flex;gap:var(--sp3);align-items:baseline;opacity:.45;
+  transition:opacity .3s var(--ease)}
+.ledger li.seen{opacity:1;color:var(--ink)}
+.ledger li .n{color:var(--red);font-weight:700;min-width:3ch}
+.ledger li .h{margin-left:auto;color:var(--ink-2)}
+.ledger-note{font-family:var(--mono);font-size:var(--s0);color:var(--ink-2);
+  margin-top:var(--sp4);line-height:1.6}
+
+/* ---------- seal demo ---------- */
+.seal-zone{background:var(--ink);color:var(--paper);border-radius:12px;
+  padding:var(--sp10) var(--sp6);position:relative;overflow:hidden}
+@media(min-width:760px){.seal-zone{padding:var(--sp10) var(--sp8)}}
+.seal-zone .sec-kicker{color:#e8a49a}
+.seal-zone h2{color:var(--paper)}
+.seal-zone p{color:#cfc9ba;max-width:60ch;margin-bottom:var(--sp4)}
+.seal-zone p strong{color:var(--paper)}
+.seal-row{display:flex;gap:var(--sp5);align-items:center;flex-wrap:wrap;
+  margin:var(--sp6) 0}
+.btn-red{background:var(--red);color:#fff;border:0;cursor:pointer;
+  font-family:var(--ui)}
+.btn-red:hover{background:var(--red-deep)}
+.btn-red:disabled{background:var(--ink-2);cursor:default;transform:none}
+.digest{font-family:var(--mono);font-size:var(--s0);color:var(--paper);
+  word-break:break-all;max-width:66ch;display:none}
+.digest.show{display:block}
+.digest .lbl{color:#e8a49a;display:block;margin-bottom:var(--sp2);
+  font-size:var(--s0);letter-spacing:.08em;text-transform:uppercase}
+.stamp{position:absolute;right:var(--sp6);top:var(--sp6);
+  font-family:var(--mono);font-weight:700;font-size:var(--s2);
+  letter-spacing:.12em;color:var(--red);border:4px double var(--red);
+  border-radius:8px;padding:var(--sp3) var(--sp5);transform:rotate(-8deg) scale(1.6);
+  opacity:0;pointer-events:none;background:rgba(246,244,238,.06)}
+.stamp.slam{animation:slam .45s var(--ease) forwards}
+@keyframes slam{
+  0%{opacity:0;transform:rotate(-8deg) scale(1.6)}
+  60%{opacity:1;transform:rotate(-8deg) scale(.94)}
+  100%{opacity:1;transform:rotate(-8deg) scale(1)}
+}
+.seal-fine{font-family:var(--mono);font-size:var(--s0);color:#8f887a;
+  margin-top:var(--sp5);max-width:66ch;line-height:1.6}
+
+/* ---------- install ---------- */
+.install-grid{display:grid;gap:var(--sp8)}
+@media(min-width:1000px){.install-grid{grid-template-columns:7fr 5fr;gap:var(--sp6)}}
+.codeblock{background:var(--ink);color:var(--paper);border-radius:8px;
+  padding:var(--sp5) var(--sp6);font-family:var(--mono);font-size:var(--s1);
+  display:flex;justify-content:space-between;align-items:center;gap:var(--sp4);
+  overflow-x:auto;margin-bottom:var(--sp4)}
+.codeblock code{white-space:nowrap}
+.codeblock .prompt{color:#8f887a}
+.copybtn{background:transparent;border:1px solid #4a453a;color:var(--paper);
+  font-family:var(--mono);font-size:var(--s0);padding:var(--sp2) var(--sp3);
+  border-radius:4px;cursor:pointer;display:none}
+.copybtn.ready{display:inline-block}
+.copybtn:hover{border-color:var(--red);color:#fff}
+.honest{border-left:4px solid var(--red);padding:var(--sp2) 0 var(--sp2) var(--sp5);
+  max-width:60ch}
+.honest p{color:var(--ink-2);font-size:var(--s1)}
+.honest p strong{color:var(--ink)}
+.install-side{font-family:var(--mono);font-size:var(--s0);color:var(--ink-2);
+  line-height:1.7}
+.install-side a{color:var(--red)}
+.install-side li{list-style:none;padding:var(--sp2) 0;border-top:1px solid var(--line)}
+
+/* ---------- footer ---------- */
+footer{border-top:1px solid var(--line);padding:var(--sp8) 0 var(--sp10);
+  margin-top:var(--sp8)}
+.foot-grid{display:grid;gap:var(--sp6)}
+@media(min-width:760px){.foot-grid{grid-template-columns:1fr 1fr}}
+.foot-motto{font-size:var(--s2);font-weight:800;letter-spacing:-.015em;
+  margin-bottom:var(--sp3)}
+.foot-motto em{font-style:normal;color:var(--red)}
+.foot-note{font-family:var(--mono);font-size:var(--s0);color:var(--ink-2);
+  line-height:1.7;max-width:66ch}
+.foot-note a{color:var(--ink);text-decoration:underline;text-underline-offset:3px}
+.foot-links{font-family:var(--mono);font-size:var(--s0);display:flex;
+  gap:var(--sp5);flex-wrap:wrap;align-content:start}
+.foot-links a{color:var(--ink-2);text-decoration:none}
+.foot-links a:hover{color:var(--red);text-decoration:underline;
+  text-underline-offset:4px}
+
+/* ---------- scroll reveal (brief transitions only) ---------- */
+.reveal{opacity:0;transform:translateY(16px);transition:opacity .5s var(--ease),
+  transform .5s var(--ease)}
+.reveal.in{opacity:1;transform:none}
+@media (prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="REX MCP home"><b>rex</b>-mcp</a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="nav-hide" href="#custody">Custody</a>
+      <a class="nav-hide" href="#seal">The receipt</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/REX-codebase/rex-mcp">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div id="top" class="wrap">
+
+  <!-- ================= HERO ================= -->
+  <div class="hero">
+    <p class="kicker">REX MCP · Custody for coding agents</p>
+    <h1>Your agent says it&rsquo;s done. Make it <span class="pivot">prove&nbsp;it.</span></h1>
+    <p class="lede">REX MCP is a local stdio bridge into REX custody. Your agent still does the work &mdash; inside <strong>scoped workspaces</strong>, on <strong>five-minute leases</strong>, with <strong>sealed evidence</strong> and <strong>signed receipts</strong>. What REX adds isn&rsquo;t creativity. It&rsquo;s the inability to fake having done the work.</p>
+    <div class="hero-actions">
+      <a class="btn" href="#install">Install from source</a>
+      <a class="textlink" href="https://github.com/REX-codebase/rex-mcp">Read the code on GitHub</a>
+    </div>
+    <p class="hero-note">Built to a bar we call &ldquo;MCP at Ultra&rsquo;s level.&rdquo; REX is the body, Fable is the brain.</p>
+    <hr class="hero-rule">
+  </div>
+
+  <!-- ================= CUSTODY ================= -->
+  <section id="custody" aria-labelledby="custody-h">
+    <p class="sec-kicker">How custody works</p>
+    <h2 id="custody-h">Trust the record, not the agent.</h2>
+    <p class="sec-intro">Most agent tools take the agent&rsquo;s word for it. REX doesn&rsquo;t. <strong>Six custody events</strong> stand between your agent and the word &ldquo;done&rdquo; &mdash; each one recorded, each one checkable.</p>
+
+    <div class="custody-grid">
+      <div>
+        <article class="event reveal" data-event="task.opened">
+          <p class="event-id">task.opened</p>
+          <h3>A durable task record</h3>
+          <p>Every run gets a task with a <strong>resume handle</strong>. Kill the process, lose the machine &mdash; the task survives, and you pick it up where it stopped.</p>
+        </article>
+        <article class="event reveal" data-event="workspace.granted">
+          <p class="event-id">workspace.granted</p>
+          <h3>A fenced workspace</h3>
+          <p>The agent receives capabilities for <strong>exactly one workspace</strong>. Outside it, every touch is denied &mdash; not warned about, denied.</p>
+        </article>
+        <article class="event reveal" data-event="lease.heartbeat">
+          <p class="event-id">lease.heartbeat</p>
+          <h3>A five-minute leash</h3>
+          <p>Leases expire after <strong>five minutes</strong>. The agent heartbeats to stay alive, or the task stops. No silent runaways burning tokens at 3&nbsp;a.m.</p>
+        </article>
+        <article class="event reveal" data-event="evidence.sealed">
+          <p class="event-id">evidence.sealed</p>
+          <h3>Proof before &ldquo;done&rdquo;</h3>
+          <p>Completion claims must cite <strong>sealed evidence</strong>. A claim with no proof is rejected at the gate &mdash; the task cannot complete on vibes.</p>
+        </article>
+        <article class="event reveal" data-event="redteam.verdict">
+          <p class="event-id">redteam.verdict</p>
+          <h3>An adversary reads it</h3>
+          <p>Before anything is promoted, a <strong>red-team review</strong> tries to break the work. It ships only if it survives the attack.</p>
+        </article>
+        <article class="event reveal" data-event="receipt.signed">
+          <p class="event-id">receipt.signed</p>
+          <h3>A signed receipt</h3>
+          <p>The task closes with a <strong>signed, replayable receipt</strong>: who did what, with what evidence, proven when. Audit it any time.</p>
+        </article>
+      </div>
+
+      <aside class="ledger" aria-label="Custody ledger demonstration">
+        <p class="ledger-head"><span><span class="dot" aria-hidden="true"></span>Live ledger</span><span>demo</span></p>
+        <ol id="ledger-list">
+          <li data-for="task.opened"><span class="n">#1</span><span>task.opened</span><span class="h">a3f9&hellip;</span></li>
+          <li data-for="workspace.granted"><span class="n">#2</span><span>workspace.granted</span><span class="h">71c2&hellip;</span></li>
+          <li data-for="lease.heartbeat"><span class="n">#3</span><span>lease.heartbeat</span><span class="h">e804&hellip;</span></li>
+          <li data-for="evidence.sealed"><span class="n">#4</span><span>evidence.sealed</span><span class="h">9d1a&hellip;</span></li>
+          <li data-for="redteam.verdict"><span class="n">#5</span><span>redteam.verdict</span><span class="h">44b7&hellip;</span></li>
+          <li data-for="receipt.signed"><span class="n">#6</span><span>receipt.signed</span><span class="h">c2e0&hellip;</span></li>
+        </ol>
+        <p class="ledger-note">Demonstration ledger &mdash; illustrative hashes, not REX output. Scroll: each section seals its event.</p>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ================= SEAL DEMO ================= -->
+  <section id="seal" aria-labelledby="seal-h">
+    <div class="seal-zone">
+      <div class="stamp" id="stamp" aria-hidden="true">Sealed · Demo</div>
+      <p class="sec-kicker">The receipt</p>
+      <h2 id="seal-h">Seal one yourself.</h2>
+      <p>The ledger above is a <strong>demonstration</strong>, not REX output. But the shape is real: press the button and every event digests into one hash &mdash; the same shape as a custody receipt, minus the cryptography.</p>
+      <div class="seal-row">
+        <button class="btn btn-red" id="seal-btn" hidden>Seal the receipt</button>
+      </div>
+      <p class="digest" id="digest" role="status"><span class="lbl">Demo digest of the six events</span><span id="digest-val"></span></p>
+      <p class="seal-fine">A real REX receipt carries an Ed25519 signature over canonical JSON and can be replayed offline. This page computes a non-cryptographic demo hash in your browser &mdash; nothing leaves the page, nothing is claimed.</p>
+    </div>
+  </section>
+
+  <!-- ================= INSTALL ================= -->
+  <section id="install" aria-labelledby="install-h">
+    <p class="sec-kicker">Install</p>
+    <h2 id="install-h">Install it today.</h2>
+    <div class="install-grid">
+      <div>
+        <div class="codeblock">
+          <code><span class="prompt">$</span> bash scripts/rex-mcp-install.sh</code>
+          <button class="copybtn" id="copy-btn" data-copy="bash scripts/rex-mcp-install.sh">Copy</button>
+        </div>
+        <div class="honest">
+          <p><strong>Honest status:</strong> today you install from a Rust checkout. The <strong>npm launcher isn&rsquo;t published yet</strong> &mdash; when it is, the one-line install will appear here. Not before.</p>
+        </div>
+      </div>
+      <div class="install-side">
+        <ul>
+          <li>→ Source: github.com/REX-codebase/rex-mcp</li>
+          <li>→ Transport: local stdio &mdash; no accounts, no cloud</li>
+          <li>→ License &amp; contributing: see the repo</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+</div>
+</main>
+
+<footer>
+  <div class="wrap foot-grid">
+    <div>
+      <p class="foot-motto">REX is the <em>body</em>. Fable is the <em>brain</em>.</p>
+      <p class="foot-note">No testimonials. No user counts. No &ldquo;trusted by&rdquo; strip. This page claims only what the software does &mdash; everything else would be the exact fakery REX exists to prevent. Demo ledger and digest on this page are illustrative, not REX output.</p>
+    </div>
+    <nav class="foot-links" aria-label="Footer">
+      <a href="https://github.com/REX-codebase/rex-mcp">GitHub</a>
+      <a href="#custody">Custody</a>
+      <a href="#install">Install</a>
+      <a href="#top">Back to top</a>
+    </nav>
+  </div>
+</footer>
+<script>
+(function(){
+  "use strict";
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* Reveal JS-dependent controls: without JS the page stays fully readable
+     and no dead control is shown. */
+  var sealBtn = document.getElementById("seal-btn");
+  var copyBtn = document.getElementById("copy-btn");
+  sealBtn.hidden = false;
+  copyBtn.classList.add("ready");
+
+  /* Scroll reveals + ledger sealing. Brief transitions only; reduced-motion
+     gets the final state immediately with no animation. */
+  var reveals = Array.prototype.slice.call(document.querySelectorAll(".reveal"));
+  var ledgerItems = {};
+  Array.prototype.forEach.call(document.querySelectorAll("#ledger-list li"), function(li){
+    ledgerItems[li.getAttribute("data-for")] = li;
+  });
+
+  function sealEvent(key){
+    var li = ledgerItems[key];
+    if(li) li.classList.add("seen");
+  }
+
+  if(reduced || !("IntersectionObserver" in window)){
+    reveals.forEach(function(el){ el.classList.add("in"); });
+    Object.keys(ledgerItems).forEach(sealEvent);
+  } else {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting){
+          e.target.classList.add("in");
+          var key = e.target.getAttribute("data-event");
+          if(key) sealEvent(key);
+          io.unobserve(e.target);
+        }
+      });
+    }, {threshold: 0.35});
+    reveals.forEach(function(el){ io.observe(el); });
+  }
+
+  /* Demo digest: cyrb53 over the ledger text. Explicitly non-cryptographic
+     and labeled as a demo — it demonstrates the receipt's shape, nothing more. */
+  function cyrb53(str, seed){
+    var h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
+    for(var i = 0; i < str.length; i++){
+      var ch = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
+  }
+
+  var digestEl = document.getElementById("digest");
+  var digestVal = document.getElementById("digest-val");
+  var stamp = document.getElementById("stamp");
+
+  sealBtn.addEventListener("click", function(){
+    var text = Array.prototype.map.call(
+      document.querySelectorAll("#ledger-list li"),
+      function(li){ return li.textContent.replace(/\s+/g, " ").trim(); }
+    ).join("|");
+    digestVal.textContent = "demo:" + cyrb53(text, 7) + " (illustrative — not a REX seal)";
+    digestEl.classList.add("show");
+    stamp.classList.add("slam");
+    sealBtn.disabled = true;
+    sealBtn.textContent = "Receipt sealed";
+  });
+
+  /* Copy install command. */
+  copyBtn.addEventListener("click", function(){
+    var val = copyBtn.getAttribute("data-copy");
+    function done(){ copyBtn.textContent = "Copied"; setTimeout(function(){ copyBtn.textContent = "Copy"; }, 1600); }
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(val).then(done, function(){ copyBtn.textContent = "Copy failed"; });
+    } else {
+      var ta = document.createElement("textarea");
+      ta.value = val; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); done(); } catch(e){ copyBtn.textContent = "Copy failed"; }
+      document.body.removeChild(ta);
+    }
+  });
+})();
+</script>
+</body>
+</html>
