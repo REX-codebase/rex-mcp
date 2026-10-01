@@ -2,7 +2,7 @@
 
 A local stdio MCP bridge into REX custody. The host agent still does the work; REX keeps the task record, limits the workspace, checks leases and budgets, and requires evidence for completion. It cannot force a host to continue.
 
-This is a private repository. The npm launcher is not published, so `npx @rex-codebase/rex-mcp@latest` does not yet work. From a checkout with Rust installed, run `bash scripts/rex-mcp-install.sh`. It builds and copies `rex-mcp` to `$HOME/.rex/bin/rex-mcp` (or `REX_INSTALL_DIR`). Use a literal absolute path in JSON or YAML settings, not `$HOME`.
+This repository is public. The npm launcher is not published, so `npx @rex-codebase/rex-mcp@latest` does not yet work. From a checkout with Rust installed, run `bash scripts/rex-mcp-install.sh`. It builds and copies `rex-mcp` to `$HOME/.rex/bin/rex-mcp` (or `REX_INSTALL_DIR`). Use a literal absolute path in JSON or YAML settings, not `$HOME`.
 
 The stdio server negotiates MCP `2025-11-25` and `2025-06-18`. A client offering an unsupported version receives the server's latest supported version and decides whether to disconnect. CI checks this handshake through a simulated stdio client; these setup examples are not verified installed-host results.
 
