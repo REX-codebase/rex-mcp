@@ -1816,36 +1816,59 @@ impl ToolRuntime {
         unsafe {
             use std::os::unix::process::CommandExt;
             command.pre_exec(move || {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if with_sandbox {
-                    if let Err(reason) = sandbox::apply_in_child() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!("{}{reason}", sandbox::SANDBOX_ERROR_PREFIX),
-                        ));
+                let outcome = (|| -> std::io::Result<()> {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
+                    if with_sandbox {
+                        if let Err(reason) = sandbox::apply_in_child() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                format!("{}{reason}", sandbox::SANDBOX_ERROR_PREFIX),
+                            ));
+                        }
+                    }
+                    let cpu = libc::rlimit {
+                        rlim_cur: 120,
+                        rlim_max: 120,
+                    };
+                    let mem = libc::rlimit {
+                        rlim_cur: 1024 * 1024 * 1024,
+                        rlim_max: 1024 * 1024 * 1024,
+                    };
+                    let files = libc::rlimit {
+                        rlim_cur: 256,
+                        rlim_max: 256,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0
+                        || libc::setrlimit(libc::RLIMIT_AS, &mem) != 0
+                        || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })();
+                if with_sandbox {
+                    // Any failure while setting up the confined child - the
+                    // namespaces, or the rlimits applied inside them - means the
+                    // sandbox could not be established. Mark it with the prefix
+                    // so the caller applies the fail-closed policy (refuse, or
+                    // degrade only under the explicit opt-in) rather than
+                    // masking it as an ordinary spawn failure.
+                    outcome.map_err(|e| {
+                        let message = format!("{e}");
+                        if message.starts_with(sandbox::SANDBOX_ERROR_PREFIX) {
+                            e
+                        } else {
+                            std::io::Error::new(
+                                e.kind(),
+                                format!("{}{e}", sandbox::SANDBOX_ERROR_PREFIX),
+                            )
+                        }
+                    })
+                } else {
+                    outcome
                 }
-                let cpu = libc::rlimit {
-                    rlim_cur: 120,
-                    rlim_max: 120,
-                };
-                let mem = libc::rlimit {
-                    rlim_cur: 1024 * 1024 * 1024,
-                    rlim_max: 1024 * 1024 * 1024,
-                };
-                let files = libc::rlimit {
-                    rlim_cur: 256,
-                    rlim_max: 256,
-                };
-                if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0
-                    || libc::setrlimit(libc::RLIMIT_AS, &mem) != 0
-                    || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
             });
         }
         command.spawn().map_err(|e| {
