@@ -8,7 +8,13 @@ STATE_DIR="${REX_STATE_DIR:-$HOME/.rex/harness}"
 if [ -d "$STATE_DIR/tasks" ]; then
   for f in "$STATE_DIR"/tasks/*/task.json; do
     [ -e "$f" ] || continue
-    v=$(grep -o '"store_schema_version":[0-9]*' "$f" | head -1 | grep -o '[0-9]*' || true)
+    # Prefer a real JSON parse so a differently-spaced or reordered field still
+    # reads; fall back to a whitespace-tolerant scan when python3 is absent.
+    if command -v python3 >/dev/null 2>&1; then
+      v=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("store_schema_version",""))' "$f" 2>/dev/null || true)
+    else
+      v=$(sed -n 's/.*"store_schema_version"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$f" | head -1)
+    fi
     if [ -n "$v" ] && [ "$v" -gt 2 ]; then
       echo "Task store at $STATE_DIR was written by a newer REX (schema v$v)." >&2
       echo "Install the newer server instead of downgrading onto it." >&2
