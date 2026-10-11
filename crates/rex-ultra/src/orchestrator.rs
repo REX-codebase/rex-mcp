@@ -29,8 +29,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+/// Take a lock, recovering the guard if a prior panic poisoned it. A poisoned
+/// lock would otherwise make every later caller panic too, turning one panic
+/// into a subsystem-wide cascade. Recovering matches `parking_lot` semantics
+/// (whose locks do not poison) without pulling in a new dependency.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const CONTRACT_ATTEMPTS: u8 = 3;
 const JUDGE_ATTEMPTS: u8 = 2;
@@ -399,7 +407,7 @@ struct DriveCtx {
 }
 
 fn set_phase(handle: &RunHandle, phase: UltraPhase) {
-    handle.shared.lock().expect("state poisoned").phase = phase;
+    lock(&handle.shared).phase = phase;
 }
 
 fn cancelled(handle: &RunHandle) -> bool {
@@ -407,7 +415,7 @@ fn cancelled(handle: &RunHandle) -> bool {
 }
 
 fn finish(handle: &RunHandle, terminal: UltraTerminal) {
-    let mut state = handle.shared.lock().expect("state poisoned");
+    let mut state = lock(&handle.shared);
     state.phase = match &terminal {
         UltraTerminal::Promoted => UltraPhase::Promoted,
         UltraTerminal::Rejected { .. } => UltraPhase::Rejected,
@@ -442,7 +450,7 @@ fn await_subrun<S: SecretStore + 'static, T: Transport + 'static>(
         match inner.snapshot(run_id) {
             Some(snap) => {
                 let terminal = snap.terminal_reason.is_some();
-                handle.shared.lock().expect("state poisoned").builder = Some(snap.clone());
+                lock(&handle.shared).builder = Some(snap.clone());
                 if terminal {
                     return snap;
                 }
@@ -528,7 +536,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
             return;
         }
     };
-    ctx.handle.shared.lock().expect("state poisoned").model = worker_model.clone();
+    lock(&ctx.handle.shared).model = worker_model.clone();
     ledger.record(
         &format!("worker model resolved to {worker_model}"),
         FactClass::Observed {
@@ -591,7 +599,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
         return;
     };
     write_json(&ultra_dir.join("contract.json"), &acceptance);
-    ctx.handle.shared.lock().expect("state poisoned").contract = Some(acceptance.clone());
+    lock(&ctx.handle.shared).contract = Some(acceptance.clone());
 
     let judge_provider = ctx
         .options
@@ -614,7 +622,7 @@ fn drive<S: SecretStore + 'static, T: Transport + 'static>(
         .clone()
         .unwrap_or_else(|| worker_model.clone());
     {
-        let mut state = ctx.handle.shared.lock().expect("state poisoned");
+        let mut state = lock(&ctx.handle.shared);
         state.judge_model = format!("{judge_provider}/{judge_model}");
         state.adversary_model = format!("{adversary_provider}/{adversary_model}");
     }
@@ -685,7 +693,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
             }
             other => {
                 let detail = format!("builder ended without completing: {other:?}");
-                let mut state = ctx.handle.shared.lock().expect("state poisoned");
+                let mut state = lock(&ctx.handle.shared);
                 if state.repair < MAX_REPAIRS {
                     state.repair += 1;
                     drop(state);
@@ -799,8 +807,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                     }
                 }
                 write_json(&ultra_dir.join("adversary.json"), &adversary_report_inner);
-                ctx.handle.shared.lock().expect("state poisoned").adversary =
-                    Some(adversary_report_inner.clone());
+                lock(&ctx.handle.shared).adversary = Some(adversary_report_inner.clone());
             }
             adversary_report = Some(adversary_report_inner);
 
@@ -886,7 +893,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
                     },
                 );
             }
-            ctx.handle.shared.lock().expect("state poisoned").judge = judge_result.clone();
+            lock(&ctx.handle.shared).judge = judge_result.clone();
         } // end if executable_all_proven
 
         // Promotion decision: every world that ran must agree.
@@ -1290,7 +1297,7 @@ a deterministic verifier, an adversary and a clean-room judge:\n",
             return;
         }
 
-        let mut state = ctx.handle.shared.lock().expect("state poisoned");
+        let mut state = lock(&ctx.handle.shared);
         if state.repair < MAX_REPAIRS {
             state.repair += 1;
             let n = state.repair;
@@ -1357,6 +1364,19 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
     use std::time::Instant;
+
+    #[test]
+    fn poisoned_lock_recovers_instead_of_cascading() {
+        let m = std::sync::Mutex::new(1u32);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = m.lock().unwrap();
+            panic!("boom while holding the lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(m.is_poisoned());
+        // The helper takes the guard back instead of panicking again.
+        assert_eq!(*lock(&m), 1);
+    }
 
     struct Script {
         turns: Mutex<VecDeque<String>>,
