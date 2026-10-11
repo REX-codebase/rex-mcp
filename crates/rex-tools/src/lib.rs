@@ -1724,13 +1724,21 @@ impl ToolRuntime {
         let (mut child, sandbox_status) = match self.spawn_command(argv, &cwd, true) {
             Ok(child) => (child, sandbox::SandboxStatus::Applied),
             Err(setup) => {
-                // Distinguish a kernel refusal of the sandbox (which the host
-                // may explicitly opt out of) from an ordinary spawn failure
-                // such as a missing program, which is surfaced as-is.
-                let Some(reason) = setup.strip_prefix(sandbox::SANDBOX_ERROR_PREFIX) else {
-                    return Err(err(ErrorKind::Io, &setup));
-                };
-                let status = sandbox_unavailable_outcome(reason.to_string())?;
+                let reason = setup
+                    .strip_prefix(sandbox::SANDBOX_ERROR_PREFIX)
+                    .unwrap_or(&setup)
+                    .to_string();
+                // A missing program fails identically with or without
+                // confinement, so surface it rather than blaming the sandbox.
+                // Anything else means the confinement could not be established
+                // (the namespaces, or a step applied inside them).
+                if reason.contains(NOT_ON_PATH)
+                    || reason.contains("no such program at that path")
+                    || reason.contains("argv[0] holds a whole command line")
+                {
+                    return Err(err(ErrorKind::Io, &reason));
+                }
+                let status = sandbox_unavailable_outcome(reason)?;
                 let child = self
                     .spawn_command(argv, &cwd, false)
                     .map_err(|e| err(ErrorKind::Io, &e))?;
@@ -1816,59 +1824,36 @@ impl ToolRuntime {
         unsafe {
             use std::os::unix::process::CommandExt;
             command.pre_exec(move || {
-                let outcome = (|| -> std::io::Result<()> {
-                    if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if with_sandbox {
-                        if let Err(reason) = sandbox::apply_in_child() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                format!("{}{reason}", sandbox::SANDBOX_ERROR_PREFIX),
-                            ));
-                        }
-                    }
-                    let cpu = libc::rlimit {
-                        rlim_cur: 120,
-                        rlim_max: 120,
-                    };
-                    let mem = libc::rlimit {
-                        rlim_cur: 1024 * 1024 * 1024,
-                        rlim_max: 1024 * 1024 * 1024,
-                    };
-                    let files = libc::rlimit {
-                        rlim_cur: 256,
-                        rlim_max: 256,
-                    };
-                    if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0
-                        || libc::setrlimit(libc::RLIMIT_AS, &mem) != 0
-                        || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                })();
-                if with_sandbox {
-                    // Any failure while setting up the confined child - the
-                    // namespaces, or the rlimits applied inside them - means the
-                    // sandbox could not be established. Mark it with the prefix
-                    // so the caller applies the fail-closed policy (refuse, or
-                    // degrade only under the explicit opt-in) rather than
-                    // masking it as an ordinary spawn failure.
-                    outcome.map_err(|e| {
-                        let message = format!("{e}");
-                        if message.starts_with(sandbox::SANDBOX_ERROR_PREFIX) {
-                            e
-                        } else {
-                            std::io::Error::new(
-                                e.kind(),
-                                format!("{}{e}", sandbox::SANDBOX_ERROR_PREFIX),
-                            )
-                        }
-                    })
-                } else {
-                    outcome
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
+                if with_sandbox {
+                    if let Err(reason) = sandbox::apply_in_child() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("{}{reason}", sandbox::SANDBOX_ERROR_PREFIX),
+                        ));
+                    }
+                }
+                let cpu = libc::rlimit {
+                    rlim_cur: 120,
+                    rlim_max: 120,
+                };
+                let mem = libc::rlimit {
+                    rlim_cur: 1024 * 1024 * 1024,
+                    rlim_max: 1024 * 1024 * 1024,
+                };
+                let files = libc::rlimit {
+                    rlim_cur: 256,
+                    rlim_max: 256,
+                };
+                if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0
+                    || libc::setrlimit(libc::RLIMIT_AS, &mem) != 0
+                    || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
             });
         }
         command.spawn().map_err(|e| {
