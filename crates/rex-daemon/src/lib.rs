@@ -31,6 +31,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 mod lease_keeper;
 pub use lease_keeper::{LeaseKeeper, LeaseKeeperConfig, LeaseRenewalReport, RenewedLease};
@@ -2813,7 +2814,14 @@ impl HarnessDaemon {
             Some(p) => (
                 true,
                 Self::proof_content_hash(p)? == p.bundle_hash,
-                hmac_sha256_hex(proof_key.as_bytes(), p.bundle_hash.as_bytes()) == p.bundle_mac,
+                {
+                    let expected = hmac_sha256_hex(proof_key.as_bytes(), p.bundle_hash.as_bytes());
+                    expected
+                        .as_bytes()
+                        .ct_eq(p.bundle_mac.as_bytes())
+                        .unwrap_u8()
+                        == 1
+                },
                 p.bundle_hash == fresh.bundle_hash,
                 manifest_ok(&p.evidence_manifest) && manifest_ok(&fresh.evidence_manifest),
             ),

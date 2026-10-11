@@ -33,6 +33,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tombstone {
@@ -428,7 +429,13 @@ impl CustodyRegistry {
             self.violate(&token.grant_id, v.clone(), now_ms)?;
             return Err(CustodyError::Quarantined(v));
         }
-        if token.secret != grant.token_secret {
+        if token
+            .secret
+            .as_bytes()
+            .ct_eq(grant.token_secret.as_bytes())
+            .unwrap_u8()
+            == 0
+        {
             let v = Violation::TokenForgery {
                 grant_id: token.grant_id.clone(),
             };
@@ -568,7 +575,12 @@ impl CustodyRegistry {
             self.release(grant_id, ReleaseReason::LeaseExpired, now_ms)?;
             return Err(CustodyError::GrantReleased(ReleaseReason::LeaseExpired));
         }
-        if resume_secret != grant.resume_secret {
+        if resume_secret
+            .as_bytes()
+            .ct_eq(grant.resume_secret.as_bytes())
+            .unwrap_u8()
+            == 0
+        {
             // Wrong secret on a suspended grant is a forgery attempt.
             let v = Violation::TokenForgery {
                 grant_id: grant_id.to_string(),
