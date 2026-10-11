@@ -7,6 +7,7 @@
 //! or agent can never perform) would invalidate every outstanding token.
 
 use crate::registry::CustodyError;
+use hmac::{Hmac, Mac};
 use rex_tools::ToolRequest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -178,29 +179,13 @@ pub fn hex_sha256(data: &[u8]) -> String {
 /// HMAC-SHA256 (RFC 2104) over `msg` with `key`, hex-encoded. Used by the
 /// daemon to MAC proof bundles with its daemon-held key: a state editor
 /// that can rewrite task/event files but cannot read the 0600 key file
-/// cannot mint a valid bundle MAC.
+/// cannot mint a valid bundle MAC. Delegates to the audited `hmac` crate.
 pub fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
-    const BLOCK: usize = 64;
-    let reduced = if key.len() > BLOCK {
-        let mut h = Sha256::new();
-        h.update(key);
-        h.finalize().to_vec()
-    } else {
-        key.to_vec()
-    };
-    let mut k = [0u8; BLOCK];
-    k[..reduced.len()].copy_from_slice(&reduced);
-    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
-    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    inner.update(msg);
-    let inner_digest = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(inner_digest);
-    outer
-        .finalize()
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(msg);
+    mac.finalize()
+        .into_bytes()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
