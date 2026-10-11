@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,8 +101,16 @@ pub struct StoreGuard {
 
 impl CustodyRegistry {
     pub fn open(root: PathBuf) -> Result<Self, CustodyError> {
+        // The grant files hold `token_secret`/`resume_secret` in cleartext, so
+        // the store gets the same owner-only discipline as the daemon MAC key
+        // (`rex-daemon`) and the provider secret store (`rex-providers`): the
+        // root and its subdirectories are 0700, and the files are 0600.
+        fs::create_dir_all(&root).map_err(ioe)?;
+        restrict_dir(&root)?;
         fs::create_dir_all(root.join("grants")).map_err(ioe)?;
+        restrict_dir(&root.join("grants"))?;
         fs::create_dir_all(root.join("audit")).map_err(ioe)?;
+        restrict_dir(&root.join("audit"))?;
         let index: Index = match fs::read(root.join("index.json")) {
             Ok(bytes) => {
                 serde_json::from_slice(&bytes).map_err(|e| CustodyError::Io(e.to_string()))?
@@ -183,9 +192,9 @@ impl CustodyRegistry {
             .root
             .join("grants")
             .join(format!("{}.json", grant.grant_id));
-        fs::write(
+        write_private(
             &tmp,
-            serde_json::to_vec_pretty(grant).expect("grant serializes"),
+            &serde_json::to_vec_pretty(grant).expect("grant serializes"),
         )
         .map_err(ioe)?;
         let result = fs::rename(&tmp, &fin);
@@ -198,9 +207,9 @@ impl CustodyRegistry {
     fn persist_index(&self) -> Result<(), CustodyError> {
         let tmp = self.root.join(format!("index.{}.json.tmp", random_hex(8)));
         let fin = self.root.join("index.json");
-        fs::write(
+        write_private(
             &tmp,
-            serde_json::to_vec_pretty(&self.index).expect("index serializes"),
+            &serde_json::to_vec_pretty(&self.index).expect("index serializes"),
         )
         .map_err(ioe)?;
         let result = fs::rename(&tmp, &fin);
@@ -888,6 +897,40 @@ impl CustodyRegistry {
             instance_id: format!("aginst-{}", random_hex(8)),
         }
     }
+}
+
+/// Force a directory to owner-only (0700) on unix; a no-op elsewhere.
+#[cfg(unix)]
+fn restrict_dir(path: &Path) -> Result<(), CustodyError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(ioe)
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &Path) -> Result<(), CustodyError> {
+    Ok(())
+}
+
+/// Write bytes to `path` with owner-only (0600) permissions from creation,
+/// resetting the mode if a stale temp file already existed. Mirrors the
+/// daemon's `load_or_create_secret`.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        // A leftover temp file keeps its old mode; reset it.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn ioe(e: std::io::Error) -> CustodyError {

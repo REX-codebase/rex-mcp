@@ -818,3 +818,39 @@ fn stopped_by_another_host_before_execution_denies_prepared_effect() {
     assert!(!result.ok, "released grant must block prepared effect");
     assert!(!c.workspace.join("must-not-exist.txt").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn custody_store_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = ctx();
+    let mut reg = CustodyRegistry::open(c.root.clone()).unwrap();
+    let (token, grant) =
+        offer_and_accept(&mut reg, "task-perm", agent(), full_caps(&c.workspace), T0);
+    // Force an audit append so the audit file exists.
+    reg.heartbeat(&token, 1, T0 + 1000).unwrap();
+
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&c.root), 0o700, "store root must be 0700");
+    assert_eq!(mode(&c.root.join("grants")), 0o700, "grants/ must be 0700");
+    assert_eq!(mode(&c.root.join("audit")), 0o700, "audit/ must be 0700");
+    let grant_file = c
+        .root
+        .join("grants")
+        .join(format!("{}.json", grant.grant_id));
+    assert_eq!(
+        mode(&grant_file),
+        0o600,
+        "grant file holds secrets; must be 0600"
+    );
+    assert_eq!(
+        mode(&c.root.join("index.json")),
+        0o600,
+        "index file must be 0600"
+    );
+    let audit_file = c
+        .root
+        .join("audit")
+        .join(format!("{}.jsonl", grant.grant_id));
+    assert_eq!(mode(&audit_file), 0o600, "audit file must be 0600");
+}
