@@ -17,6 +17,13 @@ jobs:
       - run: bash -n scripts/rex-mcp-install.sh scripts/rex-mcp-uninstall.sh
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
+        env:
+          # GitHub's ubuntu-latest runners cannot create unprivileged user
+          # namespaces, so the command sandbox is unavailable there. The suite
+          # deliberately exercises command execution (e.g. the stdio lifecycle
+          # and the sandbox tests), so this trusted, disposable host opts into
+          # unconfined execution. Hosts that can confine commands never need it.
+          REX_ALLOW_UNCONFINED_COMMANDS: "1"
   npm:
     runs-on: ubuntu-latest
     steps:
