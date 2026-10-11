@@ -581,13 +581,16 @@ mod tests {
         ManagedTaskRequest {
             task_id: task_id.into(),
             task: "build a tea house page".into(),
-            operator: OperatorIdentity::Agent(CustodyRegistry::register_agent(
-                "t3-code",
-                AgentProtocol::Acp {
-                    client: "t3".into(),
-                    version: "1.0".into(),
-                },
-            )),
+            operator: OperatorIdentity::Agent(
+                CustodyRegistry::register_agent(
+                    "t3-code",
+                    AgentProtocol::Acp {
+                        client: "t3".into(),
+                        version: "1.0".into(),
+                    },
+                )
+                .unwrap(),
+            ),
             provider: "gemini".into(),
             model: Some("gemini-3.5-flash-lite".into()),
             workspace: Some(workspace.clone()),

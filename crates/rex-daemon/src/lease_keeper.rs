@@ -213,7 +213,7 @@ fn renew_locked(
         grant_id: grant.grant_id.clone(),
         epoch: grant.lease.epoch,
         secret: grant.token_secret.clone(),
-        scope_hash: grant.capabilities.scope_hash(),
+        scope_hash: grant.capabilities.scope_hash()?,
     };
     let lease = reg.heartbeat(&token, grant.lease.next_seq, now_ms)?;
     Ok(Some(RenewedLease {

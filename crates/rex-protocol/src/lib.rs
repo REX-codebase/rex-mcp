@@ -184,6 +184,12 @@ impl ProtocolError {
     }
 }
 
+impl From<std::io::Error> for ProtocolError {
+    fn from(e: std::io::Error) -> Self {
+        ProtocolError::new(ErrorCode::Internal, e.to_string())
+    }
+}
+
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}: {}", self.code, self.message)

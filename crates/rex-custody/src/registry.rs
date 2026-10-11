@@ -185,10 +185,11 @@ impl CustodyRegistry {
     }
 
     fn persist_grant(&self, grant: &CustodyGrant) -> Result<(), CustodyError> {
-        let tmp =
-            self.root
-                .join("grants")
-                .join(format!("{}.{}.json.tmp", grant.grant_id, random_hex(8)));
+        let tmp = self.root.join("grants").join(format!(
+            "{}.{}.json.tmp",
+            grant.grant_id,
+            random_hex(8)?
+        ));
         let fin = self
             .root
             .join("grants")
@@ -206,7 +207,7 @@ impl CustodyRegistry {
     }
 
     fn persist_index(&self) -> Result<(), CustodyError> {
-        let tmp = self.root.join(format!("index.{}.json.tmp", random_hex(8)));
+        let tmp = self.root.join(format!("index.{}.json.tmp", random_hex(8)?));
         let fin = self.root.join("index.json");
         write_private(
             &tmp,
@@ -265,7 +266,7 @@ impl CustodyRegistry {
             return Err(CustodyError::DelegationRefused);
         }
         let offer = CustodyOffer {
-            offer_id: format!("offer-{}", random_hex(8)),
+            offer_id: format!("offer-{}", random_hex(8)?),
             task_id: task_id.to_string(),
             task_summary: task_summary.chars().take(500).collect(),
             operator,
@@ -274,7 +275,7 @@ impl CustodyRegistry {
             budgets,
             lease_terms,
             contract,
-            nonce: random_hex(16),
+            nonce: random_hex(16)?,
             created_ms: now_ms,
             expires_ms: now_ms + DEFAULT_OFFER_TTL_MS as u128,
         };
@@ -308,9 +309,9 @@ impl CustodyRegistry {
             return Err(CustodyError::CommitmentMismatch);
         }
         self.offers.remove(&acceptance.offer_id);
-        let grant_id = format!("custody-{}", random_hex(8));
+        let grant_id = format!("custody-{}", random_hex(8)?);
         let lease = Lease {
-            lease_id: format!("lease-{}", random_hex(8)),
+            lease_id: format!("lease-{}", random_hex(8)?),
             epoch: 1,
             issued_ms: now_ms,
             expires_ms: now_ms + offer.lease_terms.lease_ms as u128,
@@ -332,8 +333,8 @@ impl CustodyRegistry {
             contract: offer.contract.clone(),
             phase: CustodyPhase::Active,
             claim_attempts: 0,
-            resume_secret: random_hex(16),
-            token_secret: random_hex(32),
+            resume_secret: random_hex(16)?,
+            token_secret: random_hex(32)?,
             created_ms: now_ms,
             updated_ms: now_ms,
             suspended_at_ms: None,
@@ -354,7 +355,7 @@ impl CustodyRegistry {
                 "task_id": grant.task_id,
                 "operator": grant.operator.label(),
                 "worker": grant.worker,
-                "scope_hash": grant.capabilities.scope_hash(),
+                "scope_hash": grant.capabilities.scope_hash()?,
                 "offer_hash": offer.offer_hash(),
                 "epoch": 1,
             }),
@@ -368,7 +369,7 @@ impl CustodyRegistry {
             grant_id: grant_id.clone(),
             epoch: 1,
             secret: grant.token_secret.clone(),
-            scope_hash: grant.capabilities.scope_hash(),
+            scope_hash: grant.capabilities.scope_hash()?,
         };
         Ok((token, grant))
     }
@@ -442,7 +443,7 @@ impl CustodyRegistry {
             self.violate(&token.grant_id, v.clone(), now_ms)?;
             return Err(CustodyError::Quarantined(v));
         }
-        if token.scope_hash != grant.capabilities.scope_hash() {
+        if token.scope_hash != grant.capabilities.scope_hash()? {
             return Err(CustodyError::CommitmentMismatch);
         }
         if grant.phase != CustodyPhase::Active {
@@ -590,12 +591,12 @@ impl CustodyRegistry {
         }
         let grant = self.grants.get_mut(grant_id).expect("checked");
         grant.lease.epoch += 1;
-        grant.lease.lease_id = format!("lease-{}", random_hex(8));
+        grant.lease.lease_id = format!("lease-{}", random_hex(8)?);
         grant.lease.issued_ms = now_ms;
         grant.lease.expires_ms = now_ms + grant.lease_terms.lease_ms as u128;
         grant.lease.next_seq = 1;
-        grant.resume_secret = random_hex(16);
-        grant.token_secret = random_hex(32);
+        grant.resume_secret = random_hex(16)?;
+        grant.token_secret = random_hex(32)?;
         grant.phase = CustodyPhase::Active;
         grant.suspended_at_ms = None;
         grant.updated_ms = now_ms;
@@ -604,7 +605,7 @@ impl CustodyRegistry {
             grant_id: grant.grant_id.clone(),
             epoch,
             secret: grant.token_secret.clone(),
-            scope_hash: grant.capabilities.scope_hash(),
+            scope_hash: grant.capabilities.scope_hash()?,
         };
         self.persist_grant(self.grants.get(grant_id).expect("checked"))?;
         self.audit(grant_id, now_ms, "resumed", json!({ "epoch": epoch }))?;
@@ -902,12 +903,15 @@ impl CustodyRegistry {
 
     /// Register a named external agent instance (id minting lives here so
     /// name collisions never share identity).
-    pub fn register_agent(name: &str, protocol: crate::identity::AgentProtocol) -> AgentIdentity {
-        AgentIdentity {
+    pub fn register_agent(
+        name: &str,
+        protocol: crate::identity::AgentProtocol,
+    ) -> Result<AgentIdentity, CustodyError> {
+        Ok(AgentIdentity {
             name: name.chars().take(120).collect(),
             protocol,
-            instance_id: format!("aginst-{}", random_hex(8)),
-        }
+            instance_id: format!("aginst-{}", random_hex(8)?),
+        })
     }
 }
 
@@ -943,6 +947,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+impl From<std::io::Error> for CustodyError {
+    fn from(e: std::io::Error) -> Self {
+        CustodyError::Io(e.to_string())
+    }
 }
 
 fn ioe(e: std::io::Error) -> CustodyError {

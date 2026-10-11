@@ -66,13 +66,16 @@ impl GateEvaluator for FailGates {
 }
 
 fn agent() -> OperatorIdentity {
-    OperatorIdentity::Agent(CustodyRegistry::register_agent(
-        "t3-code",
-        AgentProtocol::Acp {
-            client: "t3".into(),
-            version: "1.0".into(),
-        },
-    ))
+    OperatorIdentity::Agent(
+        CustodyRegistry::register_agent(
+            "t3-code",
+            AgentProtocol::Acp {
+                client: "t3".into(),
+                version: "1.0".into(),
+            },
+        )
+        .unwrap(),
+    )
 }
 
 fn offer_and_accept(
@@ -853,4 +856,19 @@ fn custody_store_is_owner_only() {
         .join("audit")
         .join(format!("{}.jsonl", grant.grant_id));
     assert_eq!(mode(&audit_file), 0o600, "audit file must be 0600");
+}
+
+#[test]
+fn entropy_and_scope_hash_return_results_not_panics() {
+    // `random_hex` and `scope_hash` are fallible now: a missing entropy source
+    // or a serialization failure is a clean error, never a panic.
+    let id = rex_custody::capability::random_hex(8).unwrap();
+    assert_eq!(id.len(), 16);
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let c = ctx();
+    let caps = full_caps(&c.workspace);
+    let h = caps.scope_hash().unwrap();
+    assert_eq!(h.len(), 64);
+    assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
 }

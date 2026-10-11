@@ -619,18 +619,19 @@ fn route(
             // The operator identity is the caller's declaration, recorded
             // for audit; custody decisions never trust the string.
             let operator = match parsed.get("operator").and_then(|o| o.as_str()) {
-                Some("agent") => rex_custody::OperatorIdentity::Agent(
-                    rex_custody::CustodyRegistry::register_agent(
-                        parsed
-                            .get("agent_name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("rex-ui-agent"),
-                        rex_custody::AgentProtocol::Mcp {
-                            client: "rex-ui".into(),
-                            version: "ui-supervision".into(),
-                        },
-                    ),
-                ),
+                Some("agent") => match rex_custody::CustodyRegistry::register_agent(
+                    parsed
+                        .get("agent_name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("rex-ui-agent"),
+                    rex_custody::AgentProtocol::Mcp {
+                        client: "rex-ui".into(),
+                        version: "ui-supervision".into(),
+                    },
+                ) {
+                    Ok(id) => rex_custody::OperatorIdentity::Agent(id),
+                    Err(e) => return json_response(500, &format!("{{\"error\":\"{e:?}\"}}")),
+                },
                 _ => rex_custody::OperatorIdentity::Human,
             };
             let task_id = format!(
