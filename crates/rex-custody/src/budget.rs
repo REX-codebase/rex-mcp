@@ -36,6 +36,10 @@ pub struct Consumption {
 
 impl CustodyBudgets {
     /// First budget this consumption exceeds, if any.
+    ///
+    /// The comparisons are strict `>` on purpose: a ceiling is inclusive, so
+    /// `max_steps: 24` permits 24 steps and trips only on the 25th. Do not
+    /// "fix" this to `>=`; that would silently drop the last allowed step.
     pub fn first_exceeded(&self, used: &Consumption) -> Option<BudgetKind> {
         if used.steps > self.max_steps {
             Some(BudgetKind::Steps)
