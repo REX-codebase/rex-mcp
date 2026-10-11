@@ -1718,20 +1718,23 @@ impl ToolRuntime {
     ) -> Result<ExecData, ToolError> {
         let cwd = self.command_cwd(cwd)?;
         // The real boundary is the OS sandbox: every child enters fresh
-        // user/network/IPC/UTS namespaces. If the kernel refuses, degrade
-        // honestly - the command still runs under rlimits and process-group
-        // isolation, and the receipt says exactly why confinement is off.
+        // user/network/IPC/UTS namespaces. If the kernel refuses, we fail
+        // closed by default - the command does not run at all. Running
+        // without confinement requires an explicit host opt-in.
         let (mut child, sandbox_status) = match self.spawn_command(argv, &cwd, true) {
             Ok(child) => (child, sandbox::SandboxStatus::Applied),
             Err(setup) => {
-                let reason = setup
-                    .strip_prefix(sandbox::SANDBOX_ERROR_PREFIX)
-                    .unwrap_or(&setup)
-                    .to_string();
+                // Distinguish a kernel refusal of the sandbox (which the host
+                // may explicitly opt out of) from an ordinary spawn failure
+                // such as a missing program, which is surfaced as-is.
+                let Some(reason) = setup.strip_prefix(sandbox::SANDBOX_ERROR_PREFIX) else {
+                    return Err(err(ErrorKind::Io, &setup));
+                };
+                let status = sandbox_unavailable_outcome(reason.to_string())?;
                 let child = self
                     .spawn_command(argv, &cwd, false)
                     .map_err(|e| err(ErrorKind::Io, &e))?;
-                (child, sandbox::SandboxStatus::Unavailable(reason))
+                (child, status)
             }
         };
         let stdout = child.stdout.take().expect("piped stdout");
@@ -1780,7 +1783,7 @@ impl ToolRuntime {
     /// Spawn one bounded command. With `with_sandbox` the child first
     /// enters the namespace sandbox; a setup failure surfaces as an
     /// error carrying sandbox::SANDBOX_ERROR_PREFIX so the caller can
-    /// retry without confinement and report the degradation.
+    /// decide whether to run unconfined (`sandbox_unavailable_outcome`).
     fn spawn_command(
         &self,
         argv: &[String],
@@ -2581,6 +2584,36 @@ pub fn standing_key(request: &ToolRequest) -> Option<String> {
     // grant to the time actually available, including the 120s cap.
     let limit_ms = timeout_ms.unwrap_or(30_000).min(MAX_TIMEOUT_MS);
     serde_json::to_string(&(argv, dir, limit_ms)).ok()
+}
+
+/// Whether the host has explicitly opted into running commands without the
+/// OS sandbox. Off by default: when the kernel refuses user/network
+/// namespaces, refusing the command is the safe outcome. This mirrors the
+/// `REX_APPROVE_TASK_MUTATIONS` opt-in - a host-only, explicit decision.
+fn unconfined_execution_allowed() -> bool {
+    std::env::var("REX_ALLOW_UNCONFINED_COMMANDS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Decide what to do when the OS sandbox could not be applied. Fail closed by
+/// default: a denylist that must be complete to be safe is not a boundary, so
+/// the command is refused unless the host opted in. The returned status records
+/// the degradation in the receipt for the opt-in case.
+fn sandbox_unavailable_outcome(reason: String) -> Result<sandbox::SandboxStatus, ToolError> {
+    if unconfined_execution_allowed() {
+        Ok(sandbox::SandboxStatus::Unavailable(reason))
+    } else {
+        Err(err(
+            ErrorKind::PolicyDenied,
+            &format!(
+                "command sandbox unavailable ({reason}); refusing to run the command \
+                 unconfined. Set REX_ALLOW_UNCONFINED_COMMANDS=1 only on a host that \
+                 cannot provide user/network namespaces, and only if you accept \
+                 unconfined execution."
+            ),
+        ))
+    }
 }
 
 fn command_policy(argv: &[String]) -> Result<(), ToolError> {
@@ -5051,6 +5084,24 @@ mod tests {
         assert!(e
             .detail
             .starts_with("'sh' is blocked: run_command has no shell"));
+    }
+    #[test]
+    fn unconfined_command_execution_is_opt_in() {
+        // Fail closed: with the flag unset, a sandbox setup failure must refuse
+        // the command rather than run it unconfined.
+        std::env::remove_var("REX_ALLOW_UNCONFINED_COMMANDS");
+        assert!(!unconfined_execution_allowed());
+        let refused = sandbox_unavailable_outcome("kernel refused namespaces".into()).unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::PolicyDenied);
+
+        // Explicit opt-in degrades instead, recording the reason.
+        std::env::set_var("REX_ALLOW_UNCONFINED_COMMANDS", "1");
+        assert!(unconfined_execution_allowed());
+        assert!(matches!(
+            sandbox_unavailable_outcome("kernel refused namespaces".into()),
+            Ok(crate::sandbox::SandboxStatus::Unavailable(_))
+        ));
+        std::env::remove_var("REX_ALLOW_UNCONFINED_COMMANDS");
     }
     #[test]
     fn output_redacts_secrets() {
