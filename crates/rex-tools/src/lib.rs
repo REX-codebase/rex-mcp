@@ -1738,7 +1738,7 @@ impl ToolRuntime {
                 {
                     return Err(err(ErrorKind::Io, &reason));
                 }
-                let status = sandbox_unavailable_outcome(reason)?;
+                let status = sandbox_unavailable_outcome(reason, unconfined_execution_allowed())?;
                 let child = self
                     .spawn_command(argv, &cwd, false)
                     .map_err(|e| err(ErrorKind::Io, &e))?;
@@ -2599,7 +2599,17 @@ pub fn standing_key(request: &ToolRequest) -> Option<String> {
 /// namespaces, refusing the command is the safe outcome. This mirrors the
 /// `REX_APPROVE_TASK_MUTATIONS` opt-in - a host-only, explicit decision.
 fn unconfined_execution_allowed() -> bool {
-    std::env::var("REX_ALLOW_UNCONFINED_COMMANDS")
+    unconfined_flag_value(
+        std::env::var("REX_ALLOW_UNCONFINED_COMMANDS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Parse the opt-in value. Kept pure so it can be tested without mutating the
+/// process environment (which would race with other tests).
+fn unconfined_flag_value(value: Option<&str>) -> bool {
+    value
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -2608,8 +2618,11 @@ fn unconfined_execution_allowed() -> bool {
 /// default: a denylist that must be complete to be safe is not a boundary, so
 /// the command is refused unless the host opted in. The returned status records
 /// the degradation in the receipt for the opt-in case.
-fn sandbox_unavailable_outcome(reason: String) -> Result<sandbox::SandboxStatus, ToolError> {
-    if unconfined_execution_allowed() {
+fn sandbox_unavailable_outcome(
+    reason: String,
+    unconfined_allowed: bool,
+) -> Result<sandbox::SandboxStatus, ToolError> {
+    if unconfined_allowed {
         Ok(sandbox::SandboxStatus::Unavailable(reason))
     } else {
         Err(err(
@@ -5095,21 +5108,25 @@ mod tests {
     }
     #[test]
     fn unconfined_command_execution_is_opt_in() {
-        // Fail closed: with the flag unset, a sandbox setup failure must refuse
+        // Fail closed: without the opt-in, a sandbox setup failure must refuse
         // the command rather than run it unconfined.
-        std::env::remove_var("REX_ALLOW_UNCONFINED_COMMANDS");
-        assert!(!unconfined_execution_allowed());
-        let refused = sandbox_unavailable_outcome("kernel refused namespaces".into()).unwrap_err();
+        let refused =
+            sandbox_unavailable_outcome("kernel refused namespaces".into(), false).unwrap_err();
         assert_eq!(refused.kind, ErrorKind::PolicyDenied);
 
         // Explicit opt-in degrades instead, recording the reason.
-        std::env::set_var("REX_ALLOW_UNCONFINED_COMMANDS", "1");
-        assert!(unconfined_execution_allowed());
         assert!(matches!(
-            sandbox_unavailable_outcome("kernel refused namespaces".into()),
+            sandbox_unavailable_outcome("kernel refused namespaces".into(), true),
             Ok(crate::sandbox::SandboxStatus::Unavailable(_))
         ));
-        std::env::remove_var("REX_ALLOW_UNCONFINED_COMMANDS");
+
+        // Flag parsing, tested without touching the process environment.
+        assert!(unconfined_flag_value(Some("1")));
+        assert!(unconfined_flag_value(Some("true")));
+        assert!(unconfined_flag_value(Some("TRUE")));
+        assert!(!unconfined_flag_value(Some("0")));
+        assert!(!unconfined_flag_value(Some("no")));
+        assert!(!unconfined_flag_value(None));
     }
     #[test]
     fn output_redacts_secrets() {
