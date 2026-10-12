@@ -8,9 +8,10 @@
 //! with no routes at all (default-deny egress), and fresh IPC/UTS
 //! namespaces.
 //!
-//! When the kernel refuses unprivileged namespaces the caller decides:
-//! run without confinement and say so in the receipt, or refuse. This
-//! module never hides the outcome.
+//! When the kernel refuses unprivileged namespaces the caller fails closed by
+//! default: the command is refused unless the host explicitly opts into
+//! unconfined execution (`REX_ALLOW_UNCONFINED_COMMANDS=1`), in which case the
+//! degradation is recorded in the receipt. This module never hides the outcome.
 
 use serde::{Deserialize, Serialize};
 

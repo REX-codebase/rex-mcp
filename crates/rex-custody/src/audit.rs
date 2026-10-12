@@ -106,10 +106,21 @@ impl AuditLog {
         };
         let mut line = serde_json::to_string(&ev).expect("event serializes");
         line.push('\n');
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            // The chain holds capability/lease detail; keep it owner-only like
+            // the grant files it sits beside.
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         f.write_all(line.as_bytes())?;
         f.sync_all()?;
         self.seq = seq;

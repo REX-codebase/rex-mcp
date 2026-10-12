@@ -10,6 +10,8 @@ rex-tools = { path = "../rex-tools" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+subtle = "2"
+hmac = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

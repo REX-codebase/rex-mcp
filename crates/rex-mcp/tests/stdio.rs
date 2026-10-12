@@ -171,7 +171,10 @@ fn full_caller_driven_lifecycle_over_stdio() {
         json!({"task_id":task_id,"capability":cap,"lease_epoch":epoch,
         "argv":["cat","note.txt"]}),
     );
-    assert!(run["stdout"].as_str().unwrap().contains("world"));
+    assert!(
+        run["stdout"].as_str().is_some_and(|s| s.contains("world")),
+        "rex_run must return stdout containing the appended line; got: {run}"
+    );
 
     let critique2 = s.tool(
         "rex_critique_prompt",

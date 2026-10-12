@@ -14,11 +14,19 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// Take a lock, recovering the guard if a prior panic poisoned it. A poisoned
+/// lock would otherwise make every later caller panic too, turning one panic
+/// into a subsystem-wide cascade. Recovering matches `parking_lot` semantics
+/// (whose locks do not poison) without pulling in a new dependency.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_BYTES: usize = 256 * 1024;
@@ -103,7 +111,7 @@ struct Runtime {
 
 impl Runtime {
     fn event(&self, kind: LifecycleKind, detail: impl Into<String>) {
-        let mut events = self.events.lock().unwrap();
+        let mut events = lock(&self.events);
         let sequence = events.back().map_or(1, |e| e.sequence + 1);
         events.push_back(LifecycleEvent {
             sequence,
@@ -127,9 +135,9 @@ impl Runtime {
             url: self.url.clone(),
             pid: self.pid,
             exit_code: self.exit_code,
-            stdout: self.stdout.lock().unwrap().text(),
-            stderr: self.stderr.lock().unwrap().text(),
-            events: self.events.lock().unwrap().iter().cloned().collect(),
+            stdout: lock(&self.stdout).text(),
+            stderr: lock(&self.stderr).text(),
+            events: lock(&self.events).iter().cloned().collect(),
         }
     }
     fn refresh_exit(&mut self) {
@@ -318,18 +326,18 @@ impl PreviewSupervisor {
             thread::sleep(READINESS_INTERVAL);
         }
         let summary = runtime.summary();
-        self.sessions.lock().unwrap().insert(id, runtime);
+        lock(&self.sessions).insert(id, runtime);
         Ok(summary)
     }
     pub fn summary(&self, id: &str) -> Result<SupervisorSummary, PreviewError> {
-        let mut s = self.sessions.lock().unwrap();
+        let mut s = lock(&self.sessions);
         s.get_mut(id)
             .map(Runtime::summary)
             .ok_or(PreviewError::NotRunning)
     }
     pub fn action(&self, id: &str, action: &BrowserAction) -> Result<(), PreviewError> {
         action.validate()?;
-        let mut s = self.sessions.lock().unwrap();
+        let mut s = lock(&self.sessions);
         let r = s.get_mut(id).ok_or(PreviewError::NotRunning)?;
         r.refresh_exit();
         if r.state != SessionState::Running {
@@ -344,7 +352,7 @@ impl PreviewSupervisor {
             .action(action, &r.url)
     }
     pub fn visible_control(&self, id: &str, selector: &str) -> Result<bool, PreviewError> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = lock(&self.sessions);
         let session = sessions.get_mut(id).ok_or(PreviewError::NotRunning)?;
         if session.browser.is_none() {
             session.browser = Some(BrowserRuntime::launch(&session.url)?);
@@ -365,7 +373,7 @@ impl PreviewSupervisor {
         id: &str,
         fields: &[rex_protocol::MobileResultField],
     ) -> Result<crate::BrowserEvidence, PreviewError> {
-        let mut s = self.sessions.lock().unwrap();
+        let mut s = lock(&self.sessions);
         let r = s.get_mut(id).ok_or(PreviewError::NotRunning)?;
         if r.browser.is_none() {
             r.browser = Some(BrowserRuntime::launch(&r.url)?);
@@ -386,7 +394,7 @@ impl PreviewSupervisor {
         Ok(evidence)
     }
     pub fn begin_iteration(&self, id: &str) -> Result<u8, PreviewError> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = lock(&self.sessions);
         sessions
             .get_mut(id)
             .ok_or(PreviewError::NotRunning)?
@@ -398,7 +406,7 @@ impl PreviewSupervisor {
         id: &str,
         receipt: IterationReceipt,
     ) -> Result<(), PreviewError> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = lock(&self.sessions);
         sessions
             .get_mut(id)
             .ok_or(PreviewError::NotRunning)?
@@ -406,7 +414,7 @@ impl PreviewSupervisor {
             .record_iteration(receipt)
     }
     pub fn production_report(&self, id: &str) -> Result<ProductionReport, PreviewError> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = lock(&self.sessions);
         let runtime = sessions.get(id).ok_or(PreviewError::NotRunning)?;
         let mut gates = BTreeMap::new();
         for item in &runtime.iteration.evidence {
@@ -420,7 +428,7 @@ impl PreviewSupervisor {
         })
     }
     pub fn finish(&self, id: &str) -> Result<(), PreviewError> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = lock(&self.sessions);
         let runtime = sessions.get_mut(id).ok_or(PreviewError::NotRunning)?;
         let mut gates = BTreeMap::new();
         for item in &runtime.iteration.evidence {
@@ -434,14 +442,14 @@ impl PreviewSupervisor {
         })
     }
     pub fn cancel(&self, id: &str) -> Result<SupervisorSummary, PreviewError> {
-        let mut s = self.sessions.lock().unwrap();
+        let mut s = lock(&self.sessions);
         let r = s.get_mut(id).ok_or(PreviewError::NotRunning)?;
         r.iteration.cancel();
         r.terminate(LifecycleKind::Cancelled);
         Ok(r.summary())
     }
     pub fn teardown(&self, id: &str) -> Result<(), PreviewError> {
-        let mut s = self.sessions.lock().unwrap();
+        let mut s = lock(&self.sessions);
         let mut r = s.remove(id).ok_or(PreviewError::NotRunning)?;
         if !r.stop.load(Ordering::SeqCst) {
             r.terminate(LifecycleKind::Cancelled)
@@ -570,7 +578,7 @@ fn spawn_child(
 fn pipe<R: Read + Send + 'static>(r: R, log: Arc<Mutex<BoundedLog>>) {
     thread::spawn(move || {
         for line in BufReader::new(r).lines().map_while(Result::ok) {
-            log.lock().unwrap().push(line)
+            lock(&log).push(line)
         }
     });
 }
@@ -648,7 +656,7 @@ fn spawn_static(
                     thread::sleep(Duration::from_millis(20));
                 }
                 Err(error) => {
-                    errors.lock().unwrap().push(error.to_string());
+                    lock(&errors).push(error.to_string());
                     break;
                 }
             }
@@ -671,6 +679,19 @@ fn mime(p: &Path) -> &'static str {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn poisoned_lock_recovers_instead_of_cascading() {
+        let m = std::sync::Mutex::new(1u32);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = m.lock().unwrap();
+            panic!("boom while holding the lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(m.is_poisoned());
+        // The helper takes the guard back instead of panicking again.
+        assert_eq!(*lock(&m), 1);
+    }
     // Several tests bind from the shared preview port range; serialize them
     // so a concurrently running test cannot occupy a port another test
     // expects to bind or skip.

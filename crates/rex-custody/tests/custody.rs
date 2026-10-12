@@ -66,13 +66,16 @@ impl GateEvaluator for FailGates {
 }
 
 fn agent() -> OperatorIdentity {
-    OperatorIdentity::Agent(CustodyRegistry::register_agent(
-        "t3-code",
-        AgentProtocol::Acp {
-            client: "t3".into(),
-            version: "1.0".into(),
-        },
-    ))
+    OperatorIdentity::Agent(
+        CustodyRegistry::register_agent(
+            "t3-code",
+            AgentProtocol::Acp {
+                client: "t3".into(),
+                version: "1.0".into(),
+            },
+        )
+        .unwrap(),
+    )
 }
 
 fn offer_and_accept(
@@ -817,4 +820,55 @@ fn stopped_by_another_host_before_execution_denies_prepared_effect() {
     let result = tools.execute(&token, &prepared.call_id, T0 + 3);
     assert!(!result.ok, "released grant must block prepared effect");
     assert!(!c.workspace.join("must-not-exist.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn custody_store_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = ctx();
+    let mut reg = CustodyRegistry::open(c.root.clone()).unwrap();
+    let (token, grant) =
+        offer_and_accept(&mut reg, "task-perm", agent(), full_caps(&c.workspace), T0);
+    // Force an audit append so the audit file exists.
+    reg.heartbeat(&token, 1, T0 + 1000).unwrap();
+
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&c.root), 0o700, "store root must be 0700");
+    assert_eq!(mode(&c.root.join("grants")), 0o700, "grants/ must be 0700");
+    assert_eq!(mode(&c.root.join("audit")), 0o700, "audit/ must be 0700");
+    let grant_file = c
+        .root
+        .join("grants")
+        .join(format!("{}.json", grant.grant_id));
+    assert_eq!(
+        mode(&grant_file),
+        0o600,
+        "grant file holds secrets; must be 0600"
+    );
+    assert_eq!(
+        mode(&c.root.join("index.json")),
+        0o600,
+        "index file must be 0600"
+    );
+    let audit_file = c
+        .root
+        .join("audit")
+        .join(format!("{}.jsonl", grant.grant_id));
+    assert_eq!(mode(&audit_file), 0o600, "audit file must be 0600");
+}
+
+#[test]
+fn entropy_and_scope_hash_return_results_not_panics() {
+    // `random_hex` and `scope_hash` are fallible now: a missing entropy source
+    // or a serialization failure is a clean error, never a panic.
+    let id = rex_custody::capability::random_hex(8).unwrap();
+    assert_eq!(id.len(), 16);
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let c = ctx();
+    let caps = full_caps(&c.workspace);
+    let h = caps.scope_hash().unwrap();
+    assert_eq!(h.len(), 64);
+    assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
 }

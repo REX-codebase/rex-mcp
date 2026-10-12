@@ -73,6 +73,14 @@ impl BrowserRuntime {
                 .is_ok()
         })
         .ok_or(PreviewError::CommandDenied)?;
+        // Chrome's own sandbox is disabled for the capture process, which is
+        // necessary on hosts where the setuid/namespace sandbox is unavailable
+        // (services, containers). The exposure is bounded instead: the DevTools
+        // endpoint is bound to loopback only (below), the port is drawn from
+        // the reserved preview range, and navigation is restricted to the
+        // allowed host/port (`validate_local_url`). If the preview runtime is
+        // itself confined this is defence in depth; otherwise the loopback-only
+        // binding is the containment.
         let child = Command::new(chrome)
             .args([
                 "--headless=new",
@@ -87,6 +95,8 @@ impl BrowserRuntime {
                 "--hide-scrollbars",
             ])
             .arg(format!("--remote-debugging-port={port}"))
+            // Never expose the DevTools endpoint beyond loopback.
+            .arg("--remote-debugging-address=127.0.0.1")
             .arg(format!("--user-data-dir={}", profile.display()))
             .arg("about:blank")
             .stdin(Stdio::null())

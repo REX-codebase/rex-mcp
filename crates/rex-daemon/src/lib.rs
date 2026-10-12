@@ -31,6 +31,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 mod lease_keeper;
 pub use lease_keeper::{LeaseKeeper, LeaseKeeperConfig, LeaseRenewalReport, RenewedLease};
@@ -471,12 +472,12 @@ impl HarnessDaemon {
             return Ok(self.execute_view(&task, true, Some(handle), Some(capability)));
         }
         let now = now_ms();
-        let task_id = format!("task-{}", random_id());
+        let task_id = format!("task-{}", random_id()?);
         // Keep creation under the same per-task lock that the keeper and
         // failsafe use when scanning a newly created task.
         let _new_task_lock = self.lock_task(&task_id)?;
-        let host_resume_handle = format!("hrh-{}", random_hex(24));
-        let task_capability = format!("cap-{}", random_hex(24));
+        let host_resume_handle = format!("hrh-{}", random_hex(24)?);
+        let task_capability = format!("cap-{}", random_hex(24)?);
         let plan = req
             .plan
             .clone()
@@ -507,13 +508,16 @@ impl HarnessDaemon {
             .min(self.policy.max_wall_ms);
         let caps = capability_set(&self.policy.workspace);
         let operator = if req.operator_is_agent {
-            OperatorIdentity::Agent(CustodyRegistry::register_agent(
-                host_label(req.host),
-                AgentProtocol::Mcp {
-                    client: host_label(req.host).into(),
-                    version: PROTOCOL_VERSION.into(),
-                },
-            ))
+            OperatorIdentity::Agent(
+                CustodyRegistry::register_agent(
+                    host_label(req.host),
+                    AgentProtocol::Mcp {
+                        client: host_label(req.host).into(),
+                        version: PROTOCOL_VERSION.into(),
+                    },
+                )
+                .map_err(internal)?,
+            )
         } else {
             OperatorIdentity::Human
         };
@@ -1351,7 +1355,7 @@ impl HarnessDaemon {
             timeout_ms: Some(rex_tools::MAX_TIMEOUT_MS),
         })?;
         let passed = run.exit_code == Some(0);
-        let evidence_id = format!("evidence-{}", random_id());
+        let evidence_id = format!("evidence-{}", random_id()?);
         let mut t = self.load(&req.task_id)?;
         t.registered_evidence.insert(evidence_id.clone());
         t.evidence
@@ -2590,7 +2594,7 @@ impl HarnessDaemon {
         let dir = self.root.join("proofs");
         fs::create_dir_all(&dir).map_err(internal)?;
         let path = dir.join(format!("{}.json", bundle.task_id));
-        let temporary = path.with_extension(format!("{}.json.tmp", random_hex(8)));
+        let temporary = path.with_extension(format!("{}.json.tmp", random_hex(8)?));
         fs::write(
             &temporary,
             serde_json::to_vec_pretty(&bundle).map_err(internal)?,
@@ -2813,7 +2817,14 @@ impl HarnessDaemon {
             Some(p) => (
                 true,
                 Self::proof_content_hash(p)? == p.bundle_hash,
-                hmac_sha256_hex(proof_key.as_bytes(), p.bundle_hash.as_bytes()) == p.bundle_mac,
+                {
+                    let expected = hmac_sha256_hex(proof_key.as_bytes(), p.bundle_hash.as_bytes());
+                    expected
+                        .as_bytes()
+                        .ct_eq(p.bundle_mac.as_bytes())
+                        .unwrap_u8()
+                        == 1
+                },
                 p.bundle_hash == fresh.bundle_hash,
                 manifest_ok(&p.evidence_manifest) && manifest_ok(&fresh.evidence_manifest),
             ),
@@ -3081,7 +3092,7 @@ impl HarnessDaemon {
     /// Called at creation and on every verified resume: the rotated
     /// resume handle vouches for the new capability.
     fn rotate_capability(&self, t: &mut DurableTask) -> Result<String, ProtocolError> {
-        let capability = format!("cap-{}", random_hex(24));
+        let capability = format!("cap-{}", random_hex(24)?);
         t.task_capability_hash = hex_sha256(capability.as_bytes());
         Ok(capability)
     }
@@ -3147,7 +3158,7 @@ impl HarnessDaemon {
 
     /// Only after the verified resume has passed every gate.
     fn rotate_resume_handle(&self, t: &mut DurableTask) -> Result<String, ProtocolError> {
-        let rotated = format!("hrh-{}", random_hex(24));
+        let rotated = format!("hrh-{}", random_hex(24)?);
         t.host_resume_handle_hash = Some(hex_sha256(rotated.as_bytes()));
         Ok(rotated)
     }
@@ -3696,7 +3707,7 @@ fn hash_json<T: Serialize>(v: &T) -> Result<String, ProtocolError> {
 }
 fn atomic_json<T: Serialize>(path: &Path, v: &T) -> Result<(), ProtocolError> {
     let bytes = serde_json::to_vec_pretty(v).map_err(internal)?;
-    let tmp = path.with_extension(format!("{}.tmp", random_hex(8)));
+    let tmp = path.with_extension(format!("{}.tmp", random_hex(8)?));
     let written = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -3749,8 +3760,8 @@ fn load_or_create_secret(path: &Path, prefix: &str) -> Result<String, ProtocolEr
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(internal(e)),
     }
-    let key = format!("{prefix}{}", random_hex(32));
-    let tmp = path.with_extension(format!("{}.tmp", random_hex(16)));
+    let key = format!("{prefix}{}", random_hex(32)?);
+    let tmp = path.with_extension(format!("{}.tmp", random_hex(16)?));
     let written = (|| -> std::io::Result<()> {
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
@@ -3804,8 +3815,8 @@ fn now_ms() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
-fn random_id() -> String {
-    random_hex(8)
+fn random_id() -> Result<String, ProtocolError> {
+    random_hex(8).map_err(internal)
 }
 fn elapsed(t: &DurableTask) -> u64 {
     now_ms().saturating_sub(t.created_ms) as u64

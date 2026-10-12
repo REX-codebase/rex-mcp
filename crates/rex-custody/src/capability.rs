@@ -6,6 +6,8 @@
 //! *grant's* scope hash, so a mid-grant capability change (which the model
 //! or agent can never perform) would invalidate every outstanding token.
 
+use crate::registry::CustodyError;
+use hmac::{Hmac, Mac};
 use rex_tools::ToolRequest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -62,9 +64,10 @@ pub struct CapabilitySet {
 
 impl CapabilitySet {
     /// Canonical content hash bound into offers, tokens and the audit log.
-    pub fn scope_hash(&self) -> String {
-        let canon = serde_json::to_string(self).expect("capability set serializes");
-        hex_sha256(canon.as_bytes())
+    pub fn scope_hash(&self) -> Result<String, CustodyError> {
+        let canon = serde_json::to_string(self)
+            .map_err(|e| CustodyError::Io(format!("capability set does not serialize: {e}")))?;
+        Ok(hex_sha256(canon.as_bytes()))
     }
 
     fn tool_class(tool: &str) -> ToolClass {
@@ -158,14 +161,13 @@ pub struct CapabilityToken {
     pub scope_hash: String,
 }
 
-pub fn random_hex(bytes: usize) -> String {
+pub fn random_hex(bytes: usize) -> Result<String, std::io::Error> {
     // /dev/urandom-backed; same entropy source class as rex-tools call ids.
+    // A missing entropy source is a clean error, never a panic.
     let mut buf = vec![0u8; bytes];
     use std::io::Read;
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .expect("system entropy");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub fn hex_sha256(data: &[u8]) -> String {
@@ -177,29 +179,13 @@ pub fn hex_sha256(data: &[u8]) -> String {
 /// HMAC-SHA256 (RFC 2104) over `msg` with `key`, hex-encoded. Used by the
 /// daemon to MAC proof bundles with its daemon-held key: a state editor
 /// that can rewrite task/event files but cannot read the 0600 key file
-/// cannot mint a valid bundle MAC.
+/// cannot mint a valid bundle MAC. Delegates to the audited `hmac` crate.
 pub fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
-    const BLOCK: usize = 64;
-    let reduced = if key.len() > BLOCK {
-        let mut h = Sha256::new();
-        h.update(key);
-        h.finalize().to_vec()
-    } else {
-        key.to_vec()
-    };
-    let mut k = [0u8; BLOCK];
-    k[..reduced.len()].copy_from_slice(&reduced);
-    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
-    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    inner.update(msg);
-    let inner_digest = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(inner_digest);
-    outer
-        .finalize()
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(msg);
+    mac.finalize()
+        .into_bytes()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
