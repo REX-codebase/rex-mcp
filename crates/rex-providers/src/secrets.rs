@@ -235,6 +235,15 @@ mod tests {
         store.set_key("a", "k1").unwrap();
         // no new files can be made in the folder
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        // Root (CAP_DAC_OVERRIDE) ignores directory modes, so the failure
+        // this test needs cannot be produced; say so rather than pass.
+        let probe = dir.join(".probe");
+        if fs::write(&probe, b"").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipped: directory permissions are not enforced for this user");
+            return;
+        }
         let failed = store.set_key("b", "k2").is_err();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(failed);

@@ -9231,7 +9231,16 @@ mod tests {
             .count();
         assert_eq!(parks, 3);
         let posts = svc.service().transport().seen();
-        let reply = &posts[1];
+        // Only the ask_user tool response: the rest of the request (system
+        // prompt, discovered skills, tool docs) is free to contain any word.
+        let reply = {
+            let post = &posts[1];
+            let start = post
+                .find(r#""name":"ask_user","response""#)
+                .unwrap_or_else(|| panic!("no ask_user response: {post}"));
+            let rest = &post[start..];
+            &rest[..rest.find(r#""ok":"#).unwrap_or(rest.len())]
+        };
         assert!(reply.contains(r#"\"answer\":\"pg\""#), "{reply}");
         assert!(reply.contains(r#"\"status\":\"declined\""#), "{reply}");
         assert!(reply.contains(r#"\"answer\":\"token\""#), "{reply}");
