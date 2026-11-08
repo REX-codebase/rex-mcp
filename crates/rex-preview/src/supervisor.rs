@@ -1027,7 +1027,7 @@ mod tests {
         sup.action(&started.id, &BrowserAction::Navigate { path: "/".into() })
             .unwrap();
         assert!(sup
-            .capture_with_fields(&started.id, &[list.clone()])
+            .capture_with_fields(&started.id, std::slice::from_ref(&list))
             .unwrap()
             .visible_result_fields
             .is_empty());

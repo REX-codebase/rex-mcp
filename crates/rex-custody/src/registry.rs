@@ -153,6 +153,7 @@ impl CustodyRegistry {
             .map_err(|_| CustodyError::Io("custody store lock poisoned".into()))?;
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(self.root.join("custody.lock"))
             .map_err(ioe)?;
@@ -870,6 +871,7 @@ impl CustodyRegistry {
             .map_err(|_| CustodyError::Io("custody store lock poisoned".into()))?;
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(root.join("custody.lock"))
             .map_err(ioe)?;

@@ -13,9 +13,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
-          components: rustfmt
+          components: rustfmt, clippy
       - run: bash -n scripts/rex-mcp-install.sh scripts/rex-mcp-uninstall.sh
       - run: cargo fmt --all -- --check
+      # These crates are also built inside rex-harness, whose CI denies
+      # clippy warnings; check here so a sync never brings in failures.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
         env:
           # GitHub's ubuntu-latest runners cannot create unprivileged user

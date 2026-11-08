@@ -182,34 +182,6 @@ fn reply_timeout(method: &str, params: &Value) -> Duration {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn long_tool_calls_outlive_the_daemon_command_cap() {
-        for name in ["rex_execute", "rex_run", "rex_test", "rex_ultra_submit"] {
-            assert_eq!(
-                reply_timeout("tools/call", &json!({"name": name})),
-                Duration::from_secs(150)
-            );
-        }
-        for name in ["rex_ultra_open", "rex_ultra_promote", "rex_proof_verify"] {
-            assert!(reply_timeout("tools/call", &json!({"name": name})) > Duration::from_secs(600));
-        }
-        for name in ["rex_status", "rex_events", "rex_result", "unknown"] {
-            assert_eq!(
-                reply_timeout("tools/call", &json!({"name": name})),
-                Duration::from_secs(30)
-            );
-        }
-        assert_eq!(
-            reply_timeout("initialize", &json!({})),
-            Duration::from_secs(30)
-        );
-    }
-}
-
 impl Drop for McpStdioClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -266,5 +238,33 @@ pub fn rex_mcp_bin() -> Result<PathBuf, String> {
             "rex-mcp binary not found next to {}; set REX_MCP_BIN",
             exe.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_tool_calls_outlive_the_daemon_command_cap() {
+        for name in ["rex_execute", "rex_run", "rex_test", "rex_ultra_submit"] {
+            assert_eq!(
+                reply_timeout("tools/call", &json!({"name": name})),
+                Duration::from_secs(150)
+            );
+        }
+        for name in ["rex_ultra_open", "rex_ultra_promote", "rex_proof_verify"] {
+            assert!(reply_timeout("tools/call", &json!({"name": name})) > Duration::from_secs(600));
+        }
+        for name in ["rex_status", "rex_events", "rex_result", "unknown"] {
+            assert_eq!(
+                reply_timeout("tools/call", &json!({"name": name})),
+                Duration::from_secs(30)
+            );
+        }
+        assert_eq!(
+            reply_timeout("initialize", &json!({})),
+            Duration::from_secs(30)
+        );
     }
 }

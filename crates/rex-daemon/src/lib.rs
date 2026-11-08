@@ -823,6 +823,7 @@ impl HarnessDaemon {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_state_step(
         &self,
         task_id: &str,
@@ -1430,7 +1431,7 @@ impl HarnessDaemon {
                 .map_err(|_| format!("{key}: invalid PNG"))?;
             let info = reader.info();
             let (w, h) = (info.width, info.height);
-            if w < min_width || w > max_width || h < 240 || h > 8192 || w > 8192 {
+            if !(min_width..=max_width).contains(&w) || !(240..=8192).contains(&h) || w > 8192 {
                 return Err(format!("{key}: invalid viewport dimensions {w}x{h}"));
             }
             let mut output = vec![
@@ -1545,7 +1546,7 @@ impl HarnessDaemon {
                     .filter(|f| !observed.is_some_and(|(_, names)| names.contains(&f.name)))
                     .map(|f| f.name.clone())
                     .collect();
-                (!missing.is_empty()).then(|| (kind, missing))
+                (!missing.is_empty()).then_some((kind, missing))
             });
             if let Some((kind, missing)) = missing {
                 let repair = format!("{kind} result contract missing visible fields: {}. Recapture the complete first view", missing.join(", "));
@@ -1911,6 +1912,7 @@ impl HarnessDaemon {
             fs::create_dir_all(&dir).map_err(internal)?;
             let file = OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .write(true)
                 .open(dir.join(format!("{key}.lock")))
                 .map_err(internal)?;
@@ -3796,6 +3798,7 @@ fn lock_task_at(root: &Path, id: &str) -> Result<std::fs::File, ProtocolError> {
     fs::create_dir_all(&dir).map_err(internal)?;
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(dir.join("task.lock"))
         .map_err(internal)?;
